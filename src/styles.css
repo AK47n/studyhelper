@@ -1,0 +1,687 @@
+@import 'katex/dist/katex.min.css';
+
+:root {
+  --bg: #0e1116;
+  --panel: #141821;
+  --panel2: #181d28;
+  --line: #232a37;
+  --line2: #2e3646;
+  --text: #dde3ee;
+  --dim: #8b95a8;
+  --dim2: #667084;
+  --acc: #6aa8ff;
+  --acc2: #2b5ea8;
+  --ok: #4ad295;
+  --warn: #ffb454;
+  --err: #ff6b6b;
+  --mono: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Consolas, 'Microsoft YaHei Mono', monospace;
+
+  /* ---- 字号阶梯：改 --s 一个数，整个界面跟着放大/缩小 ---- */
+  /* 界面上有个 A- / A+ 按钮会改这个值，也存进 localStorage */
+  --s: 1.25;
+  --fs-content: calc(16px * var(--s)); /* 正文、节点标题：要读的东西 */
+  --fs-editor: calc(15px * var(--s)); /* 原文编辑区 */
+  --fs-ui: calc(13.5px * var(--s)); /* 面板、按钮、列表 */
+  --fs-key: calc(12.5px * var(--s)); /* 字段名、标签 */
+  --fs-meta: calc(11.5px * var(--s)); /* 路径、行号这类边角信息 */
+  /* 编辑区两层的字号：绝对值变量（由 --s 派生，能跟着 A+/A− 缩放）。
+     行高必须是**无单位倍数**而不是 px —— 见 .raw/.hl-inner 的注释：
+     textarea 里 px 行高会把大字号的行盒锁死，标题会被压扁。 */
+  --src-font: calc(15.5px * var(--s));
+  --src-lh: 1.95;
+  /* 侧栏宽度也跟着长，不然放大后文字被挤掉 */
+  --w-left: calc(240px + 60px * (var(--s) - 1) * 2);
+  --w-right: calc(330px + 90px * (var(--s) - 1) * 2);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  font-size: var(--fs-ui);
+  line-height: 1.7;
+  overflow: hidden;
+}
+
+button { font-family: inherit; color: inherit; cursor: pointer; }
+code, kbd { font-family: var(--mono); }
+
+.app {
+  display: grid;
+  grid-template-columns: var(--w-left) minmax(0, 1fr) var(--w-right);
+  height: 100%;
+}
+
+/* ================= 左侧 ================= */
+.side {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.brand { display: flex; gap: 10px; align-items: center; padding: 15px 15px 13px; }
+.logo {
+  width: 2.2em; height: 2.2em; border-radius: 10px; flex: none;
+  background: linear-gradient(135deg, var(--acc), #9b7bff);
+  color: #0b1020; font-weight: 800; font-size: var(--fs-ui);
+  display: grid; place-items: center; letter-spacing: -0.5px;
+}
+.bname { font-weight: 700; font-size: calc(var(--fs-ui) * 1.1); letter-spacing: 0.2px; }
+.btag { font-size: var(--fs-meta); color: var(--dim2); margin-top: -2px; }
+
+.side-sec { padding: 11px 11px 4px; min-height: 0; display: flex; flex-direction: column; }
+.side-sec:nth-of-type(2) { flex: 1; overflow: auto; }
+.side-title {
+  font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.6px;
+  padding: 4px 6px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px;
+}
+.filelist { display: flex; flex-direction: column; gap: 2px; overflow: auto; }
+.filerow {
+  background: transparent; border: 1px solid transparent; border-radius: 9px;
+  padding: 8px 10px; text-align: left; display: flex; flex-direction: column; gap: 1px;
+}
+.filerow:hover { background: var(--panel2); }
+.filerow.on { background: #1d2536; border-color: var(--line2); }
+.fname { font-size: var(--fs-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fmeta { font-size: var(--fs-meta); color: var(--dim2); }
+
+.hubrow {
+  background: transparent; border: none; border-radius: 8px; padding: 6px 10px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left;
+}
+.hubrow:hover { background: var(--panel2); }
+.hub-name { font-family: var(--mono); font-size: var(--fs-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.heatbar { font-size: calc(var(--fs-meta) * 0.85); letter-spacing: 2px; color: var(--acc); flex: none; }
+.heatbar.h1 { color: #3f6ea8; } .heatbar.h2 { color: #4f88d0; }
+.heatbar.h3 { color: #61a0f0; } .heatbar.h4 { color: #7cb4ff; } .heatbar.h5 { color: #a8ccff; }
+
+.island-note {
+  margin: 9px 6px 2px; padding: 8px 10px; font-size: var(--fs-ui); color: var(--warn);
+  background: #241c0e; border: 1px solid #453316; border-radius: 9px;
+}
+.side-foot { padding: 11px 15px; border-top: 1px solid var(--line); margin-top: auto; display: flex; flex-direction: column; gap: 6px; }
+.side-zoom {
+  background: #1a2030; border: 1px solid var(--line2); border-radius: 7px;
+  font-size: var(--fs-meta); padding: 5px 9px; color: var(--acc); text-align: center;
+}
+.side-zoom:hover { background: #24304a; color: #cfe6ff; }
+
+/* ---- 字号调节 ---- */
+.zoom {
+  display: flex; align-items: center; gap: 3px;
+  background: #0d1119; border: 1px solid var(--line); border-radius: 9px; padding: 2px 3px;
+}
+.zoom .mini { border: none; background: transparent; font-size: var(--fs-meta); padding: 3px 7px; }
+.zoom .mini:hover:not(:disabled) { background: #24304a; border-radius: 6px; }
+.zoom .mini:disabled { opacity: 0.35; cursor: default; }
+.zoom-val {
+  background: transparent; border: none; color: var(--dim);
+  font-size: var(--fs-meta); font-family: var(--mono); min-width: 4.2em; padding: 3px 2px;
+}
+.zoom-val:hover { color: var(--text); }
+
+/* ================= 中间 ================= */
+.center { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.cur-name {
+  font-weight: 600; font-size: calc(var(--fs-ui) * 1.05);
+  display: flex; align-items: center; gap: 7px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dot-dirty { color: var(--warn); font-size: var(--fs-meta); }
+.top-actions { display: flex; gap: 7px; flex: none; align-items: center; }
+.btn {
+  background: var(--panel2); border: 1px solid var(--line2); border-radius: 8px;
+  padding: 6px 12px; font-size: var(--fs-ui);
+}
+.btn:hover:not(:disabled) { background: #202839; }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn.primary { background: var(--acc2); border-color: #3d78cf; color: #eaf2ff; }
+.btn.ghost { background: transparent; }
+.btn.icon { padding: 6px 9px; font-weight: 700; }
+kbd {
+  font-size: var(--fs-meta); background: #0c1017; border: 1px solid var(--line2);
+  border-radius: 4px; padding: 0 5px; color: var(--dim);
+}
+
+/* ---- 公式条 ---- */
+.fbar { border-bottom: 1px solid var(--line); background: #12161f; position: relative; }
+.fbar-row { display: flex; align-items: center; gap: 10px; padding: 6px 13px; flex-wrap: wrap; }
+.fbar-toggle {
+  background: transparent; border: none; font-size: var(--fs-ui); color: var(--dim);
+  display: flex; align-items: center; gap: 5px; padding: 2px 4px;
+}
+.fbar-toggle:hover { color: var(--text); }
+/* 注意：这个类叫 fbar-caret 而不是 caret —— 编辑区里有个 .caret 是自绘光标，
+   两个同名会互相污染（曾经踩过）。 */
+.fbar-caret { font-size: var(--fs-meta); }
+.fbar-tabs { display: flex; gap: 3px; background: #0d1119; border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+.fbar-tabs button {
+  background: transparent; border: none; border-radius: 6px;
+  padding: 3px 10px; font-size: calc(var(--fs-ui) * 0.95); color: var(--dim);
+}
+.fbar-tabs button.on { background: var(--acc2); color: #eaf2ff; }
+.fbar-note { font-size: var(--fs-meta); color: var(--dim2); margin-left: auto; }
+.fbar-note b { color: var(--dim); }
+
+.fbar-grid {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 0 12px 9px; max-height: calc(120px * var(--s)); overflow-y: auto;
+}
+.chip {
+  background: #1a2030; border: 1px solid var(--line2); border-radius: 6px;
+  padding: 2px 8px; font-size: calc(var(--fs-ui) * 0.95); font-family: var(--mono); line-height: 1.45;
+  min-width: 30px;
+}
+.chip:hover { background: #24304a; border-color: #3f5a8c; color: #fff; }
+.chip.sym { color: #cfe0ff; }
+.chip.struct { color: #ffe0b0; }
+
+.help-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 7px 16px; padding: 2px 16px 14px; font-size: var(--fs-ui); color: var(--dim);
+}
+.help-grid code { color: #cfe0ff; background: #1a2030; padding: 1px 5px; border-radius: 4px; }
+.help-wide { grid-column: 1 / -1; }
+
+/* ---- 「写法」页签：格式速查（缩进/空行必须原样保留，所以用 pre） ---- */
+.help-list { padding: 2px 16px 14px; font-size: var(--fs-ui); color: var(--dim); }
+.help-list ul { margin: 0; padding-left: 18px; }
+.help-list li { margin: 0 0 7px; line-height: 1.7; }
+.help-list p { margin: 0 0 8px; line-height: 1.7; }
+.help-list b { color: var(--text); }
+.help-list .help-code {
+  white-space: pre; display: block; margin: 5px 0 0;
+  font-family: var(--mono); font-size: var(--fs-key); color: #cfe0ff;
+  background: #0d1119; border: 1px solid var(--line); border-left: 2px solid var(--acc);
+  border-radius: 6px; padding: 8px 11px; overflow-x: auto;
+}
+.help-list code { color: #cfe0ff; background: #1a2030; padding: 1px 5px; border-radius: 4px; }
+.help-list .help-h { color: var(--text); font-weight: 600; margin: 12px 0 6px; }
+.help-list .help-h:first-child { margin-top: 2px; }
+.help-list .help-warn { color: var(--warn, #ffcf8a); }
+
+/* ---- [[ 自动补全 ---- */
+.ac {
+  position: absolute; left: 14px; bottom: 100%; z-index: 30; margin-bottom: 4px;
+  width: min(520px, 74vw); background: #10151f; border: 1px solid var(--line2);
+  border-radius: 11px; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55); overflow: hidden;
+}
+.ac-hint { font-size: var(--fs-meta); color: var(--dim2); padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.ac-hint code { color: var(--acc); }
+.ac-empty { color: var(--warn); }
+.ac-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; font-size: var(--fs-ui); }
+.ac-item.on { background: #1d2a42; }
+.ac-title { font-family: var(--mono); }
+.ac-path { font-size: var(--fs-meta); color: var(--dim2); }
+
+/* ---- 源码编辑 + 着色层（两层必须逐像素对齐，见 scripts/check-align.js）----
+   结构：
+     .srcbox          定位基准，overflow: hidden，负责裁剪
+       .hl-clip       绝对铺满，指针穿透，负责裁剪
+/* ---- 编辑区：单一滚动容器 + 两层（见 SourceEditor.jsx 顶部的架构说明）----
+   关键约束：
+     · .srcscroll 是**唯一**的滚动容器 —— 浏览器负责滚，没有 transform 要同步
+     · .hl-inner 和 textarea 都绝对定位、都由 JS 撑到内容高度
+     · 两者的排版参数必须逐字相同（scripts/check-align.js 盯着）
+   textarea 自己不滚动（overflow:hidden），高度 = scrollHeight。 */
+.rawwrap { flex: 1; min-height: 160px; display: flex; flex-direction: column; min-width: 0; }
+.srcwrap { flex: 1; min-height: 0; display: flex; flex-direction: column; cursor: text; }
+.srcscroll {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #0b0e14;
+  scrollbar-width: thin;
+}
+.srcscroll::-webkit-scrollbar { width: 12px; }
+.srcscroll::-webkit-scrollbar-thumb {
+  background: #2a3243; border-radius: 7px; border: 3px solid transparent; background-clip: content-box;
+}
+.srcscroll::-webkit-scrollbar-thumb:hover { background: #3a465c; background-clip: content-box; }
+.srcscroll::-webkit-scrollbar-track { background: transparent; }
+
+.raw,
+.hl-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  margin: 0;
+  padding: 18px 20px 42vh;
+  border: 0;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  /* 行高写成无单位倍数，两层共用同一个变量值。
+     用 px 时，textarea 会把大字号的行盒锁死（标题被压扁、和光标错位）。 */
+  font-size: var(--src-font);
+  line-height: var(--src-lh);
+  /* 下面这些一律显式关掉/锁死：任何一项在两个元素里取值不同，
+     字形宽度就会差一点点，几十个字符累积下来就是整行错位。 */
+  font-kerning: none;
+  font-variant-ligatures: none;
+  font-variant-east-asian: normal;
+  font-feature-settings: normal;
+  font-synthesis: none;
+  font-optical-sizing: none;
+  text-rendering: geometricPrecision;
+  text-size-adjust: 100%;
+  -webkit-text-size-adjust: 100%;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-indent: 0;
+  text-align: left;
+  direction: ltr;
+  tab-size: 4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  hyphens: none;
+  /* 两边都不留滚动条（滚动由 .srcscroll 负责），否则内容宽度不同 → 折行点不同 */
+  scrollbar-width: none;
+}
+.raw::-webkit-scrollbar,
+.hl-inner::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+.raw {
+  height: auto;
+  min-height: 100%;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent; /* 字形交给着色层画 */
+  caret-color: #7fc4ff;
+  resize: none;
+  outline: none;
+  overflow: hidden; /* 自己绝不滚动 */
+  z-index: 1;
+}
+.raw::selection { background: rgba(106, 168, 255, 0.32); }
+.raw::placeholder { color: #46506a; -webkit-text-fill-color: #46506a; }
+
+.hl-inner {
+  min-height: 100%;
+  color: #cdd6e6;
+  /* 不设 z-index：和 textarea 同层叠上下文，按 DOM 顺序压在上面 */
+  pointer-events: none; /* 点击穿透到 textarea，保住原生光标和选择 */
+}
+
+.hl-line {
+  position: relative;
+  /* min-height 用 em：行盒高度 = 这一行的字号 × 1.95，和 textarea 的
+     line-height:1.95（无单位）算法完全一致。标题字号大 → 行盒自动变高。
+     千万不能用 px —— 对照实验证明：textarea 里 px 行高会把大字号的行盒锁死
+     （字号 25.96px 仍只有 37.75px 行盒），标题就被压扁、和光标错位。 */
+  min-height: var(--src-lh);
+  line-height: var(--src-lh);
+  border-radius: 5px;
+  /* content-box + 负 margin：底色可以比文字宽 3px，但**文字的可用宽度必须和
+     textarea 完全相等**。用 border-box + padding 会把文字宽度吃掉 6px，
+     折行点就和 textarea 不一致了。 */
+  box-sizing: content-box;
+  padding: 0 3px;
+  margin: 0 -3px;
+}
+
+/* 底色不能用 background-color 直接铺在 .hl-line 上！
+   折行的行，第二行及以后的文字会落在色块之外（色块高度只按第一视觉行算），
+   看起来就是"字跑出色块"的错位。改用 repeating-linear-gradient 按视觉行重复铺。 */
+.hl-line.active {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(106, 168, 255, 0.1) 0,
+    rgba(106, 168, 255, 0.1) var(--src-lh),
+    transparent var(--src-lh),
+    transparent calc(2 * var(--src-lh))
+  );
+  background-repeat: repeat-y;
+  background-size: 100% var(--src-lh);
+  background-position: 0 0;
+  box-shadow: inset 2px 0 0 var(--acc);
+}
+.srcscroll.focused .hl-line.active {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(106, 168, 255, 0.16) 0,
+    rgba(106, 168, 255, 0.16) var(--src-lh),
+    transparent var(--src-lh),
+    transparent calc(2 * var(--src-lh))
+  );
+}
+
+/* 标题：字号跟着 # 的层数走。这些倍率必须和 SourceEditor.jsx 里的 HEAD_SCALE 对上，
+   否则行高估算会错（脚本 check-align.js 会核对）。 */
+/* 标题：**绝对不能改字号**！
+   根因记录：<textarea> 里所有行共用同一个 font-size。一旦标题行在着色层放大字号，
+   两层的行盒高度就不一样了 —— 实测总高差 71.34px（正好是 3 个标题多出来的高度），
+   于是同一篇文字在两层里越往下错得越多。而 textarea 只有一个字号，
+   这个差**不可能靠任何同步手段糊过去**（DOM 几何还永远自洽，所以探针查不出来）。
+   所以标题只用字重 + 颜色 + 行首色带来区分，字号与正文完全一致。
+   scripts/tail-compare.js 会一直盯着"两层总高必须相等"这条底线。 */
+.hl-line.head { font-weight: 700; color: #eef4ff; }
+.hl-line.head.lv1 { color: #ffffff; }
+.hl-line.head.lv2 { color: #e8effc; }
+.hl-line.head.lv3 { color: #dbe6f8; }
+.hl-line.head.lv4 { color: #dbe6f8; }
+/* 标题的层级用行首色带表达，不占行盒高度 */
+.hl-line.head::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.74em;
+  width: 3px;
+  height: 0.46em;
+  border-radius: 2px;
+  background: var(--acc);
+  opacity: 0.85;
+  pointer-events: none;
+}
+.hl-line.head.lv1::after { opacity: 1; width: 4px; }
+.hl-line.head.lv2::after { opacity: 0.7; }
+.hl-line.head.lv3::after { opacity: 0.42; }
+.hl-line.head.lv4::after { opacity: 0.42; }
+
+/* 公式：底纹 + 边界 */
+.hl-formula {
+  background: rgba(255, 196, 106, 0.1);
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px rgba(255, 196, 106, 0.22);
+  color: #ffd79a;
+}
+.hl-formula.unclosed {
+  background: rgba(255, 107, 107, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 107, 107, 0.4);
+  color: #ffb0a0;
+}
+
+/* 引用：胶囊 */
+.hl-ref {
+  background: rgba(106, 168, 255, 0.14);
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px rgba(106, 168, 255, 0.28);
+  color: #a8d0ff;
+}
+.hl-ref.unclosed {
+  background: rgba(255, 180, 84, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 180, 84, 0.35);
+  color: var(--warn);
+}
+
+/* 字段行（- 公式 | / - 用到的量 | ...）整行给点色。
+   同样用 repeating-linear-gradient 按视觉行铺，折行的第二行才不会跑到色块外。 */
+.hl-line.field.k-公式 {
+  background-image: repeating-linear-gradient(to bottom, rgba(255, 196, 106, 0.055) 0, rgba(255, 196, 106, 0.055) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+}
+.hl-line.field.k-用到的量,
+.hl-line.field.k-用到了 {
+  background-image: repeating-linear-gradient(to bottom, rgba(106, 168, 255, 0.06) 0, rgba(106, 168, 255, 0.06) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+}
+.hl-line.field.k-题型,
+.hl-line.field.k-方法 {
+  background-image: repeating-linear-gradient(to bottom, rgba(180, 140, 255, 0.06) 0, rgba(180, 140, 255, 0.06) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+}
+.hl-line.field.k-易错,
+.hl-line.field.k-注意 {
+  background-image: repeating-linear-gradient(to bottom, rgba(255, 120, 100, 0.06) 0, rgba(255, 120, 100, 0.06) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+}
+/* 当前行优先级最高，放最后覆盖字段色 */
+.hl-line.field.active {
+  background-image: repeating-linear-gradient(to bottom, rgba(106, 168, 255, 0.1) 0, rgba(106, 168, 255, 0.1) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+  box-shadow: inset 2px 0 0 var(--acc);
+}
+.srcscroll.focused .hl-line.field.active {
+  background-image: repeating-linear-gradient(to bottom, rgba(106, 168, 255, 0.16) 0, rgba(106, 168, 255, 0.16) var(--src-lh), transparent var(--src-lh), transparent calc(2 * var(--src-lh)));
+}
+
+/* 专注模式：只亮着光标那一行 */
+.rawwrap.focus .hl-inner { opacity: 0.3; }
+.rawwrap.focus .hl-line.active { opacity: 1; }
+
+/* 光标所在行的公式渲染气泡（只有这一行渲染，所以不会错位） */
+.line-preview {
+  position: absolute;
+  left: 3px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  padding: 8px 14px;
+  background: #131a26;
+  border: 1px solid var(--line2);
+  border-left: 2px solid var(--acc);
+  border-radius: 9px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55);
+  max-width: min(760px, 78vw);
+  pointer-events: none;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: var(--fs-content);
+  line-height: 1.5;
+  white-space: normal;
+}
+.line-preview .math { font-size: 1.05em; }
+.line-preview .lp-text { color: var(--dim); font-size: var(--fs-meta); }
+.line-preview .math-bad { font-family: var(--mono); font-size: var(--fs-key); }
+
+.srcfoot {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 6px 20px; border-top: 1px solid var(--line); background: #10141c;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; font-size: var(--fs-meta);
+}
+.srcfoot code { color: #cfe0ff; background: #1a2030; padding: 0 4px; border-radius: 3px; }
+
+/* ---- 自绘光标（标题行专用）----
+   textarea 只有一个字号，浏览器画的原生光标也只按这个字号算几何。
+   实测（scripts/caret-shot.js）：基础字号 19.375 → 原生光标高 23、顶在内容盒下 8px；
+   标题字号 29.06 时原生光标仍高 34、顶在 2px，而标题字形顶在 11px —— 比字高出约 9px。
+   所以标题行改用这个自己画的竖条：高度 = 该行字体的 content area，纵向居中在行盒里。 */
+.caret {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  border-radius: 1px;
+  background: #7fc4ff;
+  display: none;
+  font-size: 0; /* 空元素，不显示任何文字 */
+}
+.caret.on {
+  display: block;
+  animation: caret-blink 1.06s steps(1, end) infinite;
+}
+.srcscroll .raw { caret-color: transparent; }
+@keyframes caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* ---- 对齐诊断模式 ----
+   打开后：着色层的字 = 蓝色，编辑框里的字 = 红色，两层重合的地方 = 紫色。
+   字应该是紫色；看到红蓝分离，就说明错位了，而且分离的方向和距离一眼可见。
+   （这是把 scripts/line-lab.js 那个实验做成了界面上的开关） */
+.srcscroll.diag .hl-inner {
+  color: #4da3ff !important;
+  -webkit-text-fill-color: #4da3ff !important;
+  opacity: 0.85;
+}
+.srcscroll.diag .hl-inner .hl-formula,
+.srcscroll.diag .hl-inner .hl-ref {
+  background: none !important;
+  box-shadow: none !important;
+  -webkit-text-fill-color: #4da3ff !important;
+}
+.srcscroll.diag .hl-line,
+.srcscroll.diag .hl-line.active,
+.srcscroll.diag .hl-line.field {
+  background-image: none !important;
+  box-shadow: none !important;
+}
+.srcscroll.diag .raw {
+  color: #ff4d4d !important;
+  -webkit-text-fill-color: #ff4d4d !important;
+  caret-color: #ff4d4d !important;
+}
+.srcscroll.diag .caret { background: #ff4d4d; }
+
+/* ---- 视图切换（编辑 / 阅读）---- */
+.viewtabs { display: flex; gap: 3px; background: #0d1119; border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+.viewtabs button {
+  background: transparent; border: none; border-radius: 6px;
+  padding: 4px 14px; font-size: var(--fs-ui); color: var(--dim);
+}
+.viewtabs button.on { background: var(--acc2); color: #eaf2ff; }
+.viewtabs button:hover:not(.on) { color: var(--text); }
+
+/* ---- 预览 ---- */
+.prevwrap { flex: 1 1 48%; min-height: 0; display: flex; flex-direction: column; }
+.prevwrap.big { flex: 1 1 auto; }
+.prevbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 7px 16px; font-size: var(--fs-meta); color: var(--dim2);
+  border-bottom: 1px solid var(--line); background: #10141c;
+}
+.preview { overflow: auto; padding: 14px 18px 48px; flex: 1; }
+.preview.empty { color: var(--dim); }
+.preview.empty p { margin: 6px 0; }
+.preview.empty code { color: #cfe0ff; background: #1a2030; padding: 1px 5px; border-radius: 4px; }
+
+.pnode { position: relative; }
+.pkids { margin-left: 16px; padding-left: 12px; border-left: 1px solid var(--line); }
+.prow {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 4px 8px; border-radius: 8px; cursor: pointer; position: relative;
+}
+.prow:hover { background: #161c28; }
+.prow.on { background: #1c2740; box-shadow: inset 0 0 0 1px var(--acc2); }
+.pdot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--dim2); flex: none;
+}
+.prow.on .pdot { background: var(--acc); }
+.ptitle { font-weight: 500; font-size: var(--fs-content); }
+.ptitle .math { font-weight: 400; }
+
+.pfields { margin: 3px 0 6px 24px; display: flex; flex-direction: column; gap: 3px; }
+.pfield { display: flex; gap: 9px; align-items: baseline; font-size: var(--fs-content); }
+.fkey {
+  flex: none; min-width: 4.6em; font-size: var(--fs-key); color: var(--dim2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; text-align: center;
+  line-height: 1.65;
+}
+.pfield.k-公式 .fkey { color: #ffd79a; border-color: #4a3a1c; background: #221a0c; }
+.pfield.k-公式 .fval { font-size: calc(var(--fs-content) * 1.12); }
+.pfield.k-用到的量 .fkey, .pfield.k-用到了 .fkey { color: #9ecbff; border-color: #24405f; background: #101c2b; }
+.pfield.k-说的是 .fkey { color: var(--dim); }
+.pfield.k-题型 .fkey, .pfield.k-方法 .fkey { color: #cbb2ff; border-color: #35285c; background: #1a1428; }
+.pfield.k-易错 .fkey, .pfield.k-注意 .fkey { color: #ffb0a0; border-color: #5a2a24; background: #24120f; }
+.fval { color: #c3ccdd; }
+
+.pplain { margin: 3px 0 5px 24px; font-size: var(--fs-content); color: #aab4c8; }
+
+.badge {
+  font-size: var(--fs-meta); border-radius: 20px; padding: 1px 9px; line-height: 1.7; flex: none;
+}
+.badge.heat { background: #14243a; color: var(--acc); border: 1px solid #22405f; }
+.badge.heat.h1 { color: #5f87b8; } .badge.heat.h2 { color: #6f9ad8; }
+.badge.heat.h3 { color: #82b0f0; } .badge.heat.h4 { color: #99c2ff; } .badge.heat.h5 { color: #b6d4ff; }
+.badge.island { background: #241c0e; color: var(--warn); border: 1px solid #453316; }
+
+/* 行内公式 / 引用 */
+.math { padding: 0 1px; }
+.math-bad {
+  font-family: var(--mono); font-size: var(--fs-key); color: var(--warn);
+  background: #241c0e; border-bottom: 1px dashed var(--warn); padding: 0 3px;
+}
+.ref {
+  font-family: var(--mono); font-size: var(--fs-key); padding: 1px 6px; margin: 0 2px;
+  background: #14243a; color: #9ecbff; border: 1px solid #22405f;
+  border-radius: 6px; line-height: 1.6;
+}
+.ref:hover { background: #1d3450; color: #cfe6ff; }
+.ref.dangling { background: #241c0e; color: var(--warn); border-color: #453316; border-style: dashed; }
+
+.katex { font-size: 1.06em; }
+
+/* ================= 右侧 ================= */
+.right {
+  background: var(--panel); border-left: 1px solid var(--line);
+  overflow: auto; min-height: 0;
+}
+.ctx { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.ctx-head h3 {
+  margin: 4px 0 9px; font-size: calc(var(--fs-content) * 1.1); line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.ctx-kicker { font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.5px; }
+.ctx-actions { display: flex; gap: 6px; }
+.ctx-note { font-size: var(--fs-ui); color: var(--dim); margin: 0; }
+.ctx-hint {
+  font-size: var(--fs-ui); color: var(--dim); margin: 7px 0 0; padding: 9px 11px;
+  background: #141b26; border-left: 2px solid var(--acc2); border-radius: 0 8px 8px 0;
+}
+.ctx-hint code { color: #cfe0ff; font-size: var(--fs-key); overflow-wrap: anywhere; }
+
+.verdict { font-size: var(--fs-ui); padding: 7px 11px; border-radius: 9px; }
+.verdict.ok { background: #10251c; color: var(--ok); border: 1px solid #1d4a36; }
+.verdict.warn { background: #241c0e; color: var(--warn); border: 1px solid #453316; }
+
+.ctx-sec { display: flex; flex-direction: column; gap: 3px; }
+.sec-title {
+  font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.6px;
+  padding-bottom: 5px; border-bottom: 1px solid var(--line); margin-bottom: 5px;
+}
+.link-row {
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  padding: 6px 9px; display: flex; align-items: center; justify-content: space-between;
+  gap: 9px; text-align: left; font-size: var(--fs-ui);
+}
+.link-row:hover { background: var(--panel2); border-color: var(--line2); }
+.link-row.sub { margin-left: 9px; }
+.link-row.dangling .lr-name { color: var(--warn); }
+.lr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lr-line { font-size: var(--fs-meta); color: var(--dim2); font-family: var(--mono); flex: none; }
+.island-text { color: var(--warn); }
+
+.ctx-field { display: flex; gap: 9px; align-items: baseline; padding: 4px 0; font-size: var(--fs-content); }
+.ctx-field .fval { color: #c3ccdd; overflow-wrap: anywhere; }
+.ctx-plain { font-size: var(--fs-content); color: #aab4c8; overflow-wrap: anywhere; }
+.ctx-kids { margin-top: 7px; display: flex; flex-direction: column; gap: 2px; }
+
+.mini {
+  background: #1a2030; border: 1px solid var(--line2); border-radius: 7px;
+  font-size: var(--fs-meta); padding: 3px 9px; color: var(--dim);
+}
+.mini:hover { color: var(--text); background: #24304a; }
+.dim { color: var(--dim2); }
+.dim.small, .small { font-size: var(--fs-meta); }
+.pad { padding: 4px 8px; }
+
+/* ================= 浮层 ================= */
+.cover {
+  position: fixed; inset: 0; background: rgba(10, 13, 18, 0.75);
+  display: grid; place-items: center; color: var(--dim); font-size: var(--fs-ui); z-index: 100;
+}
+.toast {
+  position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);
+  background: #1a2331; border: 1px solid var(--line2); border-radius: 10px;
+  padding: 10px 18px; font-size: var(--fs-ui); z-index: 200;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5); max-width: 76vw;
+}
+.toast.ok { border-color: #1d4a36; color: #bdf0d7; }
+.toast.warn { border-color: #453316; color: #ffe0b0; }
+.toast.err { border-color: #5a2a24; color: #ffc9c0; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-thumb { background: #262e3d; border-radius: 7px; border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: #354054; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }

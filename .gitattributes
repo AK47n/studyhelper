@@ -1,0 +1,11 @@
+# 统一行尾：仓库里一律 LF，检出的 .bat 用 CRLF（Windows 批处理不认 LF）。
+# 不写这个的话，每个文件都会刷一条 "LF will be replaced by CRLF" 警告，
+# 而且窗口里跑得好好的 .bat 在别的机器上会失灵。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

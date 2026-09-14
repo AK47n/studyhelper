@@ -1,0 +1,34 @@
+{
+  "name": "studyhelper",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "过手总结台：把一节课整理成「量 — 公式 — 关系」的树，公式快速输入",
+  "scripts": {
+    "dev": "node server.js --dev",
+    "build": "vite build",
+    "start": "node server.js",
+    "go": "vite build && node server.js",
+    "check": "node scripts/check-parse.js",
+    "check:keys": "node scripts/check-keys.js",
+    "check:scale": "node scripts/check-scale.js",
+    "check:align": "node scripts/check-align.js",
+    "check:highlight": "esbuild scripts/check-highlight.js --bundle --platform=node --format=cjs --outfile=.cache/check-highlight.cjs --external:katex --log-level=error && node .cache/check-highlight.cjs",
+    "check:render": "esbuild scripts/check-render.js --bundle --platform=node --format=cjs --outfile=.cache/check-render.cjs --external:katex --log-level=error && node .cache/check-render.cjs",
+    "check:mount": "esbuild scripts/check-mount-body.jsx --bundle --platform=node --format=cjs --outfile=.cache/check-mount-body.cjs --external:katex --external:react --external:react-dom --log-level=error && copy scripts\\check-mount.js .cache\\check-mount-entry.mjs >nul && node .cache/check-mount-entry.mjs",
+    "check:browser": "start \"\" \"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --headless=new --disable-gpu --no-sandbox --hide-scrollbars --remote-debugging-port=9222 --user-data-dir=%TEMP%\\studyhelper-cdp http://127.0.0.1:5177/ && timeout /t 5 >nul && node scripts\\cdp-align.js && node scripts\\cdp-caretfit.js",
+    "perf": "esbuild scripts/perf.js --bundle --platform=node --format=cjs --outfile=.cache/perf.cjs --external:katex --log-level=error && node .cache/perf.cjs",
+    "check:all": "npm run check && npm run check:keys && npm run check:scale && npm run check:align && npm run check:highlight && npm run check:render && npm run check:mount"
+  },
+  "dependencies": {
+    "katex": "^0.16.11",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "esbuild": "^0.28.2",
+    "jsdom": "^30.0.1",
+    "vite": "^7.0.0"
+  }
+}
