@@ -189,7 +189,31 @@
 - 数据目录：`data/`，一个总结一个 `.md` 文件。
 - 服务是**原子写**的（先写临时文件再改名），写一半断电不会留下坏文件。
 - 你可以用 VSCode 直接改 `data/` 里的文件；页面检测到磁盘变了会提示你点「重载」。
-- 想备份 / 多设备同步：`git init` 之后把 `data/` 提交进去就行。
+
+### 备份到 GitHub
+
+仓库：**https://github.com/AK47n/studyhelper**（私有）。`data/` 里的笔记也在版本控制里，
+所以换电脑、误删、改坏了，都能从 GitHub 找回来。
+
+写完之后**双击根目录的 `备份到GitHub.bat`**（或者 `npm run sync`）。它会：
+提交 → 拉取（`--rebase`，避免两台机器写出分叉）→ 推送，任何一步失败都会说清楚卡在哪。
+
+```
+  studyhelper 备份到 GitHub
+  ─────────────────────────────────────
+  https://github.com/AK47n/studyhelper.git
+  改动清单：
+   M data/示例 · 大物电磁学.md
+  ✓ 已提交
+  ✓ 已同步远端
+  ✓ 已推送到 GitHub
+```
+
+换台电脑继续写：`git clone` 下来，`npm install`，`npm run build`，然后照旧双击启动。
+
+> 已知的小摩擦：这个 .bat 是双击用的，所以**它不会自动跑**。想省掉这一步，
+> 可以让服务在每次保存后自动推一次——没做，是因为那会在后台悄悄动你的 GitHub 账号，
+> 得你点头再加。
 
 ---
 
@@ -242,5 +266,9 @@ studyhelper/
       Preview.jsx      下半部分：渲染后的树（KaTeX）
       ContextPanel.jsx 右侧：被引用于 / 用到了，可点击跳转
   data/                你的总结（纯文本）
-  scripts/             自检脚本
+    zz · 模板….md      【】填空模板：不用会 Markdown 也能写（文件名以 zz 开头，
+                       是为了不抢"打开时载入第一个文件"的位置）
+  scripts/             自检脚本 + sync.js（一键备份到 GitHub）
+  启动 studyhelper.bat  双击启动
+  备份到GitHub.bat      双击把新写的笔记推到 GitHub
 ```
