@@ -356,7 +356,7 @@ server.listen(PORT, HOST, async () => {
   console.log(`  数据目录  ${DATA_DIR}`)
   console.log(`  地址      ${target}`)
   if (AUTO_EXIT) {
-    console.log(`  自动关闭  关掉浏览器标签页约 ${Math.round(AUTO_EXIT_MS / 1000)} 秒后，服务自己停`)
+    console.log('  自动关闭  关掉浏览器标签页就自动停（浏览器崩了的话最迟 ' + Math.round(AUTO_EXIT_MS / 1000) + ' 秒）')
   } else {
     console.log('  自动关闭  已关掉（--no-auto-exit）')
   }
