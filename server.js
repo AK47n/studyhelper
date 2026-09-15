@@ -1,5 +1,13 @@
 // studyhelper 本地服务：把 data/ 目录里的纯文本文件当成数据库用。
 // 没有任何第三方依赖，只用 node 内置模块。Ctrl+C 关闭。
+//
+// ── 关掉浏览器标签页 = 服务自己停（看这里）──
+// 页面每 HEARTBEAT_MS 发一次 /api/heartbeat；只要心跳停了（标签页关了、
+// 浏览器崩了、强杀了），超过 AUTO_EXIT_MS 就自己退出。这样你不用"先关服务"。
+// 两条防误杀的规矩：
+//   ① 从没收到过心跳时**永不退出** —— 于是命令行 curl、自检脚本、npm run dev 都不受影响；
+//   ② 超时给得比较宽（15 秒），不跟"切标签、标签卡一下"较劲。
+// 想要老行为（常驻不自动退）：--no-auto-exit，或环境变量 STUDYHELPER_AUTO_EXIT=0。
 import http from 'node:http'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -13,6 +21,16 @@ const DEV = argv.includes('--dev')
 const NO_OPEN = argv.includes('--no-open')
 const PORT = Number(process.env.STUDYHELPER_PORT || (DEV ? 5178 : 5177))
 const HOST = '127.0.0.1'
+
+/* 自动退出：见文件头的说明。要关掉就用 --no-auto-exit 或 STUDYHELPER_AUTO_EXIT=0 */
+const AUTO_EXIT = !argv.includes('--no-auto-exit') && process.env.STUDYHELPER_AUTO_EXIT !== '0'
+const AUTO_EXIT_MS = Number(process.env.STUDYHELPER_AUTO_EXIT_MS || 15000) // 心跳断多久之后退出
+const BYE_GRACE_MS = 2500 // 页面说"再见"后的宽限期（为了 F5 刷新不自杀）
+const WATCH_TICK_MS = 2000 // 多久检查一次
+
+let lastHeartbeat = 0 // 0 = 还从没收到过心跳 → 永不自动退出
+let byeAt = 0 // 页面说了"再见"的时刻；宽限期结束还没心跳才真退
+let shuttingDown = false
 
 const DATA_DIR = path.join(__dirname, 'data')
 const DIST_DIR = path.join(__dirname, 'dist')
@@ -195,6 +213,40 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { watch: Object.fromEntries(watchState) })
   }
 
+  /* 页面活着的心跳。收到第一次之后，这项服务就"归"这个页面管了。
+     心跳一律清掉 byeAt —— 页面回来了，之前那次告别作废。 */
+  if (p === '/api/heartbeat' && (req.method === 'GET' || req.method === 'POST')) {
+    lastHeartbeat = Date.now()
+    byeAt = 0
+    return sendJson(res, 200, { ok: true, autoExit: AUTO_EXIT, timeoutMs: AUTO_EXIT_MS })
+  }
+
+  /* 页面正在关（navigator.sendBeacon 发的）。不马上退，给 BYE_GRACE_MS 宽限：
+     因为**按 F5 刷新也会触发 pagehide**，立刻退出就会把刷新中的页面弄死
+     （实测会：页面重新加载的这几百毫秒里服务已经没了）。
+     宽限期内收到心跳就作废；真关掉了，也就多活 2.5 秒。 */
+  if (p === '/api/bye' && req.method === 'POST') {
+    if (AUTO_EXIT && lastHeartbeat) {
+      byeAt = Date.now()
+      return sendJson(res, 200, { ok: true, bye: true })
+    }
+    return sendJson(res, 200, { ok: true, bye: false })
+  }
+
+  /* 自动退出这件事的内部状态。给排查用（也方便自检脚本断言）：
+     看不清 lastHeartbeat / byeAt 的话，这类"什么时候退"的问题只能靠猜。 */
+  if (p === '/api/state' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      autoExit: AUTO_EXIT,
+      timeoutMs: AUTO_EXIT_MS,
+      byeGraceMs: BYE_GRACE_MS,
+      lastHeartbeat,
+      byeAt,
+      sinceHeartbeat: lastHeartbeat ? Date.now() - lastHeartbeat : null,
+      shuttingDown,
+    })
+  }
+
   return sendJson(res, 404, { error: '未知接口' })
 }
 
@@ -241,6 +293,48 @@ const server = http.createServer(async (req, res) => {
 
 await ensureData()
 
+/* 收摊：先正常关（让在飞的请求写完），1.5 秒还没关干净就强退。
+   强退是安全的：写文件走的是"先写临时文件再 rename"的原子写，
+   所以最坏情况是这一秒的编辑没落盘，不会留下写坏的文件。 */
+function shutdown(why) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log('')
+  console.log(`  ${why} —— 服务自己停了。`)
+  console.log('  数据都在 data/ 目录里，下次点桌面图标就回来。')
+  console.log('')
+  const force = setTimeout(() => process.exit(0), 1500)
+  force.unref?.()
+  server.close(() => {
+    clearTimeout(force)
+    process.exit(0)
+  })
+}
+
+/* 心跳看门狗：只有"被页面认领过"（lastHeartbeat 非 0）才计时。
+   从没收到过心跳 → 永不自动退出，于是命令行访问、自检脚本、npm run dev 都照常。 */
+if (AUTO_EXIT) {
+  setInterval(() => {
+    if (!lastHeartbeat || shuttingDown) return
+    // 页面明确说了"再见"：宽限 BYE_GRACE_MS 之后仍没心跳，才算真关掉
+    if (byeAt && Date.now() - byeAt > BYE_GRACE_MS) {
+      shutdown('浏览器标签页关了')
+      return
+    }
+    // 兜底：标签页没打招呼就没了（浏览器崩了 / 被强杀）
+    if (Date.now() - lastHeartbeat > AUTO_EXIT_MS) shutdown('浏览器标签页已经不在了')
+  }, WATCH_TICK_MS).unref?.()
+}
+
+// Ctrl+C / 关黑窗口也走同一条收摊路径，输出一致
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  try {
+    process.on(sig, () => shutdown('收到关闭信号'))
+  } catch {
+    /* Windows 上有些信号注册不了，忽略 */
+  }
+}
+
 // 端口被占：说明已经开着一个了，直接把浏览器指过去
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -261,7 +355,12 @@ server.listen(PORT, HOST, async () => {
   console.log('  ─────────────────────────────────────')
   console.log(`  数据目录  ${DATA_DIR}`)
   console.log(`  地址      ${target}`)
-  console.log('  关闭      Ctrl + C（或直接关掉这个黑窗口）')
+  if (AUTO_EXIT) {
+    console.log(`  自动关闭  关掉浏览器标签页约 ${Math.round(AUTO_EXIT_MS / 1000)} 秒后，服务自己停`)
+  } else {
+    console.log('  自动关闭  已关掉（--no-auto-exit）')
+  }
+  console.log('  手动关闭  Ctrl + C（或直接关掉这个黑窗口）')
   console.log('')
   if (!DEV && !NO_OPEN) openBrowser(target)
 })

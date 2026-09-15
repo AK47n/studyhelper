@@ -197,6 +197,38 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current, text])
 
+  // ---- 让服务知道"页面还在"：关掉标签页 = 服务自己停 ----
+  // 服务端只认心跳。心跳停了（标签页关了、浏览器崩了、被强杀）就自己退出，
+  // 于是你不用"先关服务"再关浏览器。
+  // 这里刻意**不**在标签页切到后台时停心跳：切标签不等于关页面，
+  // 把服务停掉会让你切回来时看到一个死页面。
+  useEffect(() => {
+    // 刚打开时先报一次到，避免"服务在页面加载期间就以为自己没人管了"
+    const beat = () => {
+      fetch('/api/heartbeat', { method: 'POST' }).catch(() => {})
+    }
+    beat()
+    const t = setInterval(beat, 5000)
+
+    // 正在关页面：用 sendBeacon 立刻通知，不用等服务端那 15 秒超时。
+    // 为什么要 beacon：普通 fetch 在页面卸载时会被取消，来不及发出去。
+    const bye = () => {
+      try {
+        navigator.sendBeacon('/api/bye')
+      } catch {
+        /* 发不出去也没关系，服务端还有心跳超时兜底 */
+      }
+    }
+    window.addEventListener('pagehide', bye)
+    window.addEventListener('beforeunload', bye)
+
+    return () => {
+      clearInterval(t)
+      window.removeEventListener('pagehide', bye)
+      window.removeEventListener('beforeunload', bye)
+    }
+  }, [])
+
   // ---- 磁盘被外部改动的检测 ----
   useEffect(() => {
     const t = setInterval(async () => {
