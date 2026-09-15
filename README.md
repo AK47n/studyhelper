@@ -304,6 +304,13 @@ studyhelper/
     zz · 模板….md      【】填空模板：不用会 Markdown 也能写（文件名以 zz 开头，
                        是为了不抢"打开时载入第一个文件"的位置）
   scripts/             自检脚本 + sync.js（一键备份到 GitHub）
-  启动 studyhelper.bat  双击启动
+    common.ps1         启停共用：找浏览器、「已停止」提示页地址
+    start-app.ps1      起服务（隐藏窗口）→ 等真的能响应 → 开浏览器
+    stop-app.ps1       按端口杀服务 → 显示「已停止」提示页
+    toggle.ps1         开关：按 5177 端口有没有人在听，决定走上面哪条
+    server-run.ps1     真身：跑 node，并把输出按 UTF-8 写进 .cache\server.log
+    stopped.html       「已停止」提示页（关服务后给你看的）
+  启动 studyhelper.bat  前台启动（黑窗口看得见，关窗口=关服务）
+  studyhelper 开关.bat  开关：没跑就启动，跑着就关掉（桌面快捷方式指向它）
   备份到GitHub.bat      双击把新写的笔记推到 GitHub
 ```
