@@ -4,7 +4,10 @@ import { parseDoc, renderTitle, displayBody, quantityRefsIn } from '../src/lib/p
 
 const dir = 'data'
 let bad = 0
-for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.md'))) {
+/* 白板文件（board-*.md）内容是 JSON，不是笔记格式 —— 它不是笔记，别拿笔记的规矩考它。
+   凡是遍历 data/*.md 的脚本都得跳过它，否则会报一条看着像"笔记坏了"的假故障。 */
+const files = fs.readdirSync(dir).filter((x) => x.endsWith('.md') && !/^board-.*\.md$/i.test(x))
+for (const f of files) {
   const text = fs.readFileSync(path.join(dir, f), 'utf8')
   const doc = parseDoc(text)
   console.log(`\n=== ${f} ===`)

@@ -12,9 +12,17 @@ import ContextPanel from '../src/components/ContextPanel.jsx'
 import { parseDoc, extractRefs } from '../src/lib/parse.js'
 
 const dir = path.join(process.cwd(), 'data')
-const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md'))
+/* ⚠ 白板文件也住在 data/ 里、后缀也是 .md（见 README「白板 → 数据长什么样」），
+   但它的内容是 JSON，不是笔记格式。第一版没排除它，于是这个自检一打开
+   board-*.md 就报"预览里没有渲染出任何 KaTeX 公式" —— 一条假故障，
+   而且看起来像笔记界面坏了。
+   凡是"遍历 data/*.md"的脚本，都要先跳过 board- 开头的那批。 */
+const BOARD_RE = /^board-.*\.md$/i
+const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md') && !BOARD_RE.test(f))
+const boards = fs.readdirSync(dir).filter((f) => BOARD_RE.test(f))
+if (boards.length) console.log(`（跳过 ${boards.length} 个白板文件：${boards.join('、')}）`)
 if (!files.length) {
-  console.log('data/ 里没有 .md 文件')
+  console.log('data/ 里没有笔记文件')
   process.exit(0)
 }
 

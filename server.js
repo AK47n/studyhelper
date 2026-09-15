@@ -14,6 +14,8 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
+import { extractFilePart } from './src/lib/multipart.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const argv = process.argv.slice(2)
@@ -66,6 +68,18 @@ async function readBody(req) {
     chunks.push(c)
   }
   return Buffer.concat(chunks).toString('utf8')
+}
+
+// 二进制版本（手写识别要收 PNG）。和上面同一个体积上限。
+async function readBodyBuffer(req, limit = 8 * 1024 * 1024) {
+  const chunks = []
+  let size = 0
+  for await (const c of req) {
+    size += c.length
+    if (size > limit) throw new Error('图片太大（超过 8MB）—— 白板上的笔迹不该有这个体积')
+    chunks.push(c)
+  }
+  return Buffer.concat(chunks)
 }
 
 // 原子写：先写临时文件再 rename，避免写一半断电留下坏文件
@@ -247,7 +261,99 @@ async function handleApi(req, res, url) {
     })
   }
 
+  /* ─────────────── 手写识别 ───────────────
+     密钥只存在 config/ocr.json（.gitignore 里排掉了），浏览器从来没见过它。
+     这里只做四件事：报状态、存配置、体检、代理一次识别。
+     真正的请求构造/错误分类在 server-ocr.js —— 那部分能用假服务整条测通。 */
+  if (p === '/api/ocr/status' && req.method === 'GET') {
+    const cfg = await loadConfig(__dirname)
+    return sendJson(res, 200, { ok: true, ...publicStatus(cfg) })
+  }
+
+  if (p === '/api/ocr/config' && (req.method === 'PUT' || req.method === 'POST')) {
+    const body = await readBody(req)
+    let patch = {}
+    try {
+      patch = JSON.parse(body || '{}')
+    } catch {
+      return sendJson(res, 400, { ok: false, error: '配置不是合法 JSON' })
+    }
+    // 只认我们知道的字段，别让前端随手塞东西进来
+    const allow = ['enabled', 'provider', 'base', 'turbo', 'tokenHeader', 'token', 'dsBase', 'model']
+    const clean = {}
+    for (const k of allow) if (k in patch) clean[k] = patch[k]
+    // 空字符串 = "我要清掉密钥"，这是合法操作，不能当成"没改"
+    if (clean.token === '') clean.token = ''
+    const cfg = await saveConfig(__dirname, clean)
+    return sendJson(res, 200, { ok: true, ...publicStatus(cfg) })
+  }
+
+  if (p === '/api/ocr/test' && req.method === 'POST') {
+    const cfg = await loadConfig(__dirname)
+    const r = await testProvider(cfg)
+    return sendJson(res, 200, r)
+  }
+
+  if (p === '/api/ocr' && req.method === 'POST') {
+    const cfg = await loadConfig(__dirname)
+    if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
+
+    const raw = await readBodyBuffer(req)
+    const part = extractFilePart(raw, req.headers['content-type'] || '')
+    if (!part) {
+      return sendJson(res, 200, {
+        ok: false,
+        kind: 'bad',
+        error: '没收到图片（这里要的是 multipart/form-data，字段名 file）',
+      })
+    }
+    const img = part.data
+    // 只收图片：这是个只给本机前端用的接口，但"顺手当文件上传器"这种事不该发生
+    const magic = img.subarray(0, 4)
+    const isPng = magic[0] === 0x89 && magic[1] === 0x50 && magic[2] === 0x4e && magic[3] === 0x47
+    const isJpg = magic[0] === 0xff && magic[1] === 0xd8 && magic[2] === 0xff
+    if (!isPng && !isJpg) {
+      return sendJson(res, 200, { ok: false, kind: 'bad', error: '收到的不是 PNG/JPEG 图片' })
+    }
+
+    const r = await callProvider(cfg, img)
+    if (!r.ok) {
+      console.log(`  [手写识别] 失败（${r.kind}）：${r.error}`)
+      return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
+    }
+    console.log(`  [手写识别] 认出：${r.latex.slice(0, 70)}${r.conf != null ? '（置信度 ' + r.conf + '）' : ''}`)
+    return sendJson(res, 200, {
+      ok: true,
+      latex: r.latex,
+      conf: r.conf,
+      note: r.conf != null && r.conf < 0.6 ? '这次置信度偏低，多半得手动改两笔' : '',
+      debug: { bytes: img.length, endpoint: cfg.turbo ? 'turbo' : 'standard', requestId: r.requestId },
+    })
+  }
+
   return sendJson(res, 404, { error: '未知接口' })
+}
+
+/* 从 multipart/form-data 里抠出那个文件。
+ * 实现搬去了 src/lib/multipart.js —— 那里能在 node 里单独测（含二进制不被改写
+ * 这条最关键的断言）。这里只留一个 import，别在这儿再抄一份。 */
+
+/* 缓存策略。
+ *
+ * ⚠ 这里踩过一次：改了代码、`npm run build`、也确认服务端发的是新产物，
+ *   但用户浏览器窗口里还是**几小时前的旧版**（工具条上少一个按钮、
+ *   画布行为也不对），看起来像"功能没做"或者"画不了"。
+ *   dist 里的 js/css 文件名是带内容哈希的，但 index.html 不是 ——
+ *   浏览器照着旧的 index.html 去要旧的 js，而我们又把旧 js 缓存住了。
+ *
+ * 所以：**文字类资源一律 no-cache**（每次都回来问一句 ETag 变了没）。
+ * 对本地单机服务来说，"回来问一句"就是同机一次内存查询，代价可以忽略；
+ * 换来的是"改完刷新就生效"，不会再出现"明明改了却没有"。
+ * 字体/图标是内容哈希命名的，可以放心长缓存。
+ */
+const CACHEABLE = new Set(['.woff', '.woff2', '.ttf', '.otf', '.png', '.jpg', '.svg', '.ico'])
+function cacheHeaderFor(ext) {
+  return CACHEABLE.has(ext) ? 'public, max-age=31536000, immutable' : 'no-cache'
 }
 
 async function serveStatic(req, res, url) {
@@ -264,6 +370,7 @@ async function serveStatic(req, res, url) {
       const ext = path.extname(file).toLowerCase()
       return send(res, 200, await fsp.readFile(file), {
         'Content-Type': MIME[ext] || 'application/octet-stream',
+        'Cache-Control': cacheHeaderFor(ext),
       })
     }
   }
@@ -273,7 +380,12 @@ async function serveStatic(req, res, url) {
     const base = DEV ? SRC_DIR : DIST_DIR
     const idx = path.join(base, 'index.html')
     const s = await statOf(idx)
-    if (s) return send(res, 200, await fsp.readFile(idx), { 'Content-Type': MIME['.html'] })
+    if (s) {
+      return send(res, 200, await fsp.readFile(idx), {
+        'Content-Type': MIME['.html'],
+        'Cache-Control': 'no-cache',
+      })
+    }
   }
 
   return send(res, 404, 'not found: ' + rel, { 'Content-Type': 'text/plain; charset=utf-8' })

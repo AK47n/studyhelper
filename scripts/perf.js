@@ -6,7 +6,12 @@ import katex from 'katex'
 import { parseDoc } from '../src/lib/parse.js'
 
 const dir = 'data'
-const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md'))
+// 白板文件（board-*.md）内容是 JSON，不是笔记格式 —— 拿它当性能样本会测出假数字
+const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md') && !/^board-.*\.md$/i.test(f))
+if (!files.length) {
+  console.log('data/ 里没有笔记文件，没得测')
+  process.exit(0)
+}
 let base = fs.readFileSync(path.join(dir, files[0]), 'utf8')
 
 // 造一个"一学期规模"的压力样本：把样板重复 30 遍

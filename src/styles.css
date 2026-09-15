@@ -112,6 +112,17 @@ code, kbd { font-family: var(--mono); }
   font-size: var(--fs-meta); padding: 5px 9px; color: var(--acc); text-align: center;
 }
 .side-zoom:hover { background: #24304a; color: #cfe6ff; }
+/* 左栏底部那一行：放大/缩小按钮 + 当前百分比。
+   原来只有一个"字太小 →"（只会放大），白板模式下顶栏不渲染，
+   于是整个白板里没有"调小"的入口 —— 这一行补上，并且是成对的。 */
+.side-zoom-row { display: flex; align-items: center; gap: 6px; }
+.side-zoom-row .side-zoom { flex: 1; }
+.side-zoom-val {
+  background: transparent; border: 1px solid var(--line2); border-radius: 7px;
+  font-size: var(--fs-meta); padding: 5px 7px; color: var(--dim2); cursor: pointer;
+  min-width: 46px; text-align: center;
+}
+.side-zoom-val:hover { color: var(--text); background: #24304a; }
 
 /* ---- 字号调节 ---- */
 .zoom {
@@ -685,3 +696,425 @@ kbd {
 ::-webkit-scrollbar-thumb { background: #262e3d; border-radius: 7px; border: 3px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-thumb:hover { background: #354054; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ================= 白板 =================
+   这一整块是"笔优先"的界面，和上面那套深色的笔记界面并存。
+
+   它是**浅色**的：真白板的直觉就是白底、纸感、墨迹黑。
+   字号仍然由 --s 驱动（和全站一致，按 A+ 会跟着放大）。 */
+
+/* 白板模式下没有右边那一栏（关系面板在板子里），所以整个网格变成两列。
+   直接用 .app 的三列布局会在右边留一条空白 —— 白板要靠"整屏"才有纸的感觉。
+
+   ⚠ 这里踩过一个很隐蔽的坑：**改列数不等于换了布局引擎**。
+   `.app` 是 grid，白板那一块要占的是"第二列"；光把模板从三列改成两列、
+   却没管白板元素落在哪，它就会掉到**第二行**去，于是被压成
+   "左栏那么宽、高度只剩一点点" —— 表现出来就是"白板整个不见了、只剩一片黑"。
+   而且这个坑还会**再来一次**：白板外面套了"文件名那一行"之后，
+   只给内层的画布指定格子，那一行文件名的兄弟就会被自动放进第 2 行，
+   把画布挤掉一半。所以规则写在外层容器 .bd-shell 上，孩子只管在它里面排。 */
+.app.board-mode { grid-template-columns: var(--w-left) minmax(0, 1fr); }
+.app.board-mode > .bd-shell {
+  grid-column: 2; grid-row: 1;
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0;
+}
+
+/* 白板顶上那条：只放"现在开的是哪张板"。
+   白板自己有一套工具条，所以这里刻意做得很薄 —— 一行就够。 */
+.bd-topline {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+.bd-topline .bd-file {
+  font-size: var(--fs-ui); color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 白板 / 笔记 两个入口 */
+.modes { display: flex; gap: 6px; padding: 0 15px 11px; }
+.modes .mode {
+  flex: 1; background: var(--panel2); border: 1px solid var(--line2); border-radius: 9px;
+  color: var(--dim); font-size: var(--fs-ui); padding: 7px 6px; cursor: pointer;
+}
+.modes .mode:hover { color: var(--text); background: #24304a; }
+.modes .mode.on { background: var(--acc2); border-color: var(--acc); color: #fff; }
+
+.bd {
+  --ink: #1b1d22;
+  --paper: #fbfbf9;
+  --paper-line: #e6e7e1;
+  --bd-radius: 10px;
+  position: relative;
+  flex: 1; /* 在 .bd-shell 里把剩下的高度全吃掉（上面那行文件名不占多少） */
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #0e1116;
+  color: #dde3ee;
+}
+
+.bd-stagewrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--paper);
+  /* 纸感的淡格：太明显的格子会跟手写的线抢注意力，所以只是"似有似无" */
+  background-image:
+    linear-gradient(var(--paper-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--paper-line) 1px, transparent 1px);
+  background-size: 32px 32px;
+  cursor: crosshair;
+  touch-action: none; /* 触屏手势我们自己管，不然浏览器会先滚动/缩放页面 */
+}
+
+.bd-stage { position: absolute; left: 0; top: 0; }
+
+/* 三层按 z 叠：墨迹 → 连线 → 卡片 → 收事件层。
+   连线夹在墨迹和卡片之间是有意的：线被卡片挡住两端，看起来是"连着卡片"，
+   而不是"穿过卡片"。 */
+.bd-ink, .bd-live { position: absolute; left: 0; top: 0; display: block; pointer-events: none; }
+.bd-ink { z-index: 1; }
+.bd-live { z-index: 3; }
+.bd-edges { position: absolute; left: 0; top: 0; z-index: 2; pointer-events: none; overflow: visible; }
+
+.bd-edge {
+  fill: none;
+  stroke: #b9becb;
+  stroke-width: 1.6;
+  stroke-dasharray: 6 5;
+  opacity: 0.85;
+}
+.bd-edge.inked { stroke: #7c8798; stroke-dasharray: none; opacity: 1; }
+.bd-edge.hot { stroke: #2f6fd0; stroke-width: 2.6; opacity: 1; }
+
+/* 世界层：**唯一**做 translate+scale 的地方（卡片在里面）。
+   它和两层 canvas 同在 .bd-stage 里、同在左上角，所以三者共用同一个
+   世界原点 —— 屏幕上"字"和"线"永远对得上。
+   宽度高度都是 0：卡片各自绝对定位，不让这一层撑出滚动条。
+   它必须在 .bd-hit（收事件层）下面，卡片才点得到。 */
+.bd-world { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 4; }
+.bd-card {
+  position: absolute;
+  background: #fff;
+  border: 1.5px solid #ccd2dd;
+  border-radius: var(--bd-radius);
+  box-shadow: 0 3px 14px rgba(20, 24, 33, 0.09);
+  padding: 10px 12px;
+  color: var(--ink);
+  /* 字号跟着**视图缩放**走（--bd-card-scale 由卡片自己写在 style 上），
+     不跟界面字号（--s）。原因：白板上的字是"画在纸上的内容"，
+     它该跟着纸的缩放变大变小；而 --s 是"我给整个界面调多大"，两回事。
+     混在一起的话，把界面调到 200% 再缩放画布，字体大小会乘两次。 */
+  font-size: calc(15px * var(--s) * var(--bd-card-scale, 1));
+  line-height: 1.5;
+  transition: box-shadow 0.12s, border-color 0.12s, opacity 0.12s;
+  cursor: grab;
+  user-select: none;
+}
+.bd-card:hover { box-shadow: 0 6px 20px rgba(20, 24, 33, 0.16); }
+.bd-card.on { border-color: #2f6fd0; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.18), 0 6px 20px rgba(20, 24, 33, 0.16); }
+.bd-card.dim { opacity: 0.35; }
+.bd-card.editing { cursor: default; box-shadow: 0 10px 34px rgba(20, 24, 33, 0.22); }
+.bd-card.is-formula { background: #fffdf4; border-color: #e2d9bc; }
+.bd-card.is-note { background: #f6f9ff; border-color: #c9d8ef; }
+
+.bd-card-empty { color: #a3aab8; font-size: calc(13px * var(--s)); }
+.bd-note { white-space: pre-wrap; word-break: break-word; }
+.bd-tex { overflow-x: auto; overflow-y: hidden; }
+.bd-tex-in { display: block; }
+.bd-tex-in .katex { font-size: 1.06em; }
+.bd-tex-bad { font-family: var(--mono); color: #b03030; font-size: calc(13px * var(--s)); word-break: break-all; }
+
+.bd-card-del {
+  position: absolute; right: -10px; top: -10px; width: 22px; height: 22px;
+  border-radius: 50%; border: 1px solid #d5dae4; background: #fff; color: #666;
+  font-size: calc(15px * var(--s)); line-height: 1; cursor: pointer; padding: 0;
+}
+.bd-card-del:hover { background: #ffeceb; color: #c92a2a; border-color: #f2b8b5; }
+
+.bd-card-edit { display: flex; flex-direction: column; gap: 7px; cursor: default; }
+.bd-card-edit textarea {
+  width: 100%; resize: none; font-family: var(--mono);
+  font-size: calc(14px * var(--s)); line-height: 1.45;
+  border: 1px solid #ccd2dd; border-radius: 7px; padding: 6px 8px; background: #fff;
+  color: var(--ink); min-height: 2.6em;
+}
+.bd-mini-preview {
+  min-height: 2.2em; padding: 6px 8px; background: #fffbe9;
+  border: 1px dashed #e0d3a6; border-radius: 7px; overflow-x: auto;
+}
+.bd-snips { display: flex; flex-wrap: wrap; gap: 4px; }
+.bd-snips button {
+  border: 1px solid #d5dae4; background: #fff; border-radius: 6px;
+  font-size: calc(12px * var(--s)); padding: 2px 7px; cursor: pointer; color: #333;
+}
+.bd-snips button:hover { background: #eef3ff; border-color: #a9c4ee; }
+.bd-card-acts { display: flex; justify-content: flex-end; gap: 6px; }
+.bd-card-acts .mini { background: #fff; border-color: #d5dae4; color: #444; }
+.bd-card-acts .mini:hover { background: #f1f4f9; color: #111; }
+.bd-card-acts .mini.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+
+/* 收事件的那一层盖在最上面。卡片是它的兄弟、z-index 更高，
+   所以点卡片不会被这一层吃掉 —— 这是"卡片能选中、空白能画"的关键。 */
+.bd-hit { position: absolute; inset: 0; z-index: 5; touch-action: none; }
+
+.bd-eraser {
+  position: absolute; border: 1.5px solid #2f6fd0; border-radius: 50%;
+  background: rgba(47, 111, 208, 0.12); pointer-events: none; z-index: 6;
+}
+.bd-selbox {
+  position: absolute; border: 1.5px dashed #2f6fd0; border-radius: 6px;
+  pointer-events: none; z-index: 6;
+}
+
+/* ---------- 工具条 ---------- */
+.bd-cbar {
+  position: absolute; left: 14px; bottom: 14px; right: 14px; z-index: 20;
+}
+.bd-tools {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: rgba(22, 26, 34, 0.92); backdrop-filter: blur(10px);
+  border: 1px solid #2e3646; border-radius: 12px; padding: 6px 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  font-size: calc(12.5px * var(--s));
+}
+.bd-tools .right { margin-left: auto; }
+.bd-group { display: flex; align-items: center; gap: 3px; }
+.bd-group + .bd-group { border-left: 1px solid #2e3646; padding-left: 8px; }
+.bd-t {
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  color: #cfd6e4; padding: 4px 8px; cursor: pointer; font-size: inherit; white-space: nowrap;
+}
+.bd-t:hover { background: #232b3a; color: #fff; }
+.bd-t.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.bd-t.icon { min-width: 32px; text-align: center; font-size: calc(15px * var(--s)); }
+.bd-t:disabled { opacity: 0.35; cursor: default; }
+.bd-t:disabled:hover { background: transparent; }
+
+.bd-swatch {
+  width: 20px; height: 20px; border-radius: 50%; border: 2px solid #3a4457;
+  cursor: pointer; padding: 0;
+}
+.bd-swatch.on { border-color: #fff; box-shadow: 0 0 0 2px #2f6fd0; }
+.bd-w {
+  width: 26px; height: 24px; display: grid; place-items: center;
+  background: transparent; border: 1px solid transparent; border-radius: 7px; cursor: pointer; padding: 0;
+}
+.bd-w span { display: block; background: #cfd6e4; border-radius: 3px; }
+.bd-w.on { border-color: #4b87e0; background: #232b3a; }
+.bd-w.on span { background: #fff; }
+.bd-save { font-size: calc(11.5px * var(--s)); color: #667084; padding: 0 4px; }
+.bd-save.on { color: #ffb454; }
+/* 工具条里那个百分比按钮：当"显示当前值 + 点一下回默认"用，别做得像主操作 */
+.bd-t.zoomish { color: #8b95a8; font-size: calc(11.5px * var(--s)); padding: 4px 6px; min-width: 42px; text-align: center; }
+.bd-t.zoomish:hover { color: #fff; }
+/* "纸"这个字是刻意的：把右边那组和左边的 A−/A+ 区分开 ——
+   一个缩放画布（纸放大缩小），一个缩放界面（字放大缩小）。
+   不写清楚的话，两个 −/+ 摆在同一根工具条上必然让人懵。 */
+.bd-zoomlabel { font-size: calc(11px * var(--s)); color: #667084; padding: 0 2px 0 6px; }
+
+/* ---------- 关系面板 ---------- */
+.bd-cpanel {
+  position: absolute; right: 14px; top: 14px; bottom: 78px; width: 320px; z-index: 20;
+}
+.bd-rel {
+  height: 100%; overflow: auto;
+  background: rgba(22, 26, 34, 0.94); backdrop-filter: blur(10px);
+  border: 1px solid #2e3646; border-radius: 12px; padding: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  font-size: calc(13px * var(--s));
+}
+.bd-rel-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.bd-rel-sub { color: #8b95a8; font-size: calc(11.5px * var(--s)); margin: 10px 0 5px; }
+.bd-tree { display: flex; flex-direction: column; gap: 2px; }
+.bd-node-row {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: 7px;
+  color: #cfd6e4; padding: 4px 6px; cursor: pointer; font-size: inherit;
+}
+.bd-node-row:hover { background: #232b3a; color: #fff; }
+.bd-node-row.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.bd-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.bd-dot.formula { background: #ffd43b; }
+.bd-dot.note { background: #6aa8ff; }
+.bd-islands { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
+.bd-islands-head { color: #ffb454; margin-bottom: 3px; }
+.bd-orphan {
+  display: block; width: 100%; text-align: left; margin-top: 4px;
+  background: #232b3a; border: 1px solid #3a4457; border-radius: 7px;
+  color: #cfd6e4; padding: 4px 7px; cursor: pointer; font-size: calc(12px * var(--s));
+}
+.bd-orphan:hover { background: #2c3648; color: #fff; }
+.bd-edges-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
+.bd-edge-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 6px;
+  font-size: calc(12px * var(--s)); color: #b6bfd0;
+}
+.bd-edge-row:hover { background: #232b3a; }
+.bd-edge-row.inked { color: #dde3ee; }
+.bd-kind {
+  flex: none; font-size: calc(10.5px * var(--s)); padding: 1px 5px; border-radius: 4px;
+  border: 1px solid #3a4457; color: #8b95a8;
+}
+.bd-kind.k-contain { color: #bdf0d7; border-color: #1d4a36; }
+.bd-kind.k-overlap { color: #ffe0b0; border-color: #453316; }
+.bd-er { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 空板提示 ---------- */
+.bd-hint {
+  position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
+  width: min(560px, 82%); z-index: 7; text-align: center;
+  background: rgba(255, 255, 255, 0.9); border: 1px dashed #c3c9d6; border-radius: 14px;
+  padding: 22px 26px; color: #3b4354; box-shadow: 0 10px 30px rgba(20, 24, 33, 0.08);
+}
+.bd-hint-t { font-size: calc(20px * var(--s)); font-weight: 600; margin-bottom: 8px; color: #1b1d22; }
+.bd-hint-s { font-size: calc(13.5px * var(--s)); line-height: 1.7; color: #5a6478; }
+.bd-hint-row { display: flex; gap: 10px; justify-content: center; margin: 14px 0 10px; }
+.bd-hint .btn { background: #fff; border: 1px solid #ccd2dd; color: #2b3242; }
+.bd-hint .btn:hover { background: #f2f5fa; }
+.bd-hint .btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+
+/* ---------- 变体 B：全屏画布 ---------- */
+.bd.variant-B .bd-floatbar { position: absolute; left: 14px; right: 14px; bottom: 14px; z-index: 20; }
+.bd.variant-B .bd-drawer {
+  position: absolute; right: 14px; top: 14px; bottom: 86px; width: 330px; z-index: 20;
+}
+.bd-drawer-toggle {
+  position: absolute; right: 14px; top: 14px; z-index: 21;
+  background: rgba(22, 26, 34, 0.92); border: 1px solid #2e3646; color: #cfd6e4;
+  border-radius: 9px; padding: 6px 11px; cursor: pointer; font-size: calc(12.5px * var(--s));
+}
+.bd-drawer-toggle:hover { background: #232b3a; color: #fff; }
+
+/* ---------- 变体 C：关系占左边一整列 ---------- */
+.bd.variant-C .bd-stagewrap { margin-left: 300px; }
+.bd-csplit { position: absolute; left: 0; top: 0; bottom: 0; width: 300px; z-index: 20; display: flex; flex-direction: column; }
+.bd-clist { flex: 1; min-height: 0; }
+.bd-clist .bd-rel { border-radius: 0; border-left: 0; border-top: 0; border-bottom: 0; }
+.bd-cbar { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 22; }
+.bd.variant-C .bd-cbar { left: 312px; }
+
+/* ---------- 手写公式：写字板 + 设置 ----------
+   这两块是弹层，风格跟白板工具条一致（深色玻璃），因为它们浮在浅色纸上。 */
+.wp-back {
+  position: fixed; inset: 0; z-index: 400;
+  background: rgba(10, 13, 18, 0.55);
+  display: grid; place-items: center; padding: 20px;
+}
+.wp {
+  width: min(760px, 94vw);
+  max-height: 92vh; overflow: auto;
+  background: #161a22; border: 1px solid #2e3646; border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  color: #dde3ee; font-size: calc(13.5px * var(--s));
+  display: flex; flex-direction: column;
+}
+.wp-settings { width: min(620px, 94vw); }
+.wp-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 13px 16px; border-bottom: 1px solid #2e3646;
+}
+.wp-head b { font-size: calc(15px * var(--s)); }
+.wp-x {
+  margin-left: auto; background: transparent; border: 0; color: #8b95a8;
+  font-size: calc(20px * var(--s)); line-height: 1; cursor: pointer; padding: 0 6px; border-radius: 8px;
+}
+.wp-x:hover { background: #232b3a; color: #fff; }
+.wp-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.wp-warn {
+  margin: 10px 16px 0; padding: 9px 12px; border-radius: 9px;
+  background: #2a2113; border: 1px solid #5a4520; color: #ffe0b0;
+}
+.wp-padwrap {
+  position: relative; margin: 12px 16px 0; height: 240px;
+  background: #fdfdfb; border: 1px solid #3a4457; border-radius: 11px;
+  overflow: hidden; touch-action: none;
+  /* 田字格：手写的时候有个参照，比纯白好写 */
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.06) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.wp-pad { display: block; cursor: crosshair; }
+.wp-hint {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  color: #a8aebc; pointer-events: none; font-size: calc(14px * var(--s));
+}
+.wp-acts {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 11px 16px;
+}
+.wp-acts .btn { margin-left: auto; }
+.wp-err {
+  margin: 0 16px 12px; padding: 10px 13px; border-radius: 9px;
+  background: #2a1a18; border: 1px solid #5a2a24; color: #ffc9c0;
+  display: flex; flex-direction: column; gap: 5px; align-items: flex-start;
+}
+.wp-err.good { background: #16281f; border-color: #1d4a36; color: #bdf0d7; }
+.wp-err.kind-no-key, .wp-err.kind-key { background: #2a2113; border-color: #5a4520; color: #ffe0b0; }
+.wp-res { margin: 0 16px 12px; border: 1px solid #2e3646; border-radius: 10px; overflow: hidden; }
+.wp-res-head { display: flex; align-items: baseline; gap: 9px; padding: 9px 12px; background: #1c212b; }
+.wp-conf { font-size: calc(11.5px * var(--s)); color: #bdf0d7; }
+.wp-conf.low { color: #ffb454; }
+.wp-preview {
+  padding: 14px 12px; background: #fffdf4; color: #1b1d22;
+  overflow-x: auto; min-height: 62px; display: flex; align-items: center; justify-content: center;
+}
+.wp-edit {
+  width: 100%; background: #0e1116; border: 1px solid #2e3646; border-radius: 8px;
+  color: #dde3ee; font-family: var(--mono); font-size: calc(13px * var(--s));
+  padding: 8px 10px; box-sizing: border-box;
+}
+.wp-res .wp-edit { border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; }
+.wp-res-acts { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.wp-res-acts .btn { margin-left: auto; }
+.wp-foot { padding: 0 16px 14px; }
+.wp-field { display: flex; flex-direction: column; gap: 6px; }
+.wp-field label { color: #cfd6e4; }
+.wp-check { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.wp .link { background: none; border: 0; color: #6aa8ff; cursor: pointer; padding: 0; font-size: inherit; text-decoration: underline; }
+.wp code { background: #0e1116; padding: 1px 5px; border-radius: 5px; font-family: var(--mono); font-size: 0.95em; }
+
+/* 弹层里的按钮复用白板的按钮样式，但底色要跟着弹层走 */
+.wp .btn { background: #232b3a; border: 1px solid #3a4457; color: #dde3ee; border-radius: 9px; padding: 7px 14px; cursor: pointer; font-size: inherit; }
+.wp .btn:hover { background: #2c3648; }
+.wp .btn.primary { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.wp .btn.primary:disabled { opacity: 0.45; cursor: default; }
+.wp .mini { background: #232b3a; border: 1px solid #3a4457; color: #cfd6e4; border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: inherit; }
+.wp .mini:hover:not(:disabled) { background: #2c3648; color: #fff; }
+.wp .mini:disabled { opacity: 0.4; cursor: default; }
+.wp .mini.primary { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.wp .dim { color: #8b95a8; }
+.wp .small { font-size: calc(11.5px * var(--s)); line-height: 1.6; }
+
+/* 选识别服务：两张卡片式的单选，比下拉框更能说清"用哪家、要什么密钥" */
+.wp-providers { display: flex; flex-direction: column; gap: 7px; }
+.wp-prov {
+  display: flex; align-items: flex-start; gap: 8px; cursor: pointer;
+  background: #1c212b; border: 1px solid #2e3646; border-radius: 9px; padding: 9px 11px;
+}
+.wp-prov.on { border-color: #4b87e0; background: #1e2637; }
+.wp-prov input { margin-top: 3px; }
+.wp-prov > span { display: flex; flex-direction: column; gap: 2px; }
+
+/* ---------- 原型变体切换器 ----------
+   它是"给你挑摆法"用的，不属于设计本身：做成高对比的小药丸，
+   一眼就知道这不是白板的一部分。挑完连它带落选的摆法一起删掉。 */
+.bd-proto {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px; z-index: 300;
+  background: #11151d; border: 1px solid #3a4457; border-radius: 999px;
+  padding: 6px 10px; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+  color: #cfd6e4; font-size: calc(12px * var(--s));
+}
+.bd-proto button {
+  background: transparent; border: 0; color: #8b95a8; cursor: pointer;
+  font-size: calc(16px * var(--s)); line-height: 1; padding: 2px 8px; border-radius: 8px;
+}
+.bd-proto button:hover { background: #232b3a; color: #fff; }
+.bd-proto-t { white-space: nowrap; }
+.bd-proto-t b { color: #6aa8ff; }

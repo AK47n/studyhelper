@@ -3,9 +3,12 @@ import FormulaBar from './components/FormulaBar.jsx'
 import Preview from './components/Preview.jsx'
 import ContextPanel from './components/ContextPanel.jsx'
 import SourceEditor from './components/SourceEditor.jsx'
+import Board from './components/Board.jsx'
+import { isBoardName, newBoard, serializeBoardDocument } from './lib/board.js'
 import { parseDoc, renderTitle, cleanName } from './lib/parse.js'
 import { normalizeMarkers, useFormulaEditing } from './lib/useFormulaEditing.js'
 import { SEED_NAME, SEED_TEXT } from './seed.js'
+import { buildSeedBoard } from './seed-board.js'
 
 const api = {
   list: () => fetch('/api/list').then((r) => r.json()),
@@ -22,6 +25,33 @@ const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, text }),
     }).then((r) => r.json()),
+}
+
+/* 白板的新建得先问一下"这一课叫什么" —— 板子里有标题，
+   文件名只是给人看的（Git、列表）。两步都做，看着才不别扭。 */
+async function createBoard({ prompt, flash, refresh }) {
+  const raw = prompt('这一课叫什么？（写"大物 · 电磁学"就行）', '')
+  if (!raw || !raw.trim()) return null
+  const title = raw.trim().replace(/\.md$/i, '')
+  const r = await api.create('board-' + title + '.md', serializeBoardDocument(newBoard(title)))
+  if (r.error) {
+    flash(r.error, 'err')
+    return null
+  }
+  await refresh()
+  return r.name
+}
+
+/* 第一次打开"一张白板都没有"的时候，先放一张样板进去。
+   理由是"关系靠位置"这件事必须看见一次才懂 —— 空板配一句说明，人是不会照做的。 */
+async function createSeedBoard({ refresh, flash }) {
+  const r = await api.create('board-示例 · 大物电磁学.md', serializeBoardDocument(buildSeedBoard()))
+  if (r.error) {
+    flash(r.error, 'err')
+    return null
+  }
+  await refresh()
+  return r.name
 }
 
 // 字号缩放：整个界面由 CSS 变量 --s 驱动，这里只负责改它 + 记住你调到了多少
@@ -59,6 +89,12 @@ export default function App() {
 
   const taRef = useRef(null)
   const jumpRef = useRef(null)
+  // 白板那边自己管存盘（它是自动存的），这里只留最后一次要落盘的内容
+  const boardTextRef = useRef('')
+
+  const isBoard = isBoardName(current)
+  const boardFiles = useMemo(() => files.filter((f) => isBoardName(f.name)), [files])
+  const noteFiles = useMemo(() => files.filter((f) => !isBoardName(f.name)), [files])
 
   // 打字时 text 立刻更新（编辑区/着色层要跟手），但解析整棵树 + 重渲染预览
   // 会随文件变大而变贵（实测：1 节课 0.1ms，30 节课 1.5ms，之后还有 DOM 开销），
@@ -119,11 +155,19 @@ export default function App() {
         return
       }
       if (list.files.length === 0) {
+        // 全新的用户：先给一张白板样板 + 一份笔记样板。
+        // 白板在前，因为它才是入口（见下方"打开哪一个"的说明）。
+        await createSeedBoard({ refresh: async () => {}, flash })
         await api.create(SEED_NAME, SEED_TEXT)
         list = await api.list()
       }
       setFiles(list.files || [])
-      if (list.files && list.files.length) await open(list.files[0].name)
+      if (list.files && list.files.length) {
+        // 打开哪一个？优先白板 —— 这是"打开就能画"的默认入口。
+        // 排序在服务端钉死了（见 server.js 的 /api/list），所以这里的结果是稳定的。
+        const firstBoard = list.files.find((f) => isBoardName(f.name))
+        await open((firstBoard || list.files[0]).name)
+      }
       setBusy(false)
     })()
     return () => {
@@ -133,19 +177,36 @@ export default function App() {
   }, [])
 
   async function open(name, { force = false } = {}) {
-    if (!force && dirty && !confirm('当前文件有没保存的改动，切换会丢掉。继续？')) return
+    if (!force && !isBoardName(name) && dirty && !confirm('当前文件有没保存的改动，切换会丢掉。继续？')) return
     const r = await api.get(name)
     if (r.error) return flash(r.error, 'err')
     setCurrent(name)
     const shown = String(r.text ?? '')
+    // 白板的原文由 Board 自己解析、自己存（它是自动存的），
+    // 这里只把原文交给它，别顺手塞进 textarea 的那套状态里
+    boardTextRef.current = shown
     if (deriveTimer.current) clearTimeout(deriveTimer.current)
     setText(shown)
-    setDerivedText(shown) // 换文件立即生效，不用等防抖
+    setDerivedText(shown)
     if (taRef.current) taRef.current.value = shown
     setDiskMtime(r.mtime || 0)
     setDirty(false)
     setSelectedId(null)
     requestAnimationFrame(() => taRef.current && taRef.current.focus())
+  }
+
+  async function refreshList() {
+    const list = await api.list().catch(() => null)
+    if (list && list.files) setFiles(list.files)
+  }
+
+  // 白板：它自己决定什么时候存，我们只负责写盘 + 回个时间戳
+  async function saveBoardText(t) {
+    if (!current) return
+    boardTextRef.current = t
+    const r = await api.put(current, t)
+    if (r.error) return flash(r.error, 'err')
+    setDiskMtime(r.mtime || 0)
   }
 
   async function save() {
@@ -163,15 +224,21 @@ export default function App() {
     setFiles(list.files || [])
   }
 
-  async function newFile() {
-    const name = prompt('新文件叫什么？（一节课 / 一周一个文件都行）', '大物 · 电磁学')
+  async function newNote() {
+    const name = prompt('新笔记叫什么？（一节课 / 一周一个文件都行）', '大物 · 电磁学')
     if (!name) return
     const r = await api.create(name, `# ${name.replace(/\.md$/i, '')}\n\n- \n`)
     if (r.error) return flash(r.error, 'err')
-    const list = await api.list()
-    setFiles(list.files || [])
+    await refreshList()
     await open(r.name, { force: true })
     flash('建好了：' + r.name)
+  }
+
+  async function newBoardFile() {
+    const name = await createBoard({ prompt, flash, refresh: refreshList })
+    if (!name) return
+    await open(name, { force: true })
+    flash('新白板：画吧')
   }
 
   // ---- Ctrl+S 保存 / Ctrl+Shift+加号减号 调字号 ----
@@ -181,7 +248,8 @@ export default function App() {
       const k = e.key
       if (k === 's' || k === 'S') {
         e.preventDefault()
-        save()
+        // 白板是自动存的，别抢它的 Ctrl+S（它自己也没绑）
+        if (!isBoard) save()
         return
       }
       if (e.shiftKey && (k === '=' || k === '+' || k === 'Add')) {
@@ -195,7 +263,7 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current, text])
+  }, [current, text, isBoard])
 
   // ---- 让服务知道"页面还在"：关掉标签页 = 服务自己停 ----
   // 服务端只认心跳。心跳停了（标签页关了、浏览器崩了、被强杀）就自己退出，
@@ -271,7 +339,7 @@ export default function App() {
   const islandCount = doc.quantityNodes.filter((n) => (doc.refCount.get(n.id) || 0) === 0).length
 
   return (
-    <div className="app">
+    <div className={'app' + (isBoard ? ' board-mode' : '')}>
       <aside className="side">
         <div className="brand">
           <div className="logo">sh</div>
@@ -281,15 +349,35 @@ export default function App() {
           </div>
         </div>
 
+        {/* 两个入口：白板是"打开就能画"的那一个，笔记是"整理成树"的那一个。
+            刻意把白板放第一个 —— 以前这里只有笔记，于是工具长成了一个
+            "要精通 Markdown 的老师才用得动"的备课器，那不是我最初要的东西。 */}
+        <div className="modes">
+          <button
+            className={'mode' + (isBoard ? ' on' : '')}
+            onClick={() => boardFiles[0] ? open(boardFiles[0].name) : newBoardFile()}
+            title="白板：手一画，关系自己出来"
+          >
+            ✎ 白板
+          </button>
+          <button
+            className={'mode' + (!isBoard ? ' on' : '')}
+            onClick={() => noteFiles[0] ? open(noteFiles[0].name) : newNote()}
+            title="笔记：量 — 公式 — 关系 的树（适合最后通一遍）"
+          >
+            ▤ 笔记
+          </button>
+        </div>
+
         <div className="side-sec">
           <div className="side-title">
-            我的总结
-            <button className="mini" onClick={newFile}>
+            {isBoard ? '我的一课一页' : '我的总结笔记'}
+            <button className="mini" onClick={isBoard ? newBoardFile : newNote}>
               ＋ 新建
             </button>
           </div>
           <div className="filelist">
-            {files.map((f) => (
+            {(isBoard ? boardFiles : noteFiles).map((f) => (
               <button
                 key={f.name}
                 className={'filerow' + (f.name === current ? ' on' : '')}
@@ -297,41 +385,105 @@ export default function App() {
                 title={f.name}
               >
                 <span className="fname">{f.title}</span>
-                <span className="fmeta">{f.nodes} 节点</span>
+                <span className="fmeta">{isBoard ? '白板' : f.nodes + ' 节点'}</span>
               </button>
             ))}
-            {files.length === 0 && <div className="dim pad">还没有文件</div>}
+            {(isBoard ? boardFiles : noteFiles).length === 0 && (
+              <div className="dim pad">{isBoard ? '还没有白板，点「＋ 新建」' : '还没有笔记'}</div>
+            )}
           </div>
         </div>
 
-        <div className="side-sec">
-          <div className="side-title">枢纽（被引最多）</div>
-          {hubs.map((n) => (
-            <button key={n.id} className="hubrow" onClick={() => setSelectedId(n.id)}>
-              <span className="hub-name">{cleanName(renderTitle(n))}</span>
-              <span className={'heatbar h' + Math.min(doc.refCount.get(n.id) || 0, 5)}>
-                {'▮'.repeat(Math.min(doc.refCount.get(n.id) || 0, 5))}
-              </span>
-            </button>
-          ))}
-          {hubs.length === 0 && <div className="dim pad">还没有连线</div>}
-          {islandCount > 0 && (
-            <div className="island-note">
-              有 <b>{islandCount}</b> 个量没人用到（孤岛）
-            </div>
-          )}
-        </div>
+        {!isBoard && (
+          <div className="side-sec">
+            <div className="side-title">枢纽（被引最多）</div>
+            {hubs.map((n) => (
+              <button key={n.id} className="hubrow" onClick={() => setSelectedId(n.id)}>
+                <span className="hub-name">{cleanName(renderTitle(n))}</span>
+                <span className={'heatbar h' + Math.min(doc.refCount.get(n.id) || 0, 5)}>
+                  {'▮'.repeat(Math.min(doc.refCount.get(n.id) || 0, 5))}
+                </span>
+              </button>
+            ))}
+            {hubs.length === 0 && <div className="dim pad">还没有连线</div>}
+            {islandCount > 0 && (
+              <div className="island-note">
+                有 <b>{islandCount}</b> 个量没人用到（孤岛）
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="side-foot">
           <div className="dim small">数据在 data/ 目录，纯文本</div>
-          <button className="side-zoom" onClick={() => bumpScale(SCALE_STEP)} title="字太小？点这里放大">
-            字太小 →
-          </button>
+          {/* ★ 这个开关必须是**双向**的。
+              原来它写死"字太小 →"、只会放大 —— 而白板模式下顶栏不渲染
+              （白板用自己的工具条），于是白板里根本找不到"调小"的入口，
+              只有这一个只会变大的按钮。用户看到的正是这个。
+              现在按当前字号决定箭头方向：比默认小就提示放大，比默认大就提示缩小，
+              正好在默认值上就两端都给。 */}
+          <div className="side-zoom-row">
+            {scale > SCALE_DEFAULT ? (
+              <button className="side-zoom" onClick={() => bumpScale(-SCALE_STEP)} title="字太大了？点这里缩小">
+                ← 字太大
+              </button>
+            ) : null}
+            {scale < SCALE_DEFAULT ? (
+              <button className="side-zoom" onClick={() => bumpScale(SCALE_STEP)} title="字太小？点这里放大">
+                字太小 →
+              </button>
+            ) : null}
+            {scale === SCALE_DEFAULT ? (
+              <>
+                <button className="side-zoom" onClick={() => bumpScale(-SCALE_STEP)} title="缩小字号">
+                  ← 小
+                </button>
+                <button className="side-zoom" onClick={() => bumpScale(SCALE_STEP)} title="放大字号">
+                  大 →
+                </button>
+              </>
+            ) : null}
+            <button
+              className="side-zoom-val"
+              onClick={() => setScale(SCALE_DEFAULT)}
+              title={'当前 ' + Math.round(scale * 100) + '%，点一下回到默认 ' + Math.round(SCALE_DEFAULT * 100) + '%'}
+            >
+              {Math.round(scale * 100)}%
+            </button>
+          </div>
         </div>
       </aside>
 
-      <main className="center">
-        <div className="topbar">
+      {isBoard ? (
+        /* ★ 必须**包一层**再放进网格。
+           .bd-topline 和 Board 是两个兄弟元素：只给 .bd 指定 grid-column:2/row:1 的话，
+           网格的自动放置会把 topline 丢进**第 2 行**，于是第一行只剩白板、
+           第二行被 topline 占掉 —— 表现就是"白板高度莫名少了一半"。
+           包一层之后，这一层占住 (1,2)，两个孩子在它里面纵向排。 */
+        <div className="bd-shell">
+          {/* 白板自己有一套工具条，但"现在开的是哪个文件"必须一眼看见 ——
+              不然画了半天不知道画在哪张板上（有五张板的时候非常要命）。 */}
+          <div className="bd-topline">
+            <span className="bd-file">{current || '（没有打开白板）'}</span>
+            <span className="dim small">自动保存 · 手写笔直接画 · 两根手指平移缩放</span>
+          </div>
+          <Board
+            key={current}
+            file={current}
+            initialText={boardTextRef.current}
+            onSave={saveBoardText}
+            flash={flash}
+            /* 界面字号：白板模式顶栏不渲染，所以调字号的入口得进白板工具条，
+               否则白板里就只能靠左栏那一个（而且那一个原来只会放大）。 */
+            scale={scale}
+            onScale={bumpScale}
+            onScaleReset={() => setScale(SCALE_DEFAULT)}
+          />
+        </div>
+      ) : (
+        <>
+          <main className="center">
+            <div className="topbar">
           <div className="cur-name">
             {current || '（没有打开文件）'}
             {dirty && <span className="dot-dirty" title="有没保存的改动">●</span>}
@@ -425,19 +577,21 @@ export default function App() {
         )}
       </main>
 
-      <aside className="right">
-        <ContextPanel
-          doc={doc}
-          selectedId={selectedId}
-          onSelect={(id) => {
-            setSelectedId(id)
-            const n = doc.nodes.find((x) => x.id === id)
-            if (n) jumpToLine(n.line)
-          }}
-          onRefTitle={onRefTitle}
-          onJumpLine={jumpToLine}
-        />
-      </aside>
+          <aside className="right">
+            <ContextPanel
+              doc={doc}
+              selectedId={selectedId}
+              onSelect={(id) => {
+                setSelectedId(id)
+                const n = doc.nodes.find((x) => x.id === id)
+                if (n) jumpToLine(n.line)
+              }}
+              onRefTitle={onRefTitle}
+              onJumpLine={jumpToLine}
+            />
+          </aside>
+        </>
+      )}
 
       {busy && <div className="cover">载入中…</div>}
       {toast && <div className={'toast ' + toast.kind}>{toast.msg}</div>}

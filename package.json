@@ -18,8 +18,20 @@
     "check:render": "esbuild scripts/check-render.js --bundle --platform=node --format=cjs --outfile=.cache/check-render.cjs --external:katex --log-level=error && node .cache/check-render.cjs",
     "check:mount": "esbuild scripts/check-mount-body.jsx --bundle --platform=node --format=cjs --outfile=.cache/check-mount-body.cjs --external:katex --external:react --external:react-dom --log-level=error && copy scripts\\check-mount.js .cache\\check-mount-entry.mjs >nul && node .cache/check-mount-entry.mjs",
     "check:browser": "start \"\" \"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --headless=new --disable-gpu --no-sandbox --hide-scrollbars --remote-debugging-port=9222 --user-data-dir=%TEMP%\\studyhelper-cdp http://127.0.0.1:5177/ && timeout /t 5 >nul && node scripts\\cdp-align.js && node scripts\\cdp-caretfit.js",
+    "check:board": "node scripts/check-board.js",
+    "check:board-browser": "start \"\" \"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --headless=new --disable-gpu --no-sandbox --hide-scrollbars --window-size=1440,900 --remote-debugging-port=9223 --user-data-dir=%TEMP%\\studyhelper-board-cdp http://127.0.0.1:5177/ && timeout /t 5 >nul && node scripts\\check-board-browser.js",
+    "check:board-all": "npm run check:board && npm run check:board-browser",
+    "check:ocr": "node scripts/check-ocr-server.js",
+    "check:ocr-browser": "node scripts/check-ocr-browser.js",
+    "check:zoom": "node scripts/check-zoom.js",
+    "check:highlighter": "node scripts/check-highlighter.js",
+    "check:loaded": "node scripts/check-loaded.js",
+    "diag:board": "node scripts/diag-board.js",
+    "diag:interact": "node scripts/diag-interact.js",
+    "diag:net": "node scripts/diag-net.js",
+    "try:ocr": "node scripts/try-ocr.js",
     "perf": "esbuild scripts/perf.js --bundle --platform=node --format=cjs --outfile=.cache/perf.cjs --external:katex --log-level=error && node .cache/perf.cjs",
-    "check:all": "npm run check && npm run check:keys && npm run check:scale && npm run check:align && npm run check:highlight && npm run check:render && npm run check:mount"
+    "check:all": "npm run check && npm run check:keys && npm run check:scale && npm run check:align && npm run check:highlight && npm run check:render && npm run check:mount && npm run check:board && npm run check:ocr"
   },
   "dependencies": {
     "katex": "^0.16.11",

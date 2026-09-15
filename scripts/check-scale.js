@@ -15,11 +15,17 @@ const bad = (m) => {
 //    这些变量自己在 :root 里都由 --s 派生，所以只要不是写死 px 就安全。
 const fontSizes = [...css.matchAll(/font-size:\s*([^;]+);/g)].map((m) => m[1].trim())
 const SIZING_VARS = ['--fs-', '--src-font', '--s']
+// 这几个是"不写死字号"的正当写法，不算违规：
+//   0        —— 不显示文字
+//   inherit  —— 真的继承父级，父级会跟着 --s 缩放，所以它也跟着缩
+//   inherit 这条是补的：白板工具条里按钮和列表项故意用 inherit 跟着容器走，
+//   一开始它被误报成"写死 px"，差点让我把好好的写法改坏。
+const OK_LITERAL = new Set(['0', 'inherit', 'unset', 'revert'])
 const hard = fontSizes.filter(
   (v) =>
     !SIZING_VARS.some((name) => v.includes(name)) &&
     !/^[\d.]+(em|rem)$/.test(v) &&
-    v !== '0' // font-size:0 是"不显示文字"的正当写法，不是写死的字号
+    !OK_LITERAL.has(v)
 )
 if (hard.length) bad(`还有 ${hard.length} 处写死 px 的字号，不会跟着放大: ${[...new Set(hard)].join(' | ')}`)
 else ok(`全部 ${fontSizes.length} 处字号都跟着缩放走（px 走变量，em 走父级）`)
