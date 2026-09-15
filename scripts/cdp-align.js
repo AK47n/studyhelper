@@ -1,9 +1,13 @@
 // 回归检查（真浏览器）：着色层和 textarea 必须逐行对齐，折行的行也要按实际高度算对。
 // 这是「直接编辑渲染视图」这套做法的命门，所以留一个能真跑的断言。
 //
-// 用法：先启动 Chrome 带调试端口，再跑本脚本
-//   chrome --headless=new --remote-debugging-port=9222 --user-data-dir=%TEMP%\p http://127.0.0.1:5177/
+// 用法：先把浏览器按 9222 起好（Edge 优先，见 lib/browser.js），再跑本脚本
+//   node scripts/cdp-open.js 9222
 //   node scripts/cdp-align.js
+//   一步到位：npm run check:browser
+import { findAppPage } from './lib/cdp.js'
+import { gotoNoteMode } from './lib/note-mode.js'
+
 const CDP_URL = process.env.CDP_URL || 'http://127.0.0.1:9222'
 
 const EXPR = `(() => {
@@ -65,7 +69,8 @@ const EXPR = `(() => {
 
 async function main() {
   const list = await (await fetch(CDP_URL + '/json/list')).json()
-  const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl)
+  // 必须挑 http(s) 那个页面：Edge 会把 edge:// 内部页和扩展后台页也列进来，还排在前面
+  const page = findAppPage(list)
   if (!page) throw new Error('没有可调试的页面')
   const ws = new WebSocket(page.webSocketDebuggerUrl)
   let id = 0
@@ -88,6 +93,20 @@ async function main() {
     ws.addEventListener('open', r)
     ws.addEventListener('error', j)
   })
+  const ev = async (expression) => {
+    const out = await send('Runtime.evaluate', { expression, returnByValue: true })
+    return out.result && out.result.value
+  }
+  /* ★ 先切到笔记界面再做检查。
+     应用现在**打开就是白板**（一张板都没有时还会自动补一张），所以"环境里碰巧没有板"
+     这个老前提已经没了。不切的话，下面那句求值会对着白板画布找 textarea.raw，
+     报出来是「✗ 找不到 textarea 或 .hl-inner」—— 看着像页面坏了，其实是模式不对。 */
+  try {
+    if ((await gotoNoteMode(ev)) === 'switched') console.log('  （默认进的是白板，已切到笔记界面）\n')
+  } catch (e) {
+    console.log('  ✗ ' + e.message)
+    process.exit(1)
+  }
   const r = await send('Runtime.evaluate', { expression: EXPR, returnByValue: true })
   const d = JSON.parse(r.result.value)
   if (d.error) {

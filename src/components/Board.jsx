@@ -59,7 +59,7 @@ const COLORS = [
 const WIDTHS = [1.6, 2.6, 4.2]
 const VARIANTS = ['A', 'B', 'C']
 
-export default function Board({ file, initialText, onSave, flash, scale, onScale, onScaleReset }) {
+export default function Board({ file, initialText, reloadToken, onSave, flash, scale, onScale, onScaleReset, fullscreen, onToggleFullscreen }) {
   const [board, setBoard] = useState(() => load(initialText, file))
   const [tool, setTool] = useState('pen')
   const [color, setColor] = useState(COLORS[0].v)
@@ -72,6 +72,18 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
   const [panelOpen, setPanelOpen] = useState(true)
   const [eraserAt, setEraserAt] = useState(null)
   const [hoverEdge, setHoverEdge] = useState(null)
+  /* 用笔写字时把鼠标光标收掉 —— 笔尖底下一直跟着一个十字，写字时很碍眼。
+     但**不能简单粗暴地 cursor:none**：那样鼠标也会一起没光标，画布上就没法定位了。
+     所以记着"最近一次是谁在操作"：笔 → 藏，鼠标 → 显示。
+     penModeRef 是为了只在真的换了设备时才 setState —— 每次 pointermove 都 set 会白重渲染。 */
+  const [penMode, setPenMode] = useState(false)
+  const penModeRef = useRef(false)
+  /* 笔杆键框选出来的那一组墨迹（存 id）。
+     和卡片的 selectedId 是两码事：那个是单选一张卡，这个是多选一堆笔迹。 */
+  const [inkSel, setInkSel] = useState(null) // Set<strokeId> | null
+  const [lasso, setLasso] = useState(null) // 正在拖的那个框（世界坐标，已经规范化成 x0<x1 / y0<y1）
+  const lassoRef = useRef(null)
+  const inkMoveRef = useRef(null)
   const [size, setSize] = useState({ w: 0, h: 0 })
   /* 手写公式：写字板、设置弹层的开关。
      写字板是"另开一块地方写"，不是"圈住白板上的字去识别" —— 理由见 WritingPad.jsx 顶部。 */
@@ -148,7 +160,15 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
     [commit]
   )
 
-  // ── 换文件：整块重来。白板是"一节课一页"，不混着开 ──
+  /* ── 换文件 / 点「重载」：整块重来。白板是"一节课一页"，不混着开 ──
+     ⚠ 依赖里**不能**放 initialText。
+       它是 App 塞进来的"最新内容"，每自动保存一次就会变一次字符串。
+       一旦按它重跑，这个 effect 就会在每次保存之后把 undoRef 清空 ——
+       表现是"拖完东西按 Ctrl+Z 没反应、撤销按钮永远是灰的"，
+       而且从代码上完全看不出毛病（这一条排查了一整轮才揪出来，
+       中间还错怪了 pointerup 那几行）。
+       真该重来的时候（换文件、点重载），App 会把 reloadToken 加一。
+       initialText 照样读得到：effect 执行时拿到的就是那一刻的 props。 */
   useEffect(() => {
     const b = load(initialText, file)
     boardRef.current = b
@@ -171,7 +191,7 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       }
     })
     return () => cancelAnimationFrame(raf)
-  }, [file, initialText, commit])
+  }, [file, reloadToken, commit])
 
   // ── 量可用区域 ──
   useEffect(() => {
@@ -247,10 +267,39 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
     [commit]
   )
 
+  /* 选中的那组墨迹的包围盒（世界坐标）。
+     渲染那个虚线框、以及判断"这一下是不是按在选区里"，都用它。只在真有选中时才算。 */
+  const inkBox =
+    inkSel && inkSel.size ? strokesBBox(board.strokes.filter((s) => inkSel.has(s.id))) : null
+
+  /* 谁在操作？只在"换了设备"时才更新一次状态。
+     笔悬停时 pointerType 也已经是 'pen'（不用等落笔），所以笔一靠近光标就没了
+     —— 那正好是写字前最碍眼的时候。 */
+  const trackPointerKind = useCallback((e) => {
+    const isPen = e.pointerType === 'pen'
+    if (isPen !== penModeRef.current) {
+      penModeRef.current = isPen
+      setPenMode(isPen)
+    }
+  }, [])
+
+  /* 把框选中的那组墨迹删掉。一次删除 = 一步撤销（commit 默认记历史）。
+     ⚠ 必须定义在下面那个键盘 useEffect **之前**：它的依赖数组里引用了这里。
+       const 是有暂时性死区的，写在后面的话组件一渲染就
+       "Cannot access 'xx' before initialization"，整页白屏、什么都不显示。
+       （踩过一次：构建完全正常、vite 也不报错，只有浏览器控制台里能看到。） */
+  const deleteInkSel = useCallback(() => {
+    if (!inkSel || !inkSel.size) return
+    const ids = inkSel
+    commit((cur) => ({ ...cur, strokes: cur.strokes.filter((s) => !ids.has(s.id)) }))
+    setInkSel(null)
+  }, [inkSel, commit])
+
   const onPointerDown = useCallback(
     (e) => {
       const el = wrapRef.current
       if (!el) return
+      trackPointerKind(e)
       /* ★ 指针捕获必须设在**收到事件的那个元素自己**身上（这里是 .bd-hit）。
          第一版设在最外层的 .bd-stagewrap 上：于是 pointermove / pointerup 被
          重定向到那个 div，而监听器挂在 .bd-hit 上 —— 结果就是
@@ -282,7 +331,40 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
         return
       }
 
-      if (tool === 'eraser') {
+      /* ① 笔杆侧键按着 → 开始框选（OneNote 那个手感）。
+         必须放在"擦"和"画"前面：按住笔杆键落笔时，不该在板上留下墨迹。 */
+      if (isPenBarrel(e)) {
+        const box = { x0: wp.x, y0: wp.y, x1: wp.x, y1: wp.y }
+        lassoRef.current = { from: wp, box }
+        setLasso(box)
+        return
+      }
+
+      /* ② 已经选着一组墨迹、又正好按在它的框里 → 整组拖着走。 */
+      if (
+        inkBox &&
+        tool !== 'eraser' &&
+        wp.x >= inkBox.x0 && wp.x <= inkBox.x1 &&
+        wp.y >= inkBox.y0 && wp.y <= inkBox.y1
+      ) {
+        // 把"选中那几条按下时的原样"存下来，拖动时拿它算偏移（不累加，见 onPointerMove）
+        const origin = new Map()
+        for (const s of boardRef.current.strokes) if (inkSel.has(s.id)) origin.set(s.id, s)
+        inkMoveRef.current = { from: wp, origin, moved: false }
+        return
+      }
+
+      /* ③ 按在别处 = 取消选中（和大多数软件一样）。
+         放在画/擦前面，是为了"点空白"既取消选中、也照常落笔，不用点两次。 */
+      if (inkSel) setInkSel(null)
+
+      /* 会"擦"的两种情况：
+         ① 工具条上选着橡皮；
+         ② **笔的另一头**（橡皮端）—— 翻过来按就是橡皮，不用先去切工具。
+            抬笔之后工具条上的选择不变，原来选着笔就还是笔。
+            于是"写一笔 → 翻过来擦掉 → 翻回来接着写"中间一次点击都不用。
+            这就是 OneNote 的手感，也是 Surface 上最省事的一条路。 */
+      if (tool === 'eraser' || isPenEraser(e)) {
         eraseAt(wp)
         drawRef.current = { kind: 'erase' }
         return
@@ -298,11 +380,50 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, inkBox, inkSel]
   )
 
   const onPointerMove = useCallback(
     (e) => {
+      trackPointerKind(e)
+
+      /* 框选中：把矩形更新到当前点。始终规范化成 x0<x1 / y0<y1，
+         这样从右下往左上反着拖也是同一个矩形，渲染时不用再判方向。 */
+      if (lassoRef.current) {
+        const lp = localPoint(e)
+        const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
+        const a = lassoRef.current.from
+        const box = {
+          x0: Math.min(a.x, wp.x),
+          y0: Math.min(a.y, wp.y),
+          x1: Math.max(a.x, wp.x),
+          y1: Math.max(a.y, wp.y),
+        }
+        lassoRef.current.box = box
+        setLasso(box)
+        return
+      }
+
+      /* 拖着选中的那组墨迹走。
+         ★ 每次都从"按下那一刻的原样"重新算偏移，**不是**累加每一帧的增量 ——
+           累加会攒浮点误差，来回拖几次位置就飘了。 */
+      if (inkMoveRef.current) {
+        const lp = localPoint(e)
+        const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
+        const mv = inkMoveRef.current
+        const dx = wp.x - mv.from.x
+        const dy = wp.y - mv.from.y
+        if (dx || dy) mv.moved = true // 给松手时用：点一下没拖的话，不该往撤销栈里塞东西
+        commit(
+          (cur) => ({
+            ...cur,
+            strokes: cur.strokes.map((s) => (mv.origin.has(s.id) ? shiftStroke(mv.origin.get(s.id), dx, dy) : s)),
+          }),
+          false
+        )
+        return
+      }
+
       if (pointersRef.current.has(e.pointerId)) {
         pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
       }
@@ -344,8 +465,16 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       const lp = localPoint(e)
       const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
 
-      if (tool === 'eraser') {
-        setEraserAt(wp)
+      /* 在擦的两种情况：工具条上选着橡皮，或者这一笔是**用笔的另一头**起的。
+         后者必须看 drawRef 而不是看工具 —— 用橡皮头的时候，工具条上可能还选着"笔"，
+         只看工具的话，就只有按下那一点会被擦掉，拖过去是不擦的。 */
+      if (tool === 'eraser' || (drawRef.current && drawRef.current.kind === 'erase')) {
+        /* ⚠ 这里必须把 r 一起塞进去。
+           screenToWorld 只给 {x, y}，而 .bd-eraser 的宽高是 2 * eraserAt.r * view.s ——
+           少了 r 就成了 NaN，浏览器直接忽略 → 那个橡皮圈**一直画不出来**（原有的问题）。
+           除以 view.s 是因为 r 走世界坐标、渲染时又乘回去，于是圈在屏幕上恒定大小，
+           和擦除判定用的是同一个半径。 */
+        setEraserAt({ x: wp.x, y: wp.y, r: ERASER_R / boardRef.current.view.s })
         if (drawRef.current && drawRef.current.kind === 'erase') eraseAt(wp, false)
         return
       }
@@ -376,7 +505,7 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
         if (added) paintLive(liveRef, d.stroke, boardRef.current.view)
       }
     },
-    [tool, localPoint, setView, eraseAt]
+    [tool, localPoint, setView, eraseAt, trackPointerKind, commit]
   )
 
   const onPointerUp = useCallback(
@@ -384,6 +513,34 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       pointersRef.current.delete(e.pointerId)
       if (pointersRef.current.size < 2) pinchRef.current = null
       panRef.current = null
+
+      /* 框选松手：把圈到的墨迹选上。
+         用 lassoRef 里的 box 而不是 lasso 这个 state —— 两者在同一帧里可能差一步，
+         松手这一刻要的是"最后画出来那个框"。 */
+      if (lassoRef.current) {
+        const box = lassoRef.current.box
+        lassoRef.current = null
+        setLasso(null)
+        const ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
+        setInkSel(ids.length ? new Set(ids) : null)
+        return
+      }
+
+      /* 拖完松手：把整次拖动记成一步撤销（中途那些帧都不记）。 */
+      if (inkMoveRef.current) {
+        const mv = inkMoveRef.current
+        inkMoveRef.current = null
+        const now = boardRef.current.strokes
+        /* 用拖动过程中打的 moved 标记，不去逐条比对坐标 ——
+           比对那版看着更"严谨"，实际不可靠。 */
+        if (mv.moved) {
+          undoRef.current.push({ ...boardRef.current, strokes: now.map((s) => mv.origin.get(s.id) || s) })
+          if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
+          redoRef.current = []
+          setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
+        }
+        return
+      }
 
       const d = drawRef.current
       if (!d) return
@@ -399,9 +556,13 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
         if (pathLength(pts) < 2.5) return
         const simple = simplifyPoints(pts, 0.6)
         commit((cur) => ({ ...cur, strokes: [...cur.strokes, { ...d.stroke, points: toFlat(simple) }] }))
+      } else if (d.kind === 'erase' && tool !== 'eraser') {
+        /* 这一次是**笔的另一头**在擦，抬笔就把那个橡皮圈收掉。
+           （工具是橡皮的时候不能收 —— 那个圈得一直跟着鼠标，当光标用。） */
+        setEraserAt(null)
       }
     },
-    [commit]
+    [commit, tool]
   )
 
   // ── 滚轮：缩放 / 横向平移 ──
@@ -459,6 +620,7 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       if (e.key === 'Escape') {
         setSelectedId(null)
         setEditingId(null)
+        setInkSel(null)
         return
       }
       if (e.key === 'p' || e.key === 'P') return setTool('pen')
@@ -466,6 +628,13 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       // W = write：写字板。挑 W 是因为它没被占（P 是笔、E 是橡皮、Space 是平移）
       if (e.key === 'w' || e.key === 'W') {
         setPadOpen((v) => !v)
+        return
+      }
+      /* 框选着一组墨迹时，Delete / Backspace 删掉它们。
+         用笔的时候不一定按得到键盘，所以画布上还浮着一个删除按钮兜着。 */
+      if ((e.key === 'Delete' || e.key === 'Backspace') && inkSel) {
+        e.preventDefault()
+        deleteInkSel()
         return
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
@@ -487,7 +656,7 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant])
+  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -496,26 +665,22 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
     return screenToWorld(el.clientWidth / 2, el.clientHeight / 2, boardRef.current.view)
   }, [])
 
-  function addCard(kind) {
-    const c = newCard(kind, stageCenterWorld().x, stageCenterWorld().y)
-    // 稍微散开一点，连点两次不会完全叠住
-    commit((cur) => {
-      const n = cur.cards.length
-      const off = (n % 5) * 26
-      return { ...cur, cards: [...cur.cards, { ...c, x: c.x + off, y: c.y + off }] }
-    })
-    setSelectedId(c.id)
-    setEditingId(c.id)
-  }
+  /* 手写识别的结果落到白板上。卡片放在视野中央，然后立刻打开编辑器：
+     识别总会有认错的时候，直接让你改比"先放上去、再发现错了、再双击"少两步。
 
-  /* 手写识别的结果落到白板上。
-     ★ 只写 tex（显示用的式子），**不动 src**（你手打的那串）—— 留空的 src
-       让你之后双击改的时候有一个"我原来写了什么"的参照。
-       卡片放在视野中央，然后立刻打开编辑器：识别总会有认错的时候，
-       直接让你改比"先放上去、再发现错了、再双击"少两步。 */
+     ★ src 必须一起写上识别结果（原来这里是留空的 src: ''）——
+       编辑态里编辑的是 **src**，而编辑态**只渲染那个输入框**（不渲染 tex 的公式）。
+       留空 = 卡片里出现一个空框，刚认出来的式子在编辑态下**一个字都看不见**；
+       更糟的是用户顺手按个回车，commitEdit 就把 `tex: toTex('')` 写进去，
+       整张卡被清空成"双击写公式"。
+       实测（2026-09-15）：插进去 tex 是对的，但编辑框 value 是 ""，按一次回车 → tex/src 全空。
+       用户报的正是这个：「识别是对的，但放不到白板上，还弹出一个没法交互的弹窗」
+       （那个"弹窗"就是卡片里的空输入框）。
+       原来留空 src 的理由是"给手打的那串留个参照" —— 手写这条路没有"手打的那串"，
+       留空没有任何参照价值，只有上面那一串坏处。 */
   function insertRecognized({ tex }) {
     const c = newCard('formula', stageCenterWorld().x, stageCenterWorld().y)
-    commit((cur) => ({ ...cur, cards: [...cur.cards, { ...c, src: '', tex }] }))
+    commit((cur) => ({ ...cur, cards: [...cur.cards, { ...c, src: tex, tex }] }))
     setPadOpen(false)
     setSelectedId(c.id)
     setEditingId(c.id)
@@ -526,10 +691,12 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, selectedId, hoverEdge, eraserAt,
     onPointerDown, onPointerMove, onPointerUp,
+    lasso, inkBox, onDeleteInk: deleteInkSel,
     /* 卡片层作为 children 传进画布组件 —— 它必须和两层 canvas 待在**同一个**
        .bd-stage 里面（同一个世界原点）。理由见 BoardCanvas 里那段说明。
-       注意这里**不要再套一层带 translate 的容器**：世界变换由 BoardCanvas
-       里的 .bd-world 统一做，两处各写一次就又会重复同一次平移。 */
+       注意这里**不要再套一层带 translate / scale 的容器**：世界变换不靠 CSS，
+       卡片自己算 left/top（同一个公式、同一个原点）。BoardCanvas 里那层 .bd-world
+       只负责叠放（z-index 要高过收事件层，卡片才点得到），给它加变换就多做一次平移。 */
     children: (
       <>
         {board.cards.map((c) => (
@@ -612,7 +779,6 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       tool={tool} setTool={setTool}
       color={color} setColor={setColor}
       width={width} setWidth={setWidth}
-      onAddCard={addCard}
       onWriteFormula={() => setPadOpen(true)}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
@@ -629,17 +795,19 @@ export default function Board({ file, initialText, onSave, flash, scale, onScale
       onScale={onScale}
       onScaleReset={onScaleReset}
       dirty={dirty}
+      fullscreen={fullscreen}
+      onToggleFullscreen={onToggleFullscreen}
     />
   )
 
   return (
-    <div className={'bd variant-' + variant}>
-      <div className="bd-stagewrap" ref={wrapRef}>
+    <div className={'bd variant-' + variant + (fullscreen ? ' bd-fs' : '')}>
+      <div className={'bd-stagewrap' + (penMode ? ' nocursor' : '')} ref={wrapRef}>
         {/* 画布、连线、卡片都在 BoardCanvas 里面 —— 它们必须是同一个世界原点。
             卡片通过 children 传进去，就是为了让"世界原点"这件事只有一个地方说话。 */}
         <BoardCanvas {...stageProps} />
 
-        {board.cards.length === 0 && board.strokes.length === 0 && <Hint onAdd={addCard} />}
+        {board.cards.length === 0 && board.strokes.length === 0 && <Hint />}
       </div>
 
       {variant === 'B' ? (
@@ -698,8 +866,21 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
   }, [editing, isFormula, card.src, card.text])
 
   function commitEdit() {
-    if (isFormula) onCommit({ src: draft, tex: toTex(draft) })
-    else onCommit({ text: draft })
+    if (isFormula) {
+      /* ★ 空提交什么都不改。
+         公式卡显示的是 tex，而编辑框里编辑的是 src ——
+         一旦空串提交进来，下面这句 `tex: toTex(draft)` 会把 tex 清掉，
+         整张卡变成"双击写公式"，而用户只是"想确认一下"。
+         实测栽过一次（手写识别插入的卡片原来 src 是空的，一按回车就没了）。
+         想清空有「删除」，想放弃有「取消」，所以这里把"空"当成"没有修改"。 */
+      if (!draft.trim()) {
+        onCloseEdit()
+        return
+      }
+      onCommit({ src: draft, tex: toTex(draft) })
+    } else {
+      onCommit({ text: draft })
+    }
     onCloseEdit()
   }
 
@@ -843,7 +1024,7 @@ const SNIP_LABEL = { frac: 'a/b', sqrt: '√', sup: 'xⁿ', sub: 'xₙ', mu0: '�
 
 // ────────────────────────────── 工具条 ──────────────────────────────
 
-function Toolbar({ tool, setTool, color, setColor, width, setWidth, onAddCard, onWriteFormula, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty }) {
+function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormula, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen }) {
   return (
     <div className="bd-tools">
       <div className="bd-group">
@@ -879,10 +1060,8 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onAddCard, o
       </div>
 
       <div className="bd-group">
-        <button className="bd-t" onClick={() => onAddCard('formula')} title="插一张公式卡：写 F = ma 就变成好看的式子">
-          ∑ 公式
-        </button>
-        <button className="bd-t" onClick={() => onAddCard('note')} title="插一张便签">▤ 便签</button>
+        {/* 「∑ 公式」「▤ 便签」两个入口收掉了 —— 现在只留手写公式。
+            卡片本身的渲染和编辑都还在，所以已经存下来的卡片不会坏，只是不能再新建。 */}
         <button className="bd-t" onClick={onWriteFormula} title="手写一个公式，认出来变成好看的式子（也可以用键盘打）">
           ✍ 手写公式
         </button>
@@ -913,6 +1092,15 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onAddCard, o
         <button className="bd-t icon" onClick={() => onZoom(1 / 1.2)} title="画布缩小（纸变小）">−</button>
         <button className="bd-t icon" onClick={onFit} title="把所有内容装回屏幕（Ctrl+0）">⤢</button>
         <button className="bd-t icon" onClick={() => onZoom(1.2)} title="画布放大（纸变大）">＋</button>
+        {/* 全屏：把两侧栏和顶栏全收掉，连浏览器那圈也一起收，只留一张纸（Esc 退出）。
+            放在这组最右边是有意的 —— 它和"纸缩放"一样是"怎么看这块画布"的操作。 */}
+        <button
+          className={'bd-t' + (fullscreen ? ' on' : '')}
+          onClick={onToggleFullscreen}
+          title={fullscreen ? '退出全屏（Esc）' : '画布全屏：只留一张纸，四周什么都收起来'}
+        >
+          ⛶ {fullscreen ? '退出' : '全屏'}
+        </button>
       </div>
     </div>
   )
@@ -942,7 +1130,7 @@ function RelationPanel({ board, relations, inkPairs, selectedId, onSelect, onHov
         <span className="dim small">按位置读出来的</span>
       </div>
 
-      {board.cards.length === 0 && <div className="dim pad">还没有卡片。点工具条上的「∑ 公式」插一张。</div>}
+      {board.cards.length === 0 && <div className="dim pad">这张板上还没有卡片。</div>}
 
       <div className="bd-tree">
         {roots.map((r) => (
@@ -1016,19 +1204,17 @@ function TreeNode({ node, depth, relations, byId, label, selectedId, onSelect, o
 
 // ────────────────────────────── 空板提示 ──────────────────────────────
 
-function Hint({ onAdd }) {
+function Hint() {
   return (
     <div className="bd-hint">
       <div className="bd-hint-t">拿笔直接画</div>
       <div className="bd-hint-s">
-        关系靠位置：把「安培环路定理」写在一张便签上，公式卡放到它旁边、或者摞在它上面，
-        工具就会把这张公式归到它底下。
+        写公式不用管格式：点工具条上的「✍ 手写公式」，在那块小板上把式子写一遍，
+        它会认成排好的样子，再放到板上。
       </div>
-      <div className="bd-hint-row">
-        <button className="btn primary" onClick={() => onAdd('note')}>先放一张便签</button>
-        <button className="btn" onClick={() => onAdd('formula')}>再放一张公式卡</button>
+      <div className="bd-hint-s dim">
+        笔尖写字，翻过来就是橡皮。触屏：两根手指拖 = 平移，捏 = 缩放。
       </div>
-      <div className="bd-hint-s dim">触屏：两根手指拖 = 平移，捏 = 缩放。手写笔永远只画画，不会误触。</div>
     </div>
   )
 }
@@ -1042,13 +1228,32 @@ function Hint({ onAdd }) {
    这不是最终形态，是给你翻着挑的 —— 挑完我把落选的两套删掉。 */
 function VariantSwitcher({ variant, setVariant }) {
   const names = { A: '工具条在顶 · 关系在右', B: '全屏画布 · 都做成浮层', C: '关系在左一整列' }
+  // 默认收起。这东西是"翻着挑摆法"用的，摆法定了之后平时根本用不到，
+  // 之前一直摊在屏幕底下、还压着工具条 —— 收成一个角标，要用再点开。
+  const [open, setOpen] = useState(false)
+  const prev = () => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 2) % 3], setVariant)
+  const next = () => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 1) % 3], setVariant)
+
+  if (!open) {
+    return (
+      <button
+        className="bd-proto-mini"
+        onClick={() => setOpen(true)}
+        title={`布局摆法：${variant} — ${names[variant]}（点一下展开）`}
+      >
+        {variant}
+      </button>
+    )
+  }
+
   return (
     <div className="bd-proto">
-      <button onClick={() => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 2) % 3], setVariant)} title="上一个摆法（←）">‹</button>
+      <button onClick={prev} title="上一个摆法（←）">‹</button>
       <span className="bd-proto-t">
         <b>{variant}</b> — {names[variant]}
       </span>
-      <button onClick={() => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 1) % 3], setVariant)} title="下一个摆法（→）">›</button>
+      <button onClick={next} title="下一个摆法（→）">›</button>
+      <button className="bd-proto-x" onClick={() => setOpen(false)} title="收起">⌄</button>
     </div>
   )
 }
@@ -1081,6 +1286,69 @@ function pathLength(pts) {
   let len = 0
   for (let i = 0; i + 1 < pts.length; i++) len += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y)
   return len
+}
+
+/* 笔的"另一头"—— 橡皮端。
+   把 Surface Pen 翻过来按在屏幕上时，Windows 给的事件是：
+     pointerType === 'pen'，button === 5（PointerEvent 规范里 5 就是 eraser），
+     buttons 里还会带上 32（= 1 << 5，同一个按钮的位）。
+   笔杆上的侧键不是这个值（那是 1 / 2），所以不会把侧键误判成橡皮。
+   ★ OneNote 的手感就靠这一条：不用去点工具条，翻过来就能擦。 */
+function isPenEraser(e) {
+  // 按位判（不是 === 32）：笔杆键和橡皮端有可能同时按着，那时 buttons 是 34
+  return e.pointerType === 'pen' && (e.button === 5 || (e.buttons & 32) !== 0)
+}
+
+/* 笔杆侧键（Surface Pen 上那个长条按钮）。
+   按住它再用笔尖碰屏幕时，事件里 buttons 的 bit 1（值 2）是亮的。
+   OneNote 拿它当"框选"用，这里跟着做：
+   按住笔杆键拖一圈 → 圈到的墨迹被选中 → 可以直接拖着走，或者删掉。
+   注意别和橡皮端混了：那个是 bit 5（32），两个都按住时 buttons = 34，
+   所以一律按位判断、不做相等比较。 */
+function isPenBarrel(e) {
+  return e.pointerType === 'pen' && (e.buttons & 2) !== 0
+}
+
+/* 一笔有没有"碰到"这个矩形（都是世界坐标）。
+   判定用碰着就算 —— 只要有任意一个点落在框里，这一笔就算被圈住了。
+   比"整笔必须完全落在里面"符合直觉得多：手写时很少有人能一笔不越界地圈住东西，
+   按"完全包含"来判，用户会觉得"我明明框住了它却没选上"。 */
+function strokeHitsRect(stroke, r) {
+  for (const p of toPoints(stroke.points)) {
+    if (p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1) return true
+  }
+  return false
+}
+
+/* 一组笔迹的包围盒（世界坐标）。选中之后画那个虚线框要用它。 */
+function strokesBBox(strokes) {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const s of strokes) {
+    for (const p of toPoints(s.points)) {
+      if (p.x < x0) x0 = p.x
+      if (p.y < y0) y0 = p.y
+      if (p.x > x1) x1 = p.x
+      if (p.y > y1) y1 = p.y
+    }
+  }
+  return Number.isFinite(x0) ? { x0, y0, x1, y1 } : null
+}
+
+/* 整笔平移。★ points 必须保持那个**扁平**数组格式（x, y, 压力 三连），
+   这是这个项目的铁律 —— 见 lib/board.js 顶部的说明，
+   内存里一旦换成对象数组，画布就会把一笔 10 个点读成 3 个。 */
+function shiftStroke(stroke, dx, dy) {
+  const pts = stroke.points
+  const out = new Array(pts.length)
+  for (let i = 0; i < pts.length; i += 3) {
+    out[i] = pts[i] + dx
+    out[i + 1] = pts[i + 1] + dy
+    out[i + 2] = pts[i + 2]
+  }
+  return { ...stroke, points: out }
 }
 
 function clearLive(liveRef) {

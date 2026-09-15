@@ -38,7 +38,12 @@ const send = (method, params = {}) =>
 const ev = (expr) => send('Runtime.evaluate', { expression: expr, returnByValue: true }).then((r) => r.result && r.result.value)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// 切摆法：点切换器按钮，直到 class 对上
+// 切摆法：点切换器按钮，直到 class 对上。
+// ⚠ 必须先点开那个角标 —— 切换器默认收起成 .bd-proto-mini，
+//   展开后才有 .bd-proto 和里面的按钮。漏了这一下就永远切不动
+//   （循环空转 5 次，class 一直是 variant-A）。
+await ev(`(() => { const m = document.querySelector('.bd-proto-mini'); if (m) m.click(); return 1 })()`)
+await sleep(300)
 for (let i = 0; i < 5; i++) {
   const cls = await ev(`document.querySelector('.bd').className`)
   if (cls && cls.includes('variant-' + want)) break

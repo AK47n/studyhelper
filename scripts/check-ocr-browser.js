@@ -22,6 +22,8 @@ import http from 'node:http'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { browserExe } from './lib/browser.js'
+import { newBoard, serializeBoardDocument } from '../src/lib/board.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
@@ -29,8 +31,23 @@ const APP_PORT = Number(process.env.OCR_TEST_APP_PORT || 5179)
 const MOCK_PORT = Number(process.env.OCR_TEST_MOCK_PORT || 5198)
 const CDP_PORT = Number(process.env.OCR_TEST_CDP_PORT || 9223)
 const APP = `http://127.0.0.1:${APP_PORT}/`
-const CHROME = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+const CHROME = browserExe()
 const TEST_TOKEN = 'test-uat-token-abcdefgh'
+
+/* ── 夹具板：绝不动用户自己的板 ──────────────────────────────────────────
+   这个自检中途会**真的往白板上插一张公式卡**，而应用打开的是
+   "列表里第一个 board-*.md" —— 那多半是用户自己的板（今天那次就是
+   `board-新白板.md`），于是跑一次自检就往人家板里塞一张 E = mc²。
+   实测：跑两遍，用户板上多了两张一模一样的 E = mc²。
+   这和 check-board-browser 当年的教训是同一个：**自检不许写进用户的数据**。
+
+   所以先造一张自己的板（board- 前缀 + zz-ocr 前缀，跑完删），
+   再从左栏文件列表里点开它 —— 不依赖任何排序。
+   `process.on('exit')` 保证中途报错退出也会删。 */
+const FIXTURE_NAME = 'board-zz-ocrcheck.md'
+const FIXTURE_TITLE = 'board-zz-ocrcheck'
+const FIXTURE = path.join(ROOT, 'data', FIXTURE_NAME)
+fs.writeFileSync(FIXTURE, serializeBoardDocument(newBoard('自检夹具（跑完自动删除）')), 'utf8')
 
 let fails = 0
 const ok = (m) => console.log('  ✓ ' + m)
@@ -86,6 +103,13 @@ await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r))
 const realConfig = path.join(ROOT, 'config', 'ocr.json')
 const stash = realConfig + '.checkocr-bak'
 let stashed = false
+/* 上一次自检**没跑完**（被强杀 / 崩了）时，真配置会留在 .checkocr-bak 里没人管 ——
+   先把这种情况认回来，否则用户看到的是"我的密钥怎么没了"。 */
+if (!fs.existsSync(realConfig) && fs.existsSync(stash)) {
+  try {
+    fs.renameSync(stash, realConfig)
+  } catch {}
+}
 if (fs.existsSync(realConfig)) {
   fs.renameSync(realConfig, stash)
   stashed = true
@@ -115,19 +139,36 @@ const cleanup = () => {
   try {
     mock.close()
   } catch {}
-  if (stashed && fs.existsSync(stash)) {
+  /* ★ 把真配置放回去；**只有跑之前根本没有真配置**时，才删掉自检写下的那个假配置。
+     ⚠ 这里原来是无条件连着做两步的：先把 .checkocr-bak 恢复成 config/ocr.json，
+     紧接着又把这个 ocr.json 删掉 —— 于是"跑一次手写识别的自检"就等于
+     **把用户的真密钥删了**，而且删得无声无息（fs.rmSync 不进回收站，
+     config/ 又在 .gitignore 里，本机任何地方都找不回来）。
+     2026-09-15 实际发生过一次。改配置相关的清理逻辑时，先想清楚"删的是谁的"。
+     （跑之前有真配置 → 恢复它；跑之前没有 → 删掉的只是自检自己写的假配置。） */
+  if (stashed) {
     try {
-      fs.renameSync(stash, realConfig)
+      if (fs.existsSync(stash)) {
+        fs.renameSync(stash, realConfig)
+        console.log('  （你原来的 config/ocr.json 已经放回去了）')
+      }
+    } catch {}
+  } else {
+    try {
+      if (fs.existsSync(realConfig)) {
+        fs.rmSync(realConfig)
+        console.log('  （删掉的是自检自己写的假配置，你原来没有配置文件）')
+      }
     } catch {}
   }
-  // 自检期间写下的配置也要清掉（它是假的地址 + 假密钥，留着会让人困惑）
-  try {
-    if (fs.existsSync(realConfig)) fs.rmSync(realConfig)
-  } catch {}
+  /* 自检期间写下的配置也要清掉（它是假的地址 + 假密钥，留着会让人困惑） */
   try {
     if (fs.existsSync(path.join(ROOT, 'config')) && fs.readdirSync(path.join(ROOT, 'config')).length === 0) {
       fs.rmdirSync(path.join(ROOT, 'config'))
     }
+  } catch {}
+  try {
+    fs.rmSync(FIXTURE, { force: true })
   } catch {}
 }
 process.on('exit', cleanup)
@@ -234,6 +275,30 @@ await s.send('Runtime.enable')
 await s.send('Page.enable')
 await s.send('Page.navigate', { url: APP })
 await s.sleep(2600)
+
+/* ★ 先换到自己的夹具板再开始。应用打开的是"列表里第一个 board-*.md"，
+   那个多半是用户自己的板 —— 本自检会往里插卡片，不能插到别人板上。 */
+{
+  const pick = await s.eval(`(() => {
+    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
+    if (cur.trim() === ${JSON.stringify(FIXTURE_NAME)}) return 'already'
+    const row = [...document.querySelectorAll('.filerow')].find(
+      (r) => ((r.querySelector('.fname') || {}).textContent || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
+    )
+    if (!row) return 'no-row'
+    row.click()
+    return 'clicked'
+  })()`)
+  if (pick === 'no-row') {
+    console.error('\n  左栏里找不到夹具板 ' + FIXTURE_TITLE + ' —— 后面会往别人的板上插卡片，停在这里。\n')
+    process.exit(2)
+  }
+  if (pick === 'clicked') {
+    await s.sleep(1200)
+    const now = await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)
+    console.log('  （夹具板：' + now + '）')
+  }
+}
 
 // ═════════════════════ 开始断言 ═════════════════════
 console.log('\n[1] 工具条上有「手写公式」这个入口')
@@ -362,6 +427,44 @@ console.log('\n[2] 打开写字板')
   if (res.insertBtn) ok('有「放到白板上」按钮')
   else bad('没有放上去的按钮')
 
+  /* ★★ 那个输入框要**真的点得进去** —— 用真鼠标事件，不要 dispatchEvent。
+     用户 2026-09-15 报的「可编辑的弹窗点不了、还在上面乱涂乱画」：
+     "放上去之后那个框"其实半点不能碰，一点就在白板上落墨。
+     根因在卡片层的 z-index（.bd-hit 把卡片整个盖住，见 BoardCanvas 的说明），
+     但**症状从写字板这一侧看是一模一样的**：结果区、输入框、预览都在，
+     就是点不动。所以这条断言盯的是"命中测试"本身：
+       ① 输入框中心那一点，elementFromPoint 必须就是它；
+       ② 真鼠标按下去之后，光标（activeElement）必须落在它身上；
+       ③ 顺带确认这一下**没有**变成笔迹（写的是 1 笔，别变成 2 笔）。 */
+  const editHit = await s.eval(`(() => {
+    const ta = document.querySelector('.wp-res .wp-edit')
+    if (!ta) return null
+    const r = ta.getBoundingClientRect()
+    const cx = Math.round((r.left + r.right) / 2)
+    const cy = Math.round((r.top + r.bottom) / 2)
+    const el = document.elementFromPoint(cx, cy)
+    return { cx, cy, isInput: el === ta, hit: el ? el.tagName + '.' + (typeof el.className === 'string' ? el.className : '') : 'null' }
+  })()`)
+  if (!editHit) {
+    bad('找不到结果区的输入框（.wp-res .wp-edit）')
+  } else {
+    if (editHit.isInput) ok('输入框中心命中的就是输入框自己')
+    else bad(`输入框中心命中的是 ${editHit.hit} —— 它被别的层盖住了，用户点不进去`)
+    const strokesBefore = (await s.eval(`[...document.querySelectorAll('.wp-acts .dim')].map(e => e.textContent).join(' ')`)).match(/(\d+) 笔/)
+    await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: editHit.cx, y: editHit.cy, button: 'left', buttons: 1, clickCount: 1 })
+    await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: editHit.cx, y: editHit.cy, button: 'left', buttons: 0, clickCount: 1 })
+    await s.sleep(300)
+    const afterClick = await s.eval(`(() => ({
+      focused: document.activeElement === document.querySelector('.wp-res .wp-edit'),
+      meta: [...document.querySelectorAll('.wp-acts .dim')].map(e => e.textContent).join(' '),
+    }))()`)
+    if (afterClick.focused) ok('真鼠标点一下，光标就进到输入框里了（能改）')
+    else bad('点了输入框，光标没进去 —— 用户改不了认错的式子')
+    const strokesAfter = afterClick.meta.match(/(\d+) 笔/)
+    if (!strokesBefore || !strokesAfter || strokesBefore[1] === strokesAfter[1]) ok('点输入框没有在写字板上多画一笔')
+    else bad(`点输入框居然变成写字了（${strokesBefore[1]} 笔 → ${strokesAfter[1]} 笔）`)
+  }
+
   const cardsBefore = await s.eval(`document.querySelectorAll('.bd-card').length`)
   await s.eval(`(() => { const b = [...document.querySelectorAll('.wp-res-acts .btn')].find(x => /放到白板上/.test(x.textContent)); b.click(); return 1 })()`)
   /* ★ 轮询，别睡死一个固定时间。
@@ -386,10 +489,87 @@ console.log('\n[2] 打开写字板')
   if (afterInsert.editing) ok('新卡片直接进入编辑态（识别总会认错，让你马上能改）')
   else bad('新卡片没进编辑态')
 
+  /* ★ 编辑框里必须**有内容**（就是刚认出来的那个式子）。
+     这条是 2026-09-15 那个 bug 的钉子：插入的卡片原来写的是 `src: ''`，
+     而编辑态编辑的正是 src、编辑态又**只渲染那个输入框**（不渲染 tex 的公式）——
+     于是"放到白板上"之后卡片里只有一个**空框**，刚认出来的式子一个字都看不见；
+     用户顺手按个回车，commitEdit 就把 `tex: toTex('')` 写进去，整张卡变成"双击写公式"。
+     用户报的正是这个：「识别是对的，但放不到白板上，还弹出一个没法交互的弹窗」
+     —— 那个"弹窗"就是卡片里的空输入框。 */
+  const editInside = await s.eval(`(() => {
+    const ta = document.querySelector('.bd-card.editing textarea')
+    const card = document.querySelector('.bd-card.editing')
+    return {
+      has: !!ta,
+      value: ta ? ta.value : '',
+      showsFormula: card ? card.querySelectorAll('.katex').length : 0,
+    }
+  })()`)
+  if (editInside.has && editInside.value.trim()) ok('编辑框里就是刚认出来的式子：' + JSON.stringify(editInside.value))
+  else bad('编辑框是空的（式子看不见，一按回车还会被抹掉）：' + JSON.stringify(editInside.value))
+  if (editInside.showsFormula > 0) ok('编辑态里能同时看到渲染后的式子（KaTeX ' + editInside.showsFormula + ' 处）')
+  else bad('编辑态看不到渲染结果')
+
+  /* ★★ 白板上那张卡片里的编辑框，也要**真的点得到**（真鼠标事件）。
+     这就是用户那句「点不了，给我识别成写字了，在弹窗上乱涂乱画」的正主：
+     卡片 DOM 被 .bd-hit（收事件层）整个盖住 —— 按下去落墨、输入框点不进去。
+     自检以前用 dispatchEvent 合成事件，绕过命中测试，所以一直是假绿灯。 */
+  const cardEditHit = await s.eval(`(() => {
+    const ta = document.querySelector('.bd-card.editing textarea')
+    if (!ta) return null
+    const r = ta.getBoundingClientRect()
+    const cx = Math.round((r.left + r.right) / 2)
+    const cy = Math.round((r.top + r.bottom) / 2)
+    const el = document.elementFromPoint(cx, cy)
+    return { cx, cy, isInput: el === ta, hit: el ? el.tagName + '.' + (typeof el.className === 'string' ? el.className : '') : 'null' }
+  })()`)
+  if (!cardEditHit) {
+    bad('找不到卡片里的编辑框')
+  } else {
+    if (cardEditHit.isInput) ok('卡片编辑框中心命中的就是它自己（没被收事件层盖住）')
+    else bad(`卡片编辑框中心命中的是 ${cardEditHit.hit} —— 卡片被盖住了，用户点不进去`)
+    const inkBefore = await s.eval(`document.querySelector('canvas.bd-ink').dataset.strokes`)
+    /* 先把光标挪开，再点回来 —— 否则"光标在输入框里"只是自动聚焦的结果，
+       证明不了"点得到"。 */
+    await s.eval(`(() => { const ta = document.querySelector('.bd-card.editing textarea'); if (ta) ta.blur(); return 1 })()`)
+    await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cardEditHit.cx, y: cardEditHit.cy, button: 'left', buttons: 1, clickCount: 1 })
+    await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cardEditHit.cx, y: cardEditHit.cy, button: 'left', buttons: 0, clickCount: 1 })
+    await s.sleep(300)
+    const clickBack = await s.eval(`(() => ({
+      focused: document.activeElement === document.querySelector('.bd-card.editing textarea'),
+      ink: document.querySelector('canvas.bd-ink').dataset.strokes,
+    }))()`)
+    if (clickBack.focused) ok('真鼠标点一下卡片编辑框，光标就进去了（能改）')
+    else bad('点了卡片编辑框，光标进不去 —— 这就是用户说的"点不了"')
+    if (clickBack.ink === inkBefore) ok(`在卡片上点一下没落墨（还是 ${clickBack.ink} 笔）`)
+    else bad(`在卡片上点一下就画了一笔（${inkBefore} → ${clickBack.ink}）—— 被当成写字了`)
+  }
+
   await s.sleep(1200) // 等自动存盘
   const saved = await s.eval(`(() => { const e = document.querySelector('.bd-save'); return e ? e.textContent : null })()`)
   if (saved === '已存') ok('识别出来的公式已经落盘')
   else bad('没落盘：状态「' + saved + '」')
+
+  /* ★ 再按一次回车（用户"确认一下"的自然动作）：式子在不在？
+     空提交必须什么都不改 —— 想清空有「删除」，想放弃有「取消」。 */
+  await s.eval(`(() => {
+    const ta = document.querySelector('.bd-card.editing textarea')
+    if (!ta) return 'no-ta'
+    ta.focus()
+    ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    return 'sent'
+  })()`)
+  await s.sleep(1000)
+  const afterEnter = await s.eval(`(() => {
+    const card = document.querySelector('.bd-card')
+    return {
+      empty: !!document.querySelector('.bd-card .bd-card-empty'),
+      editing: !!document.querySelector('.bd-card.editing'),
+      katex: card ? card.querySelectorAll('.katex').length : 0,
+    }
+  })()`)
+  if (!afterEnter.empty && afterEnter.katex > 0) ok('按回车确认之后式子还在（不会被空提交抹掉）')
+  else bad('一按回车卡片就被清空了（空提交覆盖了 tex）')
 }
 
 console.log('\n[6] 失败路径：密钥不对时要说人话')

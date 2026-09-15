@@ -14,22 +14,13 @@ import path from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { browserExe } from './lib/browser.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
 
-const CANDIDATES = [
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-]
-const exe = CANDIDATES.find((p) => fs.existsSync(p))
-if (!exe) {
-  console.error('  找不到 Edge / Chrome')
-  process.exit(2)
-}
-
+const exe = browserExe() // Edge 优先，也认 CHROME_PATH，见 scripts/lib/browser.js
 // 服务端现在发的是什么
 const html = await fetch(APP).then((r) => r.text())
 const served = (/assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(html) || [])[1] || '(没找到 js 引用)'

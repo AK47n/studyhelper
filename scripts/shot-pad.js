@@ -7,6 +7,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { extractFilePart } from '../src/lib/multipart.js'
+import { browserExe } from './lib/browser.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
@@ -51,7 +52,7 @@ for (let i = 0; i < 40; i++) {
 const userDataDir = path.join(ROOT, '.cache', 'shot-cdp')
 fs.rmSync(userDataDir, { recursive: true, force: true })
 const chrome = spawn(
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  browserExe(),
   ['--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars', '--window-size=1440,900', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${userDataDir}`, APP],
   { stdio: 'ignore' }
 )

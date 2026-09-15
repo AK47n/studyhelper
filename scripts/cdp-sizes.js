@@ -4,7 +4,6 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 
 const CDP_URL = 'http://127.0.0.1:9222'
-const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
 const SIZES = [
   [1500, 950],
   [1280, 800],

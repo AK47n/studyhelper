@@ -428,6 +428,24 @@ export default function SourceEditor({
     fitHeight()
   }, [lines, fontSizePx, fitHeight])
 
+  /* 挂载时，自己把 text 灌进 textarea。
+     ── 为什么非要有这一句 ──
+     这个 textarea 是**非受控**的（刻意不写 value={text}，受控会让 React 在打字时重渲染抢光标），
+     平时靠 App.open() 里那句 `taRef.current.value = shown` 直接写 DOM。
+     但**从白板切回笔记**的时候，SourceEditor 还没挂载 —— taRef.current 是 null，
+     那句就静默落空了。结果是"着色层有字、编辑框是空的"，
+     用户往空框里打一个字，onEdit 拿到的就只有那一个字，整篇被覆盖（丢数据）。
+     实测：切到笔记后 ta.value.length = 0，而 .hl-line 有 52 行。
+     挂载这一下必须自己兜住 —— effect 在首次渲染后跑，拿到的就是最新的 text。 */
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    const want = text ?? ''
+    if (el.value !== want) el.value = want
+    fitHeight()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   useEffect(() => {
     const el = textareaRef.current
     if (!el || typeof ResizeObserver === 'undefined') return

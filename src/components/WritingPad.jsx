@@ -31,6 +31,10 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
   const wrapRef = useRef(null)
   const cvRef = useRef(null)
   const drawRef = useRef(null)
+  /* 和画布那边同一个道理：用笔写的时候，别让十字光标跟在笔尖底下。
+     鼠标照样显示 —— 不然鼠标就没法定位了。 */
+  const [penMode, setPenMode] = useState(false)
+  const penModeRef = useRef(false)
 
   // 打开时问一下配没配密钥 —— 没配的话第一步应该是去设置，而不是白写一遍
   useEffect(() => {
@@ -72,8 +76,18 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
     return { x: e.clientX - r.left, y: e.clientY - r.top }
   }, [])
 
+  /* 谁在操作？只在真的换了设备时才 setState —— 每次 pointermove 都 set 会白重渲染。 */
+  const trackPointerKind = useCallback((e) => {
+    const isPen = e.pointerType === 'pen'
+    if (isPen !== penModeRef.current) {
+      penModeRef.current = isPen
+      setPenMode(isPen)
+    }
+  }, [])
+
   const onDown = useCallback(
     (e) => {
+      trackPointerKind(e)
       if (busy) return
       /* ★ 指针捕获要设在**收到事件的那个元素自己**身上（这里是 canvas）。
          第一版设在了外层的 .wp-padwrap 上：于是 pointermove / pointerup 全部
@@ -90,11 +104,12 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
       const ctx = cvRef.current.getContext('2d')
       drawStroke(ctx, drawRef.current.stroke, { live: true })
     },
-    [busy, local]
+    [busy, local, trackPointerKind]
   )
 
   const onMove = useCallback(
     (e) => {
+      trackPointerKind(e)
       const d = drawRef.current
       if (!d || d.id !== e.pointerId) return
       const ne = e.nativeEvent
@@ -122,7 +137,7 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
         drawStroke(ctx, d.stroke)
       }
     },
-    [strokes]
+    [strokes, trackPointerKind]
   )
 
   const onUp = useCallback(
@@ -153,8 +168,13 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
     } else {
       setResult(r)
       if (r.kind === 'no-key') {
-        // 没配密钥是最常见的第一步，直接把设置摊开，别让用户去找
-        setTimeout(() => onOpenSettings(), 500)
+        /* 没配密钥是最常见的第一步，直接把设置摊开，别让用户去找。
+           ⚠ 但这个弹层和写字板是**同级**覆盖层（都是 .wp-back、都是 z-index:400），
+             谁在上面只看 DOM 顺序 —— 设置是后渲染的，所以它会盖住写字板。
+             所以：① 延时给够（原来 500ms 太急，"还没配密钥"这句提示刚出现就被盖住了，
+             用户只看到一个突然蹦出来的设置窗口，不知道发生了什么）；
+             ② 设置窗口里写清了"关掉这里就回到写字板"，免得以为刚写的笔迹丢了。 */
+        setTimeout(() => onOpenSettings(), 1200)
       }
     }
   }, [strokes, flash, onOpenSettings])
@@ -190,7 +210,7 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
         <div className="wp-padwrap" ref={wrapRef}>
           <canvas
             ref={cvRef}
-            className="wp-pad"
+            className={'wp-pad' + (penMode ? ' nocursor' : '')}
             style={{ width: size.w, height: size.h }}
             onPointerDown={onDown}
             onPointerMove={onMove}
@@ -429,6 +449,11 @@ export function OcrSettings({ onClose, onSaved, flash }) {
             配置文件在 <code>{status && status.configHint}</code>，已经在 .gitignore 里 —— 不会被备份到 GitHub。
             换电脑要重新填一次。
           </div>
+
+          {/* 这句是给"没配密钥 → 自动摊开设置"那条路准备的：
+              设置盖住了写字板，用户第一反应是"我刚写的没了"。
+              点这个窗口外面（或右上角 ×）就能回到写字板，笔迹一直在内存里。 */}
+          <div className="dim small">关掉这里就回到写字板 —— 写好的笔迹还在，不用重写。</div>
         </div>
       </div>
     </div>

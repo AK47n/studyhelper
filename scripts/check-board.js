@@ -386,6 +386,27 @@ console.log('\n[6] 存取：round-trip 不能丢东西')
   eq(back.cards.length, 2, '两张卡都回来了')
   eq(back.cards[0].src, 'B = mu0 I / (2 pi r)', '公式卡片的原文回来了（一个字不改）')
   eq(back.cards[1].text, '安培环路定理', '便签文字回来了')
+
+  /* ★ 老文件的地雷：早期版本的手写识别只写 tex、src 留空。
+     而卡片编辑态编辑的是 src —— 空 src 就是"双击进去一个空输入框"，
+     用户按回车还会把式子抹掉（就是「识别是对的但放不到白板上」那个 bug）。
+     所以读盘时要把这种卡的 src 就地补成 tex。 */
+  {
+    const legacy = JSON.parse(serializeBoardDocument(b))
+    legacy.cards[0].src = ''
+    legacy.cards[0].tex = 'E = mc^{2}'
+    const fixed = parseBoardDocument(JSON.stringify(legacy))
+    eq(fixed.cards[0].src, 'E = mc^{2}', '老文件里 src 空的公式卡：读盘时用 tex 补齐（双击进去看得见式子）')
+    // 手打过的 src 一个字不能动
+    const handwritten = JSON.parse(serializeBoardDocument(b))
+    handwritten.cards[0].src = 'B = mu0 I / (2 pi r)'
+    eq(parseBoardDocument(JSON.stringify(handwritten)).cards[0].src, 'B = mu0 I / (2 pi r)', '手打过的 src 不动')
+    // 便签卡没有 src 这回事，别凭空给它造一个
+    const noteOnly = JSON.parse(serializeBoardDocument(b))
+    noteOnly.cards[1].src = ''
+    noteOnly.cards[1].tex = '不该被搬进来'
+    eq(parseBoardDocument(JSON.stringify(noteOnly)).cards[1].src, '', '便签卡不会被塞进 tex')
+  }
   eq(back.strokes[1].tool, 'highlighter', '荧光笔的工具名回来了')
   eq(back.strokes[1].width, 16, '线宽回来了')
   near(back.view.s, 1.414, 0.001, '视图缩放回来了')

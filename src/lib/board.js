@@ -181,6 +181,8 @@ function normalizeCard(c) {
   const kind = CARD_KINDS.includes(c.kind) ? c.kind : 'note'
   const w = Number(c.w) > 40 ? Number(c.w) : DEFAULT_CARD_SIZE.w
   const h = Number(c.h) > 32 ? Number(c.h) : DEFAULT_CARD_SIZE.h
+  const src = typeof c.src === 'string' ? c.src : ''
+  const tex = typeof c.tex === 'string' ? c.tex : ''
   return {
     id: typeof c.id === 'string' && c.id ? c.id : newId(kind === 'formula' ? 'f' : 'n'),
     kind,
@@ -188,8 +190,13 @@ function normalizeCard(c) {
     y: Number(c.y) || 0,
     w,
     h,
-    src: typeof c.src === 'string' ? c.src : '',
-    tex: typeof c.tex === 'string' ? c.tex : '',
+    /* 早期版本的手写识别只写 tex、故意把 src 留空（当时的理由是"给手打的那串留个参照"）。
+       但**编辑态编辑的就是 src** —— 空 src 等于"双击进卡片看到一个空输入框"，
+       而这正是「识别是对的，但放不到白板上」那个 bug 的另一半。
+       所以读盘时就地补齐：公式卡有 tex 没 src，就把 src 当成 tex。
+       只补公式卡、只在 src 真的空的时候补 —— 手打过的 src 一个字都不动。 */
+    src: kind === 'formula' && !src.trim() && tex.trim() ? tex : src,
+    tex,
     text: typeof c.text === 'string' ? c.text : '',
   }
 }

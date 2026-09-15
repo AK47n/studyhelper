@@ -42,6 +42,33 @@ async function createBoard({ prompt, flash, refresh }) {
   return r.name
 }
 
+/* 一张白板都没有的时候，直接开一张**空**的，别退回笔记界面。
+   ── 为什么不能退：白板是这个工具的入口（左栏第一个按钮、README 第一段），
+      列表里没有板就不给板 = 把入口锁上了。用户真正的遭遇：
+      data/ 里板被删干净、只剩笔记，打开就进笔记界面；
+      想画还得先点一下「白板」，再回答一个"这一课叫什么"的弹窗。
+   ── 为什么是空白板而不是样板板：样板是"第一次装这个工具"的见面礼，
+      只在 data/ 完全为空时给（见 createSeedBoard 的调用处）；
+      用户已经把板删干净了，说明他要自己从头来，再塞一张示例进去是添乱。
+   ── 为什么名字要在这里先探一遍：服务端 /api/new 撞名直接回 409，
+      不探就是静默失败（结果还是进笔记界面，症状和没修一样）。 */
+async function ensureBoard({ files, refresh, flash }) {
+  const taken = new Set((files || []).map((f) => f.name))
+  let name = ''
+  for (let i = 1; i <= 99 && !name; i += 1) {
+    const cand = i === 1 ? 'board-新白板.md' : `board-新白板 ${i}.md`
+    if (!taken.has(cand)) name = cand
+  }
+  if (!name) return null
+  const r = await api.create(name, serializeBoardDocument(newBoard('新白板')))
+  if (r.error) {
+    flash(r.error, 'err')
+    return null
+  }
+  await refresh()
+  return r.name
+}
+
 /* 第一次打开"一张白板都没有"的时候，先放一张样板进去。
    理由是"关系靠位置"这件事必须看见一次才懂 —— 空板配一句说明，人是不会照做的。 */
 async function createSeedBoard({ refresh, flash }) {
@@ -85,6 +112,16 @@ export default function App() {
   const [focusMode, setFocusMode] = useState(false)
   const [diag, setDiag] = useState(false) // 对齐诊断：两层分别染色，重合处为紫色
   const [scale, setScale] = useState(readScale)
+  // 画布全屏：把左侧栏、顶栏、关系面板全收掉，只留一张纸。
+  // 它和"浏览器全屏"是联动的 —— 所以点一下连地址栏那圈也一起收掉，
+  // 这才是 OneNote 那种"满屏只剩页面"的感觉。
+  const [boardFs, setBoardFs] = useState(false)
+  /* "换文件 / 重载"的计数器。
+     ★ 为什么不靠 initialText 让 Board 判断"内容换没换"：那个 prop 每自动保存一次
+       就会变一次，Board 一旦按它重跑初始化就会把撤销栈清空
+       （拖完东西按 Ctrl+Z 没反应、撤销按钮一直是灰的）。
+       所以"要换内容了"这件事，用一个只在真换的时候才动的计数器来说。 */
+  const [boardReload, setBoardReload] = useState(0)
   const [pendingJump, setPendingJump] = useState(null) // 从阅读视图切回编辑后要跳到的行
 
   const taRef = useRef(null)
@@ -122,6 +159,53 @@ export default function App() {
   }, [scale])
 
   const bumpScale = useCallback((d) => setScale((s) => clampScale(s + d)), [])
+
+  /* 画布全屏。两件事一起做：
+       ① 界面这边把左侧栏、顶栏、关系面板收掉（靠 .app.fs / .bd-fs 那几条样式）；
+       ② 请求**真正的浏览器全屏** —— 不然地址栏、标签栏还在，"彻底"就无从谈起。
+     为什么监听 fullscreenchange 而不自己记状态：用户按 Esc 或 F11 退出时，
+     浏览器不会来通知这个按钮，只能靠这个事件把状态跟上，
+     否则按钮会一直显示"退出全屏"，点了也退不出来。 */
+  useEffect(() => {
+    const onCh = () => setBoardFs(!!document.fullscreenElement)
+    document.addEventListener('fullscreenchange', onCh)
+    return () => document.removeEventListener('fullscreenchange', onCh)
+  }, [])
+
+  const toggleBoardFs = useCallback(() => {
+    if (document.fullscreenElement) {
+      const p = document.exitFullscreen?.()
+      if (p && p.catch) p.catch(() => {})
+      setBoardFs(false) // 兜底：万一事件没来，状态也别卡在"全屏"
+      return
+    }
+    // 已经处于"只收界面"的降级状态（浏览器没让全屏），再点一下就是退出
+    if (boardFs) {
+      setBoardFs(false)
+      return
+    }
+    const p = document.documentElement.requestFullscreen?.()
+    if (p && p.catch) {
+      // 全屏被拒（权限 / 策略 / 不是用户手势）时退化成"只收界面"：
+      // 至少画布是铺满的 —— 总比点了没反应强
+      p.catch(() => setBoardFs(true))
+    } else {
+      setBoardFs(true) // 浏览器压根不支持全屏 API
+    }
+  }, [boardFs])
+
+  /* 降级模式下（浏览器不给全屏，比如页面被嵌在别的容器里）Esc 是不会自己生效的，
+     这里自己接一下 —— 不然会卡在全屏里出不来，只能去点那个按钮。
+     真·浏览器全屏时不用管：Esc 浏览器自己处理，处理完 fire fullscreenchange，
+     上面那个监听会把状态收回来。 */
+  useEffect(() => {
+    if (!boardFs) return
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !document.fullscreenElement) setBoardFs(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [boardFs])
 
   // 从阅读视图切回编辑后，把待跳的行补上（编辑器这时才挂载完）
   useEffect(() => {
@@ -166,7 +250,16 @@ export default function App() {
         // 打开哪一个？优先白板 —— 这是"打开就能画"的默认入口。
         // 排序在服务端钉死了（见 server.js 的 /api/list），所以这里的结果是稳定的。
         const firstBoard = list.files.find((f) => isBoardName(f.name))
-        await open((firstBoard || list.files[0]).name)
+        if (firstBoard) {
+          await open(firstBoard.name)
+        } else {
+          /* 一张板都没有（笔记还在、板被删干净了）。
+             ★ 这里以前是直接打开第一个笔记 —— 用户看到的就是"怎么打开是笔记界面"。
+             现在：补一张空板再进去；真的建不出来（名字探完了 / 写盘失败）才退回笔记。 */
+          const made = await ensureBoard({ files: list.files, refresh: refreshList, flash })
+          await open(made || list.files[0].name, { force: true })
+          if (made) flash('没有白板，先给你开了一张空的：' + made)
+        }
       }
       setBusy(false)
     })()
@@ -192,6 +285,7 @@ export default function App() {
     setDiskMtime(r.mtime || 0)
     setDirty(false)
     setSelectedId(null)
+    setBoardReload((x) => x + 1) // 告诉 Board：内容换了（换文件、或点了「重载」）
     requestAnimationFrame(() => taRef.current && taRef.current.focus())
   }
 
@@ -339,7 +433,7 @@ export default function App() {
   const islandCount = doc.quantityNodes.filter((n) => (doc.refCount.get(n.id) || 0) === 0).length
 
   return (
-    <div className={'app' + (isBoard ? ' board-mode' : '')}>
+    <div className={'app' + (isBoard ? ' board-mode' : '') + (boardFs ? ' fs' : '')}>
       <aside className="side">
         <div className="brand">
           <div className="logo">sh</div>
@@ -471,6 +565,7 @@ export default function App() {
             key={current}
             file={current}
             initialText={boardTextRef.current}
+            reloadToken={boardReload}
             onSave={saveBoardText}
             flash={flash}
             /* 界面字号：白板模式顶栏不渲染，所以调字号的入口得进白板工具条，
@@ -478,6 +573,8 @@ export default function App() {
             scale={scale}
             onScale={bumpScale}
             onScaleReset={() => setScale(SCALE_DEFAULT)}
+            fullscreen={boardFs}
+            onToggleFullscreen={toggleBoardFs}
           />
         </div>
       ) : (

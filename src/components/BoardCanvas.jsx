@@ -16,9 +16,15 @@ import { drawStroke } from '../lib/ink.js'
  * 坐标系：两者都用**世界坐标**，靠 ctx.setTransform 和 CSS 的 translate/scale
  * 映射到屏幕。视图变了只改变换，不动数据（见 lib/board.js 顶部的说明）。
  */
+
+/* 框选那个包围框往外让出的量（**屏幕像素**，不是世界坐标）。
+   给在屏幕这边是为了让留白看起来一样宽 —— 放世界坐标里的话，
+   画布一缩放，留白就跟着一起胀缩，选中状态看起来忽胖忽瘦。 */
+const INK_PAD = 6
 export default function BoardCanvas({
   sceneRef, liveRef, view, size, strokes, relations, cardById, cardsForInk,
-  selectedId, hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp, children,
+  selectedId, hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
+  lasso, inkBox, onDeleteInk, children,
 }) {
   const dpr = typeof window === 'undefined' ? 1 : Math.min(2.5, window.devicePixelRatio || 1)
 
@@ -110,8 +116,20 @@ export default function BoardCanvas({
               而 .bd-stagewrap 本身在页面里是偏的（左边有侧栏、上面有文件名那一行）。
               CSS 变换不认这件事，于是卡片整体多偏一个"容器在页面里的位置"，
               而且这个量随布局变化 —— 换摆法、改字号、窗口大小一变就又不齐。
-              JS 算坐标就没有这个问题：偏移量直接来自 getBoundingClientRect。 */}
-      {children}
+              JS 算坐标就没有这个问题：偏移量直接来自 getBoundingClientRect。
+
+          ★★ 但外面**必须**再套一层 .bd-world —— 它只管叠放（z-index），不管坐标。
+             不加这一层的话，卡片是 z-index:auto 的定位元素，而 .bd-hit 是 z-index:5：
+             按 CSS 的绘制顺序，**正 z-index 的元素排在所有 z-index:auto 的定位元素后面**
+             （也就是更上面），于是 .bd-hit 把卡片整个盖住 ——
+             "点卡片" = 在板上落笔，卡片里那个输入框一个字都点不进去。
+             2026-09-15 用户报的「点不了，给我识别成写字了，在弹窗上乱涂乱画」
+             就是这一条：放上去的卡片进编辑态，但鼠标点上去只会画墨。
+             自检当时测不到它：check-board-browser 用 dispatchEvent 合成 dblclick
+             （直接投给卡片，**绕过命中测试**），所以"卡片点得到"这条一直是假的绿灯。
+             现在那条自检改成用真鼠标点了 —— 见 scripts/check-board-browser.js 第 [5] 节。
+             记法：**沾指针的东西，只有真鼠标事件能证明它点得到。** */}
+      <div className="bd-world">{children}</div>
 
       {/* 正在画、还没提交的那一笔 */}
       <canvas
@@ -132,6 +150,52 @@ export default function BoardCanvas({
             height: 2 * eraserAt.r * view.s,
           }}
         />
+      )}
+
+      {/* 笔杆键拖出来的框选矩形（世界坐标 → 屏幕坐标） */}
+      {lasso && (
+        <div
+          className="bd-lasso"
+          style={{
+            left: lasso.x0 * view.s + view.tx,
+            top: lasso.y0 * view.s + view.ty,
+            width: Math.max(1, (lasso.x1 - lasso.x0) * view.s),
+            height: Math.max(1, (lasso.y1 - lasso.y0) * view.s),
+          }}
+        />
+      )}
+
+      {/* 框选出来的那组墨迹：一个虚线包围框 + 一个删除按钮。
+          用笔的人不一定腾得出手按 Delete 键，所以删除必须放在手边。
+          按钮靠 transform 把"右下角"对齐到包围框的右上角，这样位置自动跟着框走，
+          不用去量按钮自己的宽高（按钮宽度会随界面字号变）。 */}
+      {inkBox && (
+        <>
+          <div
+            className="bd-inkbox"
+            style={{
+              left: inkBox.x0 * view.s + view.tx - INK_PAD,
+              top: inkBox.y0 * view.s + view.ty - INK_PAD,
+              width: (inkBox.x1 - inkBox.x0) * view.s + INK_PAD * 2,
+              height: (inkBox.y1 - inkBox.y0) * view.s + INK_PAD * 2,
+            }}
+          />
+          <button
+            className="bd-inkdel"
+            style={{
+              left: inkBox.x1 * view.s + view.tx + INK_PAD,
+              top: inkBox.y0 * view.s + view.ty - INK_PAD,
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation()
+              onDeleteInk()
+            }}
+            title="删掉选中的这几笔（也可以按 Delete）"
+          >
+            ✕ 删除
+          </button>
+        </>
       )}
 
       {selectedId && cardById.get(selectedId) && (

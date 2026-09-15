@@ -1,8 +1,7 @@
 /* 白板交互体检：为什么"能看见但点不动"。
  *
- * 用 系统 Chrome（不是 Edge —— Edge headless 下 CDP 合成的鼠标事件不会变成
- * pointer 事件，会给出假的"画不出来"）+ CDP 的 Input.dispatchMouseEvent，
- * 把这几件事查清楚：
+ * 用系统浏览器（默认 Edge，见 scripts/lib/browser.js）+
+ * CDP 的 Input.dispatchMouseEvent，把这几件事查清楚：
  *   ① 光标所在的那一层是不是 .bd-hit（不是的话，事件被别人吃了）
  *   ② pointerdown 到底有没有派到 .bd-hit 上
  *   ③ 各层的 z-index / pointer-events / 覆盖范围
@@ -15,12 +14,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { browserExe } from './lib/browser.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
 const CDP_PORT = Number(process.env.CDP_PORT || 9227)
-const CHROME = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+const CHROME = browserExe()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const profile = path.join(ROOT, '.cache', 'interact-cdp')

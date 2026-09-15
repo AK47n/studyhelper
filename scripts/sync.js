@@ -43,7 +43,7 @@ if (!existsSync(path.join(root, '.git'))) {
 
 const hasRemote = git(['remote', 'get-url', 'origin']) === 0
 if (!hasRemote) {
-  die('没有配置远端 origin', '先跑：gh repo create studyhelper --private --source=. --remote=origin --push')
+  die('没有配置远端 origin', '先跑：gh repo create studyhelper --public --source=. --remote=origin --push')
 }
 
 /* 有没有要提交的：--quiet 干净时退 0、有改动时退 1（不看输出，所以不怕管道限制）。
