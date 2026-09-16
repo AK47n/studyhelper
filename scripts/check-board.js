@@ -10,7 +10,7 @@ import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  descendantsOf, deriveChains, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
+  chainOfStroke, descendantsOf, deriveChains, findTip, freezeGroup, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
   strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
 } from '../src/lib/board.js'
@@ -1097,6 +1097,48 @@ console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方�
   eq(inkNodeAt(idx, { x: 3, y: 3 }).id, 'grp:g1', '落在第一坨上 → 拿到的是固定的那一块')
   eq(inkNodeAt(idx, { x: 33, y: 3 }).id, 'grp:g2', '落在第二坨上 → 另一块')
 
+  /* ① 固定块必须在 **buildLinks** 里生效（不能只直接问 inkNodeAt）——
+     2026-09-16 审查挑出来的严重 bug：固定块登记在 `owner` 上，而 `owner` 在 dropKey
+     变化时被清掉（dropKey 初始是 undefined，第一次 buildLinks 就清光），
+     于是"固定反而丢连接、把相隔很远的两坨固定成一块还会凭空造出连接"。
+     自检当时只直接问了 inkNodeAt，所以两条都漏过了。 */
+  {
+    const blobs = (cx) => [0, 1, 2].map((i) => [`${cx}_${i}`, toFlat([{ x: cx + i * 9, y: 0 }, { x: cx + i * 9 + 6, y: 7 }])])
+    const mkB = (groups) => {
+      const b = makeBoard()
+      b.strokes = [
+        ...blobs(0).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
+        ...blobs(600).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
+        { ...newStroke('pen', toFlat([{ x: 12, y: 3 }, { x: 612, y: 3 }])), id: 'ln' },
+      ]
+      b.groups = groups
+      return b
+    }
+    /* 干净板：两头都是自动聚出来的块 */
+    const l0 = buildLinks(mkB([]))[0]
+    eq([l0 && l0.aKind, l0 && l0.bKind], ['ink', 'ink'], '不固定时：两头都是自动聚出来的墨迹块')
+
+    /* 固定第一坨 → **buildLinks 必须还给出这条连接**，而且那一头是「固定的块」 */
+    const fixed = mkB([{ id: 'gA', ids: ['0_0', '0_1', '0_2'] }])
+    const idx = createInkIndex(fixed.strokes, fixed.groups)
+    const l1 = buildLinks(fixed, idx)[0] // ← 走应用真实路径（复用记忆化的索引）
+    if (l1) {
+      eq(l1.a, 'grp:gA', '固定之后：那一头是固定的块（id 用组 id）')
+      if (/固定/.test(l1.aLabel || '')) ok(`名字也对：${l1.aLabel}`)
+      else bad(`固定块的名字不对：${l1.aLabel}`)
+      eq(l1.bKind, 'ink', '另一头还是自动聚的块')
+    } else {
+      bad('固定一坨之后连接没了 —— 固定块在 buildLinks 里失效了（owner 被清掉那个 bug）')
+    }
+    /* 复用同一个索引再来一次（应用里就是复用），结果必须一样 */
+    eq(JSON.stringify(buildLinks(fixed, idx)), JSON.stringify(buildLinks(fixed, idx)), '复用索引连算两次结果一致')
+
+    /* 把**相隔很远的两坨固定成一块**：线两头落在同一个节点里 → 不该成连接。
+       （这条 bug 的表现是"凭空造出一条连接"：索引被清之后两头各算成一块自动块。） */
+    const one = mkB([{ id: 'gAll', ids: ['0_0', '0_1', '0_2', '600_0', '600_1', '600_2'] }])
+    eq(buildLinks(one, createInkIndex(one.strokes, one.groups)).length, 0, '两坨固定成一块之后：线两头是同一个节点 → 不算连接')
+  }
+
   /* 存盘：只在真有固定块时才写这个字段；成员被擦掉的那些不留尸体 */
   const text = serializeBoardDocument(b2)
   const back = parseBoardDocument(text, 'x')
@@ -1208,8 +1250,73 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
     eq(ch2.map((c) => c.steps.map((s) => s.from + '→' + s.to).join(',')), ['kb→kc'], '标成「因果」的那条不进推导链（链从 B 开始）')
   }
 
-  /* ⑥ 分叉与成环都不能把面板卡死 */
+  /* ⑦ 条件不能是**别的连接线**（审查挑出来的）：两条卡片连线交叉时，
+     交叉的那条线会被读成对方的条件，于是"缺条件"被无关的线掩盖。 */
   {
+    const dense = (x0, y0, x1, y1, n = 24) =>
+      toFlat(Array.from({ length: n }, (_, i) => ({ x: x0 + ((x1 - x0) * i) / (n - 1), y: y0 + ((y1 - y0) * i) / (n - 1) })))
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 0, y: 0, id: 'k1' },
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 400, y: 0, id: 'k2' },
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 400, y: 400, id: 'k3' },
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 0, y: 400, id: 'k4' },
+    ]
+    b.strokes = [
+      { ...newStroke('pen', dense(40, 25, 440, 425)), id: 'l1' }, // 左上 → 右下（卡↔卡）
+      { ...newStroke('pen', dense(40, 425, 440, 25)), id: 'l2' }, // 左下 → 右上（交叉）
+    ]
+    const ls = buildLinks(b)
+    eq(ls.length, 2, '两条交叉的卡片连线都成立')
+    const cross = ls.filter((l) => l.cond && l.cond.kind === 'ink' && l.cond.ids.includes('l2'))
+    const cross2 = ls.filter((l) => l.cond && l.cond.kind === 'ink' && l.cond.ids.includes('l1'))
+    eq(cross.length + cross2.length, 0, '别的连接线不会被当成条件（两条线互相都不算）')
+  }
+
+  /* ⑧ 端点卡离中点更近时，真正写在中点旁边的"条件卡"仍然要读出来 */
+  {
+    /* 线 (60,120)→(60,200)：中点 (60,160)。两张**端点卡**各离中点 20px、条件卡 k3 离 40px ——
+       旧代码"只看最近一张卡"会挑到端点卡、然后**整体放弃卡片分支**，
+       于是真正写在中点旁边那张 k3 被漏掉（审查挑出来的）。 */
+    const b = makeBoard()
+    b.strokes = [{ ...newStroke('pen', toFlat([{ x: 60, y: 120 }, { x: 60, y: 200 }])), id: 'ln' }]
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 0, y: 90, id: 'k1' },
+      { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 20, y: 180, id: 'k2' },
+      { ...newCard('note', 0, 0, { w: 80, h: 40 }), x: 100, y: 150, id: 'k3' },
+    ]
+    const l = buildLinks(b)[0]
+    if (l && l.cond && l.cond.id === 'k3') ok('两张端点卡都比它近，中点旁边 40px 那张条件卡照样读出来')
+    else bad(`条件卡被漏掉了：cond=${JSON.stringify(l && l.cond)}`)
+  }
+
+  /* ⑨ 分叉要每条路都走；太长要标记（不能静默截断） */
+  {
+    const mkL = (pairs) => pairs.map(([a, bb]) => ({ a, b: bb, kind: 'derive', cond: null, strokeId: a + bb }))
+    const fork = deriveChains(mkL([['A', 'B'], ['B', 'C'], ['B', 'D']]))
+    const flat = fork.map((c) => c.steps.map((s) => s.from + '→' + s.to).join(',')).sort()
+    eq(flat, ['A→B,B→C', 'A→B,B→D'], '分叉的每条路都成链（B→D 不再消失）')
+    const long = mkL([['A', 'B'], ['B', 'C'], ['C', 'D'], ['D', 'E']])
+    const cut = deriveChains(long, 2)
+    eq(cut[0].steps.length, 2, '超过上限就截断到上限')
+    eq(cut[0].truncated, true, '截断了要标出来（面板才不会假装"就这么多"）')
+    eq(deriveChains(mkL([['A', 'A']])).length, 0, '自环不算链（a===b 没有意义）')
+  }
+
+  /* ⑩ 「又算回连接」要按**整条链**清：link:'none' 当初写在整条链上 */
+  {
+    const b = makeBoard()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }])), id: 'p1', link: 'none' },
+      { ...newStroke('pen', toFlat([{ x: 100, y: 0 }, { x: 200, y: 0 }])), id: 'p2', link: 'none' },
+      { ...newStroke('pen', toFlat([{ x: 400, y: 0 }, { x: 460, y: 0 }])), id: 'other' },
+    ]
+    const chain = chainOfStroke(b, 'p1')
+    eq(chain.sort(), ['p1', 'p2'], 'chainOfStroke：点到链里任意一笔，都给回整条链')
+    eq(chainOfStroke(b, 'other'), ['other'], '不在任何链里的笔：给回它自己')
+  }
+
+  /* ⑥ 分叉与成环都不能把面板卡死 */  {
     const C = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 800, y: 0, id: 'kc' }
     const D = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 800, y: 300, id: 'kd' }
     const mkLinks = (pairs) => pairs.map(([a, bb]) => ({ a, b: bb, kind: 'derive', cond: null, strokeId: a + bb }))
@@ -1221,6 +1328,79 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
     eq(deriveChains(mkLinks([])).length, 0, '没有推导连接 → 一条链都没有')
     void C
     void D
+  }
+}
+
+// ═════════════════════ 6j. 三条"查出来的 bug"的回归闸 ═════════════════════
+console.log('\n[6j] 回归闸：缓存不许串味 · 写得出去就必须读得回来 · 一笔只能进一个组')
+{
+  /* 这一节全是 2026-09-16 用对抗性探针（随机板 + 不变量 + 新旧版本对照）查出来的，
+     每条都曾经真的错。放常驻自检里，免得以后又退化。 */
+
+  /* ── ① 缓存必须按排除集隔离 ──
+     同一个索引、同一个点，用**不同的排除集**问两次，各自必须尊重自己的排除集。
+     修之前：第二次会读到第一次算出来的节点（缓存把结果固定住了）——
+     表现是"条件"里混进这条线自己、同一块拿到两个不同的 id。 */
+  {
+    const dense = (x1, y, x2, step = 16) => {
+      const pts = []
+      for (let x = x1; x <= x2; x += step) pts.push({ x, y })
+      pts.push({ x: x2, y })
+      return toFlat(pts)
+    }
+    const b = makeBoard()
+    b.strokes = [
+      { ...newStroke('pen', dense(60, 30, 560)), id: 'line1' }, // 密集采样 → 会贴住下面的块
+      { ...newStroke('pen', dense(290, 48, 320, 10)), id: 'cd1' },
+      { ...newStroke('pen', dense(290, 56, 322, 10)), id: 'cd2' },
+    ]
+    const idx = createInkIndex(b.strokes, [])
+    const iLine = idx.byId.get('line1')
+    const at = { x: 300, y: 52 }
+    const a = inkNodeAt(idx, at, 12, 24, new Set([iLine]))
+    const c = inkNodeAt(idx, at, 12, 24, null)
+    const d = inkNodeAt(idx, at, 12, 24, new Set([iLine]))
+    eq(!!(a && a.ids.includes('line1')), false, '带排除集的那次不含 line1')
+    eq(!!(c && c.ids.includes('line1')), true, '不排除的那次算进了 line1（说明它真的贴着）')
+    eq(!!(d && d.ids.includes('line1')), false, '再排除那次**没有**读到"不排除"那份缓存（不串味）')
+  }
+
+  /* ── ② 写得出去就必须读得回来 ──
+     一个只有一个点的笔迹：serialize 不该把它写进文件（写进去也会在读的时候丢掉，
+     于是文件里攒垃圾、而且"存→读→再存"不再字节一致）。 */
+  {
+    const b = makeBoard()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 40, y: 0 }])), id: 'ok1' },
+      { ...newStroke('pen', toFlat([{ x: 10, y: 10 }])), id: 'junk' }, // 一个点
+    ]
+    const text = serializeBoardDocument(b)
+    if (!text.includes('"junk"')) ok('一个点的笔迹不会被写进文件（写出去也读不回来）')
+    else bad('一个点的笔迹被写进文件了 —— 存→读→再存会不一致')
+    const back = parseBoardDocument(text, 'x')
+    eq(back.strokes.length, 1, '读回来只剩能读的那一笔')
+    if (serializeBoardDocument(back) === text) ok('存→读→再存字节一致')
+    else bad('存→读→再存不一致（文件里留下了读不回来的东西）')
+  }
+
+  /* ── ③ 一笔只能进一个组（界面的"⧉ 固定成一块"调的就是 freezeGroup）── */
+  {
+    const before = [
+      { id: 'g1', ids: ['a', 'b'] },
+      { id: 'g2', ids: ['c', 'd'] },
+    ]
+    const after = freezeGroup(before, ['b', 'c'])
+    eq(after.map((g) => g.ids), [['a'], ['d'], ['b', 'c']], '新固定的一块赢：别处只剩没被拿走的')
+    const flat = after.flatMap((g) => g.ids)
+    eq(new Set(flat).size, flat.length, '没有一笔同时属于两块')
+    eq(freezeGroup([{ id: 'g9', ids: ['x', 'y'] }], ['x', 'y']).length, 1, '整块重新固定 → 原来那个组消失（不留空壳）')
+    /* 内存里守住了，文件才守得住：这一串操作之后往返仍然字节一致 */
+    const b = makeBoard()
+    b.strokes = ['x', 'y'].map((id) => ({ ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 20, y: 0 }])), id }))
+    b.groups = freezeGroup([{ id: 'g9', ids: ['x', 'y'] }], ['x', 'y'])
+    const t = serializeBoardDocument(b)
+    if (serializeBoardDocument(parseBoardDocument(t, 'x')) === t) ok('固定之后：存→读→再存仍然字节一致')
+    else bad('固定之后往返不一致')
   }
 }
 

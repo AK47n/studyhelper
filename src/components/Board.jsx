@@ -13,7 +13,7 @@ import { Tex } from './Tex.jsx'
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, createInkIndex, deriveChains, descendantsOf, fitView, newCard, newId, newStroke, parseBoardDocument,
+  buildRelations, createInkIndex, deriveChains, chainOfStroke, descendantsOf, freezeGroup, fitView, newCard, newStroke, parseBoardDocument,
   screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
@@ -713,12 +713,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         /* ★ 点一下那条线 = 选中它（"点线即选中"，2026-09-16 加）。
            以前改一个词得先**框住**那条线 —— 一条线本来就是一个点得中的东西，
            多一个框的手势是白费的。判据三条，都是为了让"点"不误伤：
-             · 框小到几乎是一个点（≤4 世界像素见方）—— 拖框的行为一个字不变；
+             · 框小到几乎是一个点（**≤4 屏幕像素**见方）—— 拖框的行为一个字不变；
              · 框里没有别的笔迹；
              · 只认**已经算出来是连接**的那些笔（linkByStroke），
                所以点一下字不会把某一笔字选中。
-           过一会儿那排词会在线上浮出来（.bd-inklink），和框住时看到的是同一个。 */
-        if (!ids.length && box.x1 - box.x0 <= 4 && box.y1 - box.y0 <= 4) {
+           过一会儿那排词会在线上浮出来（.bd-inklink），和框住时看到的是同一个。
+           ⚠ 这里的"小框"和下面那个命中半径**必须是同一套单位（屏幕像素）**：
+             原来写的是"4 世界像素"，放大到 6 倍时 4 世界像素 = 24 屏幕像素 ——
+             轻轻拖一下就成了"点"，行为跟手上的动作对不上（审查挑出来的）。 */
+        const vs = boardRef.current.view.s
+        if (!ids.length && (box.x1 - box.x0) * vs <= 4 && (box.y1 - box.y0) * vs <= 4) {
           const cx = (box.x0 + box.x1) / 2
           const cy = (box.y0 + box.y1) / 2
           const r = 10 / boardRef.current.view.s
@@ -1035,10 +1039,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }
 
   /* 把选中的那几笔从"不算连接"改回来：去掉 `link: 'none'` → 回到按形状自动判。
-     这是那道单向门的回头路（见 applyLink 里的 LINK_NONE）。 */
+     这是那道单向门的回头路（见 applyLink 里的 LINK_NONE）。
+     ★ 要按**整条链**清（`chainOfStroke`），不能只清框住的那一笔：
+     `link:'none'` 当初是写在整条链上的，链里还剩一笔 none，buildLinks 仍然整条跳过 ——
+     用户点了按钮却什么都没发生（审查挑出来的）。 */
   function clearNoLink() {
     if (!inkSel || !inkSel.size) return
-    const ids = inkSel
+    const board0 = boardRef.current
+    const ids = new Set()
+    for (const id of inkSel) for (const cid of chainOfStroke(board0, id)) ids.add(cid)
     commit((cur) => ({
       ...cur,
       strokes: cur.strokes.map((st) => {
@@ -1060,8 +1069,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   function freezeInkGroup() {
     if (!inkSel || !inkSel.size) return
     const ids = [...inkSel]
-    commit((cur) => ({ ...cur, groups: [...(cur.groups || []), { id: newId('g'), ids }] }))
-    flash(`固定成一块了（${ids.length} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`, 'ok')
+    /* `freezeGroup` 会把这几笔从别的组里拿走（一笔只能属于一个组）——
+       不这么干的话，界面能造出"内存里重叠、文件里只认一笔"的状态，下次打开分组悄悄变。 */
+    const taken = (boardRef.current.groups || []).filter((g) => g.ids.some((id) => inkSel.has(id)))
+    commit((cur) => ({ ...cur, groups: freezeGroup(cur.groups, ids) }))
+    flash(
+      taken.length
+        ? `固定成一块了（${ids.length} 笔）—— 其中几笔原来在别的块里，已经挪过来了`
+        : `固定成一块了（${ids.length} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`,
+      'ok'
+    )
   }
 
   function dissolveInkGroup() {

@@ -742,6 +742,18 @@ console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里�
   const hasFreeze = await s.eval(`!!document.querySelector('[data-ink-group="on"]')`)
   if (hasFreeze) ok('浮层上有「⧉ 固定成一块」')
   else bad('浮层上没有「固定成一块」那个按钮')
+  /* ★ 不能只看"在不在 DOM 里"：浮出来的按钮被别的层盖住、或者跑到画布外面，
+     在这套界面里都是踩过的坑（README 第 13 条）。命中测试说了算。 */
+  const freezeHit = await s.eval(`(() => {
+    const b = document.querySelector('[data-ink-group="on"]')
+    if (!b) return 'no-btn'
+    const r = b.getBoundingClientRect()
+    const el = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2))
+    if (!el) return '(无)'
+    return el === b || b.contains(el) ? 'self' : (el.className && typeof el.className === 'string' ? el.className : el.tagName)
+  })()`)
+  if (freezeHit === 'self') ok('那颗按钮**真的点得到**（中心命中的是它自己）')
+  else bad(`「固定成一块」中心命中的是「${freezeHit}」—— 用户点不到`)
 
   const clicked = await s.eval(`(() => {
     const b = document.querySelector('[data-ink-group="on"]')

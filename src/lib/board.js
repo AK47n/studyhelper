@@ -305,6 +305,33 @@ export function isNoLink(stroke) {
   return !!stroke && stroke.link === LINK_NONE
 }
 
+/* 把一组笔**固定成一块**：返回新的 `groups`（界面只负责调它）。
+ * 一笔只能属于一个组（见 normalizeGroups），所以这里先把这些笔从别的组里**拿走** ——
+ * 新选的这块更具体，它赢；被拿空的组直接消失（不留空壳）。
+ * 为什么要放进 lib：不这么干的话，界面能造出"内存里两笔重叠、文件里只认一笔"的状态，
+ * 于是**存→读→再存不一致**（下次打开分组悄悄变了）—— 模糊测试逮到过。 */
+export function freezeGroup(groups, ids) {
+  const set = new Set(ids)
+  const out = []
+  for (const g of groups || []) {
+    const keep = (g.ids || []).filter((id) => !set.has(id))
+    if (keep.length) out.push({ ...g, ids: keep })
+  }
+  out.push({ id: newId('g'), ids: [...set] })
+  return out
+}
+
+/* 一笔的点**够不够格进文件** —— 读和写**只有这一份判据**。
+ * `normalizeStroke` 用它决定"读不读得回来"，`serializeBoardDocument` 用它决定"写不写出去"。
+ * 两边各写一份的话，一定会出现"写得出去、读不回来"的文件：
+ * 模糊测试当场逮到过 —— 一个只有一个点的笔迹被写进文件，下次打开却被丢掉，
+ * 于是文件里攒下读不回来的垃圾、而且"存→读→再存"不再字节一致。
+ * （应用自己产生不了这种笔迹：落笔那一下有 2.5px 的闸、抽稀后至少留两点。
+ *   但别的入口、手改过的文件、以后的新代码都可能产生，所以出关也拦一道。） */
+export function isStrokePointsOK(flat) {
+  return toFlat(flat).length >= 6 // 两个点 × (x, y, p)
+}
+
 /* ═══════════ 显式分组：「这一坨就是我说的那一块」 ═══════════
  *
  * 自动聚类（见下面"墨迹块"那一节）会把挨得近的两坨并成一块 —— 后果虽然轻
@@ -629,12 +656,19 @@ export function joinStrokes(strokes, tol = JOIN_TOL, blockedAt = null) {
     for (const c of nearEnds(i)) {
       if (c.d > tol) break
       if (blocked(ends[c.j].p)) continue
-      /* "顺着往下"：进来的方向和出去的方向夹角 ≥ STRAIGHT_DEG。
-         进来的方向 = 从本笔另一头到接头；出去的方向 = 从接头到对方的另一头。 */
       const u = unit(dest(i), ends[i].p)
       const v = unit(ends[c.j].p, dest(c.j))
       if (!u || !v) continue
-      if (angleDeg(u, v) < STRAIGHT_DEG) continue
+      /* "顺着往下"：两条笔在这一头的**内角** ≥ STRAIGHT_DEG(150°) 才算续着画的。
+         u 是"进来"的方向（本笔另一头 → 接头）、v 是"出去"的方向（接头 → 对方另一头），
+         两者之间那个角是**偏转角**，内角 = 180 − 偏转 —— 所以判据要写成"偏转 ≤ 30°"。
+         ⚠ 2026-09-16 修：原来写的是 `偏转 < STRAIGHT_DEG 就 continue` ——
+           那等于"只有**折回来**才接"，恰好把这条判据要接的那种（方向接着往下）
+           全部拒掉，而 V 形折回反倒被接成一条。实测（修之前）：
+             直线续画 → 2 条（该接没接）；折回来 → 1 条（不该接却接了）—— 正好反了。
+           自检里以前没有一条断言"直线续画能被接上"，所以这个反了的判据一直没被抓到
+           （是 2026-09-16 审查 + chainOfStroke 的断言顺带挖出来的）。 */
+      if (angleDeg(u, v) > 180 - STRAIGHT_DEG) continue
       return c.j
     }
     return -1
@@ -807,9 +841,14 @@ export function createInkIndex(strokes, groups = []) {
        （实测：目标变成"箭头自己的两撇 + 一个小点"）。 */
     caches: new Map(),
     byId: new Map(list.map((it, i) => [it.id, i])),
-    /* 你**固定过**的那些块（见 normalizeGroups）：它们的成员从自动聚类里剔出去，
-       而且一开始就登记进 owner —— 所以端点落在固定块里拿到的一定是这个块，
-       不是"跟旁边那坨自动并起来的大块"。 */
+    /* 你**固定过**的那些块（见 normalizeGroups）：它们的成员从自动聚类里剔出去。
+       ★ 单独放一个 Map，**绝不能挂在 `owner` 上**：`owner` 是"候选线"那套缓存，
+         `dropKey` 一变就会被清掉（而 `dropKey` 一开始是 undefined，
+         所以第一次 buildLinks 就会把它清光）—— 挂在那上面等于固定块从来没生效过：
+         本来连得上的连接会消失、把相隔很远的两坨固定成一块还会**凭空造出一条连接**。
+         （这条是 2026-09-16 让独立审查挑出来的；自检当时只直接问了 inkNodeAt，
+           没走 buildLinks，所以漏过了 —— 补的断言必须走 buildLinks。） */
+    fixed: new Map(),
     groupIdx: new Set(),
   }
   for (const g of Array.isArray(groups) ? groups : []) {
@@ -828,7 +867,7 @@ export function createInkIndex(strokes, groups = []) {
       fixed: true,
     }
     for (const i of ids) {
-      index.owner.set(i, node)
+      index.fixed.set(i, node)
       index.groupIdx.add(i)
     }
   }
@@ -928,20 +967,43 @@ function inkBounds(index, ids) {
    ★ `index.owner` 是"笔画下标 → 块"的记忆：一块只 flood fill 一次。
      没有它的话每个端点都要重走一遍整块（实测 620 笔的板上 35ms → 4.1s，
      因为一条板书上几百个端点、每块几十笔）。 */
-export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null, cacheKey = '') {
-  /* ⚠ 缓存必须**按排除集分开**（`cacheKey`）：带额外排除集的查询
-     （"尖指着谁"要把箭头自己的尖排掉）和通用查询问出来的不是同一个块。
-     混用一个 Map 就会读到一个"含箭头自己那两撇"的节点 —— 实测过。 */
-  let store = index.owner
+/* 这次查询该用哪个缓存：
+   · 给了 `cacheKey` → 用它（**跨调用**都能复用，比如"尖指着谁"那一族）；
+   · 没给、但排除集正好是本次 buildLinks 的主排除集（候选线那批）→ 用 `owner`
+     （这是热路径：端点的普通查询，跨调用复用才有意义）；
+   · 其它情况（有人加了新的排除集却忘了给 key）→ **给一个一次性的 Map**：
+     正确性优先 —— 不缓存只是慢一点，串味却会给出错的块。 */
+function storeFor(index, exclude, cacheKey) {
   if (cacheKey) {
-    store = index.caches.get(cacheKey)
-    if (!store) {
-      store = new Map()
-      index.caches.set(cacheKey, store)
+    let m = index.caches.get(cacheKey)
+    if (!m) {
+      m = new Map()
+      index.caches.set(cacheKey, m)
     }
+    return m
   }
+  if (index.mainExclude && exclude === index.mainExclude) return index.owner
+  return new Map()
+}
+
+export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null, cacheKey = '') {
+  /* ⚠ 缓存必须**按排除集分开**：带额外排除集的查询
+     （"尖指着谁"要把箭头自己的尖排掉、"线中点旁边是什么"要把这条线自己排掉）
+     和通用查询问出来的**不是同一个块**。混用一个 Map 就会读到别人的结果 ——
+     实测：同一个索引、同一个点，先按"排除 line1"问，再问"不排除"，
+     第二次读到的还是第一次那个不含 line1 的节点（缓存把结果固定住了）。
+     加新的带排除集的查询时：**要么给 cacheKey，要么什么都会被 storeFor 兜住**
+     （兜住 = 不缓存，正确但慢），所以不会再串味。 */
+  const store = storeFor(index, exclude, cacheKey)
   const seeds = [...inkNear(index, p.x, p.y, pad, exclude)]
   if (!seeds.length) return null
+  /* ★ **亲手固定过的块**（`groups`）永远优先，而且不看 store：
+     它们在 `index.fixed` 里 —— 和排除集无关、`owner` 被清也不受影响
+     （"你说它是东西它就是"）。不先查这一下，固定块在 buildLinks 里就完全失效了。 */
+  for (const i of seeds) {
+    const f = index.fixed.get(i)
+    if (f) return f
+  }
   for (const i of seeds) if (store.has(i)) return store.get(i)
   const ids = inkComponentFrom(index, seeds, gap, exclude)
   if (!ids.length) return null
@@ -975,8 +1037,8 @@ export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, groups = [] } = {}) {
   const index = createInkIndex(strokes, groups)
   const out = []
   const fixed = new Set()
-  for (const node of index.owner.values()) {
-    if (!node.fixed || fixed.has(node.id)) continue
+  for (const node of index.fixed.values()) {
+    if (fixed.has(node.id)) continue
     fixed.add(node.id)
     out.push(node)
   }
@@ -1046,15 +1108,33 @@ function chainMid(pts) {
  *     不是条件）；别的连接线也不算（条件是你写的内容，不是另一条关系）；
  *   · 太小的一撮墨不算（`INK_NODE_MIN_SIZE`，和墨迹块同一条闸）。
  * **不存盘**：条件是从位置读出来的，随时能重算 —— 你把那几笔挪走，它就不成立了。 */
-function linkCondition(ink, boxes, mid, exclude, aNode, bNode) {
+function linkCondition(ink, boxes, mid, exclude, aNode, bNode, cacheKey = '') {
   if (!mid) return null
-  const c = nearestCard(boxes, mid, LINK_COND_RADIUS)
-  if (c && (!aNode || c.id !== aNode.id) && (!bNode || c.id !== bNode.id)) {
-    return { kind: 'card', id: c.id, ids: [], label: '', at: mid }
+  /* 半径内的卡**按距离试**，跳过这条关系两端的卡 ——
+     ⚠ 不能只看"最近的那一张"：最近那张要是端点卡，真正的条件卡就被整体漏掉了
+     （实测：端点卡 60px、条件卡 62px，两个都在 64px 内 → 条件读成 null）。 */
+  const skip = new Set([aNode && aNode.id, bNode && bNode.id].filter(Boolean))
+  let card = null
+  let cd = Infinity
+  for (const b of boxes) {
+    if (skip.has(b.id)) continue
+    const r = b.r
+    const dx = Math.max(r.x - mid.x, 0, mid.x - (r.x + r.w))
+    const dy = Math.max(r.y - mid.y, 0, mid.y - (r.y + r.h))
+    const d = Math.hypot(dx, dy)
+    if (d <= LINK_COND_RADIUS && d < cd) {
+      cd = d
+      card = b
+    }
   }
+  if (card) return { kind: 'card', id: card.id, ids: [], label: '', at: mid }
   const hit = nearestInkStroke(ink, mid.x, mid.y, exclude, LINK_COND_RADIUS)
   if (!hit) return null
-  const node = inkNodeAt(ink, hit.p, INK_NODE_PAD, INK_BLOCK_GAP, exclude)
+  /* ★ `cacheKey` 必须给：这次查询带着"把这条线自己排除掉"的额外排除集，
+     和通用缓存里的节点**不是同一个东西** —— 不给就会读到别人算的节点
+     （实测：同一个索引、同一个点，先按"排除 line1"问一次，再问"不排除"，
+     第二次读到的还是第一次那个不含 line1 的节点 → 缓存把结果固定住了）。 */
+  const node = inkNodeAt(ink, hit.p, INK_NODE_PAD, INK_BLOCK_GAP, exclude, cacheKey)
   if (!node) return null
   if ((aNode && node.id === aNode.id) || (bNode && node.id === bNode.id)) return null
   return { kind: 'ink', id: node.id, ids: node.ids, label: node.label, at: hit.p }
@@ -1070,33 +1150,52 @@ function linkCondition(ink, boxes, mid, exclude, aNode, bNode) {
  *   · 一个节点有两条出边 = 分叉，各自成链（不做拓扑排序那套，够用就行）；
  *   · **防环**：走过的节点不再走（手画的关系里出环太容易了）。
  * **不存盘**：链是现算的，和关系本身一样。 */
-export function deriveChains(links = []) {
-  const steps = (links || []).filter((l) => l && l.kind === 'derive')
+export function deriveChains(links = [], maxSteps = 24) {
+  /* ⚠ 只认 `derive`，而且**自环（a===b）直接不算**（它没有任何意义，还会让下面的走法打转）。 */
+  const steps = (links || []).filter((l) => l && l.kind === 'derive' && l.a !== l.b)
   if (!steps.length) return []
   const out = new Map()
   const ind = new Set()
   for (const l of steps) {
-    if (!out.has(l.a)) out.set(l.a, [])
-    out.get(l.a).push(l)
+    const arr = out.get(l.a)
+    if (arr) arr.push(l)
+    else out.set(l.a, [l])
     ind.add(l.b)
   }
+  /* 从"只有出、没有进"的节点出发；整条都是环的时候，每个节点都当起点（免得一条都不显示）。 */
   const roots = [...out.keys()].filter((id) => !ind.has(id))
-  /* 没有根（整条都是环）时，随便挑一个当起点，免得一条都不显示。 */
   const starts = roots.length ? roots : [...out.keys()]
   const chains = []
-  for (const start of starts) {
-    for (const first of out.get(start) || []) {
-      const ids = [start]
-      const list = []
-      let cur = first
-      while (cur && !ids.includes(cur.b) && list.length < 24) {
-        list.push({ from: cur.a, to: cur.b, link: cur, cond: cur.cond || null, missing: !cur.cond })
-        ids.push(cur.b)
-        cur = (out.get(cur.b) || [])[0]
+  const seen = new Set()
+  const emit = (start, list, truncated) => {
+    if (!list.length) return
+    const key = list.map((s) => s.from + '>' + s.to).join(',')
+    if (seen.has(key)) return
+    seen.add(key)
+    chains.push({ start, steps: list, missing: list.filter((s) => s.missing).length, truncated: !!truncated })
+  }
+  /* ★ 分叉要**每条路都走**（原来只取第一条出边，B→D 那条分支会整条消失）。
+     环用"这条路上已经走过的节点"挡住；到上限就标记 truncated（面板要能说明"只显示前 N 步"）。 */
+  const walk = (start, node, path, list) => {
+    const outs = out.get(node) || []
+    if (!outs.length) {
+      emit(start, list, false)
+      return
+    }
+    for (const l of outs) {
+      if (path.has(l.b)) {
+        emit(start, list, false) // 环：走到这儿为止，但走出来的部分要显示
+        continue
       }
-      if (list.length) chains.push({ start, steps: list, missing: list.filter((s) => s.missing).length })
+      if (list.length >= maxSteps) {
+        emit(start, list, true)
+        continue
+      }
+      const step = { from: l.a, to: l.b, link: l, cond: l.cond || null, missing: !l.cond }
+      walk(start, l.b, new Set([...path, l.b]), [...list, step])
     }
   }
+  for (const s of starts) walk(s, s, new Set([s]), [])
   return chains
 }
 /* 这条链"像不像一条连接线"（只在要落在墨迹块上时用）：够长 + 中段是空白。
@@ -1170,13 +1269,15 @@ export function buildLinks(board, inkInput = null) {
       }
     }
   })
-  /* 块是按"排除集"算出来的 —— 排除集一变，缓存就得清（不然会拿到上一版的块）。 */
+  /* 块是按"排除集"算出来的 —— 排除集一变，缓存就得清（不然会拿到上一版的块）。
+     `mainExclude` 是**普通端点查询**用的那一个（别的排除集走 storeFor 给的一次性缓存）。 */
   const dropKey = [...dropIdx].sort((a, b) => a - b).join(',')
   if (ink.dropKey !== dropKey) {
     ink.owner.clear()
     ink.caches.clear()
     ink.dropKey = dropKey
   }
+  ink.mainExclude = dropIdx
   /* 一个"节点"= 卡片 或 墨迹块。卡片带 label:''（面板拿 src 显示），块自带 label。 */
   const asCard = (b) => (b ? { kind: 'card', id: b.id, label: '' } : null)
   const nodeAt = (p, pad = 8) => asCard(cardAt(boxes, p, pad)) || inkNodeAt(ink, p, INK_NODE_PAD, INK_BLOCK_GAP, dropIdx)
@@ -1317,12 +1418,7 @@ export function buildLinks(board, inkInput = null) {
     const kind = manualStroke ? manualStroke.link : auto
     const meta = linkKind(kind)
     const u = unit(fromPt, toPt)
-    /* ★ 「条件是位置送的」：线**中点**旁边那几个字（或那张卡）就是这条关系的条件。
-       用弧长中点（不是两端点的中点），并且把这条线自己的墨排除掉。见 linkCondition。 */
     const midInk = chainMid(pts)
-    const condEx = new Set(dropIdx)
-    for (const i of chainOwn[ci]) condEx.add(i)
-    const cond = linkCondition(ink, boxes, midInk, condEx, aNode, bNode)
     out.push({
       strokeId: ch.ids[0],
       ids: ch.ids.slice(),
@@ -1351,14 +1447,51 @@ export function buildLinks(board, inkInput = null) {
       /* 线**弧长**的中点（`mid` 是两端点的中点，两者常常不是同一个地方）——
          条件就是从这里周围读出来的。 */
       midInk,
-      /* 这条关系的条件（`{kind:'ink'|'card', id, ids, label, at}` 或 null）：
-         线中点附近那几个字 / 那张卡。**不存盘**，位置一变它就变。 */
-      cond,
+      /* 这条关系的条件（`{kind:'ink'|'card', id, ids, label, at}` 或 null）。
+         ⚠ 它是在下面**第二趟**填的（见 `linkStrokeIdx`）：要排除"所有成为连接的链"的笔，
+           而那件事得等第一趟把链都定下来才知道。 */
+      cond: null,
       from: { x: fromPt.x, y: fromPt.y },
       to: { x: toPt.x, y: toPt.y },
     })
   }
+  /* ── 第二趟：条件从位置送 ──
+     ★ 为什么放第二趟：条件要排除**所有成为连接的链**的笔 ——
+       别的连接线不是"内容"，不该被当成某条关系的条件。
+       实测：两条卡片连线交叉时，"那条交叉的线"会被读成对方的条件。
+       而"哪些链成了连接"要等第一趟把端点都解完才知道，所以只能第二趟算。
+     条件用**弧长中点**（不是两端点的中点），排除集 = 候选线 ∪ 所有成为连接的链。 */
+  const linkStrokeIdx = new Set(dropIdx)
+  for (const l of out) {
+    for (const id of l.ids) {
+      const i = ink.byId.get(id)
+      if (i !== undefined) linkStrokeIdx.add(i)
+    }
+  }
+  for (const l of out) {
+    l.cond = linkCondition(
+      ink,
+      boxes,
+      l.midInk,
+      linkStrokeIdx,
+      { kind: l.aKind, id: l.a },
+      { kind: l.bKind, id: l.b },
+      'c:' + l.ids.join('+')
+    )
+  }
   return out
+}
+
+/* 和这一笔**接成同一条线**的所有笔（判据就是 `joinStrokes` 那条）。
+ * 为什么需要它：`link: 'none'`（"不算连接"）是写在**整条链**上的（applyLink 就是这么写的），
+ * 那么恢复的时候也必须按**链**清 —— 只清框住的那一笔，链里还剩一笔 none，
+ * `buildLinks` 仍然整条跳过，用户点「又算回连接」就像没反应（审查挑出来的）。 */
+export function chainOfStroke(board, strokeId) {
+  const all = (board && board.strokes) || []
+  const boxes = ((board && board.cards) || []).map((c) => ({ id: c.id, r: cardBounds(c) }))
+  const chains = joinStrokes(all, JOIN_TOL, (p) => !!cardAt(boxes, p))
+  const hit = chains.find((ch) => ch.ids.includes(strokeId))
+  return hit ? hit.ids.slice() : [strokeId]
 }
 
 /* 白板的文件里其实是 JSON —— 但仍然叫 .md。
@@ -1412,7 +1545,7 @@ const clampScale = (s) => (Number.isFinite(s) && s > 0.05 && s < 20 ? s : 0)
 function normalizeStroke(s) {
   if (!s || typeof s !== 'object') return null
   const pts = toFlat(s.points) // ★ 一律归成扁平数组，见下方说明
-  if (pts.length < 6) return null
+  if (!isStrokePointsOK(pts)) return null
   const tool = s.tool === 'highlighter' ? 'highlighter' : 'pen'
   return {
     id: typeof s.id === 'string' && s.id ? s.id : newId('s'),
@@ -1503,16 +1636,16 @@ function normalizeCard(c) {
    于是 Git 每次都报一次假 diff，而你会慢慢学会忽略 diff —— 那比不备份更糟。
    宁可一个点多两个字节，也不要每天一条假改动。 */
 export function serializeBoardDocument(board) {
-  const out = {
-    title: board.title,
-    version: BOARD_VERSION,
-    viewPinned: board.viewPinned === true,
-    view: {
-      s: round(board.view && board.view.s ? board.view.s : 1, 3),
-      tx: round(board.view && board.view.tx ? board.view.tx : 0, 1),
-      ty: round(board.view && board.view.ty ? board.view.ty : 0, 1),
-    },
-    strokes: (board.strokes || []).map((s) => ({
+  /* ★ 先算出"这次真的会写进文件的笔"：后面 groups 的"哪一笔还活着"必须看**这一批**，
+     不是内存里那一批 —— 两批不一样时（内存里有一笔写不出去的垃圾笔迹），
+     groups 会引用一个文件里根本没有的 id，读回来时又被 normalizeGroups 丢掉，
+     于是"存→读→再存"不再一致（模糊测试逮到的就是这一条）。 */
+  const strokes = (board.strokes || [])
+    /* ★ 出关也要过"这一笔能不能进文件"那道闸（`isStrokePointsOK`）——
+       写得出去、读不回来的东西一个都不留。判据和 normalizeStroke 是同一份。 */
+    .map((s) => ({ s, flat: toFlat(s.points) }))
+    .filter((it) => isStrokePointsOK(it.flat))
+    .map(({ s, flat }) => ({
       id: s.id,
       tool: s.tool,
       color: s.color,
@@ -1528,8 +1661,18 @@ export function serializeBoardDocument(board) {
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
       //   直接遍历再用 Number(n) 读，每个点都会变成 0 —— 又一次静默毁数据。
       //   序列化是"出关"的地方，出关一律走同一个出口，不指望调用方守规矩。
-      points: toFlat(s.points).map((n) => round(n, 2)),
-    })),
+      points: flat.map((n) => round(n, 2)),
+    }))
+  const out = {
+    title: board.title,
+    version: BOARD_VERSION,
+    viewPinned: board.viewPinned === true,
+    view: {
+      s: round(board.view && board.view.s ? board.view.s : 1, 3),
+      tx: round(board.view && board.view.tx ? board.view.tx : 0, 1),
+      ty: round(board.view && board.view.ty ? board.view.ty : 0, 1),
+    },
+    strokes,
     cards: (board.cards || []).map((c) => ({
       id: c.id,
       kind: c.kind,
@@ -1561,10 +1704,20 @@ export function serializeBoardDocument(board) {
        写之前把"已经不在板上的笔"滤掉（这个会话里刚擦掉的那些）：文件里不留尸体。
        为了让老文件的 diff 最小，它排在最后（新字段追加在尾部）。 */
     ...(() => {
-      const live = new Set((board.strokes || []).map((s) => s.id))
-      const gs = (board.groups || [])
-        .map((g) => ({ id: g.id, ids: g.ids.filter((id) => live.has(id)) }))
-        .filter((g) => g.ids.length)
+      const live = new Set(strokes.map((s) => s.id))
+      const taken = new Set()
+      const gs = []
+      for (const g of board.groups || []) {
+        /* ★ 顺手去重：一笔只能属于一个组（先写的那个赢）——
+           和读盘时的 normalizeGroups 同一套规矩。界面已经不会造出重叠了
+           （`freezeGroup` 会先把它从别的组里拿走），但"内存里的状态"和
+           "文件里的状态"必须是同一个 —— 不然出现重叠时，文件在读回来之后
+           会悄悄变一个样（审查挑出来的那条）。 */
+        const ids = (g.ids || []).filter((id) => live.has(id) && !taken.has(id))
+        if (!ids.length) continue
+        for (const id of ids) taken.add(id)
+        gs.push({ id: g.id, ids })
+      }
       return gs.length ? { groups: gs } : {}
     })(),
   }
