@@ -476,7 +476,12 @@ export function backHook(points) {
 export function classifyLinkShape(points) {
   const pts = toPoints(points)
   const t = findTip(pts)
-  if (t && (t.frac >= 0.72 || t.frac <= 0.28)) return 'arrow'
+  /* ★ 2026-09-16（DSH 会话）修：这里原来写的是 `t.frac >= 0.72 || t.frac <= 0.28`，
+     而 `findTip` 从来不返回 `frac` —— 于是这个判据**从来没生效过**（undefined 比数字全是 false），
+     "有尖"那条路只剩 backHook 撑着；一笔画成、末端带个小尖（不回勾）的箭头一律读成"线"。
+     改成调真正干这件事的 `tipNearEnd`（就是为这条写的那两条闸：短边 ≤ HEAD_ARM_MAX
+     且 ≤ 全长 35%），并且它和 buildLinks 用的是同一个函数，两处不会再分叉。 */
+  if (t && tipNearEnd(t)) return 'arrow'
   return backHook(pts) ? 'arrow' : 'line'
 }
 
@@ -685,10 +690,225 @@ export function gatherHeads(strokes, tol = JOIN_TOL, skip = null) {
   return out
 }
 
+/* ═══════════ 墨迹块：没成卡的字迹、手画的图也能当端点 ═══════════
+ *
+ * 用户 2026-09-16 的原话：「连接的不只是卡片，可能还有我没转化成卡片的字迹，
+ * 我自己手绘的图」。在数据层它们本来就是 strokes —— 缺的只是"端点落在谁身上"
+ * 这一步：`cardAt` 只认卡片，所以那些字迹和图上永远连不住。
+ *
+ * 这里把"节点"扩成 **卡片 ∪ 墨迹块**：笔与笔挨得够近（≤ INK_BLOCK_GAP）就算同一块，
+ * 于是一段式子、一张手画的图各自是一块。**不存盘、不新增实体** —— 块是每次现算的，
+ * 像连接一样跟着笔迹走。（`groups` 字段留着给以后的"框选固化"，这一版还没用。）
+ *
+ * 三道闸（阈值都是拿他板上 439 笔量的，见 README 第 22 条）：
+ *   ① **两头各落在不同的节点里**。字里的一横两头在同一坨里 → 直接出局。
+ *   ② **中段是空白**：弧长 30%~70% 那五个采样点，离别的墨都要 ≥ INK_LINK_MID_GAP。
+ *      这条挡的是"长横线"：公式的分数线中段上下就是分子分母，一量就贴着；
+ *      而真的连接线中段是空的。
+ *   ③ **够长**（≥ INK_LINK_MIN_LEN）。
+ * 实测：他 439 笔长度中位 **26px**、99% 不到 146px；"长 ≥120px 且中段空 ≥20px"的
+ * 只有**个位数**笔。所以这三条一起非常保守 —— 宁可漏（少一条连接），不误判。
+ *
+ * ⚠ 代价（写清楚，别以后自己踩）：两块靠得很近、线又画得短时，中段采样点会落在
+ *   端点那块墨的 18px 里 → 判不出来。**把线画长一点**（跨过空白）就认了。
+ * ⚠ 卡片↔卡片那条路**一条闸都不加**（它铁定是连接，见 buildLinks 里"顺序很重要"）——
+ *   这里只约束"要落在墨迹块上"的那些。 */
+export const INK_BLOCK_GAP = 24      // 笔与笔这么近（世界像素）算同一块
+export const INK_NODE_PAD = 12       // 端点离块的墨这么近，算"落在这块里"
+export const INK_LINK_MIN_LEN = 48   // 比这短的笔不当连接
+export const INK_LINK_MID_GAP = 18   // 中段离别的墨要这么远（降到 12 会误判，实测：见 README 第 22 条）
+
+const INK_CELL = 32 // 空间格子边长（查"附近有没有墨"用）
+
+/* 格子键用**数字**，不用 "x,y" 字符串：这段每次 commit 都要跑，
+   字符串拼接 + 解析实测比数字键慢一倍以上（620 笔的板上差 10ms 量级）。
+   ±10 万格 = ±320 万像素，够用了，而且远在 Number 精确整数范围内。 */
+function inkKey(cx, cy) {
+  return (cx + 100000) * 1000000 + (cy + 100000)
+}
+
+/* 建一次空间索引：每笔一个条目（点列），每个点进一个格子。
+   为什么要它：板上 600+ 笔、上万点，而这是**每次 commit 都要跑**的一段，
+   两两全比是上亿次。索引本身是 O(点数)。荧光笔不进索引：它是"在字上做记号"，
+   一划一大片，端点很容易落在两坨字上，那属于误判（和 joinStrokes 同一条理由）。
+   ★ 它是**只依赖 strokes** 的（和卡片无关），所以上层可以按 `board.strokes` 缓存它 ——
+     拖卡片时 strokes 引用没变，就不必重建（见 Board.jsx）。 */
+export function createInkIndex(strokes) {
+  const grid = new Map()
+  const list = []
+  for (const s of strokes || []) {
+    if (!s || s.tool === 'highlighter') continue
+    const pts = toPoints(s.points)
+    if (pts.length < 2) continue
+    const i = list.length
+    list.push({ id: s.id, pts })
+    for (const p of pts) {
+      const k = inkKey(Math.floor(p.x / INK_CELL), Math.floor(p.y / INK_CELL))
+      const arr = grid.get(k)
+      if (arr) arr.push({ x: p.x, y: p.y, i })
+      else grid.set(k, [{ x: p.x, y: p.y, i }])
+    }
+  }
+  return { list, grid, owner: new Map(), byId: new Map(list.map((it, i) => [it.id, i])) }
+}
+
+/* 离 (x,y) 最近的墨点距离；`exclude`（笔画下标集合）里的点不算。
+   超过 max 就不再往外找（返回 max+1）—— 调用方只关心"够不够远"。
+   ★ 收工判据是 `best <= (ring-1) * INK_CELL`：第 ring 圈的格子里的点，
+     最近也可能离查询点在 (ring-1) 格之内，所以不能拿 ring 本身当界。 */
+function nearestInk(index, x, y, exclude, max) {
+  const grid = index.grid
+  const cx = Math.floor(x / INK_CELL)
+  const cy = Math.floor(y / INK_CELL)
+  /* 第 r 圈的格子最近也在 (r-1) 格之外，所以够到 max 只需要 floor(max/格) + 1 圈。
+     （写成 ceil(...) + 1 会白扫一圈 —— 这块是每次 commit 都跑的，实测差一倍。） */
+  const rings = Math.floor(max / INK_CELL) + 1
+  let best = max + 1
+  for (let ring = 0; ring <= rings; ring++) {
+    for (let dx = -ring; dx <= ring; dx++) {
+      for (let dy = -ring; dy <= ring; dy++) {
+        if (ring > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue
+        const arr = grid.get(inkKey(cx + dx, cy + dy))
+        if (!arr) continue
+        for (const it of arr) {
+          if (exclude && exclude.has(it.i)) continue
+          const d = Math.hypot(it.x - x, it.y - y)
+          if (d < best) best = d
+        }
+      }
+    }
+    if (best <= Math.max(0, ring - 1) * INK_CELL) break
+  }
+  return best
+}
+
+/* (x,y) 周围 pad 之内有哪些笔（返回它们在索引里的下标）。`exclude` 里的不算。 */
+function inkNear(index, x, y, pad, exclude = null) {
+  const grid = index.grid
+  const cx = Math.floor(x / INK_CELL)
+  const cy = Math.floor(y / INK_CELL)
+  const rings = Math.floor(pad / INK_CELL) + 1 // 同上：第 r 圈最近也在 (r-1) 格外
+  const out = new Set()
+  for (let ring = 0; ring <= rings; ring++) {
+    for (let dx = -ring; dx <= ring; dx++) {
+      for (let dy = -ring; dy <= ring; dy++) {
+        if (ring > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue
+        const arr = grid.get(inkKey(cx + dx, cy + dy))
+        if (!arr) continue
+        for (const it of arr) {
+          if (exclude && exclude.has(it.i)) continue
+          if (Math.hypot(it.x - x, it.y - y) <= pad) out.add(it.i)
+        }
+      }
+    }
+  }
+  return out
+}
+
+/* 从这几笔出发，把"笔与笔 ≤ gap"连着的笔全聚起来（连通分量）。 */
+function inkComponentFrom(index, seeds, gap, exclude = null) {
+  const seen = new Set(seeds)
+  const stack = [...seeds]
+  while (stack.length) {
+    const i = stack.pop()
+    for (const p of index.list[i].pts) {
+      for (const j of inkNear(index, p.x, p.y, gap, exclude)) {
+        if (seen.has(j)) continue
+        seen.add(j)
+        stack.push(j)
+      }
+    }
+  }
+  return [...seen]
+}
+
+function inkBounds(index, ids) {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const i of ids) {
+    for (const p of index.list[i].pts) {
+      if (p.x < x0) x0 = p.x
+      if (p.x > x1) x1 = p.x
+      if (p.y < y0) y0 = p.y
+      if (p.y > y1) y1 = p.y
+    }
+  }
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+/* 点 p 落在哪一块墨迹里。返回 { kind:'ink', id, ids, label, box } 或 null。
+   id 取块里**最小的那个笔迹 id** —— 只要这块的成员不变，id 就稳定
+   （面板那一行、以及"两条连接是不是同一对节点"都靠它对齐）。
+   ★ `index.owner` 是"笔画下标 → 块"的记忆：一块只 flood fill 一次。
+     没有它的话每个端点都要重走一遍整块（实测 620 笔的板上 35ms → 4.1s，
+     因为一条板书上几百个端点、每块几十笔）。 */
+export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null) {
+  const seeds = [...inkNear(index, p.x, p.y, pad, exclude)]
+  if (!seeds.length) return null
+  for (const i of seeds) if (index.owner.has(i)) return index.owner.get(i)
+  const ids = inkComponentFrom(index, seeds, gap, exclude)
+  if (!ids.length) return null
+  const strokeIds = ids.map((i) => index.list[i].id)
+  const node = {
+    kind: 'ink',
+    id: 'ink:' + strokeIds.slice().sort()[0],
+    ids: strokeIds,
+    label: `墨迹块（${strokeIds.length} 笔）`,
+    box: inkBounds(index, ids),
+  }
+  for (const i of ids) index.owner.set(i, node)
+  return node
+}
+
+/* 板上所有的墨迹块（给自检和以后的"框选固化"用；不进 buildLinks 的热路径）。 */
+export function inkBlocks(strokes, gap = INK_BLOCK_GAP) {
+  const index = createInkIndex(strokes)
+  const done = new Set()
+  const out = []
+  for (let i = 0; i < index.list.length; i++) {
+    if (done.has(i)) continue
+    const ids = inkComponentFrom(index, [i], gap)
+    for (const j of ids) done.add(j)
+    const strokeIds = ids.map((k) => index.list[k].id)
+    out.push({ id: 'ink:' + strokeIds.slice().sort()[0], ids: strokeIds, box: inkBounds(index, ids) })
+  }
+  return out
+}
+
+/* 这条链"像不像一条连接线"（只在要落在墨迹块上时用）：够长 + 中段是空白。
+   中段按**弧长**取 30%~70%（不按下标 —— 采样密度会骗人，见 findTip 那段）。
+   ★ 采样点要**沿线插值**，不能"取离目标弧长最近的那个现有点"：
+     一条直线笔迹可能只有两个点（存盘前会 simplifyPoints），那样按点取的话
+     30% 和 70% 都落在两个端点上 —— 而端点正扎在字迹里，中段判据永远不通过，
+     "一块字迹都连不上"（自检 [6f] 就是这么抓出来的）。 */
+function inkLinkShapeOK(pts, index, exclude) {
+  const total = arcLen(pts)
+  if (total < INK_LINK_MIN_LEN) return false
+  const S = new Array(pts.length)
+  S[0] = 0
+  for (let i = 1; i < pts.length; i++) S[i] = S[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
+  for (const f of [0.3, 0.4, 0.5, 0.6, 0.7]) {
+    const target = f * total
+    let i = 1
+    while (i < pts.length - 1 && S[i] < target) i++
+    const a = pts[i - 1]
+    const b = pts[i]
+    const seg = S[i] - S[i - 1]
+    const t = seg > 0 ? (target - S[i - 1]) / seg : 0
+    const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
+    if (nearestInk(index, p.x, p.y, exclude, INK_LINK_MID_GAP) < INK_LINK_MID_GAP) return false
+  }
+  return true
+}
+
 /* 板上所有"画出来的连接"。
  * 每一条带着：两端是谁、形状、实际的词、方向、给屏幕用的点（中点放词 / 尖在哪）。
- * **不碰 DOM**，所以能在 node 里断言。 */
-export function buildLinks(board) {
+ * **不碰 DOM**，所以能在 node 里断言。
+ * `inkInput`（可选）= 上层缓存好的墨迹索引（见 createInkIndex）。传了就用它，
+ *   不传就现建一个 —— 纯 node 调用方（自检）照旧只传 board 就行。 */
+export function buildLinks(board, inkInput = null) {
   const all = (board && board.strokes) || []
   const boxes = ((board && board.cards) || []).map((c) => ({ id: c.id, r: cardBounds(c) }))
   const byId = new Map(all.map((s) => [s.id, s]))
@@ -704,6 +924,39 @@ export function buildLinks(board) {
     const b = cardAt(boxes, ch.points[ch.points.length - 1])
     return !!(a && b && a.id !== b.id)
   })
+  /* ── 第二步：墨迹块（"没成卡的字迹、手画的图"当端点用）──
+     ⚠ 顺序在这里很要命：**先挑出"够格当连接线"的笔，再把它们排除掉**。
+     连接线的两头是**扎在字迹里**的 —— 留着它做连通判定，两块会被它粘成一块，
+     于是"两头在两个不同节点里"永远不成立，自己把自己接没了（第一版就这样，一个都不出）。
+     判据用"全板"量（链自己的笔排除在外），块用"去掉候选线之后"的笔来聚。 */
+  const ink = inkInput || createInkIndex(all)
+  const chainOwn = chains.map((ch) => {
+    const ex = new Set()
+    for (const id of ch.ids) {
+      const i = ink.byId.get(id)
+      if (i !== undefined) ex.add(i)
+    }
+    return ex
+  })
+  const inkOK = chains.map((ch, ci) => (connChain[ci] ? false : inkLinkShapeOK(ch.points, ink, chainOwn[ci])))
+  const dropIdx = new Set()
+  chains.forEach((ch, ci) => {
+    if (inkOK[ci]) {
+      for (const id of ch.ids) {
+        const i = ink.byId.get(id)
+        if (i !== undefined) dropIdx.add(i)
+      }
+    }
+  })
+  /* 块是按"排除集"算出来的 —— 排除集一变，缓存就得清（不然会拿到上一版的块）。 */
+  const dropKey = [...dropIdx].sort((a, b) => a - b).join(',')
+  if (ink.dropKey !== dropKey) {
+    ink.owner.clear()
+    ink.dropKey = dropKey
+  }
+  /* 一个"节点"= 卡片 或 墨迹块。卡片带 label:''（面板拿 src 显示），块自带 label。 */
+  const asCard = (b) => (b ? { kind: 'card', id: b.id, label: '' } : null)
+  const nodeAt = (p, pad = 8) => asCard(cardAt(boxes, p, pad)) || inkNodeAt(ink, p, INK_NODE_PAD, INK_BLOCK_GAP, dropIdx)
   const busy = new Set()
   chains.forEach((ch, i) => {
     if (connChain[i]) for (const id of ch.ids) busy.add(id)
@@ -751,33 +1004,68 @@ export function buildLinks(board) {
         }
       }
     }
-    if (!tip && !connChain[ci]) continue // 既没有尖、两头又没进卡 → 不是连接
+    if (!tip && !connChain[ci] && !inkOK[ci]) continue // 没尖、两头又没进卡/块 → 不是连接
     /* ── 谁连着谁、朝哪边 ──
        **两头都落在卡里的：a/b 就按你画的方向**（第一点 → 最后一点）。
        这一条不能动 —— ⇄ 的实现就是"把这一笔的点倒过来"，
        而 ⇄ 的全部意义就是让 a/b 换过来（check-board [6d] 那条断言钉着它）。
        只有"尖那一头没落进卡、靠尖指认目标"那一种，才改成"尾巴 → 尖"：
-       那种情况本来也只有一个方向说得通（从卡出发、指着另一张卡）。 */
-    let aCard = cardAt(boxes, first)
-    let bCard = cardAt(boxes, last)
-    if (!(aCard && bCard && aCard.id !== bCard.id)) {
-      aCard = null
-      bCard = null
-      if (tip) {
-        let tailPt = first
-        const dToLast = Math.hypot(tip.x - last.x, tip.y - last.y)
-        const dToFirst = Math.hypot(tip.x - first.x, tip.y - first.y)
-        tailPt = dToLast > dToFirst ? last : first // 尾巴 = 离尖远的那一头
-        const otherEnd = tailPt === first ? last : first
-        aCard = cardAt(boxes, tailPt)
-        bCard = cardAt(boxes, tip) || cardAt(boxes, otherEnd) || nearestCard(boxes, tip, TIP_PAD)
-        if (aCard && bCard && aCard.id === bCard.id) {
-          aCard = null
-          bCard = null
+       那种情况本来也只有一个方向说得通（从卡出发、指着另一张卡）。
+       ★ 2026-09-16 起端点可以是**墨迹块**（没成卡的字迹、手画的图）。
+         规矩两条：① 只要**有一头落在块上**，这一笔就得先过 inkOK 那三道闸；
+         ② **卡片优先于块** —— 免得一支箭头指着卡片时，被"尖旁边那两撇墨"
+            当成目标（[6e] 的两笔箭头就是这么被抢走的）。 */
+    const usable = (na, nb) => {
+      if (!na || !nb || na.id === nb.id) return false
+      if (na.kind === 'ink' || nb.kind === 'ink') return inkOK[ci]
+      return true
+    }
+    let aNode = null
+    let bNode = null
+    /* ① 两头都在卡里：铁定是连接，不看形状、也不受这三道闸约束 */
+    const ca = cardAt(boxes, first)
+    const cb = cardAt(boxes, last)
+    if (ca && cb && ca.id !== cb.id) {
+      aNode = asCard(ca)
+      bNode = asCard(cb)
+    }
+    /* ② 有尖：靠"尖指着谁"定方向（先在卡片里找，找不到才认墨迹块） */
+    if (!aNode && tip) {
+      const dToLast = Math.hypot(tip.x - last.x, tip.y - last.y)
+      const dToFirst = Math.hypot(tip.x - first.x, tip.y - first.y)
+      const tailPt = dToLast > dToFirst ? last : first // 尾巴 = 离尖远的那一头
+      const otherEnd = tailPt === first ? last : first
+      const na = nodeAt(tailPt)
+      /* ★ 尖自己那一坨墨**不算目标**：他画的箭头是"杆 + 两撇"，那两撇就在尖旁边，
+         不排除的话"尖指着谁"会指到自己的箭头尖上（实测：会连成 杆→自己那个 V）。
+         排除的是：链自己的笔 + gatherHeads 挑出来的那个尖的笔。 */
+      const tipEx = new Set(dropIdx)
+      for (const ids of [ch.ids, head ? head.ids : []]) {
+        for (const id of ids) {
+          const i = ink.byId.get(id)
+          if (i !== undefined) tipEx.add(i)
         }
       }
+      const nb =
+        asCard(cardAt(boxes, tip)) ||
+        asCard(nearestCard(boxes, tip, TIP_PAD)) ||
+        inkNodeAt(ink, tip, TIP_PAD, INK_BLOCK_GAP, tipEx) ||
+        nodeAt(otherEnd)
+      if (usable(na, nb)) {
+        aNode = na
+        bNode = nb
+      }
     }
-    if (!aCard || !bCard) continue
+    /* ③ 没有尖：两头各落在谁身上（卡片或墨迹块 —— 块那条要过闸） */
+    if (!aNode) {
+      const na = nodeAt(first)
+      const nb = nodeAt(last)
+      if (usable(na, nb)) {
+        aNode = na
+        bNode = nb
+      }
+    }
+    if (!aNode || !bNode) continue
     /* 屏幕上的 from→to 一律指向尖（有尖时）/ 顺着你画的方向（没尖时）。 */
     const toPt = tip || last
     const fromPt =
@@ -797,8 +1085,14 @@ export function buildLinks(board) {
     out.push({
       strokeId: ch.ids[0],
       ids: ch.ids.slice(),
-      a: aCard.id,
-      b: bCard.id,
+      a: aNode.id,
+      b: bNode.id,
+      /* 两端各是什么：'card' | 'ink'。面板要按这个决定显示 src 还是"墨迹块（N 笔）"；
+         块还有 label（卡片没有 —— 它的名字在 src 里）。 */
+      aKind: aNode.kind,
+      bKind: bNode.kind,
+      aLabel: aNode.label || '',
+      bLabel: bNode.label || '',
       shape,
       kind,
       auto,

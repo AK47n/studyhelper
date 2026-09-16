@@ -10,7 +10,7 @@ import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  descendantsOf, findTip, fitView, fontCss, inkedEdges, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
+  descendantsOf, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
   strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
 } from '../src/lib/board.js'
@@ -870,6 +870,159 @@ console.log('\n[6e] 真手画箭头：拿用户本人的笔迹当夹具（script
   const fan = buildLinks(b7)
   eq(fan.length, 2, '从同一点拉出去的两根线：各算各的（没被接成一根）')
   eq(fan.map((l) => l.a + '→' + l.b).sort(), ['k1→k2', 'k1→k3'], '两根的目标都对')
+}
+
+// ═════════════════════════ 6f. 墨迹块当端点（没成卡的字迹 / 手画的图） ═════════════════════════
+console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接的端点')
+{
+  /* 用户 2026-09-16 的原话：「连接的不只是卡片，可能还有我没转化成卡片的字迹，
+     我自己手绘的图」。这一节里的阈值全是拿他板上 439 笔量的（README 第 22 条）：
+     笔画长度中位 26px、99% 不到 146px；"长 ≥120px 且中段是空白"的只有个位数笔。
+     所以这三道闸（够长 + 中段空白 + 两头不同节点）非常保守。 */
+  const blob = (cx, cy, n = 3) => {
+    /* 一坨"字迹"：n 根短笔，彼此 3~9px（他板上"每笔到别的笔"的最近距离中位 4.3px） */
+    const out = []
+    for (let i = 0; i < n; i++) {
+      const x = cx + i * 9
+      out.push(toFlat([{ x, y: cy }, { x: x + 6, y: cy + 7 }]))
+    }
+    return out
+  }
+  const mk = (strokes, cards = []) => {
+    const b = makeBoard()
+    b.cards = cards
+    b.strokes = strokes.map(([id, flat]) => ({ ...newStroke('pen', flat), id }))
+    return b
+  }
+  const line = (id, from, to) => [id, toFlat([from, to])]
+  const A = blob(0, 0)
+  const B = blob(500, 0)
+  const put = (skip = null) => [
+    ...A.map((f, i) => ['a' + i, f]),
+    ...B.map((f, i) => ['b' + i, f]),
+    ...(skip ? [] : []),
+  ]
+
+  /* ── ① 两块字迹之间画一条直线：这就是"连到没成卡的字迹上" ── */
+  {
+    const b = mk([...put(), line('lnk', { x: 6, y: 3 }, { x: 506, y: 3 })])
+    const ls = buildLinks(b)
+    eq(ls.length, 1, '两块字迹之间画一条线 → 出来 1 条连接')
+    if (ls.length === 1) {
+      eq([ls[0].aKind, ls[0].bKind], ['ink', 'ink'], '两端都算"墨迹块"（不是卡片）')
+      eq(ls[0].kind, 'rel', '直线 → 读成"相关"（最弱的那一档，猜错也不误导）')
+      if (/墨迹块/.test(ls[0].aLabel) && /墨迹块/.test(ls[0].bLabel)) {
+        ok(`面板上有名字：${ls[0].aLabel} → ${ls[0].bLabel}`)
+      } else {
+        bad(`墨迹块的 label 不对：${JSON.stringify([ls[0].aLabel, ls[0].bLabel])}`)
+      }
+      if (ls[0].a !== ls[0].b) ok('两端是两块，不是同一块')
+      else bad('两端算成了同一块')
+    }
+  }
+
+  /* ── ② 同一坨字迹内部：字里的一横，两头落在同一块里 → 不算连接 ── */
+  {
+    const b = mk([...put(), line('lnk', { x: 2, y: 1 }, { x: 26, y: 8 })])
+    eq(buildLinks(b).length, 0, '同一块内部的一笔（字里的一横）不算连接')
+  }
+
+  /* ── ③ 公式的分数线：够长，但中段上下就是分子分母（贴着一堆墨）→ 不算连接 ── */
+  {
+    const frac = [
+      ['num', toFlat([{ x: 500, y: -14 }, { x: 540, y: -14 }])],
+      ['den', toFlat([{ x: 500, y: 16 }, { x: 540, y: 16 }])],
+      ['bar', toFlat([{ x: 496, y: 1 }, { x: 544, y: 1 }])], // 48px 的分数线
+      ['side', toFlat([{ x: 560, y: 0 }, { x: 574, y: 6 }])],
+    ]
+    const b = mk([...put(), ...frac])
+    eq(buildLinks(b).length, 0, '分数线中段贴着分子/分母 → 中段不是空白 → 不算连接')
+  }
+
+  /* ── ④ 一条长线的中段**穿过**另一坨墨 → 不算连接（中段那一段必须空） ── */
+  {
+    const mid = blob(250, -6)
+    const b = mk([...put(), ...mid.map((f, i) => ['m' + i, f]), line('lnk', { x: 6, y: 3 }, { x: 506, y: 3 })])
+    eq(buildLinks(b).length, 0, '长线的中段压着别的墨 → 不算连接')
+  }
+
+  /* ── ⑤ 卡片 → 字迹：一头卡一头块 ── */
+  {
+    const card = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: -320, y: -30, id: 'k1', text: '公式卡' }
+    const b = mk([...A.map((f, i) => ['a' + i, f]), line('lnk', { x: -260, y: 3 }, { x: 20, y: 3 })], [card])
+    const ls = buildLinks(b)
+    eq(ls.length, 1, '从卡片画一条线到字迹上 → 出来 1 条连接')
+    if (ls.length === 1) eq([ls[0].a, ls[0].aKind, ls[0].bKind], ['k1', 'card', 'ink'], '一头是卡片、一头是墨迹块')
+  }
+
+  /* ── ⑥ 卡片↔卡片那条路**不受这三道闸约束**（它铁定是连接，不能被我改坏） ── */
+  {
+    const k1 = { ...newCard('note', 0, 0, { w: 60, h: 40 }), x: 0, y: 0, id: 'k1' }
+    const k2 = { ...newCard('note', 0, 0, { w: 60, h: 40 }), x: 100, y: 0, id: 'k2' }
+    const b = mk([line('short', { x: 30, y: 20 }, { x: 100, y: 20 })], [k1, k2])
+    const ls = buildLinks(b)
+    eq(ls.length, 1, '两张卡之间的**短线**（比 INK_LINK_MIN_LEN 还短）照样算连接')
+    if (ls.length === 1) eq([ls[0].a, ls[0].b], ['k1', 'k2'], '方向按你画的方向')
+  }
+
+  /* ── ⑦ 已知代价（钉住这个取舍）：两块挨得近 + 线画得短 → 认不出来 ──
+     中段采样点（弧长 30%~70%）会落进端点那块墨的 INK_LINK_MID_GAP(18px) 里。
+     要连就得把线画长一点（跨过空白）。这是"宁可漏、不误判"的代价 ——
+     ⚠ 中段阈值从 18 降到 12 会让它认出来，但同时会在**真板**上多出一条假连接
+     （实测 2026-09-16：一条 121px 的手写竖笔被读成"卡→字迹"）—— 所以保持 18。
+     以后要放宽，先看这条、再拿真板量一遍。 */
+  {
+    const near2 = blob(70, 0)
+    const b = mk([
+      ...A.map((f, i) => ['a' + i, f]),
+      ...near2.map((f, i) => ['b' + i, f]),
+      line('lnk', { x: 10, y: 3 }, { x: 60, y: 3 }), // 50px：够长（≥48），但中段还是贴着两头的墨
+    ])
+    const ls = buildLinks(b)
+    if (ls.length === 0) ok('两块贴着、线又画得短 → 认不出（已记在案的代价：把线画长一点就认）')
+    else bad(`短距离的两块之间不该出连接，却出了 ${ls.length} 条`)
+  }
+
+  /* ── ⑧ 块本身：数得出几块、id 稳不稳 ── */
+  {
+    const b = mk(put())
+    const blocks = inkBlocks(b.strokes)
+    eq(blocks.length, 2, '两坨字迹 → 2 块（每坨内部 3 笔挨在一起）')
+    const idx = createInkIndex(b.strokes)
+    const n1 = inkNodeAt(idx, { x: 3, y: 3 })
+    const n2 = inkNodeAt(idx, { x: 3, y: 3 })
+    if (n1 && n2 && n1.id === n2.id) ok(`同一个点查两次 → 同一个块 id（${n1.id}）`)
+    else bad('块 id 不稳定')
+    if (n1 && n1.ids.length === 3) ok('块的成员是那 3 笔')
+    else bad(`块的成员数不对：${n1 && n1.ids.length}`)
+    eq(inkNodeAt(idx, { x: 250, y: 250 }), null, '空白处没有块')
+  }
+
+  /* ── ⑨ 真手画箭头指着"一坨字迹"（他的实际用法）── */
+  {
+    const fix = JSON.parse(readFileSync(new URL('./fixtures/hand-arrows.json', import.meta.url), 'utf8'))
+    const img = fix.images[0]
+    const role = Object.fromEntries(img.strokes.map((s) => [s.role, toPoints(s.points)]))
+    const shaft = role.shaft
+    const tail = shaft[0]
+    const tipPt = shaft[shaft.length - 1]
+    const V = role.barbA.slice().reverse().concat(role.barbB)
+    /* 尾巴那一头放一坨字迹；尖外面 18px 再放一坨（箭头指着它，但没碰到） */
+    const da = (dx, dy) => ({ x: dx, y: dy })
+    const blobs = [
+      ...blob(tail.x - 6, tail.y - 3).map((f, i) => ['a' + i, f]),
+      ...blob(tipPt.x + 18, tipPt.y - 3).map((f, i) => ['b' + i, f]),
+    ]
+    const b = mk([...blobs, ['sh', toFlat(shaft)], ['v1', toFlat(role.barbA)], ['v2', toFlat(role.barbB)]])
+    const ls = buildLinks(b)
+    eq(ls.length, 1, '真手画箭头（杆 + 两撇）指着字迹 → 出来 1 条连接')
+    if (ls.length === 1) {
+      eq([ls[0].aKind, ls[0].bKind, ls[0].kind, ls[0].shape, ls[0].headInk], ['ink', 'ink', 'cause', 'arrow', true],
+        '读成"因果"、尖是你自己画的（不再合成箭头）')
+      if (ls[0].a !== ls[0].b) ok('尾巴那坨和尖指的那坨是两块')
+      else bad('箭头把两坨认成了同一块')
+    }
+  }
 }
 
 // ═════════════════════ 7. 装进视口 ═════════════════════

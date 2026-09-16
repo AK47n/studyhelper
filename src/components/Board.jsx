@@ -13,7 +13,7 @@ import { Tex } from './Tex.jsx'
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, descendantsOf, fitView, inkedEdges, newCard, newStroke, parseBoardDocument,
+  buildRelations, createInkIndex, descendantsOf, fitView, newCard, newStroke, parseBoardDocument,
   screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
@@ -373,13 +373,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const cardById = useMemo(() => new Map(board.cards.map((c) => [c.id, c])), [board.cards])
   /* 画出来的连接（见 lib/board.js 的 buildLinks）。
      和 relations 一样**每次重算、不进文件** —— 你挪动卡片，连接自己跟着走。
-     只有"你手动改过的那个词"存在笔迹上（stroke.link）。 */
-  const links = useMemo(() => buildLinks(board), [board])
+     只有"你手动改过的那个词"存在笔迹上（stroke.link）。
+     ★ 墨迹索引只依赖 `board.strokes`，按它缓存：拖卡片时 strokes 引用没变，
+       那一坨（建索引 + 聚块 + flood fill）就不用重来 —— 否则拖一下卡就是几十毫秒。 */
+  const inkIndex = useMemo(() => createInkIndex(board.strokes), [board.strokes])
+  const links = useMemo(() => buildLinks(board, inkIndex), [board, inkIndex])
   const inkPairs = useMemo(() => {
+    /* ★ 从 `links` 里派生，别再调一次 `inkedEdges(board)` ——
+       那个函数内部就是 `buildLinks(board)`，等于每次 commit 白跑两遍
+       （620 笔的板上实测一遍 40ms+，这笔账省下来正好抵掉墨迹块那部分开销）。 */
     const set = new Set()
-    for (const e of inkedEdges(board)) set.add(e.a + '|' + e.b)
+    for (const l of links) set.add(l.a + '|' + l.b)
     return set
-  }, [board])
+  }, [links])
   const linkByStroke = useMemo(
     () => new Map(links.flatMap((l) => (l.ids || [l.strokeId]).map((id) => [id, l]))),
     [links]
@@ -683,7 +689,22 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const box = lassoRef.current.box
         lassoRef.current = null
         setLasso(null)
-        const ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
+        let ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
+        /* ★ 点一下那条线 = 选中它（"点线即选中"，2026-09-16 加）。
+           以前改一个词得先**框住**那条线 —— 一条线本来就是一个点得中的东西，
+           多一个框的手势是白费的。判据三条，都是为了让"点"不误伤：
+             · 框小到几乎是一个点（≤4 世界像素见方）—— 拖框的行为一个字不变；
+             · 框里没有别的笔迹；
+             · 只认**已经算出来是连接**的那些笔（linkByStroke），
+               所以点一下字不会把某一笔字选中。
+           过一会儿那排词会在线上浮出来（.bd-inklink），和框住时看到的是同一个。 */
+        if (!ids.length && box.x1 - box.x0 <= 4 && box.y1 - box.y0 <= 4) {
+          const cx = (box.x0 + box.x1) / 2
+          const cy = (box.y0 + box.y1) / 2
+          const r = 10 / boardRef.current.view.s
+          const hit = boardRef.current.strokes.find((s) => linkByStroke.has(s.id) && strokeHitsCircle(s, cx, cy, r))
+          if (hit) ids = [hit.id]
+        }
         setInkSel(ids.length ? new Set(ids) : null)
         /* 空框说一句人话。静默什么都不发生是最让人迷惑的 ——
            用户会以为"框选坏了"，而其实只是框小了/框到空白上了。 */
@@ -851,7 +872,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick])
+  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -1401,11 +1422,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       onSelect={setSelectedId}
       onHoverEdge={setHoverEdge}
       onFocus={(id) => {
-        const c = cardById.get(id)
         const el = wrapRef.current
-        if (!c || !el) return
+        if (!el) return
+        const c = cardById.get(id)
+        /* 端点是墨迹块（不是卡片）时没有卡可居中 —— 退回到"这条连接的中点"，
+           不然点了面板那一行什么都不动，看起来像坏了。 */
+        const center = c
+          ? { x: c.x + c.w / 2, y: c.y + c.h / 2 }
+          : (links.find((l) => l.a === id || l.b === id) || {}).mid
+        if (!center) return
         const v = boardRef.current.view
-        setView({ ...v, tx: el.clientWidth / 2 - (c.x + c.w / 2) * v.s, ty: el.clientHeight / 2 - (c.y + c.h / 2) * v.s })
+        setView({ ...v, tx: el.clientWidth / 2 - center.x * v.s, ty: el.clientHeight / 2 - center.y * v.s })
       }}
     />
   )
@@ -1941,6 +1968,9 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
     return (c.text || '(空便签)').slice(0, 24).replace(/\s+/g, ' ')
   }
   const roots = board.cards.filter((c) => !relations.parentOf.has(c.id))
+  /* 连接的两端可能不是卡片，而是**墨迹块**（没成卡的字迹、手画的图，见 lib/board.js）。
+     那种端点的名字在链接对象上（aLabel/bLabel），不能去卡片表里找 —— 找不到就是"(没了)"。 */
+  const endName = (l, k) => (l[k + 'Kind'] === 'ink' ? l[k + 'Label'] || '墨迹块' : label(byId.get(l[k])))
 
   return (
     <div className="bd-rel">
@@ -1974,9 +2004,9 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                 {l.name}
                 {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
               </span>
-              <span className="bd-er">{label(byId.get(l.a))}</span>
+              <span className="bd-er">{endName(l, 'a')}</span>
               <span className="dim">{l.dir ? '→' : '—'}</span>
-              <span className="bd-er">{label(byId.get(l.b))}</span>
+              <span className="bd-er">{endName(l, 'b')}</span>
             </button>
           ))}
           <div className="dim small pad">
