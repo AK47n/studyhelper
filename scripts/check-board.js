@@ -10,7 +10,7 @@ import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  descendantsOf, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
+  descendantsOf, deriveChains, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
   strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
 } from '../src/lib/board.js'
@@ -1120,6 +1120,108 @@ console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方�
     'x'
   )
   eq(dup.groups.map((g) => g.id), ['g1', 'g2'], '同一笔不能同时属于两个组（后来那个丢掉）')
+}
+
+// ═════════════════════ 6i. 条件从位置送 + 推导链 ═════════════════════
+console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导链读成链')
+{
+  /* 用户的原话：「条件是位置送的。线中点附近那几个字 / 那张卡，自动成为这条关系的条件
+     —— 你本来就要写"仅当…"，不用再告诉它是谁的条件。」 */
+  const A = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 0, y: 0, id: 'ka', text: '式子A' }
+  const B = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 400, y: 0, id: 'kb', text: '式子B' }
+  /* 两行短笔（条件）：给个 (cx,cy)，摆成一小坨 —— 个头要过 INK_NODE_MIN_SIZE */
+  const condStrokes = (cx, cy, idp) => [
+    [`${idp}1`, toFlat([{ x: cx, y: cy }, { x: cx + 10, y: cy + 6 }])],
+    [`${idp}2`, toFlat([{ x: cx + 14, y: cy }, { x: cx + 24, y: cy + 7 }])],
+    [`${idp}3`, toFlat([{ x: cx, y: cy + 12 }, { x: cx + 22, y: cy + 14 }])],
+  ]
+  const mk = (extra = [], cards = [A, B]) => {
+    const b = makeBoard()
+    b.cards = cards
+    b.strokes = [
+      ['ln', toFlat([{ x: 60, y: 30 }, { x: 460, y: 30 }])], // 卡 A → 卡 B 的一条直线
+      ...extra,
+    ].map(([id, flat]) => ({ ...newStroke('pen', flat), id }))
+    return b
+  }
+  const mid = { x: 260, y: 30 } // 那条线的弧长中点
+
+  eq(buildLinks(mk()).length, 1, '先确认这条线是连接')
+  eq(buildLinks(mk())[0].cond, null, '线中点旁边什么都没有 → 没有条件')
+
+  /* ① 中点旁边写几个字 → 它们就是条件 */
+  {
+    const b = mk(condStrokes(mid.x - 12, mid.y - 34, 'c'))
+    const l = buildLinks(b)[0]
+    if (l.cond && l.cond.kind === 'ink' && l.cond.ids.length === 3) {
+      ok(`线中点旁边那 3 笔成了条件：${l.cond.label}`)
+    } else {
+      bad(`条件没读出来：${JSON.stringify(l.cond)}`)
+    }
+    eq(l.cond && l.cond.kind, 'ink', '条件的 kind 是墨迹块')
+  }
+
+  /* ② 同样的字摆在**端点**旁边（不在中点）→ 不算条件 */
+  {
+    const b = mk(condStrokes(370, 44, 'c')) // 离中点 110px 以上，但离 B 那端很近
+    const l = buildLinks(b)[0]
+    eq(l.cond, null, '字摆在端点旁边（不是中点）→ 不算条件')
+  }
+
+  /* ③ 中点旁边放一张卡 → 卡片优先（那是"明写的条件"） */
+  {
+    const C = { ...newCard('note', 0, 0, { w: 90, h: 40 }), x: 215, y: -60, id: 'kc', text: '仅当…' }
+    const b = mk([], [A, B, C])
+    const l = buildLinks(b)[0]
+    eq(l.cond && l.cond.kind, 'card', '线中点旁边那张卡才是条件')
+    eq(l.cond && l.cond.id, 'kc', '条件指向那张卡')
+  }
+
+  /* ④ 一撮 2px 的小墨点不算条件（和墨迹块同一条"最小个头"闸） */
+  {
+    const b = mk([['p', toFlat([{ x: mid.x, y: mid.y - 30 }, { x: mid.x + 1.5, y: mid.y - 30 }])]])
+    eq(buildLinks(b)[0].cond, null, '一个 2px 的点不算条件')
+  }
+
+  /* ⑤ 推导链：A —推导→ B —推导→ C，中间那步缺条件 */
+  {
+    const C = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 800, y: 0, id: 'kc', text: '式子C' }
+    const b = makeBoard()
+    b.cards = [A, B, C]
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 60, y: 30 }, { x: 460, y: 30 }])), id: 'l1', link: 'derive' },
+      { ...newStroke('pen', toFlat([{ x: 460, y: 30 }, { x: 860, y: 30 }])), id: 'l2', link: 'derive' },
+      ...condStrokes(250, -4, 'c').map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
+    ]
+    const links = buildLinks(b)
+    eq(links.length, 2, '两条推导都成立')
+    const chains = deriveChains(links)
+    eq(chains.length, 1, '读成 1 条链')
+    eq(chains[0].steps.map((s) => s.from + '→' + s.to), ['ka→kb', 'kb→kc'], '链的顺序是 A→B→C')
+    eq(chains[0].missing, 1, '标出"有一步缺条件"')
+    eq(chains[0].steps[0].missing, false, '第一步有条件（中点旁边那 3 笔）')
+    eq(chains[0].steps[1].missing, true, '第二步缺条件')
+
+    /* 因果那条不算推导链（链只认"推导"）：把 A→B 标成因果，链就该从 B 开始 */
+    const b2 = { ...b, strokes: b.strokes.map((s) => (s.id === 'l1' ? { ...s, link: 'cause' } : s)) }
+    const ch2 = deriveChains(buildLinks(b2))
+    eq(ch2.map((c) => c.steps.map((s) => s.from + '→' + s.to).join(',')), ['kb→kc'], '标成「因果」的那条不进推导链（链从 B 开始）')
+  }
+
+  /* ⑥ 分叉与成环都不能把面板卡死 */
+  {
+    const C = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 800, y: 0, id: 'kc' }
+    const D = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 800, y: 300, id: 'kd' }
+    const mkLinks = (pairs) => pairs.map(([a, bb]) => ({ a, b: bb, kind: 'derive', cond: null, strokeId: a + bb }))
+    const fork = deriveChains(mkLinks([['ka', 'kb'], ['ka', 'kc']]))
+    eq(fork.length, 2, '一个节点分两条 → 两条链（不硬凑成一条）')
+    const cyc = deriveChains(mkLinks([['ka', 'kb'], ['kb', 'ka']]))
+    if (cyc.length >= 1 && cyc.every((c) => c.steps.length <= 24)) ok('成环也不会转不出来（走过的节点不再走）')
+    else bad(`成环的链不对：${JSON.stringify(cyc)}`)
+    eq(deriveChains(mkLinks([])).length, 0, '没有推导连接 → 一条链都没有')
+    void C
+    void D
+  }
 }
 
 // ═════════════════════ 7. 装进视口 ═════════════════════

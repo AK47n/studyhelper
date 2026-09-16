@@ -1188,6 +1188,19 @@ kbd {
 
 /* 关系面板里"你画过的"那一节 */
 .bd-links-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
+/* 条件（写在线中点旁边那几个字）：不算词，是"附着在这条线上的内容" —— 淡一点、小一点 */
+.bd-cond { margin-left: 6px; color: #8b95a8; font-size: calc(11px * var(--s)); }
+/* 推导链：A →(条件) B →(缺条件) C */
+.bd-chain-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
+.bd-chain { margin: 6px 0 10px 2px; }
+.bd-chain-node {
+  font-size: calc(12px * var(--s)); color: #dde3ee;
+  padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bd-chain-step { margin-left: 6px; border-left: 1px solid #3a4457; padding-left: 8px; }
+.bd-chain-cond { color: #8b95a8; font-size: calc(11px * var(--s)); padding: 1px 0; }
+/* 缺条件那一步要跳出来：这是这一节存在的理由（"补条件"就是在线旁边写几个字） */
+.bd-chain-cond.miss { color: #f0a020; }
 .bd-link-row {
   display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
   background: transparent; border: 1px solid transparent; border-radius: 7px;

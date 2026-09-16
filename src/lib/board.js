@@ -761,6 +761,10 @@ export const INK_NODE_PAD = 12       // 端点离块的墨这么近，算"落在
 export const INK_LINK_MIN_LEN = 48   // 比这短的笔不当连接
 export const INK_LINK_MID_GAP = 18   // 中段离别的墨要这么远（降到 12 会误判，实测：见 README 第 22 条）
 export const INK_NODE_MIN_SIZE = 18  // 一块墨的"最小个头"（包围盒对角线）：比这小的不算"一个东西"
+/* 「条件是位置送的」：线**中点**这么近的地方写着的字（或那张卡）就是这条关系的条件。
+   64 世界像素大约是"贴着线写两三个字"的距离 —— 他本来就要写"仅当…"，
+   不用再告诉应用这是谁的条件。见 linkCondition。 */
+export const LINK_COND_RADIUS = 64
 
 const INK_CELL = 32 // 空间格子边长（查"附近有没有墨"用）
 
@@ -987,6 +991,114 @@ export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, groups = [] } = {}) {
   return out
 }
 
+/* 离 (x,y) 最近的那**一笔**墨（不是距离），返回 { i, p, d } 或 null。
+   和 nearestInk 是一对：那个只要距离（判"够不够远"），这个要"是谁"。 */
+function nearestInkStroke(index, x, y, exclude, max) {
+  const grid = index.grid
+  const cx = Math.floor(x / INK_CELL)
+  const cy = Math.floor(y / INK_CELL)
+  const rings = Math.floor(max / INK_CELL) + 1
+  let best = null
+  for (let ring = 0; ring <= rings; ring++) {
+    for (let dx = -ring; dx <= ring; dx++) {
+      for (let dy = -ring; dy <= ring; dy++) {
+        if (ring > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue
+        const arr = grid.get(inkKey(cx + dx, cy + dy))
+        if (!arr) continue
+        for (const it of arr) {
+          if (exclude && exclude.has(it.i)) continue
+          const d = Math.hypot(it.x - x, it.y - y)
+          if (d <= max && (!best || d < best.d)) best = { i: it.i, p: { x: it.x, y: it.y }, d }
+        }
+      }
+    }
+    if (best && best.d <= Math.max(0, ring - 1) * INK_CELL) break
+  }
+  return best
+}
+
+/* 一条连接的**中点**（按弧长，不按两端点的中点 —— 线和端点的中点常常不是同一个地方）。 */
+function chainMid(pts) {
+  const total = arcLen(pts)
+  if (!(total > 0)) return pts[0] || null
+  const target = total / 2
+  let acc = 0
+  for (let i = 1; i < pts.length; i++) {
+    const seg = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
+    if (acc + seg >= target) {
+      const t = seg > 0 ? (target - acc) / seg : 0
+      return { x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t, y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t }
+    }
+    acc += seg
+  }
+  return pts[pts.length - 1]
+}
+
+/* ═══════════ 条件：线中点附近那几个字（或那张卡）自动成为这条关系的条件 ═══════════
+ *
+ * 用户 2026-09-16：「条件是位置送的。线中点附近那几个字 / 那张卡，自动成为这条关系的条件
+ * —— 你本来就要写"仅当…"，不用再告诉它是谁的条件。」
+ *
+ * 规矩：
+ *   · 只看**中点**（弧长一半那一点，不是两端点的中点）周围 LINK_COND_RADIUS 之内；
+ *   · **卡片优先**：线中段旁边放一张卡，那是最明确的条件；
+ *   · 排除这条线自己的笔（`exclude`）、以及**它两端的节点**（那是关系本身的两头，
+ *     不是条件）；别的连接线也不算（条件是你写的内容，不是另一条关系）；
+ *   · 太小的一撮墨不算（`INK_NODE_MIN_SIZE`，和墨迹块同一条闸）。
+ * **不存盘**：条件是从位置读出来的，随时能重算 —— 你把那几笔挪走，它就不成立了。 */
+function linkCondition(ink, boxes, mid, exclude, aNode, bNode) {
+  if (!mid) return null
+  const c = nearestCard(boxes, mid, LINK_COND_RADIUS)
+  if (c && (!aNode || c.id !== aNode.id) && (!bNode || c.id !== bNode.id)) {
+    return { kind: 'card', id: c.id, ids: [], label: '', at: mid }
+  }
+  const hit = nearestInkStroke(ink, mid.x, mid.y, exclude, LINK_COND_RADIUS)
+  if (!hit) return null
+  const node = inkNodeAt(ink, hit.p, INK_NODE_PAD, INK_BLOCK_GAP, exclude)
+  if (!node) return null
+  if ((aNode && node.id === aNode.id) || (bNode && node.id === bNode.id)) return null
+  return { kind: 'ink', id: node.id, ids: node.ids, label: node.label, at: hit.p }
+}
+
+/* ═══════════ 推导链：A —(条件)→ B —(条件)→ C ═══════════
+ *
+ * 「面板读成链并标出缺条件那步」——链只在有方向的连接上成立，这里从**推导**那条
+ * （`derive`）走：由一个式子推出下一个式子，条件是中点旁边那些字（见 linkCondition）。
+ * 返回每条链的步骤（谁 → 谁、条件是什么、**缺不缺条件**），给面板用。
+ * 规矩：
+ *   · 从"只有出、没有进"的节点出发（根）；走不通就停；
+ *   · 一个节点有两条出边 = 分叉，各自成链（不做拓扑排序那套，够用就行）；
+ *   · **防环**：走过的节点不再走（手画的关系里出环太容易了）。
+ * **不存盘**：链是现算的，和关系本身一样。 */
+export function deriveChains(links = []) {
+  const steps = (links || []).filter((l) => l && l.kind === 'derive')
+  if (!steps.length) return []
+  const out = new Map()
+  const ind = new Set()
+  for (const l of steps) {
+    if (!out.has(l.a)) out.set(l.a, [])
+    out.get(l.a).push(l)
+    ind.add(l.b)
+  }
+  const roots = [...out.keys()].filter((id) => !ind.has(id))
+  /* 没有根（整条都是环）时，随便挑一个当起点，免得一条都不显示。 */
+  const starts = roots.length ? roots : [...out.keys()]
+  const chains = []
+  for (const start of starts) {
+    for (const first of out.get(start) || []) {
+      const ids = [start]
+      const list = []
+      let cur = first
+      while (cur && !ids.includes(cur.b) && list.length < 24) {
+        list.push({ from: cur.a, to: cur.b, link: cur, cond: cur.cond || null, missing: !cur.cond })
+        ids.push(cur.b)
+        cur = (out.get(cur.b) || [])[0]
+      }
+      if (list.length) chains.push({ start, steps: list, missing: list.filter((s) => s.missing).length })
+    }
+  }
+  return chains
+}
 /* 这条链"像不像一条连接线"（只在要落在墨迹块上时用）：够长 + 中段是空白。
    中段按**弧长**取 30%~70%（不按下标 —— 采样密度会骗人，见 findTip 那段）。
    ★ 采样点要**沿线插值**，不能"取离目标弧长最近的那个现有点"：
@@ -1205,6 +1317,12 @@ export function buildLinks(board, inkInput = null) {
     const kind = manualStroke ? manualStroke.link : auto
     const meta = linkKind(kind)
     const u = unit(fromPt, toPt)
+    /* ★ 「条件是位置送的」：线**中点**旁边那几个字（或那张卡）就是这条关系的条件。
+       用弧长中点（不是两端点的中点），并且把这条线自己的墨排除掉。见 linkCondition。 */
+    const midInk = chainMid(pts)
+    const condEx = new Set(dropIdx)
+    for (const i of chainOwn[ci]) condEx.add(i)
+    const cond = linkCondition(ink, boxes, midInk, condEx, aNode, bNode)
     out.push({
       strokeId: ch.ids[0],
       ids: ch.ids.slice(),
@@ -1230,6 +1348,12 @@ export function buildLinks(board, inkInput = null) {
       tip: tip ? { x: tip.x, y: tip.y } : null,
       angle: u ? Math.atan2(u.y, u.x) : 0,
       mid: { x: (fromPt.x + toPt.x) / 2, y: (fromPt.y + toPt.y) / 2 },
+      /* 线**弧长**的中点（`mid` 是两端点的中点，两者常常不是同一个地方）——
+         条件就是从这里周围读出来的。 */
+      midInk,
+      /* 这条关系的条件（`{kind:'ink'|'card', id, ids, label, at}` 或 null）：
+         线中点附近那几个字 / 那张卡。**不存盘**，位置一变它就变。 */
+      cond,
       from: { x: fromPt.x, y: fromPt.y },
       to: { x: toPt.x, y: toPt.y },
     })

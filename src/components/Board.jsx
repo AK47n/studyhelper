@@ -13,7 +13,7 @@ import { Tex } from './Tex.jsx'
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, createInkIndex, descendantsOf, fitView, newCard, newId, newStroke, parseBoardDocument,
+  buildRelations, createInkIndex, deriveChains, descendantsOf, fitView, newCard, newId, newStroke, parseBoardDocument,
   screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
@@ -2053,6 +2053,16 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
   /* 连接的两端可能不是卡片，而是**墨迹块**（没成卡的字迹、手画的图，见 lib/board.js）。
      那种端点的名字在链接对象上（aLabel/bLabel），不能去卡片表里找 —— 找不到就是"(没了)"。 */
   const endName = (l, k) => (l[k + 'Kind'] === 'ink' ? l[k + 'Label'] || '墨迹块' : label(byId.get(l[k])))
+  /* 链里的人名：端点可能是卡片，也可能是墨迹块（名字在链接对象上）。 */
+  const nameOf = (id, link) => {
+    if (link && id === link.a && link.aKind === 'ink') return link.aLabel || '墨迹块'
+    if (link && id === link.b && link.bKind === 'ink') return link.bLabel || '墨迹块'
+    return label(byId.get(id))
+  }
+  const condName = (cond) => (cond.kind === 'ink' ? cond.label || '墨迹块' : label(byId.get(cond.id)))
+  /* 「推导链」（见 lib/board.js 的 deriveChains）：由推导连接串起来的 A→B→C，
+     并标出**哪一步缺条件** —— 条件就是写在线中点旁边那几个字，不用你声明。 */
+  const chains = deriveChains(links)
 
   return (
     <div className="bd-rel">
@@ -2089,11 +2099,39 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
               <span className="bd-er">{endName(l, 'a')}</span>
               <span className="dim">{l.dir ? '→' : '—'}</span>
               <span className="bd-er">{endName(l, 'b')}</span>
+              {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。 */}
+              {l.cond && <span className="bd-cond" title="写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件">条件 {condName(l.cond)}</span>}
             </button>
           ))}
           <div className="dim small pad">
             形状读出来的（直线=相关、带箭头=因果）**不写进文件**；
             你点过词的那几条才会记住。
+          </div>
+        </div>
+      )}
+
+      {/* ★ 推导链：把「推导」那几条串起来读成 A→B→C，并标出**哪一步缺条件**。
+          条件不需要你声明 —— 写在那条线**中点旁边**的几个字就算
+          （见 lib/board.js 的 linkCondition），所以"补条件"这件事就是
+          "在线旁边把那句话写上"，写完这一节自己就更新了。 */}
+      {chains.length > 0 && (
+        <div className="bd-chain-list">
+          <div className="bd-rel-sub">推导链（{chains.length} 条）</div>
+          {chains.map((c, ci) => (
+            <div key={'chain' + ci} className="bd-chain">
+              <div className="bd-chain-node">{nameOf(c.start, c.steps[0].link)}</div>
+              {c.steps.map((s, k) => (
+                <div key={'st' + k} className="bd-chain-step">
+                  <div className={'bd-chain-cond' + (s.missing ? ' miss' : '')}>
+                    {s.missing ? '↓ 缺条件（在线中点旁边写几个字就行）' : '↓ 条件：' + condName(s.cond)}
+                  </div>
+                  <div className="bd-chain-node">{nameOf(s.to, s.link)}</div>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div className="dim small pad">
+            「条件」= 写在那条连接线**中点旁边**的字（或那张卡）—— 位置说了算，不用你标。
           </div>
         </div>
       )}

@@ -280,6 +280,11 @@ const readBoard = () => s.eval(`(() => {
     /* 框选浮层（虚线框 + 那一排动作）在不在 */
     inkBox: !!document.querySelector('.bd-inkbox'),
     inkActs: !!document.querySelector('.bd-inkacts'),
+    /* 推导链那一节（面板）：几条链、哪几步缺条件、每一步的条件写的是什么 */
+    chainCount: document.querySelectorAll('.bd-chain').length,
+    chainMissing: document.querySelectorAll('.bd-chain-cond.miss').length,
+    chainConds: [...document.querySelectorAll('.bd-chain-cond')].map((e) => e.textContent.trim()),
+    condRows: [...document.querySelectorAll('.bd-link-row .bd-cond')].map((e) => e.textContent.trim()),
     a: card('lk-a'),
     b: card('lk-b'),
     toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
@@ -771,8 +776,59 @@ console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里�
   else bad(`拆开之后 groups 还在：${JSON.stringify(doc2.groups)}`)
 }
 
-/* ═════════════════ 11. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[11] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 11. 条件从位置送 + 推导链 ═════════════════ */
+console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上的"缺条件"就变成"条件：…"')
+{
+  /* 用户的原话：「条件是位置送的。线中点附近那几个字 / 那张卡，自动成为这条关系的条件
+     —— 你本来就要写"仅当…"，不用再告诉它是谁的条件。」
+     这一步走的正是那句话：链上那一步缺条件 → 在线中点旁边写两笔 → 它自己补上。 */
+  const st8 = await readBoard()
+  if (st8.chainCount === 1) ok('面板里读出了 1 条推导链（[5] 标的那条「推导」）')
+  else bad(`推导链应该是 1 条，实际 ${st8.chainCount}（chainConds=${JSON.stringify(st8.chainConds)}）`)
+  const before = await readBoard()
+  const missBefore = before.chainMissing
+  if (missBefore >= 0) ok(`现在有 ${missBefore} 步是"缺条件"（下一步把它补上）`)
+  /* 在那条线的**中点**旁边写两个短笔 —— 尺寸要按**世界像素**算：
+     条件要过"块的最小个头"（18 世界像素）和"中点在 64 世界像素之内"两条闸，
+     而屏幕上看到的距离要乘/除视图缩放。缩放从"两张卡的屏幕距离 ÷ 世界距离"量出来
+     （踩过：第一次按屏幕像素画 22px，视图一缩小就只剩 11 世界像素 → 个头不够、条件读不出来）。 */
+  const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  const ca = fixture.cards.find((c) => c.id === 'lk-a')
+  const cb = fixture.cards.find((c) => c.id === 'lk-b')
+  const wDist = Math.hypot(ca.x + ca.w / 2 - (cb.x + cb.w / 2), ca.y + ca.h / 2 - (cb.y + cb.h / 2))
+  const sDist = Math.hypot(before.a.cx - before.b.cx, before.a.cy - before.b.cy)
+  const scale = wDist > 0 ? sDist / wDist : 1
+  const mx = Math.round((before.a.cx + before.b.cx) / 2)
+  const my = Math.round((before.a.cy + before.b.cy) / 2)
+  const wx = (n) => n * scale // 世界像素 → 屏幕像素
+  await pickTool('笔')
+  await s.sleep(150)
+  /* 两条 30 世界像素的短笔（< INK_LINK_MIN_LEN 48，所以不会变成新连接），
+     离中点 30 / 40 世界像素（< LINK_COND_RADIUS 64），彼此差 10 像素（< 24 → 聚成一块） */
+  await s.penStroke({ x: mx - wx(15), y: my - wx(40) }, { x: mx + wx(15), y: my - wx(38) }, { steps: 4, hover: true })
+  await s.penStroke({ x: mx - wx(14), y: my - wx(30) }, { x: mx + wx(16), y: my - wx(28) }, { steps: 4, hover: true })
+  await s.key('Escape', 'Escape', 27) // 收掉可能浮出来的那排词，别挡住读数
+  await s.sleep(500)
+  const after = await readBoard()
+  if (after.ink > before.ink) ok(`中点旁边真的写上了（墨迹层 ${before.ink} → ${after.ink}，缩放 ${scale.toFixed(2)}）`)
+  else bad(`那两笔没写上（墨迹层 ${before.ink} → ${after.ink}）—— 后面的读数没意义`)
+  if (after.chainMissing < missBefore || (missBefore === 0 && after.chainConds.length > 0)) {
+    ok(`写完那几个字，"缺条件"少了（${missBefore} → ${after.chainMissing}）`)
+  } else {
+    bad(`在中点旁边写了字，条件没被读出来（missing ${missBefore} → ${after.chainMissing}，conds=${JSON.stringify(after.chainConds)}）`)
+  }
+  if (after.condRows.some((t) => /条件/.test(t))) ok(`「你画过的」那一行也挂上了条件（${after.condRows[0]}）`)
+  else bad(`连接那一行没显示条件：${JSON.stringify(after.condRows)}`)
+  if (after.count === before.count) ok('这两笔短笔没有变成新连接（够短 → 不进连接那套判据）')
+  else bad(`短笔变成了连接：${before.count} → ${after.count}`)
+  /* 条件**不写盘**：它是从位置读出来的，文件里一个字段都不该多 */
+  const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  if (!JSON.stringify(doc).includes('"cond"')) ok('条件没写进文件（位置读出来的，随时能重算）')
+  else bad('文件里出现了 cond 字段 —— 位置推断不该存盘')
+}
+
+/* ═════════════════ 12. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[12] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 
