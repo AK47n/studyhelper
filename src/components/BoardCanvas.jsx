@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { relationCurve } from '../lib/board.js'
+import { LINK_KINDS, relationCurve } from '../lib/board.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
  *
@@ -23,8 +23,10 @@ import { drawStroke } from '../lib/ink.js'
 const INK_PAD = 6
 export default function BoardCanvas({
   sceneRef, liveRef, view, size, strokes, relations, cardById, cardsForInk,
-  selectedId, hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
-  lasso, inkBox, onDeleteInk, children,
+  hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
+  lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk,
+  links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
+  children,
 }) {
   const dpr = typeof window === 'undefined' ? 1 : Math.min(2.5, window.devicePixelRatio || 1)
 
@@ -165,14 +167,21 @@ export default function BoardCanvas({
         />
       )}
 
-      {/* 框选出来的那组墨迹：一个虚线包围框 + 一个删除按钮。
-          用笔的人不一定腾得出手按 Delete 键，所以删除必须放在手边。
-          按钮靠 transform 把"右下角"对齐到包围框的右上角，这样位置自动跟着框走，
-          不用去量按钮自己的宽高（按钮宽度会随界面字号变）。 */}
+      {/* 框选出来的那组墨迹：一个虚线包围框 + 「美化」和「删除」两个按钮。
+          用笔的人不一定腾得出手按 Delete 键，也不一定够得到工具条，
+          所以这两个动作必须放在手边。
+          删除按钮靠 transform 把"右下角"对齐到包围框的右上角，这样位置自动跟着框走，
+          不用去量按钮自己的宽高（按钮宽度会随界面字号变）。
+          「美化」放在包围框**左下角下面**：它是这条路上最主要的动作（字丑才来框的），
+          而右上角已经被删除占了；放下面也不会和右上角那个撞在一起。 */}
       {inkBox && (
         <>
           <div
             className="bd-inkbox"
+            /* data-pad 就是上面那个 INK_PAD：这个虚线框比**真实笔迹范围**每边大出这么多。
+               自检要判断"卡片有没有盖住笔迹"就得把这一圈让出去，
+               而它不该在自检里再抄一份数字（抄一份就是两处会各自变的常量）。 */
+            data-pad={INK_PAD}
             style={{
               left: inkBox.x0 * view.s + view.tx - INK_PAD,
               top: inkBox.y0 * view.s + view.ty - INK_PAD,
@@ -180,35 +189,109 @@ export default function BoardCanvas({
               height: (inkBox.y1 - inkBox.y0) * view.s + INK_PAD * 2,
             }}
           />
-          <button
-            className="bd-inkdel"
+          {/* 三个动作摆在**一条横排**里、钉在包围框上方（translateY(-100%)）。
+              ★ 原来是各自绝对定位的：删除在右上角、美化在**左下角的外面**。
+                自检当场抓到美化那个点不到 —— 它落在屏幕下半部分，
+                而底部工具条（z-index 20）横在那一带，用户按下去只是在戳工具条。
+                教训和「卡片点不到」那次一样：**浮出来的按钮必须验 elementFromPoint**，
+                而且别把它放在"可能被别的东西占着"的地方（屏幕下缘就是那种地方）。
+              横排还顺手解决了另一件事：几个按钮永远不会互相重叠
+              （各自绝对定位时，选框一窄就会叠在一起）。
+              ★ 「∑ 公式」和「✨ 美化」是同一件事的两半：认式子、认字。
+                用户 2026-09-16 说"公式也该能框出来认，不用先在写字板里重写一遍"。 */}
+          <div
+            className="bd-inkacts"
             style={{
-              left: inkBox.x1 * view.s + view.tx + INK_PAD,
+              left: inkBox.x0 * view.s + view.tx,
               top: inkBox.y0 * view.s + view.ty - INK_PAD,
             }}
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation()
-              onDeleteInk()
-            }}
-            title="删掉选中的这几笔（也可以按 Delete）"
           >
-            ✕ 删除
-          </button>
+            <button
+              className="bd-inkformula"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                onFormulaInk()
+              }}
+              title="识别公式：把圈住的这一块认成一个式子，排成公式卡（一次认一个）"
+            >
+              ∑ 公式
+            </button>
+            <button
+              className="bd-inkfmt"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                onBeautifyInk()
+              }}
+              title="美化手写：把这一块认成文字，用好看的字体排成一张卡（原笔迹保留）"
+            >
+              ✨ 美化
+            </button>
+            <button
+              className="bd-inkdel"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                onDeleteInk()
+              }}
+              title="删掉选中的这几笔（也可以按 Delete）"
+            >
+              ✕ 删除
+            </button>
+            {/* ★ 框住的**正好是一条连接线**时，多给一排词。
+                这是"事后改词"的路：画完那 3.5 秒没点、或者后来改主意了，
+                框住那条线就能再改一次 —— 不用把线擦掉重画。
+                （框选本来就是这条路：圈住东西 → 框上方浮出能对它做的事。） */}
+            {selLink && (
+              <span className="bd-inklink" data-sel-link={selLink.strokeId}>
+                {LINK_KINDS.map((k) => (
+                  <button
+                    key={k.id}
+                    className={'bd-linkchip' + (k.id === selLink.kind ? ' on' : '')}
+                    data-link-kind={k.id}
+                    style={k.id === selLink.kind ? { background: k.color, borderColor: k.color, color: '#fff' } : { color: k.color, borderColor: k.color }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onApplyLink?.(selLink.strokeId, k.id)
+                    }}
+                    title={k.hint}
+                  >
+                    {k.name}
+                    {k.dir ? ' →' : ''}
+                  </button>
+                ))}
+                {selLink.dir && (
+                  <button
+                    className="bd-linkchip rev"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onApplyLink?.(selLink.strokeId, selLink.kind, { reverse: true })
+                    }}
+                    title="方向反一下"
+                  >
+                    ⇄
+                  </button>
+                )}
+              </span>
+            )}
+          </div>
         </>
       )}
 
-      {selectedId && cardById.get(selectedId) && (
-        <div
-          className="bd-selbox"
-          style={{
-            left: cardById.get(selectedId).x * view.s + view.tx,
-            top: cardById.get(selectedId).y * view.s + view.ty,
-            width: cardById.get(selectedId).w * view.s,
-            height: cardById.get(selectedId).h * view.s,
-          }}
-        />
-      )}
+      {/* ★ 这里原来还有一个"选中卡片"的蓝色虚线框（.bd-selbox），2026-09-16 删掉了。
+          两个理由，第二个才是决定性的：
+            ① 卡片自己被选中时已经是**实线蓝边 + 一圈光晕**（.bd-card.on），
+               再套一个虚线框是重复的装饰；
+            ② 它算错了 —— 那个框只乘了画布缩放 view.s、**漏了卡片自己的倍率**
+               （卡片的宽高是 w * view.s * k，k 是"这张卡自己放大缩小了多少"）。
+               实测这张卡 scale=4：卡片 190px 宽，虚线框只有 47.5px，缩在左上角，
+               看着就是"卡片角上莫名多了个蓝框"（用户 2026-09-16 报的
+               「蓝色虚线框不美观」就是这个）。倍率不是 1 的卡全都会错，
+               而拖右下角放大正是这个应用的主要操作之一。
+          记法：**同一个矩形在两处各算一遍，就一定会有一处忘了乘别的东西。** */}
 
       {/* 收事件的那一层放在最上面，盖住 canvas 和 svg。
           卡片（DOM）是它的兄弟、z-index 更高，所以点卡片不会被这层吃掉。 */}
@@ -220,6 +303,127 @@ export default function BoardCanvas({
         onPointerCancel={onPointerUp}
         onPointerLeave={onPointerUp}
       />
+
+      {/* ── 画出来的连接：一颗词 +（有方向的）一个箭头 ──
+       * 用户 2026-09-16：「更便捷的显示出两者之间的主次、因果、并列」。
+       *
+       * ★ 只有**标过词**的连接才画标记（`kind !== 'rel'`，或者你手动选了"相关"）。
+       *   默认那一档什么都不加：你画的那一笔本来就是它该有的样子，
+       *   我们不该在你的手迹上再描一遍（描了反而像"这线有两根"）。
+       * ★ **自己画过尖的不再合成箭头**（`l.headInk`）：实测他的箭头是"杆一直画到尖上、
+       *   V 尖是单独一笔"，屏幕上那个尖已经在那儿了 —— 再叠一个合成的小箭头，
+       *   看起来就是"一支箭上长了两个头"（而且位置会落在杆的末端、压在 V 里面）。
+       * ★ 这一层在**墨迹上面**（z-index 10，见 CSS）：标记被笔迹盖住就白做了。
+       *   命中：只有那颗词收指针事件，箭头是 pointer-events: none ——
+       *   不然画一笔穿过线的时候会被它挡一下。 */}
+      <div className="bd-linklayer">
+        <svg className="bd-linksvg" width={size.w} height={size.h} viewBox={`0 0 ${size.w} ${size.h}`}>
+          {links
+            .filter((l) => l.dir && !l.headInk)
+            .map((l) => {
+              const ax = l.to.x * view.s + view.tx
+              const ay = l.to.y * view.s + view.ty
+              const r = 10
+              const a1 = l.angle + Math.PI - 0.5
+              const a2 = l.angle + Math.PI + 0.5
+              return (
+                <path
+                  key={'ah' + l.strokeId}
+                  data-link-arrow={l.strokeId}
+                  d={`M ${ax + r * Math.cos(a1)} ${ay + r * Math.sin(a1)} L ${ax} ${ay} L ${ax + r * Math.cos(a2)} ${ay + r * Math.sin(a2)}`}
+                  fill="none"
+                  stroke={l.color}
+                  strokeWidth="2.4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              )
+            })}
+        </svg>
+        {links
+          .filter((l) => l.kind !== 'rel' || l.manual)
+          .map((l) => {
+            /* 词放在线的**旁边**（沿法线让开 16px），不是正中间 ——
+               线的中段常常写着你顺手写的条件（"仅当…"），压上去就挡住了。 */
+            const mx = l.mid.x * view.s + view.tx + -Math.sin(l.angle) * 16
+            const my = l.mid.y * view.s + view.ty + Math.cos(l.angle) * 16
+            return (
+              <button
+                key={'pill' + l.strokeId}
+                className="bd-linkpill"
+                data-link-kind={l.kind}
+                data-link-stroke={l.strokeId}
+                style={{ left: mx, top: my, color: l.color, borderColor: l.color }}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onPickLink?.(l)
+                }}
+                title={l.manual ? '你标过的关系：点一下可以改' : '按笔迹形状读出来的：点一下可以改'}
+              >
+                {l.name}
+                {l.dir ? ' →' : ''}
+              </button>
+            )
+          })}
+        {linkPick && (
+          <LinkChips
+            at={linkPick}
+            onPick={(kind) => onApplyLink?.(linkPick.strokeId, kind)}
+            onReverse={() => onApplyLink?.(linkPick.strokeId, linkPick.kind, { reverse: true })}
+            onHover={onLinkHover}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* 画完一条连接之后浮出来的那排词（见 Board.jsx 的 offerLink）。
+ * 它是**可选**的一步：不点也什么都有（连接早成立了，形状也读出来了），
+ * 点了就是把那个词钉成你要的。3.5 秒不点自己收走，指针停在上面就不收。
+ * 键盘 1~5 也能选（Board.jsx 的 onKey 里），鼠标用户不用去点这一小排。 */
+function LinkChips({ at, onPick, onReverse, onHover }) {
+  return (
+    <div
+      className="bd-linkchips"
+      data-link-pick={at.strokeId}
+      style={{ left: at.x, top: at.y }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onPointerEnter={() => onHover?.(true)}
+      onPointerLeave={() => onHover?.(false)}
+    >
+      <span className="bd-linkchips-t">这条线是</span>
+      {LINK_KINDS.map((k, i) => (
+        <button
+          key={k.id}
+          className={'bd-linkchip' + (k.id === at.kind ? ' on' : '')}
+          data-link-kind={k.id}
+          style={k.id === at.kind ? { background: k.color, borderColor: k.color, color: '#fff' } : { color: k.color, borderColor: k.color }}
+          onClick={(e) => {
+            e.stopPropagation()
+            onPick(k.id)
+          }}
+          title={`${k.hint}（按 ${i + 1}）`}
+        >
+          {k.name}
+          {k.dir ? ' →' : ''}
+        </button>
+      ))}
+      {at.dir && (
+        <button
+          className="bd-linkchip rev"
+          data-link-rev="1"
+          onClick={(e) => {
+            e.stopPropagation()
+            onReverse()
+          }}
+          title="方向反一下：把这一笔的起止倒过来（渲染出来一模一样，只是箭头换一边）"
+        >
+          ⇄
+        </button>
+      )}
+      <span className="bd-linkchips-x">不点也行</span>
     </div>
   )
 }

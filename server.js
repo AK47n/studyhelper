@@ -15,7 +15,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
-import { extractFilePart } from './src/lib/multipart.js'
+import { extractFilePart, extractTextPart } from './src/lib/multipart.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const argv = process.argv.slice(2)
@@ -308,6 +308,11 @@ async function handleApi(req, res, url) {
       })
     }
     const img = part.data
+    /* 这一次认的是公式还是普通文字？字段是表单里的 mode（前端 FormData 里带的）。
+       ★ 只认白名单里的两个值，别的一律当 formula —— 这个接口是给本机页面用的，
+         但"参数没校验"从来不是好习惯。认不出来就走老路，行为可预测。 */
+    const modeRaw = extractTextPart(raw, req.headers['content-type'] || '', 'mode')
+    const mode = modeRaw === 'text' ? 'text' : 'formula'
     // 只收图片：这是个只给本机前端用的接口，但"顺手当文件上传器"这种事不该发生
     const magic = img.subarray(0, 4)
     const isPng = magic[0] === 0x89 && magic[1] === 0x50 && magic[2] === 0x4e && magic[3] === 0x47
@@ -316,14 +321,26 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { ok: false, kind: 'bad', error: '收到的不是 PNG/JPEG 图片' })
     }
 
-    const r = await callProvider(cfg, img)
+    const r = await callProvider(cfg, img, { mode })
     if (!r.ok) {
       console.log(`  [手写识别] 失败（${r.kind}）：${r.error}`)
       return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
     }
+    if (mode === 'text') {
+      console.log(`  [手写美化] 认出文字：${String(r.text).slice(0, 70).replace(/\n/g, ' ⏎ ')}`)
+      return sendJson(res, 200, {
+        ok: true,
+        mode,
+        text: r.text,
+        conf: r.conf,
+        note: r.note || '',
+        debug: { bytes: img.length, endpoint: cfg.provider === 'simpletex' ? (cfg.turbo ? 'turbo' : 'standard') : cfg.dsBase, requestId: r.requestId },
+      })
+    }
     console.log(`  [手写识别] 认出：${r.latex.slice(0, 70)}${r.conf != null ? '（置信度 ' + r.conf + '）' : ''}`)
     return sendJson(res, 200, {
       ok: true,
+      mode,
       latex: r.latex,
       conf: r.conf,
       note: r.conf != null && r.conf < 0.6 ? '这次置信度偏低，多半得手动改两笔' : '',

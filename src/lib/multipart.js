@@ -71,7 +71,56 @@ export function extractFilePart(buf, contentType) {
         data: buf.subarray(dataStart, dataEnd),
       }
     }
-    pos = buf.indexOf(bBuf, next + bBuf.length)
+    /* ★ 下一个 part 就是**这个** boundary 后面那一段，所以从这里接着扫。
+       ⚠ 这里原来写的是 `buf.indexOf(bBuf, next + bBuf.length)` ——
+         那就等于把下一个 part 整个跳过，于是这个循环只看得到第 1、3、5… 个 part。
+         一直没出事，只是因为浏览器 FormData 里文件恰好排第一个（找到就返回了）。
+         手写美化要在同一个请求里加一个 mode 文本字段，这个坑才露出来：
+         `mode` 藏在第 2 个 part，永远扫不到 → 服务端会一直按"公式"处理。
+         修法就是从头扫全：**每一个 part 都要看，不能隔一个看一个。** */
+    pos = next
+  }
+  return null
+}
+
+/**
+ * 从 multipart 请求体里抠出**一个文本字段**（不是文件）。
+ *
+ * 为什么需要它：`/api/ocr` 除了那张图，还要知道"这次认的是公式还是普通文字"
+ * （mode 字段）。浏览器发的 FormData 里，文本字段排在文件**后面**，
+ * 所以扫描必须一路走过文件那一段 —— 这也正是它不能和 extractFilePart 合并的原因：
+ * 那个函数找到第一个"文件"就 return 了。
+ *
+ * ⚠ 和 extractFilePart 一样，全程在 Buffer 上按字节找边界。文本这一段最后才
+ *    toString('utf8')，绝不提前把整个 body（里面躺着 PNG）转成字符串。
+ */
+export function extractTextPart(buf, contentType, name) {
+  const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(String(contentType || ''))
+  if (!m) return null
+  const boundary = '--' + (m[1] || m[2]).trim()
+  const bBuf = Buffer.from(boundary, 'utf8')
+  const want = String(name || '')
+
+  let pos = buf.indexOf(bBuf)
+  while (pos >= 0) {
+    const headStart = pos + bBuf.length
+    const headEnd = buf.indexOf('\r\n\r\n', headStart)
+    if (headEnd < 0) return null
+    const header = buf.subarray(headStart, headEnd).toString('utf8')
+
+    const dataStart = headEnd + 4
+    const next = buf.indexOf(bBuf, dataStart)
+    if (next < 0) return null
+    let dataEnd = next
+    if (buf[dataEnd - 2] === 0x0d && buf[dataEnd - 1] === 0x0a) dataEnd -= 2
+
+    const nameMatch = /name="([^"]*)"/i.exec(header)
+    const fileMatch = /filename="([^"]*)"/i.exec(header)
+    // 文件部分跳过（不能把 PNG 当文本读），只认要的那个文本字段
+    if (!fileMatch && nameMatch && nameMatch[1] === want) {
+      return buf.subarray(dataStart, dataEnd).toString('utf8')
+    }
+    pos = next
   }
   return null
 }

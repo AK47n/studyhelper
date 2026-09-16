@@ -106,9 +106,35 @@ export async function ocrTest() {
   return r || { ok: false, error: '连不上本地服务' }
 }
 
-/* 真正识别。返回 {ok, latex, conf} 或 {ok:false, kind, error}。
+/* 服务端回话怎么理解。**抽成纯函数**，因为它必须在 node 里能被断言 ——
+   这条链路上最容易出的错是"看着成功、其实走错了路"。
+
+   ★ 为什么必须有 mode 这一道（2026-09-16 用户报的"美化手写依旧在认公式"）：
+     改了 server.js / server-ocr.js 之后**不重启服务**，5177 上跑的还是老代码 ——
+     老代码不认 mode 字段，于是它照样按公式认，回一个 { ok, latex }。
+     前端要是照单全收，就会把一串 LaTeX 塞进文字卡（用户看到一堆反斜杠花括号），
+     而且**不报任何错**。而这次的前端是新版、服务端是旧版，光看界面根本想不到。
+     所以：认文字的成功回包里**必须**带 `mode:'text'`（新版服务端会回），
+     没带就是"服务端没重启"，当场说清而不是把错东西写进卡片。 */
+export function interpretOcrResponse(body, mode = 'formula') {
+  if (!body || typeof body !== 'object') return { ok: false, kind: 'bad', error: '识别服务返回了看不懂的内容' }
+  if (!body.ok) return { ok: false, kind: body.kind || 'bad', error: body.error || '识别失败' }
+  if (mode === 'text' && body.mode !== 'text') {
+    return {
+      ok: false,
+      kind: 'stale',
+      error: '本地服务还是旧版：它没收到"这次要认文字"，回的是认公式的结果。'
+        + '把 studyhelper 关掉再打开一次（或双击一次桌面开关：关→再开），然后重新点识别。',
+    }
+  }
+  return { ok: true, latex: body.latex, text: body.text, conf: body.conf, note: body.note }
+}
+
+/* 真正识别。返回 {ok, latex} 或 {ok, text}（看 opts.mode），失败给 {ok:false, kind, error}。
    kind：'no-key'（没配密钥）| 'key'（密钥不对/没权限）| 'quota'（额度用完）
-        | 'network'（连不上）| 'empty'（没认出东西）| 'bad'（服务返回了看不懂的东西） */
+        | 'network'（连不上）| 'empty'（没认出东西）| 'provider'（这家服务干不了这件事）
+        | 'stale'（本地服务是旧版，没重启）| 'bad'（服务返回了看不懂的东西）
+   mode：'formula'（默认）| 'text'（认普通文字，白板的「美化手写」用） */
 export async function recognizeHandwriting(strokes, opts = {}) {
   const payload = await strokesToImagePayload(strokes, opts)
   if (!payload) return { ok: false, kind: 'empty', error: '没选中任何笔迹' }
@@ -125,8 +151,12 @@ export async function recognizeHandwriting(strokes, opts = {}) {
   }
   const body = await res.json().catch(() => null)
   if (!body) return { ok: false, kind: 'bad', error: `识别服务返回了看不懂的内容（HTTP ${res.status}）` }
-  if (!body.ok) return { ok: false, kind: body.kind || 'bad', error: body.error || '识别失败' }
-  return { ok: true, latex: body.latex, conf: body.conf, note: body.note, debug: { ...body.debug, sentSize: payload.size, sentScale: round2(payload.scale) } }
+  const parsed = interpretOcrResponse(body, opts.mode)
+  if (!parsed.ok) return parsed
+  return {
+    ...parsed,
+    debug: { ...body.debug, sentSize: payload.size, sentScale: round2(payload.scale) },
+  }
 }
 
 const round2 = (n) => Math.round(Number(n) * 100) / 100
@@ -141,6 +171,30 @@ export function cleanLatex(raw) {
   else if (s.startsWith('$') && s.endsWith('$') && s.length > 2) s = s.slice(1, -1).trim()
   // \[ \] 和 \( \) 也剥掉（不同服务的习惯不一样）
   s = s.replace(/^\\\[|\\\]$/g, '').replace(/^\\\(|\\\)$/g, '').trim()
+  return s
+}
+
+/* 认普通文字的结果怎么清。
+   ⚠ 和 cleanLatex 是两回事，别合并 —— 公式那套会剥 `$`、认「最后一个冒号后面」，
+      而笔记里到处是冒号和 `$`：拿公式的规则去清文字，会把用户写的一整行砍掉半句，
+      而且**界面上看不出来**（卡片里就是少了一段字，你会以为是自己没写全）。
+      服务端有一份一样的（server-ocr.js 的 cleanTextOutput），
+      两边行为要一致：服务端兜"前端拿到的脏内容"，前端兜"写进卡片之前"。
+      两份都很短，且 check-ocr-server.js 会断言两边一致。 */
+export function cleanText(raw) {
+  let s = String(raw == null ? '' : raw).trim()
+  if (!s) return ''
+  const fence = /```(?:text|markdown|md|plain|latex|tex)?\s*([\s\S]*?)```/i.exec(s)
+  if (fence) s = fence[1].trim()
+  const pairs = [['"', '"'], ['“', '”'], ["'", "'"], ['「', '」'], ['『', '』']]
+  for (const [a, b] of pairs) {
+    if (s.length > 1 && s.startsWith(a) && s.endsWith(b) && !s.slice(1, -1).includes(b)) {
+      s = s.slice(1, -1).trim()
+      break
+    }
+  }
+  // 句末的句号有半角也有全角（"这张图里没有文字。"）—— 和 server-ocr.js 那份一致
+  if (/^(EMPTY|N\/A|无|没有文字|图片中没有文字|这张图.*没有(文字|内容))[.。]?$/i.test(s)) return ''
   return s
 }
 

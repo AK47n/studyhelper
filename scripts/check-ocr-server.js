@@ -17,11 +17,12 @@
  * 跑：npm run check:ocr
  */
 import http from 'node:http'
-import { extractFilePart, buildMultipart } from '../src/lib/multipart.js'
+import { extractFilePart, extractTextPart, buildMultipart } from '../src/lib/multipart.js'
 import { httpRequest } from '../src/lib/http.js'
+import { cleanText, interpretOcrResponse } from '../src/lib/ocr.js'
 import {
-  DEFAULT_CONFIG, PROVIDERS, authHeaders, callDeepSeek, callProvider, callSimpleTex, cleanLatex,
-  cleanModelOutput, configFile, endpointOf, hasKey, loadConfig, normalizeConfig, parseProviderResponse,
+  DEFAULT_CONFIG, PROVIDERS, TEXT_PROMPT, authHeaders, callDeepSeek, callProvider, callSimpleTex, cleanLatex,
+  cleanModelOutput, cleanTextOutput, configFile, endpointOf, hasKey, loadConfig, normalizeConfig, parseProviderResponse,
   publicStatus, saveConfig, testProvider, tinyWhitePng,
 } from '../server-ocr.js'
 
@@ -401,9 +402,154 @@ console.log('\n[7] httpRequest：真的能把 body 发出去并收回 JSON')
   slow.close()
 }
 
+// ═════════════════════ 8. 认普通文字（白板「美化手写」那条路） ═════════════════════
+/* 这一节钉的是**两条路必须不一样**：认公式和认文字共用同一个接口、同一个 provider，
+   差别全在 mode 上。混起来的后果都很安静 ——
+   发错提示词（拿到一堆解释）、用错清洗规则（把用户写的半句话砍掉），
+   界面上都不会报错，只会"认出来不对劲"。 */
+console.log('\n[8] mode=text：认普通文字')
+{
+  const png = tinyWhitePng(8, 8)
+
+  // ── mode 是 multipart 里的一个文本字段，而且排在文件**后面** ──
+  const { body, contentType } = buildMultipart([
+    { name: 'file', filename: 'ink.png', type: 'image/png', data: png },
+    { name: 'mode', data: 'text' },
+  ])
+  eq(extractTextPart(body, contentType, 'mode'), 'text', '读得出 mode=text（它在文件那一段的后面，扫描得走过去）')
+  /* ★ 文本字段排在**文件前面**时，文件也得找得到。
+     这一条钉的是一个老 bug：multipart 的扫描原来是"每轮跳过下一个 part"，
+     于是只看得到第 1、3、5… 个 part。以前浏览器总是把 file 排第一，所以没露出来。 */
+  const swapped = buildMultipart([
+    { name: 'mode', data: 'text' },
+    { name: 'file', filename: 'ink.png', type: 'image/png', data: png },
+  ])
+  const sBack = extractFilePart(swapped.body, swapped.contentType)
+  if (sBack && Buffer.compare(sBack.data, png) === 0) ok('文本字段排在前面时，后面的图照样找得到（不再隔一个 part 看一个）')
+  else bad('文件排在第二个就找不到了 —— 扫描漏了偶数位那个 part')
+  eq(extractTextPart(swapped.body, swapped.contentType, 'mode'), 'text', '文本字段排在前面时也读得到')
+  const back = extractFilePart(body, contentType)
+  if (back && Buffer.compare(back.data, png) === 0) ok('同一个包里那张图仍然逐字节完整（多一个文本字段没把它切坏）')
+  else bad('加了文本字段之后图被切坏了 —— 这正是"识别服务说看不懂这张图"的来源')
+  eq(extractTextPart(body, contentType, 'nope'), null, '没有这个字段 → null（不是空串，别把两者混起来）')
+  eq(extractTextPart(png, 'image/png', 'mode'), null, '不是 multipart → null，不崩')
+
+  // ── 清洗：文字这条**必须**和公式那条不同 ──
+  eq(cleanTextOutput('安培环路定理：只对稳恒电流成立'), '安培环路定理：只对稳恒电流成立', '★ 冒号不动它 —— 整行都在')
+  eq(cleanModelOutput('安培环路定理：只对稳恒电流成立'), '', '（对照）公式那条规则把它当"一句人话"整句丢掉 —— 所以两边必须是两个函数')
+  eq(cleanTextOutput('第一行\n第二行'), '第一行\n第二行', '多行原样保留（公式那条只留"最像 LaTeX"的一行）')
+  eq(cleanTextOutput('```\n一段笔记\n```'), '一段笔记', '``` 围栏剥掉（说了不要，模型还是会包）')
+  eq(cleanTextOutput('“一句话”'), '一句话', '整段被成对引号包着 → 剥掉')
+  eq(cleanTextOutput('EMPTY'), '', 'EMPTY → 没认出')
+  eq(cleanTextOutput('这张图里没有文字。'), '', '"没有文字" → 没认出')
+  eq(cleanTextOutput(''), '', '空回话 → 空')
+  eq(cleanTextOutput(null), '', 'null → 空，不崩')
+
+  /* 前端那份（src/lib/ocr.js 的 cleanText）和服务端这份各写了一遍 ——
+     两份就必须**逐例一致**，否则"服务端清干净了、前端又清坏一遍"。 */
+  const samples = ['a：b', '第一行\n第二行', '```\nx\n```', '“引用”', '「引用」', 'EMPTY', '', '  留白  ', '上面：下面\n第三行']
+  const diff = samples.filter((s) => cleanTextOutput(s) !== cleanText(s))
+  if (!diff.length) ok(`前端那份 cleanText 和服务端逐例一致（${samples.length} 个样例）`)
+  else bad('两边清洗结果不一致：' + JSON.stringify(diff.map((s) => [s, cleanTextOutput(s), cleanText(s)])))
+
+  // ── SimpleTex 干不了这件事，而且要当场说清换哪一家 ──
+  const sx = normalizeConfig({ provider: 'simpletex', base: 'http://127.0.0.1:1/api/latex_ocr', token: 'test-token-123456' })
+  const rp = await callProvider(sx, png, { mode: 'text' })
+  eq(rp.kind, 'provider', 'SimpleTex + 认文字 → 单独一类错（不是笼统的"识别失败"）')
+  if (/DeepSeek/.test(rp.error)) ok('这句提示直接告诉用户该换成 DeepSeek')
+  else bad('错误提示里没说该换哪一家：' + rp.error)
+
+  // ── DeepSeek 走 text：发出去的必须是**另一段提示词** ──
+  const seen = []
+  let reply = { code: 200, body: { choices: [{ message: { content: '```\n安培环路定理：只对稳恒电流成立\n```' } }] } }
+  const srv = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      let json = null
+      try {
+        json = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {}
+      seen.push({ url: req.url, json })
+      res.writeHead(reply.code, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(reply.body))
+    })
+  })
+  const port = await new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)))
+  const ds = normalizeConfig({ provider: 'deepseek', dsBase: `http://127.0.0.1:${port}/chat/completions`, token: 'sk-test-abcdefgh' })
+
+  const rt = await callProvider(ds, png, { mode: 'text' })
+  eq(rt.ok, true, '认普通文字 → 成功')
+  eq(rt.text, '安培环路定理：只对稳恒电流成立', '围栏剥掉了，而且**整行都在**（冒号没被当成分隔符）')
+
+  const promptOf = (req) => {
+    const c = req && req.json && req.json.messages && req.json.messages[0] && req.json.messages[0].content
+    const t = Array.isArray(c) ? c.find((x) => x.type === 'text') : null
+    return (t && t.text) || ''
+  }
+  const pText = promptOf(seen[0])
+  if (pText === TEXT_PROMPT) ok('发出去的是认文字那段提示词（原样，没被改过）')
+  else bad('提示词不对：' + pText.slice(0, 80))
+  if (/换行/.test(pText)) ok('提示词里要求保留换行（不然两行笔记会被连成一坨）')
+  else bad('提示词没提换行')
+  if (/不要.*LaTeX/.test(pText)) ok('提示词里写明了别把符号转成 LaTeX（文字卡是纯文本，转了就是一堆反斜杠）')
+  else bad('提示词没挡住 LaTeX 转换')
+
+  // 公式模式不能被这次改动带跑偏：不传 mode 时还是老样子
+  reply = { code: 200, body: { choices: [{ message: { content: 'B=\\frac{a}{b}' } }] } }
+  const rf = await callProvider(ds, png)
+  eq(rf.latex, 'B=\\frac{a}{b}', '不传 mode（老调用方）→ 还是走公式那条路')
+  if (promptOf(seen[1]) !== TEXT_PROMPT) ok('公式模式发的仍是公式提示词（两条路没有串）')
+  else bad('公式模式也发成了文字提示词 —— 老功能会认出一堆解释')
+
+  srv.close()
+}
+
+// ═════════════════════ 9. 服务端没重启时不许"悄悄认成公式" ═════════════════════
+/* 2026-09-16 用户报的原话：「美化手写依旧在认公式而不是字」。
+ *
+ * 根因不是这段逻辑，而是**改了 server-ocr.js 却没重启服务**：
+ * 5177 上跑的还是启动那一刻加载的模块，它不认 mode 字段，
+ * 于是照样按公式认、回一个 { ok, latex }。而前端是新构建的 ——
+ * 一半新一半旧，界面上一句报错都没有，看起来就是"功能没做对"。
+ *
+ * 这条链路上必须有东西**当场认出"服务端是旧的"**，否则用户拿到的是
+ * 一串塞进文字卡里的 LaTeX（反斜杠花括号），而且完全不知道哪里错了。
+ * 两道防线：
+ *   ① 面板读 /api/ocr/status 里的 `providers[p].modes` —— 老服务端根本没这个字段；
+ *   ② 真发出去之后，认文字的**成功回包必须带 mode:'text'**，没带就拒收。
+ * 这一节钉的是第 ② 道（纯函数，能在这里断言）。 */
+console.log('\n[9] 服务端旧版：不许把"认公式的结果"当成文字收下')
+{
+  const staleBody = { ok: true, latex: 'B=\\frac{\\mu_0 I}{2\\pi r}', conf: null }
+  const r1 = interpretOcrResponse(staleBody, 'text')
+  eq(r1.ok, false, '认文字收到一个"没有 mode 字段"的成功回包 → **拒收**')
+  eq(r1.kind, 'stale', '归类成 stale（不是 bad，也不是成功）—— 界面才能给出"重启服务"这句下一步')
+  if (/重启|关掉再打开/.test(r1.error)) ok('错误里直接说了该重启：' + r1.error.slice(0, 40) + '…')
+  else bad('没说清该干什么：' + r1.error)
+
+  // 新版服务端的成功回包：带 mode:'text'
+  const good = interpretOcrResponse({ ok: true, mode: 'text', text: '安培环路定理', conf: null }, 'text')
+  eq(good.ok, true, '新版服务端（回包带 mode:text）→ 正常收下')
+  eq(good.text, '安培环路定理', '文字原样拿到')
+  // 公式这条老路不能被误伤：回包里本来就没有 mode 的时代也照样能用
+  eq(interpretOcrResponse({ ok: true, latex: 'x^2', conf: 0.9 }, 'formula').ok, true, '公式模式不检查 mode（老回包照样收）')
+  eq(interpretOcrResponse({ ok: true, mode: 'formula', latex: 'x^2' }, 'formula').latex, 'x^2', '公式模式拿到 latex')
+  // 不传 mode = 老调用方的默认行为
+  eq(interpretOcrResponse({ ok: true, latex: 'x^2' }).ok, true, '不传 mode（默认公式）→ 收下')
+  // 错误回包原样透传，别被这道防线改写成 stale
+  eq(interpretOcrResponse({ ok: false, kind: 'no-key', error: '还没填密钥' }, 'text').kind, 'no-key', '失败回包原样透传（不覆盖成 stale）')
+  eq(interpretOcrResponse(null, 'text').kind, 'bad', '空回包 → bad，不崩')
+
+  /* 第 ① 道防线就在 status 里：`modes` 是老服务端不会有的字段。
+     这里断言它确实跟着 PROVIDERS 一起发出去（面板靠它提前警告）。 */
+  const st = publicStatus(normalizeConfig({ provider: 'deepseek' }))
+  eq(st.providers.deepseek.modes, ['formula', 'text'], 'status 里报得出"DeepSeek 能认公式也能认文字"（老服务端没这个字段）')
+  eq(st.providers.simpletex.formulaOnly, true, 'status 里说清了 SimpleTex 只认公式（面板据此提前警告，而不是等失败）')
+}
+
 console.log('\n' + '─'.repeat(56))
-if (fails) {
-  console.log(`  ${checks} 项通过，${fails} 项失败`)
+if (fails) {  console.log(`  ${checks} 项通过，${fails} 项失败`)
   process.exit(1)
 } else {
   console.log(`  全部 ${checks} 项通过`)

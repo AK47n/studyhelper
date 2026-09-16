@@ -7,11 +7,14 @@
  * 跑：npm run check:board
  */
 import {
-  NEAR_GAP, READABLE_FIT_S, buildRelations, descendantsOf, fitView, inkedEdges, isBoardDocument, newBoard,
-  newCard, newStroke, parseBoardDocument, pointSegDist, relationCurve, screenToWorld,
-  serializeBoardDocument, simplifyPoints, strokeBounds, strokeHitsCircle, toFlat, toPoints,
-  worldToScreen, zoomAt,
+  CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
+  DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
+  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
+  descendantsOf, findTip, fitView, fontCss, inkedEdges, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
+  parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
+  strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
 } from '../src/lib/board.js'
+import { readFileSync } from 'node:fs'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 
 let fails = 0
@@ -449,6 +452,424 @@ console.log('\n[6] 存取：round-trip 不能丢东西')
   eq(dirty.cards.length, 2, 'null 卡片丢掉，认不出的 kind 归成便签')
   eq(dirty.cards[0].w, 260, '尺寸太小的框被拉回默认值（不然框里什么都放不下）')
   near(dirty.view.s, 1, 1e-9, '非法的缩放被拉回 1')
+}
+
+// ═════════════════════ 6b. 文字卡：字体和落点 ═════════════════════
+/* 「美化手写」那一步的产物是一张**文字卡**（kind=note + 一个字体预设）。
+   这里钉三件事，全是"坏了也不报错、只是在屏幕上慢慢不对"的类型：
+     ① 字体表里不能有网络字体（白板不上传这条底线，也包括不为好看去联网拉字体）；
+     ② 默认字体**不写进文件**（否则所有老板文件在 Git 里凭空变脏）；
+     ③ 卡片落点必须钉在那块笔迹的**左上角**、宽度跟着它 ——
+        这是"卡片盖住丑字、拖开就变回手写"的全部机制，偏一点就露馅。 */
+console.log('\n[6b] 文字卡：字体和落点')
+{
+  if (CARD_FONTS.length >= 3) ok(`字体预设 ${CARD_FONTS.length} 种：${CARD_FONTS.map((f) => f.name).join(' / ')}`)
+  else bad('字体预设太少，用户没得挑')
+  if (CARD_FONTS.every((f) => f.id && f.name && f.css && !/url\(|@font-face|https?:/.test(f.css))) {
+    ok('每一项都是纯 CSS 候选串（系统里有哪个用哪个，不下载任何字体）')
+  } else bad('字体表里混进了网络字体 —— 那就破"不联网"这条底线了')
+  if (CARD_FONT_IDS.includes(DEFAULT_CARD_FONT)) ok('默认字体在表里')
+  else bad('默认字体不在表里，渲染层会拿不到它')
+  eq(fontCss('这个字体不存在'), fontCss(DEFAULT_CARD_FONT), '认不出的字体 id → 退回默认（不是 undefined）')
+  eq(newCard('note', 0, 0).font, DEFAULT_CARD_FONT, '新建的文字卡带默认字体')
+
+  // ── 老文件：没有 font 字段 ──
+  const b0 = makeBoard()
+  b0.cards.push({ ...newCard('note', 100, 100), id: 'n1', text: '安培环路定理' })
+  delete b0.cards[0].font
+  const s0 = serializeBoardDocument(b0)
+  if (!/"font"/.test(s0)) ok('默认字体**不写进文件**（老板文件打开一次不会整块变成"已修改"）')
+  else bad('默认字体被写进文件了 —— 所有老板文件会在 Git 里凭空变脏')
+  const r0 = parseBoardDocument(s0, 'x')
+  eq(r0.cards[0].font, DEFAULT_CARD_FONT, '老板文件（没这个字段）读进来也有默认字体')
+  if (serializeBoardDocument(r0) === s0) ok('老板文件：存→读→再存 字节级一致（不会造假 diff）')
+  else bad('老板文件往返不一致')
+
+  // ── 选了非默认字体 ──
+  const b1 = makeBoard()
+  b1.cards.push({ ...newCard('note', 100, 100), id: 'n1', text: '安培环路定理', font: 'hei' })
+  const s1 = serializeBoardDocument(b1)
+  if (/"font": "hei"/.test(s1)) ok('选了非默认字体 → 写进文件（这样重新打开还记得住）')
+  else bad('非默认字体没写进文件，重新打开会变回楷体')
+  const r1 = parseBoardDocument(s1, 'x')
+  eq(r1.cards[0].font, 'hei', '读回来还是黑体')
+  if (serializeBoardDocument(r1) === s1) ok('非默认字体往返也字节级一致')
+  else bad('非默认字体往返不一致')
+  const dirtyFont = parseBoardDocument(
+    JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'x', font: 'Comic Sans MS' }] }),
+    'x'
+  )
+  eq(dirtyFont.cards[0].font, DEFAULT_CARD_FONT, '文件里手改出一个不认识的字体 id → 退回默认（渲染层拿不到脏值）')
+
+  /* ── 落点：卡片的左上角钉在那块笔迹的左上角（但**不负责盖住它**）──
+     卡片只管贴合自己的内容；"盖住"那套 2026-09-16 按用户要求拆掉了
+     （「不用盖住，就让框贴合公式和字就行」）。 */
+  const box = { x0: 120, y0: 80, x1: 420, y1: 180 } // 300 × 100
+  const one = textCardRect(box, '安培环路定理')
+  eq([one.x, one.y], [120, 80], '左上角钉在圈的那块笔迹的左上角（落点，不是"盖住"）')
+  eq(one.w, 300, '宽度先跟着那块笔迹走（插进去之后按真实自然宽再收一次）')
+  eq(textCardRect({ x0: 0, y0: 0, x1: 40, y1: 30 }, '字').w, TEXT_CARD_MIN_W, '框很小 → 宽度有下限（不然窄得放不下一个字）')
+  eq(textCardRect({ x0: 0, y0: 0, x1: 5000, y1: 40 }, '字').w, TEXT_CARD_MAX_W, '框特别宽 → 有上限（一行拉太长没法读）')
+  /* ★ 这一条是"不再盖住"的钉子：圈一个很高很空的框，卡片也不该跟着变高 ——
+     高度只按**内容**估。上一版这里会等价于"至少和那块笔迹一样高"。 */
+  const tallBox = { x0: 0, y0: 0, x1: 300, y1: 900 }
+  eq(textCardRect(tallBox, '一行字').h, textCardRect({ x0: 0, y0: 0, x1: 300, y1: 20 }, '一行字').h,
+    '圈得再高也不影响卡片高度（高度只跟内容有关，不再撑大去盖那块笔迹）')
+
+  const longText = '字'.repeat(160)
+  const long = textCardRect(box, longText)
+  if (long.h > one.h) ok(`文字多 → 卡片自己长高（${one.h} → ${long.h}）`)
+  else bad('文字多了高度不变，字会溢出卡片外面')
+  const narrow = { x0: 0, y0: 0, x1: 40, y1: 30 }
+  if (textCardRect(narrow, longText).h > long.h) ok('框窄 → 行数更多、卡片更高（排版估算是跟着宽度算的）')
+  else bad('宽度没参与高度估算')
+  eq(textCardRect(box, '第一行\n第二行').h, 2 * TEXT_CARD_LINE_H + TEXT_CARD_PAD_Y, '换行被算成两行（卡片不会把两行挤成一行）')
+  /* emoji / 生僻字在 JS 里是**两个 UTF-16 单位**。按 .length 数会把它当成两个字，
+     行长估多一倍 —— 卡片高度就和真的行数对不上（字压在边框上）。
+     窄框（宽 220 → 每行 13 个字）下这个差别一眼能看出来：52 vs 78。 */
+  eq(textCardRect(narrow, '🙂'.repeat(13)).h, textCardRect(narrow, '字'.repeat(13)).h, 'emoji 也按一个字算（不是两个）')
+  eq(textCardRect(box, '').h, one.h, '空文字不崩，高度按一行算')
+
+  /* ── 放大缩小（拖右下角那个柄）──
+     倍率是**一个数管全部**：字号、内边距、宽高一起乘它。
+     只改宽高不把字号跟着变的话，卡片越拉越大、字还是那么小（看着像坏了），
+     所以这里钉的其实是"那个数怎么算"。 */
+  const base = newCard('note', 0, 0, { w: 260, h: 96 })
+  eq(base.scale, DEFAULT_CARD_SCALE, '新建的卡片倍率是 1（原样）')
+  near(nextCardScale(base, 1), 1, 1e-9, '没拖动 → 倍率不变')
+  near(nextCardScale(base, 2), 2, 1e-9, '拖到两倍宽 → 倍率 2（字跟着一起变）')
+  eq(nextCardScale(base, 0.001), CARD_MIN_SCALE, '往小拖到底 → 夹在倍率下限')
+  eq(nextCardScale(base, 1000), CARD_MAX_SCALE, '往大拖到底 → 夹在倍率上限')
+  /* ★ 这两条是"世界宽度"那一层夹：只夹倍率的话，宽卡片乘 4 能铺满整块板 */
+  {
+    const wideK = nextCardScale({ w: 1500, scale: 1 }, 4)
+    if (wideK * 1500 <= CARD_MAX_W + 1e-6) ok(`本来就很宽的卡也夹住了（1500 × ${round(wideK)} = ${round(wideK * 1500)} ≤ ${CARD_MAX_W}）`)
+    else bad(`宽卡乘出来后 ${round(wideK * 1500)} 宽，超过了上限 ${CARD_MAX_W}`)
+    const tinyK = nextCardScale({ w: 120, scale: 1 }, 0.5)
+    if (tinyK * 120 >= CARD_MIN_W - 1e-6) ok(`窄卡不会缩到看不见（120 × ${round(tinyK)} = ${round(tinyK * 120)} ≥ ${CARD_MIN_W}）`)
+    else bad(`窄卡缩成了 ${round(tinyK * 120)} 宽，比下限还小`)
+  }
+  eq(clampCardScale(0), DEFAULT_CARD_SCALE, '倍率 0 → 退回 1（0 就是"整张卡看不见"）')
+  eq(clampCardScale(-3), DEFAULT_CARD_SCALE, '负倍率 → 退回 1')
+  eq(clampCardScale(NaN), DEFAULT_CARD_SCALE, 'NaN → 退回 1，不崩')
+  eq(clampCardScale('两倍'), DEFAULT_CARD_SCALE, '字符串 → 退回 1')
+
+  // 存取：默认不写（老板文件不能凭空变脏）、非默认要写、脏值要退回
+  const bs = makeBoard()
+  bs.cards.push({ ...newCard('note', 100, 100), id: 's1', text: '放大过的便签' })
+  const ts1 = serializeBoardDocument(bs)
+  if (!/"scale"/.test(ts1)) ok('倍率 1（原样）**不写进文件**（老板文件不会凭空变成"已修改"）')
+  else bad('默认倍率被写进文件了')
+  bs.cards[0].scale = 2.5
+  const ts2 = serializeBoardDocument(bs)
+  if (/"scale": 2.5/.test(ts2)) ok('放大过的卡片写进文件（重新打开还是大的）')
+  else bad('倍率没写进文件，重新打开会变回原样')
+  eq(parseBoardDocument(ts2, 'x').cards[0].scale, 2.5, '读回来还是 2.5')
+  if (serializeBoardDocument(parseBoardDocument(ts2, 'x')) === ts2) ok('倍率往返字节级一致')
+  else bad('倍率往返不一致（会在 Git 里造假 diff）')
+  eq(
+    parseBoardDocument(JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'x', scale: -3 }] }), 'x').cards[0].scale,
+    DEFAULT_CARD_SCALE,
+    '文件里手改出负数倍率 → 退回 1（渲染层拿不到脏值）'
+  )
+
+  /* ── 高度贴着内容（"留白太多"治的就是这条）──
+     内容渲染多高 → h 该是多少：除以视图缩放和卡片倍率，再夹上限。
+     ★ 量的是**内容**（.bd-card-body），不是卡片自己 —— 卡片的 min-height 就是 h，
+       量它等于量自己，96 的卡量出来永远还是 96，底下的空白永远消不掉。 */
+  near(cardHeightFromContent(44, { s: 1.1, scale: 1 }), 40, 0.05, '内容 44px ÷ 视图缩放 1.1 → h = 40 世界像素')
+  near(cardHeightFromContent(44, { s: 1.1, scale: 2 }), 20, 0.05, '卡片自己放大 2 倍 → 折算回的世界高度减半（倍率也算进去）')
+  eq(cardHeightFromContent(3, { s: 1 }), CARD_MIN_H, '内容再矮也有下限（不然卡片成一条线）')
+  eq(cardHeightFromContent(300, { s: 1 }), 300, '内容多高 → h 就是多少（不再有"至少要盖住笔迹"那种下限）')
+  eq(cardHeightFromContent(0, { s: 1 }), CARD_MIN_H, '量不到（0）也不崩，退回下限')
+  eq(cardHeightFromContent(44, { s: 0 }), 44, 's 还是 0（容器还没量出来）也不会除以 0')
+  {
+    const h1 = cardHeightFromContent(57.3, { s: 1.117, scale: 1 })
+    const h2 = cardHeightFromContent(h1 * 1.117, { s: 1.117, scale: 1 })
+    near(h2, h1, 0.05, '量一遍写回去、再量一遍还是同一个数（不会来回振荡 —— 振荡就是每存一次盘造一条假 diff）')
+  }
+  // 新默认值：贴着内容，不再是"一行字下面空一大截"的那种框
+  eq(DEFAULT_CARD_SIZE.h, 44, '新卡片的默认高度贴着内容（原来是 96）')
+  eq(TEXT_CARD_PAD_Y, 14, '文字卡高度的上下留白估算收到 14（原来 26）')
+  /* ⚠ 这两条是一对：h 的"当没写"阈值必须跟 CARD_MIN_H 对齐。
+     识别插进来的卡可能只有 30 出头，阈值要是还写死 32，它们每次存盘都会被抬回默认值。 */
+  eq(
+    parseBoardDocument(JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'x', h: 30 }] }), 'x').cards[0].h,
+    30,
+    'h=30 的小卡片读回来还是 30（阈值和 CARD_MIN_H 对齐，不会被抬回默认值）'
+  )
+  eq(
+    parseBoardDocument(JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'x', h: 3 }] }), 'x').cards[0].h,
+    DEFAULT_CARD_SIZE.h,
+    'h=3 这种荒谬值当没写 → 默认值'
+  )
+
+  /* ── 宽度：**公式卡和文字卡都量**（"就让框贴合公式和字"）──
+     用户 2026-09-16 第二次报"识别公式留白依旧很多"，说的就是这一轴：
+     公式卡一直是 260 宽，一行 `E = mc²` 只有 60 出头，居中之后左右全是空的。
+     文字卡的自然宽度也量了（= 最长那一行）—— 识别结果保住了你写的换行，
+     所以不会变成一长条；超过 TEXT_CARD_MAX_W 才折行。 */
+  near(cardWidthFromContent(88, { s: 1.1, scale: 1 }), 80, 0.05, '公式自然宽 88px ÷ 视图缩放 1.1 → w = 80 世界像素')
+  eq(cardWidthFromContent(5, { s: 1 }), CARD_FIT_MIN_W, '再窄的公式也有下限（不然卡片看着像一条缝）')
+  eq(cardWidthFromContent(99999, { s: 1 }), CARD_MAX_W, '很长的公式卡在上限（不然能拉到屏幕外面）')
+  eq(cardWidthFromContent(80, { s: 1 }), 80, '没有"至少盖住笔迹"那种下限了：内容多宽就是多宽')
+  eq(cardWidthFromContent(0, { s: 1 }), CARD_FIT_MIN_W, '量不到（0）也不崩，退回下限')
+  /* ★★ 内边距/边框也要算进去（全局 `box-sizing: border-box`）。
+     这一条钉的是一个真踩过的 bug：卡片上写的 `width` 是 **border-box**，
+     内容实际拿到的是 `width − 内边距 − 边框`。算尺寸时忘了加这一圈，
+     内容就被**当场裁掉** —— 实测 `E = mc²` 的 `c²` 直接不见了（差 18px）。
+     讽刺的是当时那两条"卡宽 − 自然宽"的断言还是**绿的**：两边都错在同一个数上。 */
+  near(cardWidthFromContent(76, { s: 1, scale: 1, padPx: 18 }), 94, 0.05, '内容需要 76px + 内边距边框 18px → 卡片 94px（border-box）')
+  near(cardHeightFromContent(63, { s: 1, scale: 1, padPx: 10 }), 73, 0.05, '内容 63px + 上下内边距边框 10px → 卡片 73px')
+  near(cardWidthFromContent(76.31, { s: 1 }), 76.4, 0.001, '宽度向上取整到 0.1（宽度是硬约束，宁可大一点也不能裁内容）')
+  /* 文字卡的宽度下限仍然明显大于公式卡：一段话收成 60 宽会一行一个字。 */
+  if (TEXT_CARD_MIN_W > CARD_FIT_MIN_W) {
+    ok(`公式卡可以收到 ${CARD_FIT_MIN_W}，文字卡仍有 ${TEXT_CARD_MIN_W} 的下限 —— 一段话不会被收成一条缝`)
+  } else bad('文字卡的宽度下限不该比公式卡还小')
+}
+
+// ═════════════════════ 6c. 卡片的「固定」（locked） ═════════════════════
+/* 用户 2026-09-16：「给卡片加一个固定按钮用来防止误触」。
+   纯逻辑这一层管两件事：字段怎么读、什么时候写。
+   行为（拖不动/双击不进去/📌 还点得到）在 check-lock.js 里用真浏览器钉。 */
+console.log('\n[6c] 卡片的「固定」（locked）')
+{
+  eq(newCard('formula', 0, 0).locked, undefined, '新建的卡没有 locked 字段（默认就是不固定）')
+
+  const b = makeBoard()
+  b.cards.push({ ...newCard('note', 100, 100), id: 'n1', text: '安培环路定理', locked: true })
+  const s = serializeBoardDocument(b)
+  if (/"locked": true/.test(s)) ok('固定住了 → 写进文件（重开还记得住）')
+  else bad('固定没写进文件，重开会自己解开')
+
+  const r = parseBoardDocument(s, 'x')
+  eq(r.cards[0].locked, true, '读回来还是固定着的')
+  if (serializeBoardDocument(r) === s) ok('固定往返字节级一致（不造假 diff）')
+  else bad('固定往返不一致')
+
+  /* ★ 没固定的卡**不许写这个字段**。理由和 font / scale 完全一样：
+     老文件里一张卡都没有 locked，凭空写出去 = 用户一打开软件，
+     所有老板文件在 Git 里整块变成"已修改"。 */
+  const b2 = makeBoard()
+  b2.cards.push({ ...newCard('note', 100, 100), id: 'n1', text: 'x' })
+  const s2 = serializeBoardDocument(b2)
+  if (!/"locked"/.test(s2)) ok('没固定的卡不写这个字段（老板文件打开一次不会整块变脏）')
+  else bad('没固定的卡也写了 locked —— 所有老板文件会在 Git 里凭空变脏')
+  eq(parseBoardDocument(s2, 'x').cards[0].locked, false, '老文件（没这个字段）读进来是"不固定"')
+
+  /* 手改文件写个 "false" / 1 / 0 —— 只认真正的 true。
+     认字符串的话，"locked": "false" 会把卡片变成锁死的，而用户以为自己是解开。 */
+  const weird = parseBoardDocument(
+    JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'x', locked: 'false' }, { kind: 'note', text: 'y', locked: 1 }] }),
+    'x'
+  )
+  eq(weird.cards.map((c) => c.locked), [false, false], '手改出来的 "false" / 1 都不算固定（只认真正的 true）')
+  eq(parseBoardDocument(JSON.stringify({ strokes: [], cards: [{ kind: 'note', text: 'z', locked: true }] }), 'x').cards[0].locked, true, '真的 true 才算固定')
+}
+
+// ═════════════════════ 6d. 画出来的连接（形状读类型 / 只有手动过的才存） ═════════════════════
+/* 用户 2026-09-16：「更便捷的显示出两者之间的主次、因果、并列」+
+ * 「我没时间去逐步操作这个表示关系的步骤」+「连接的不只是卡片」。
+ * 纯逻辑这一层管三件事：形状怎么读、连上了谁、什么该写进文件。
+ * 行为（浮词、点词、框选改词、箭头画在哪）在 check-link.js 里用真浏览器钉。 */
+console.log('\n[6d] 画出来的连接：形状读类型，只有手动标过的才写进文件')
+{
+  const straight = toFlat([{ x: 0, y: 0 }, { x: 60, y: 1 }, { x: 130, y: -1 }, { x: 200, y: 0 }])
+  /* 一笔画的箭头：划到尖(200,0) → 回勾(182,9) → 甩到另一侧(204,-3)。
+     注意**最后这一点的投影比尖还远** —— 这正是把第一版判据打死的那种形状
+     （那时候"末尾"是按投影最远的点切的，于是整个箭头都被当成"前面"了）。 */
+  const arrow = toFlat([
+    { x: 0, y: 0 }, { x: 70, y: 0 }, { x: 140, y: 0 }, { x: 200, y: 0 }, { x: 182, y: 9 }, { x: 204, y: -3 },
+  ])
+  /* 弧形（往下鼓 40）：投影一路递增、不回勾 —— 它是线，不是箭头。
+     这一条是"别把弧线认成箭头"的哨兵。 */
+  const arcPts = []
+  for (let i = 0; i <= 20; i++) {
+    const x = (200 * i) / 20
+    arcPts.push({ x, y: (40 * 4 * x * (200 - x)) / (200 * 200) })
+  }
+  const arc = toFlat(arcPts)
+  const elbow = toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 80 }, { x: 200, y: 80 }])
+
+  eq(classifyLinkShape(straight), 'line', '一笔直线 → 线')
+  eq(classifyLinkShape(arrow), 'arrow', '一笔带箭头的（末端回勾）→ 箭头')
+  eq(classifyLinkShape(arc), 'line', '弧形不算箭头（它不回勾）')
+  eq(classifyLinkShape(elbow), 'line', '折线（拐个弯）也不算箭头')
+  eq(classifyLinkShape(toFlat([{ x: 0, y: 0 }, { x: 10, y: 3 }])), 'line', '太短的一笔不猜（当线）')
+
+  const b = makeBoard()
+  /* 两张卡离得开一点：**线要真的从一张卡进到另一张卡**。
+     第一版把两张卡摆成 0..200 / 600..800，而线只有 0→200 长 ——
+     两个端点都落在第一张卡里，于是 buildLinks 正确地返回了 0 条，
+     报出来却是"两笔连线 → 两条连接 实际 0"。夹具错，不是代码错。 */
+  b.cards = [
+    { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 0, id: 'k1', text: 'A' },
+    { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 0, id: 'k2', text: 'B' },
+  ]
+  const s1 = newStroke('pen', straight)
+  b.strokes.push({ ...s1, id: 'link1', points: toFlat([{ x: 60, y: 40 }, { x: 300, y: 41 }, { x: 660, y: 40 }]) })
+  const s2 = newStroke('pen', arrow)
+  b.strokes.push({ ...s2, id: 'link2', points: toFlat([
+    { x: 60, y: 40 }, { x: 300, y: 40 }, { x: 600, y: 40 }, { x: 580, y: 52 }, { x: 662, y: 38 },
+  ]) })
+
+  const links = buildLinks(b)
+  eq(links.length, 2, '两笔连线 → 两条连接')
+  eq([links[0].a, links[0].b], ['k1', 'k2'], '第一条连的是 k1 → k2')
+  eq(links[0].kind, 'rel', '直线读成"相关"')
+  eq(links[0].dir, false, '"相关"没有方向')
+  eq(links[1].kind, 'cause', '带箭头那笔读成"因果"')
+  eq(links[1].dir, true, '"因果"有方向（方向 = 你画的方向）')
+  eq(links[1].manual, false, '形状读出来的不算"你标过"')
+
+  /* ★ 只有**手动标过**的才写进文件。上一步那两条都是形状读的 —— 文件里不许有 link。 */
+  const s0 = serializeBoardDocument(b)
+  if (!/"link"/.test(s0)) ok('形状读出来的类型**不写进文件**（老文件、没动过的文件零字节变化）')
+  else bad('形状读出来的类型被写进文件了 —— 会和笔迹对不上（擦掉箭头文件里还留着"因果"）')
+
+  /* 手动标一个：改一个"自动读不出来的"词，这次必须写。 */
+  b.strokes = b.strokes.map((x) => (x.id === 'link1' ? { ...x, link: 'derive' } : x))
+  const back1 = parseBoardDocument(serializeBoardDocument(b), 'x')
+  eq(back1.strokes.find((x) => x.id === 'link1').link, 'derive', '手动标的词读得回来')
+  eq(buildLinks(back1).find((l) => l.strokeId === 'link1').kind, 'derive', '手动标的词压过形状读出来的')
+  eq(buildLinks(back1).find((l) => l.strokeId === 'link1').manual, true, '它被认成"你标过的"')
+
+  /* ★ 标回"形状自动读出来那一档"（直线标回 rel）时，字段该**消失**、不是写个 link: "rel"。
+     这条规矩的实现落在 UI 那边（Board.jsx 的 applyLink —— 只有它知道"自动读出来的是什么"），
+     所以由真浏览器那条自检钉（check-link.js 会去查文件里有没有 link 字段）。
+     纯逻辑这一层只钉"手动标的写出去、认不出的丢掉"。 */
+
+  /* 手改文件写了个认不出的词（中文名、大小写、别的版本的 id）：一律丢掉、回到自动。 */
+  const dirty = parseBoardDocument(
+    JSON.stringify({ strokes: [{ id: 's1', tool: 'pen', points: straight, link: '因果' }], cards: [] }),
+    'x'
+  )
+  eq(dirty.strokes[0].link, undefined, '文件里认不出的 link 值丢掉（不退回默认再写回去）')
+  const dirty2 = parseBoardDocument(
+    JSON.stringify({ strokes: [{ id: 's1', tool: 'pen', points: straight, link: 1 }], cards: [] }),
+    'x'
+  )
+  eq(dirty2.strokes[0].link, undefined, '数字 1 也不算（只认那几个 id）')
+
+  /* 荧光笔跳过：它是"在字上做记号"，一划一大片，端点很容易正好落在两张卡里。 */
+  const b4 = makeBoard()
+  b4.cards = b.cards
+  b4.strokes = [{ ...newStroke('highlighter', straight), id: 'hl1' }]
+  b4.strokes[0].points = straight
+  eq(buildLinks(b4).length, 0, '荧光笔不算连接（记号 ≠ 关系）')
+
+  /* 方向：把点倒过来，a/b 就换了 —— 箭头方向就是这么表达的（渲染出来一模一样）。 */
+  const b5 = parseBoardDocument(serializeBoardDocument(b), 'x')
+  const flip = (flat) => {
+    const out = []
+    for (let i = flat.length - 3; i >= 0; i -= 3) out.push(flat[i], flat[i + 1], flat[i + 2])
+    return out
+  }
+  const rev = { ...b5, strokes: b5.strokes.map((x) => (x.id === 'link2' ? { ...x, points: flip(x.points) } : x)) }
+  const l5 = buildLinks(rev).find((l) => l.strokeId === 'link2')
+  eq([l5.a, l5.b], ['k2', 'k1'], '把这一笔的点倒过来 → 方向反过来（k1→k2 变成 k2→k1）')
+
+  /* 连线两端落在**同一张卡**里不算连接（那是圈了一下自己）。 */
+  const b6 = makeBoard()
+  b6.cards = [{ ...newCard('note', 0, 0, { w: 400, h: 300 }), x: 0, y: 0, id: 'big', text: '大卡' }]
+  b6.strokes = [{ ...newStroke('pen', straight), id: 'in1', points: toFlat([{ x: 20, y: 20 }, { x: 200, y: 20 }]) }]
+  eq(buildLinks(b6).length, 0, '两端在同一张卡里不算连接')
+}
+
+// ═════════════════════════ 6e. 用户真手画的箭头 ═════════════════════════
+console.log('\n[6e] 真手画箭头：拿用户本人的笔迹当夹具（scripts/fixtures/hand-arrows.json）')
+{
+  /* 这一节存在的唯一理由：**形状判据不能凭空定阈值**。
+     用户 2026-09-16 把两张手画箭头的截图发来，scripts/extract-hand-arrows.py
+     把墨迹细化成骨架、解出"杆 / 两个臂"的中心线，并按纸的横线反推出缩放 ——
+     于是这里跑的是他的真实笔迹，不是我想象中的箭头。
+     他两张图量出来的共同点：张开角 105~107°、臂长 51~59 世界像素、
+     **杆的墨迹一直画到尖上**（V 的顶点和杆的末端重叠）。
+     他画箭头的方式是**两笔**：一杆一笔、V 尖一笔。 */
+  const fix = JSON.parse(readFileSync(new URL('./fixtures/hand-arrows.json', import.meta.url), 'utf8'))
+  eq(fix.images.length, 2, '夹具里有两张图（长杆箭头 / 短粗箭头）')
+
+  for (const img of fix.images) {
+    const role = Object.fromEntries(img.strokes.map((s) => [s.role, toPoints(s.points)]))
+    const shaft = role.shaft
+    const barbA = role.barbA
+    const barbB = role.barbB
+    const tipPt = shaft[shaft.length - 1]
+    const tailPt = shaft[0]
+    const V = barbA.slice().reverse().concat(barbB)
+
+    /* ── 判据本身 ── */
+    eq(classifyLinkShape(shaft), 'line', `${img.key}：光一根杆 → 线（它自己是直的）`)
+    const tip1 = findTip(shaft)
+    const tipOne = findTip(shaft.concat(barbA))
+    if (tipOne && tipOne.open <= TIP_MAX_ANGLE && tipNearEnd(tipOne)) {
+      ok(`${img.key}：一整笔（杆+臂）读出了尖，张开 ${round(tipOne.open)}°、两边弧长 ${round(tipOne.back)}/${round(tipOne.fwd)}`)
+    } else {
+      bad(`${img.key}：一整笔没读出尖（${JSON.stringify(tipOne)}）`)
+    }
+    const head = readArrowHead(V)
+    if (head) ok(`${img.key}：单独那个 V 认成了箭头尖（臂长 ${round(head.arm)} 世界像素，张开 ${round(findTip(V).open)}°）`)
+    else bad(`${img.key}：单独一个 V 没认出来（这是"两笔画的箭头"那条路能不能走通的关键）`)
+
+    /* ── 摆到板上：两张卡，尖指着第二张（离它 20px，**没有碰到**）── */
+    const mkBoard = (strokes) => {
+      const b = makeBoard()
+      const w = 220
+      const h = 90
+      b.cards = [
+        { ...newCard('note', 0, 0, { w, h }), x: tailPt.x - w + 20, y: tailPt.y - h / 2, id: 'k1', text: 'A' },
+        { ...newCard('note', 0, 0, { w, h }), x: tipPt.x + 20, y: tipPt.y - h / 2, id: 'k2', text: 'B' },
+      ]
+      b.strokes = strokes.map(([id, pts]) => ({ ...newStroke('pen', toFlat(pts)), id }))
+      return b
+    }
+    const cases = [
+      ['一笔画成（杆 + 臂连在一起）', [['s1', shaft.concat(barbA)]], true],
+      ['两笔：杆 ｜ V 尖', [['s1', shaft], ['s2', V]], true],
+      ['两笔：杆 ｜ V 尖（尖朝另一头画）', [['s1', shaft], ['s2', barbB.slice().reverse().concat(barbA)]], true],
+      ['三笔：杆 ｜ 臂A ｜ 臂B（每笔一撇）', [['s1', shaft], ['s2', barbA], ['s3', barbB]], true],
+      ['只有一根杆（没有尖）', [['s1', shaft]], false],
+    ]
+    for (const [name, strokes, want] of cases) {
+      const b = mkBoard(strokes)
+      const links = buildLinks(b)
+      const l = links.find((x) => x.a === 'k1' && x.b === 'k2')
+      if (want) {
+        if (!l) {
+          bad(`${img.key}·${name}：没连上（应该是 k1 → k2）`)
+          continue
+        }
+        eq([l.a, l.b, l.kind, l.shape, l.headInk], ['k1', 'k2', 'cause', 'arrow', true],
+          `${img.key}·${name}：k1→k2、读成因果、尖是你画的（不再合成箭头）`)
+        near(Math.hypot(l.tip.x - tipPt.x, l.tip.y - tipPt.y), 0, 6, `${img.key}·${name}：尖的位置对得上他画的尖`)
+      } else if (links.length === 0) {
+        ok(`${img.key}·${name}：不成立连接（没有尖 → 不靠"指着谁"连）`)
+      } else {
+        bad(`${img.key}·${name}：不该有连接，却出来 ${links.length} 条`)
+      }
+    }
+  }
+
+  /* ── 反例：别把别的东西认成箭头 ── */
+  /* L 形：拐弯 90°，但尖在**正中间** —— 它是一条折线式的连接，不是箭头。 */
+  const elbowBig = toFlat([{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 200 }, { x: 400, y: 200 }])
+  const te = findTip(elbowBig)
+  if (te && !tipNearEnd(te)) ok('L 形折线的拐角虽然够尖，但它**不挨着任何一头** → 不当箭头')
+  else bad(`L 形折线被判成了箭头尖（${JSON.stringify(te)}）`)
+  /* "两根从同一点拉出去的线"：各自都是长线，不该被接成一根。 */
+  const b7 = makeBoard()
+  b7.cards = [
+    { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 0, id: 'k1' },
+    { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: -300, id: 'k2' },
+    { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 300, id: 'k3' },
+  ]
+  b7.strokes = [
+    { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 660, y: -260 }])), id: 'fan1' },
+    { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 660, y: 340 }])), id: 'fan2' },
+  ]
+  const fan = buildLinks(b7)
+  eq(fan.length, 2, '从同一点拉出去的两根线：各算各的（没被接成一根）')
+  eq(fan.map((l) => l.a + '→' + l.b).sort(), ['k1→k2', 'k1→k3'], '两根的目标都对')
 }
 
 // ═════════════════════ 7. 装进视口 ═════════════════════

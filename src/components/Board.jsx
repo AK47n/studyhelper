@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import BoardCanvas from './BoardCanvas.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
+import InkToCard from './InkToCard.jsx'
 import { Tex } from './Tex.jsx'
 /* ⚠ drawStroke 在这里**不能省**。
    它原来住在 BoardCanvas.jsx 里，后来搬去了 lib/ink.js（为了让"导出给识别"
@@ -11,9 +12,9 @@ import { Tex } from './Tex.jsx'
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
-  HL_COLOR, HL_WIDTH,
+  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
   buildRelations, descendantsOf, fitView, inkedEdges, newCard, newStroke, parseBoardDocument,
-  screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, toFlat, toPoints, zoomAt,
+  screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 
@@ -43,6 +44,10 @@ import { displayTex, snippetFor, toTex } from '../lib/formula.js'
  */
 
 const SAVE_DEBOUNCE_MS = 700
+/* 笔停下来多久之后，公式卡重新量一次尺寸（见下面那个 effect）。
+   取 400ms 的用意：它比"存盘 700ms"短，所以屏幕上先贴合、再落盘；
+   又比一次连续擦除/画一笔的节奏长，所以一整串手势只量一趟。 */
+const REFIT_IDLE_MS = 400
 const ERASER_R = 14 // 世界坐标半径，约一个字宽
 const UNDO_MAX = 60
 /* HL_COLOR / HL_WIDTH 从 lib/board.js 来（那边是"存储层归一化"用的同一对常量）。
@@ -59,6 +64,83 @@ const COLORS = [
 const WIDTHS = [1.6, 2.6, 4.2]
 const VARIANTS = ['A', 'B', 'C']
 
+/* ── 纸面：几种背景，用户自己挑 ──
+ * 2026-09-16 用户：「现在白板背景是十字格子纸，可以改成纯白纸，或者说有几种类型的
+ * 背景让用户去选择」。于是做成**四档可挑**，并且把默认从"十字格子"改成**纯白**
+ * （他那句话的头半句就是"可以改成纯白纸"）。
+ *
+ * ★ 纸面存在 localStorage，**不进 board-*.md**。理由两条：
+ *   ① 纸是"我习惯怎么看这张板"，不是这张板的内容 —— 用户心里只有一种纸，
+ *      存进文件就变成"每张板各有一张纸"，切板时纸跟着跳，很吵；
+ *   ② 板文件是自动存的（停笔 0.7 秒写盘），多一个字段就是多一处假 diff 的来源
+ *      —— 这条纪律 README 里写过（见"压力保留两位小数"那一段）。
+ * id 同时是 CSS 类名后缀（.paper-<id>），改 id 记得改 styles.css。 */
+const PAPERS = [
+  { id: 'plain', name: '纯白', hint: '一张干净的白纸，什么都不铺（默认）', tile: 0 },
+  { id: 'grid', name: '方格', hint: '一格 32 世界像素的十字格子，画图对得齐', tile: 32 },
+  { id: 'rule', name: '横线', hint: '只有横线，写一行对一行', tile: 32 },
+  { id: 'dots', name: '点阵', hint: '一层小点，比格子安静', tile: 24 },
+]
+const DEFAULT_PAPER = 'plain'
+const PAPER_KEY = 'studyhelper.paper'
+
+/* 画出一条连接线之后，那排词在屏幕上停多久（毫秒）。
+ * 3.5 秒的来历：比你抬笔看一眼再决定要长一点，又不至于一直挂在那儿碍事。
+ * 指针停在那排词上时不会收（LinkChips 的 onPointerEnter）。 */
+const LINK_PICK_MS = 3500
+
+/* 把一笔的扁平点数组整个倒过来（[x,y,p] 三个一组）。
+ * 用途：连接的"方向"就是"第一点 → 最后一点"，所以反向 = 把点倒过来。
+ * 渲染出来一模一样（同一条路径），所以这是一次**纯语义**的操作，
+ * 不用为方向单开一个字段 —— 也不会有"方向和笔迹对不上"的可能。 */
+function reverseFlat(flat) {
+  const out = []
+  for (let i = flat.length - 3; i >= 0; i -= 3) out.push(flat[i], flat[i + 1], flat[i + 2])
+  return out
+}
+
+/* ── 纸面在屏幕上的几何：格距 + 原点 ──
+ * ★ 用户 2026-09-16 的第二条：「平移的时候有一种背景不动字动的感觉，
+ *   我要的是字就在背景上，字跟着背景一起动」。
+ *   上一版把底纹当成"贴在屏幕上的纹理"（固定 32px 的 background-size），
+ *   于是平移时墨迹在走、格线钉在屏幕上 —— 视觉上字就成了"浮"在纸上面的。
+ *   现在按**世界坐标**算：
+ *     格线在世界里周期是 tile（方格/横线 32、点阵 24）
+ *     → 屏幕上的周期 = tile × 视图缩放 s
+ *     → 原点就是视图平移 tx / ty
+ *   两个数交给 CSS 的 background-size / background-position，底纹就和墨迹、卡片
+ *   **用的是同一个变换**：平移、缩放、Ctrl+0 装回屏幕全都自动跟着走，不用各自特殊处理。
+ *
+ * 为什么取模：格线每 tile_s 就重复一次，不取模的话平移越远塞给浏览器的数越大
+ * （几千几万像素既没必要也容易在小数上抖）。负数要补正 —— 负的
+ * background-position 本身合法，但补正之后值更小、也不依赖浏览器怎么处理负数。
+ *
+ * 抽成纯函数（不碰 DOM）：`check-paper.js` 要按真实格距去选采样框，
+ * 而且"格距 = 世界格距 × 缩放"这一条值得能一眼读懂。 */
+function paperGeometry(view, paperId) {
+  const p = PAPERS.find((x) => x.id === paperId) || PAPERS[0]
+  const s = Number(view && view.s) > 0 ? Number(view.s) : 1
+  const size = p.tile * s
+  const mod = (v) => {
+    const n = Number(v) || 0
+    if (!(size > 0)) return 0
+    return ((n % size) + size) % size
+  }
+  return {
+    '--paper-s': String(s),
+    '--paper-tile': size > 0 ? size.toFixed(3) + 'px' : '0px',
+    '--paper-x': mod(view && view.tx).toFixed(2) + 'px',
+    '--paper-y': mod(view && view.ty).toFixed(2) + 'px',
+    /* 线宽也按缩放走（和笔迹一个道理：纸离得远线就细），夹在 0.8~2.4px
+       —— 下限是"别细到看不见"，上限是"别粗成一道条纹"。
+       ⚠ 这个数**算在这里**，不能写成 CSS 里的 `calc(var(--paper-s) * 1px)`：
+         `--paper-s` 是设置在这层元素上的，自定义属性里的 var() 是在
+         **声明它的那个元素**上就解析掉的 —— 写在 .bd 上会拿不到这个值、
+         静默退回 1px（线宽永远不缩放，而且不报错）。 */
+    '--paper-lw': Math.min(2.4, Math.max(0.8, s)).toFixed(2) + 'px',
+  }
+}
+
 export default function Board({ file, initialText, reloadToken, onSave, flash, scale, onScale, onScaleReset, fullscreen, onToggleFullscreen }) {
   const [board, setBoard] = useState(() => load(initialText, file))
   const [tool, setTool] = useState('pen')
@@ -69,6 +151,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [dirty, setDirty] = useState(false)
   const [hist, setHist] = useState({ undo: 0, redo: 0 })
   const [variant, setVariant] = useState(readVariant)
+  const [paper, setPaper] = useState(readPaper)
   const [panelOpen, setPanelOpen] = useState(true)
   const [eraserAt, setEraserAt] = useState(null)
   const [hoverEdge, setHoverEdge] = useState(null)
@@ -84,11 +167,20 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [lasso, setLasso] = useState(null) // 正在拖的那个框（世界坐标，已经规范化成 x0<x1 / y0<y1）
   const lassoRef = useRef(null)
   const inkMoveRef = useRef(null)
+  /* 刚画完一条连接线时浮出来的那排词（见 applyLink / LinkChips）。
+   * { strokeId, x, y, kind, dir }，x/y 是**屏幕坐标**（相对画布容器）。
+   * 它是"可选的一步"：不点时 3.5 秒自己收走，连接已经成立、屏幕上照样有标记。 */
+  const [linkPick, setLinkPick] = useState(null)
+  const linkLeftRef = useRef(false) // 指针是不是停在那排词上（在上面就别自动收）
   const [size, setSize] = useState({ w: 0, h: 0 })
   /* 手写公式：写字板、设置弹层的开关。
      写字板是"另开一块地方写"，不是"圈住白板上的字去识别" —— 理由见 WritingPad.jsx 顶部。 */
   const [padOpen, setPadOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  /* 「从框选到卡片」：把圈住的那一块笔迹认成东西落成一张卡。
+     mode='text' 认文字（文字卡 + 字体）、mode='formula' 认公式（公式卡）。
+     和写字板是两条路：那条是"另开一块小板先写再认"（见 InkToCard.jsx 顶部）。 */
+  const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
 
   const wrapRef = useRef(null)
   const sceneRef = useRef(null)
@@ -104,6 +196,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const saveTimer = useRef(null)
   const dirtyRef = useRef(false)
   const dragStartRef = useRef(null)
+  const pendingFitRef = useRef(new Map())
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -179,6 +272,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     undoRef.current = []
     redoRef.current = []
     setHist({ undo: 0, redo: 0 })
+    /* ★ 重开一张板时，把卡片过时的尺寸重新量一次（用户 2026-09-16：
+       「公式板子周围留白太大」—— 一半是 KaTeX 的 1em 边距，另一半是 w/h 过时）。
+       为什么非要在"每次打开"跑一趟：w/h 是**存进文件**的测量值，而它可能是在
+       另一种渲染规则、另一种字体状态下量出来的，只改 CSS 收不掉它 ——
+       min-height 就是 h，h 不收，式子仍旧飘在一个大空盒子里。
+       规矩只有一条：**两条轴都按真实内容量，收到贴着内容为止**（原来还多一条
+       "至少要盖住你圈的那块笔迹"，2026-09-16 用户明确说不要了：
+       「不用盖住，就让框贴合公式和字就行」）。
+       量稳了就不再写盘：fitCardSize 要"连续两趟量出同一个数"才收手，重开板这一趟
+       还额外带 1.5 世界像素的余量（见下面 opts.tol 那段）—— 所以不会每次打开都造一条假 diff。
+       ⚠ 空白卡（"双击写公式"/"双击写字"那个占位）不量 —— 还没有内容可量。 */
+    pendingFitRef.current.clear()
+    queueFormulaRefits(b)
     // 视野没被你亲手定过 → 每次打开都重新适配一遍。
     // 这么做的原因见 lib/board.js 里 viewPinned 的说明：tx/ty 是相对容器的坐标，
     // 容器一变旧坐标就是错的，与其迁移不如"没定过就重算"。
@@ -203,6 +309,35 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     measure()
     return () => ro.disconnect()
   }, [])
+
+  /* 退出编辑态（回车 / 取消 / Esc）时，把"插进来还没量过高度"的卡片量一次。
+     编辑态量不得 —— 那时候卡片里装的是编辑器，量出来是编辑器的高度。 */
+  useEffect(() => {
+    scheduleFits()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingId])
+
+  /* ★★ 板子安静下来之后，卡片自己重量一次尺寸（公式卡和文字卡都量）。
+     这一条是用户 2026-09-16 第三次报的：「依旧神秘留白出现，这框不贴合公式」。
+     上一版的根因是卡片高度里混了一份"盖住底下那块笔迹"，而笔迹是会被擦掉的；
+     用户随后明确说不要"盖住"这套了（「不用盖住，就让框贴合公式和字就行」）。
+     但"重量"这件事本身仍然需要：**尺寸是存进文件的测量值**，
+     内容一改（双击改完式子/文字）它就过时了，而用户不会为此重开文件 ——
+     实测那张卡 h=89，重开一次才被"载入时重量"收成 54。
+
+     为什么不挂在"每一次 commit"上：画一笔、拖一下、平移缩放都是一次 commit，
+     而它们跟尺寸无关，白量一趟要强制一次布局。这里盯的是
+     `board.strokes` / `board.cards` 这两个**数组的引用**
+     （commit 是纯函数式更新，视图变化不会换掉它们）—— 也就是说：
+     **只有笔迹或卡片真的变了才排队**，而且按 REFIT_IDLE_MS 防抖，
+     一整串连续操作只量最后一趟。
+
+     ⚠ 正在编辑的那张会挂起来等（fitCardSize 里的 'wait'）。 */
+  useEffect(() => {
+    const t = setTimeout(() => queueFormulaRefits(boardRef.current), REFIT_IDLE_MS)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [board.strokes, board.cards])
 
   // ── 存盘 ──
   const flushSave = useCallback(() => {
@@ -236,11 +371,26 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   // ── 派生：关系和连线都从位置现算，不存进文件 ──
   const relations = useMemo(() => buildRelations(board), [board])
   const cardById = useMemo(() => new Map(board.cards.map((c) => [c.id, c])), [board.cards])
+  /* 画出来的连接（见 lib/board.js 的 buildLinks）。
+     和 relations 一样**每次重算、不进文件** —— 你挪动卡片，连接自己跟着走。
+     只有"你手动改过的那个词"存在笔迹上（stroke.link）。 */
+  const links = useMemo(() => buildLinks(board), [board])
   const inkPairs = useMemo(() => {
     const set = new Set()
     for (const e of inkedEdges(board)) set.add(e.a + '|' + e.b)
     return set
   }, [board])
+  const linkByStroke = useMemo(
+    () => new Map(links.flatMap((l) => (l.ids || [l.strokeId]).map((id) => [id, l]))),
+    [links]
+  )
+  /* 框选里如果**正好只有一条连接线**，就在框上那条浮层里多给一排词 ——
+     这是"事后改词"的入口（画完那 3.5 秒没点、或者改主意了）。 */
+  const selLink = useMemo(() => {
+    if (!inkSel || inkSel.size !== 1) return null
+    for (const id of inkSel) return linkByStroke.get(id) || null
+    return null
+  }, [inkSel, linkByStroke])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
     const set = descendantsOf(relations, selectedId)
@@ -271,6 +421,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      渲染那个虚线框、以及判断"这一下是不是按在选区里"，都用它。只在真有选中时才算。 */
   const inkBox =
     inkSel && inkSel.size ? strokesBBox(board.strokes.filter((s) => inkSel.has(s.id))) : null
+  /* 选中的**笔迹对象**（不只是 id）。美化要拿它们渲染成图发出去。 */
+  const inkStrokes = useMemo(
+    () => (inkSel && inkSel.size ? board.strokes.filter((s) => inkSel.has(s.id)) : []),
+    [inkSel, board.strokes]
+  )
 
   /* 谁在操作？只在"换了设备"时才更新一次状态。
      笔悬停时 pointerType 也已经是 'pen'（不用等落笔），所以笔一靠近光标就没了
@@ -331,9 +486,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
-      /* ① 笔杆侧键按着 → 开始框选（OneNote 那个手感）。
-         必须放在"擦"和"画"前面：按住笔杆键落笔时，不该在板上留下墨迹。 */
-      if (isPenBarrel(e)) {
+      /* ① 笔杆侧键按着、或者工具条上选着「框选」→ 开始框选（OneNote 那个手感）。
+         必须放在"擦"和"画"前面：按住笔杆键落笔时，不该在板上留下墨迹。
+         ★ 为什么还留一个工具条上的「框选」：笔杆侧键只有那几支笔有。
+           用鼠标的人、笔上没有侧键的人，原来根本选不中笔迹 ——
+           "框住一块字再美化"这条路就对他们完全关着。 */
+      if (tool === 'select' || isPenBarrel(e)) {
         const box = { x0: wp.x, y0: wp.y, x1: wp.x, y1: wp.y }
         lassoRef.current = { from: wp, box }
         setLasso(box)
@@ -355,8 +513,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
 
       /* ③ 按在别处 = 取消选中（和大多数软件一样）。
-         放在画/擦前面，是为了"点空白"既取消选中、也照常落笔，不用点两次。 */
+         放在画/擦前面，是为了"点空白"既取消选中、也照常落笔，不用点两次。
+         ★ 卡片也要一起取消。原来这里只清 inkSel，**selectedId 一直留着** ——
+           于是刚插进来的那张卡永远保持选中、右上角永远挂着一个 ×，
+           用户 2026-09-16 报的「一直是右上角有 x，容易误删除」就是这么来的。
+           选中这个东西只在"你正在动它"的时候才该亮着。 */
       if (inkSel) setInkSel(null)
+      if (selectedId) setSelectedId(null)
 
       /* 会"擦"的两种情况：
          ① 工具条上选着橡皮；
@@ -380,9 +543,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, inkBox, inkSel]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, inkBox, inkSel, selectedId]
   )
-
   const onPointerMove = useCallback(
     (e) => {
       trackPointerKind(e)
@@ -523,6 +685,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         setLasso(null)
         const ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
         setInkSel(ids.length ? new Set(ids) : null)
+        /* 空框说一句人话。静默什么都不发生是最让人迷惑的 ——
+           用户会以为"框选坏了"，而其实只是框小了/框到空白上了。 */
+        if (!ids.length) flash('框里没有笔迹 —— 框大一点，或者框到字上', 'warn')
         return
       }
 
@@ -555,14 +720,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         // 太短的一笔（误触）丢掉，别在板上留个孤立墨点
         if (pathLength(pts) < 2.5) return
         const simple = simplifyPoints(pts, 0.6)
-        commit((cur) => ({ ...cur, strokes: [...cur.strokes, { ...d.stroke, points: toFlat(simple) }] }))
+        const stroke = { ...d.stroke, points: toFlat(simple) }
+        commit((cur) => ({ ...cur, strokes: [...cur.strokes, stroke] }))
+        /* ★ 这一笔要是正好连上了两个东西，就在旁边浮出那排词。
+           顺序要紧：先 commit（boardRef 里已经有这一笔了），再 offerLink ——
+           offerLink 是拿**最新的板**去算连接的，早了就找不到自己这一笔。 */
+        offerLink(stroke)
       } else if (d.kind === 'erase' && tool !== 'eraser') {
         /* 这一次是**笔的另一头**在擦，抬笔就把那个橡皮圈收掉。
            （工具是橡皮的时候不能收 —— 那个圈得一直跟着鼠标，当光标用。） */
         setEraserAt(null)
       }
     },
-    [commit, tool]
+    [commit, tool, flash]
   )
 
   // ── 滚轮：缩放 / 横向平移 ──
@@ -617,6 +787,21 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         if (el) setView(fitView(boardRef.current, el.clientWidth, el.clientHeight, 70), false)
         return
       }
+      /* 那排词浮着的时候：`1`~`5` 直接选一个（鼠标用户不用去点它），`Esc` 收走。
+         放在这一串快捷键的最前面 —— 它是个"正在等你回一句"的临时界面，
+         要有优先权，不然会被下面的字母键当工具切换吃掉。 */
+      if (linkPick && /^[1-5]$/.test(e.key)) {
+        const k = LINK_KINDS[Number(e.key) - 1]
+        if (k) {
+          e.preventDefault()
+          applyLink(linkPick.strokeId, k.id)
+          return
+        }
+      }
+      if (linkPick && e.key === 'Escape') {
+        setLinkPick(null)
+        return
+      }
       if (e.key === 'Escape') {
         setSelectedId(null)
         setEditingId(null)
@@ -625,6 +810,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
       if (e.key === 'p' || e.key === 'P') return setTool('pen')
       if (e.key === 'e' || e.key === 'E') return setTool('eraser')
+      // S = select：框选。挑 S 是因为它没被占（P 是笔、E 是橡皮、W 是写字板、Space 是平移）
+      if (e.key === 's' || e.key === 'S') return setTool('select')
       // W = write：写字板。挑 W 是因为它没被占（P 是笔、E 是橡皮、Space 是平移）
       if (e.key === 'w' || e.key === 'W') {
         setPadOpen((v) => !v)
@@ -639,6 +826,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
         e.preventDefault()
+        /* ★ 固定的卡片不给删。它是"锁住"的语义，而 Delete 是最容易误按的一个键。
+           （它平时选不中，所以正常路径下也走不到这儿；但关系面板里点一下名字
+           是会选中的 —— 那条路得挡住。）想删就先点 📌 解开。 */
+        const sel = boardRef.current.cards.find((c) => c.id === selectedId)
+        if (sel && sel.locked === true) {
+          flash('这张卡固定着，先点它左下角的 📌 解开再删', 'warn')
+          return
+        }
         commit((cur) => ({ ...cur, cards: cur.cards.filter((c) => c.id !== selectedId) }))
         setSelectedId(null)
       }
@@ -656,7 +851,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel])
+  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -684,14 +879,445 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setPadOpen(false)
     setSelectedId(c.id)
     setEditingId(c.id)
+    /* ★ 写字板这条路上来的公式卡**也要量一次尺寸**：完全贴着式子。
+       不量的话它就是默认的 260 宽：一行 `E = mc²` 只有 60 宽，居中之后左右全是空的
+       （用户 2026-09-16 报的"识别公式留白依旧很多"，多半就是这张）。
+       keepCenterX：卡片是以视野中心放上去的，收宽度要**从中间缩**，不然会往左跳。 */
+    pendingFitRef.current.set(c.id, { fitWidth: true, keepCenterX: true })
+    scheduleFits()
   }
 
+  /* 换纸。**当场存**，不像板的内容那样等停笔 0.7 秒 ——
+     它是"我习惯怎么看这张板"，跟板里画了什么没关系（理由见上面 PAPERS 那段）。
+     写不进去（隐私模式下 localStorage 会抛）就算了：这一次照样生效，
+     下次打开回到默认，而不是整个界面炸掉。 */
+  function pickPaper(id) {
+    if (!PAPERS.some((p) => p.id === id)) return
+    setPaper(id)
+    try {
+      localStorage.setItem(PAPER_KEY, id)
+    } catch {
+      /* 存不了就只生效这一次 */
+    }
+  }
+
+  /* 固定 / 解开一张卡（2026-09-16 用户：「给卡片加一个固定按钮用来防止误触」）。
+   *
+   * 「固定」= **这张卡不再收指针事件**（CSS 里的 .bd-card.locked）。
+   * 于是它变成"纸的一部分"：
+   *   · 用笔从它身上划过 = 在纸上写字（笔本来就让路，现在鼠标也一样）；
+   *   · 鼠标/手指按上去 = 落在下面的收事件层上 —— 拖不动、也选不中；
+   *   · 双击不进编辑态、× 和缩放柄也不出现（选中才会有，而它选不中）。
+   * 只有角上那颗 📌 自己还收事件 —— 所以"钉死了拿不下来"不会发生。
+   *
+   * 为什么要它：用笔写字的时候手会蹭到卡片，一下就把它拖走了，或者点出一堆手柄；
+   * 位置定好的公式卡本来就不该被碰。
+   *
+   * 存的字段是 `locked`（不是 pinned）—— 板文件里 `viewPinned` 已经占掉了
+   * "pinned" 这个词（那个是"视角定住了、下次打开别自动适配"），两个混起来
+   * 以后读代码的人一定会看错。序列化只在真的锁了的时候写这个字段（见 lib/board.js）。 */
+  function toggleLock(id) {
+    const c = boardRef.current.cards.find((x) => x.id === id)
+    if (!c) return
+    const locked = c.locked !== true
+    commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === id ? { ...x, locked } : x)) }))
+    /* 锁上 → 顺手取消选中（不然手柄留在锁定的卡上，看着像还能动，其实点不动）；
+       解开 → 顺手选中它，手柄立刻出来，接着拖就行。 */
+    setSelectedId(locked ? null : id)
+    flash(locked ? '固定住了：拖不动、双击也不会进编辑（点 📌 解开）' : '解开了，可以拖了', 'ok')
+  }
+
+  /* ── 连接线上的那一步（可选）──
+   * 2026-09-16 用户：「我要更便捷的显示出两者之间的主次、因果、并列等关系」
+   * 「我操作的速度是很快的，我没有时间去逐步花很多时间操作这个表示关系的步骤」
+   *
+   * 所以这里的设计是**零步骤优先**：一条连接 = 你画的那一笔（形状决定类型，见
+   * lib/board.js 的 buildLinks / classifyLinkShape），画完就成立、屏幕上立刻有标记。
+   * 下面这几个函数只做一件事：**让你随时用一下（或者不用）去改那一个词** ——
+   * 画完 3.5 秒浮出来，不点就收走；以后想改，框住那条线还能再浮一次。
+   *
+   * 为什么不用弹窗/必须点：你在想事情的时候，任何"必须先处理一下"的界面都是打断。
+   * 为什么还要留这一个口子：形状读不出箭头的手型是真实存在的（比如分两笔画），
+   * 那就必须有一条"一句话改回来"的路，否则猜错了只能重画。
+   */
+  function applyLink(strokeId, kind, opt = {}) {
+    if (!isLinkKind(kind)) return
+    commit((cur) => ({
+      ...cur,
+      strokes: cur.strokes.map((st) => {
+        if (st.id !== strokeId) return st
+        /* ⇄ 反向 = 把这笔的点**倒过来**。
+           倒过来渲染出来一模一样（都是同一条路径），但"第一点 → 最后一点"变了 ——
+           箭头方向就是靠这个表达的，所以不用另存一个方向字段。 */
+        const points = opt.reverse ? reverseFlat(st.points) : st.points
+        /* ★ auto 取**连接这一层**读出来的那个（buildLinks 的结果），不是单看这一笔：
+           用户的箭头常常是"一杆 + 一个 V 尖"两笔画的 —— 单看那根杆永远是"相关"，
+           只有连接层知道旁边那个尖是它的。所以选"因果"时不能写进文件（写进去就是噪音，
+           而且以后擦掉尖它也不会自己回来）。
+           ⇄ 反向时形状变了（回勾跑到另一头去），这时退回单笔判断。 */
+        const known = linkByStroke.get(strokeId)
+        const auto = !opt.reverse && known ? known.auto : autoLinkKind({ ...st, points })
+        const next = { ...st, points }
+        /* ★ 选的就是"形状自动读出来那一档" → **不写这个字段**（回到自动）。
+           于是文件里只有"你特意改过的"那几个词：一条没动过的连接是零字节，
+           老文件也不会因为我们加了这个功能而变脏。 */
+        if (kind === auto) delete next.link
+        else next.link = kind
+        return next
+      }),
+    }))
+    setLinkPick(null)
+    flash(opt.reverse ? `方向反过来了：${linkKind(kind).name}` : `这条线：${linkKind(kind).name}`, 'ok')
+  }
+
+  /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
+     线中段常常写着你顺手写的条件（"仅当…"），压在上面会挡住它。
+     ★ 还要**夹进画布范围**：浮出来的东西跑到屏幕外或压到底部工具条底下，
+     用户就点不到了（缩放柄、美化按钮都栽过这一条，见 README 第 13 条）。 */
+  function linkPickAt(midWorld) {
+    const el = wrapRef.current
+    const v = boardRef.current.view
+    if (!el) return { x: 0, y: 0 }
+    const x = midWorld.x * v.s + v.tx
+    const y = midWorld.y * v.s + v.ty
+    return {
+      x: Math.min(Math.max(x, 130), Math.max(130, el.clientWidth - 130)),
+      y: Math.min(Math.max(y, 96), Math.max(96, el.clientHeight - 60)),
+    }
+  }
+
+  /* 刚画完一笔：如果它正好连上了两个东西，就把那排词浮出来。
+     注意这时候连接**已经成立了**（buildLinks 从笔迹现算），浮词只是给你一次改的机会。 */
+  function offerLink(stroke) {
+    const hit = buildLinks(boardRef.current).find((l) => l.strokeId === stroke.id)
+    if (!hit) return
+    const { x, y } = linkPickAt(hit.mid)
+    setLinkPick({ strokeId: stroke.id, x, y, kind: hit.kind, dir: hit.dir })
+  }
+
+  /* 点那颗词（已经标过的连接上那个小标签）→ 再浮一次，方便改。 */
+  function openLinkPick(link) {
+    const { x, y } = linkPickAt(link.mid)
+    setLinkPick({ strokeId: link.strokeId, x, y, kind: link.kind, dir: link.dir })
+  }
+
+  /* 3.5 秒不点就收走（指针停在那排词上就不收 —— 正在读的人别被打断）。 */
+  useEffect(() => {
+    if (!linkPick) return
+    const t = setTimeout(() => {
+      if (!linkLeftRef.current) setLinkPick(null)
+    }, LINK_PICK_MS)
+    return () => clearTimeout(t)
+  }, [linkPick])
+
+  /* 打开「从框选到卡片」。没有框住东西就直说 —— 这两个按钮在选区浮层上，
+     理论上按得到就一定选着东西；但工具条上那个入口不保证。 */
+  function openInkPanel(mode) {
+    if (!(inkSel && inkSel.size)) {
+      flash('先用「⬚ 框选」圈住要认的手写（或者按住笔杆键拖一个框）', 'warn')
+      return
+    }
+    setInkMode(mode)
+  }
+
+  /* ★ 卡片尺寸**按真实内容量一次**。
+   *
+   * 为什么必须有这一步：`textCardRect` 只能按字数估，估出来的尺寸不是多了就是少了；
+   * 而公式卡连估都估不了（分式、根号差别很大）。多出来的部分就是用户报的"留白太多"——
+   * 一行字的卡下面空一大截（高度），一行短公式左右全是空的（宽度）。
+   *
+   * 两条轴都量，而且都是"贴合内容"这**一条**规矩（2026-09-16 用户定下来的：
+   * 「不用盖住，就让框贴合公式和字就行」）：
+   *   · **高度**量的是内容（`.bd-card-body`）——卡片的 min-height 就是 h，
+   *     量卡片自己等于量自己，永远量不出"其实只有一行字"。
+   *   · **宽度**量的是内容的**自然宽度**：临时把宽度放开成 `max-content` 读一次
+   *     （折行内容量不出自然宽）。公式是一行不折行的，它自己多宽就是多宽；
+   *     文字卡的自然宽 = 最长那一行（识别结果保住了你写的换行），
+   *     超过 `TEXT_CARD_MAX_W` 才折行。
+   *   （上一版还多一条"至少要盖住你圈的那块笔迹"，那套 2026-09-16 拆掉了 ——
+   *     它会让卡片永远比内容大一块，看起来就是"框不贴合"。）
+   *
+   * ★ **编辑态不能量。** 那时候卡片里装的是编辑器（输入框 + KaTeX 预览 + 一排符号按钮），
+   *   量出来是编辑器的尺寸 —— 实测把 h 写成了 204，是真正内容的好几倍。
+   *   所以编辑态就把它挂在 pendingFitRef 里，等退出编辑（回车/取消/点别处）再量。
+   *
+   * opts.keepCenterX：从**中间**收宽度（写字板那条路是"以视野中心"放上去的，
+   * 不收中间的话卡片会往左跳）。默认按左上角收（圈选那条路钉在笔迹左上角）。
+   * 返回 'done' / 'missing' / 'wait'，见 runPendingFits。
+   */
+  function fitCardSize(cardId, opts = {}, attempt = 0) {
+    const wrap = wrapRef.current
+    const cur = boardRef.current.cards.find((c) => c.id === cardId)
+    if (!wrap || !cur) return 'done' // 卡片已经没了，当量过了
+    const cardEl = wrap.querySelector('[data-card-id="' + cardId + '"]')
+    const el = cardEl ? cardEl.querySelector('.bd-card-body') : null
+    if (!el) return 'missing' // 还没挂上，让调用方下一帧再来
+    if (cardEl.classList.contains('editing')) return 'wait' // 编辑态量不得，挂着
+
+    const s = boardRef.current.view.s
+    const scale = cur.scale || 1
+    /* 内边距 + 边框（屏幕像素）：这个仓库全局是 `box-sizing: border-box`，
+       卡片上写的 width/min-height **都把这一圈算在里面**，所以算尺寸时必须加上它 ——
+       不加就正好少一整圈，宽度那条线上直接表现为内容被裁掉。 */
+    const cs = getComputedStyle(cardEl)
+    const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
+    const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth)
+
+    /* ★★ 先确认 DOM 上这张卡的宽度**已经是数据里的宽度**，再动尺子。
+       为什么：宽度那一条改完要等 React 重渲染，而"量尺寸"可能在同一帧里被叫第二次
+       （scheduleFits 有几处调用点）—— 那时候量到的是**上一次渲染的世界**：
+       宽度还是旧的，文字就还是折成旧行数，高度会被算错并钉死（实测：钉在 94.4，
+       而正确值是 66，且不会再自己好）。所以对不上就返回 'stale'，下一帧再来。
+       高度不一样没关系 —— 写的是 min-height，布局尺寸只由宽度决定。 */
+    const wantW = cur.w * s * scale
+    if (Math.abs(cardEl.getBoundingClientRect().width - wantW) > 1) return 'stale'
+
+    const nextH = cardHeightFromContent(el.getBoundingClientRect().height, { s, scale, padPx: padY })
+    opts.measuredH = nextH // 高度需求，留给外面判断"这一趟稳定了没有"
+    opts.measured = nextH
+
+    let nextW = cur.w
+    if (opts.fitWidth) {
+      const prev = el.style.width
+      el.style.width = 'max-content'
+      const natural = el.getBoundingClientRect().width
+      el.style.width = prev
+      /* 还要把"已经溢出的那部分"算进去：字体没就绪时 max-content 可能偏小，
+         而溢出量（scrollWidth − clientWidth）任何情况下都准。两个取大的那个当需求。 */
+      const tex = el.querySelector('.bd-tex')
+      const spilled = tex ? Math.max(0, tex.scrollWidth - tex.clientWidth) : 0
+      const needPx = Math.max(natural, spilled ? (tex ? tex.clientWidth : 0) + spilled : 0)
+      opts.measured = needPx // 宽度需求（那才是会被裁的那一轴）
+      nextW = cardWidthFromContent(needPx, { s, scale, padPx: padX })
+    }
+
+    /* "差这么点就不写盘"的门槛。默认 0.6（一次性的拟合，量多准写多准）。
+       ★ 自动重量那一趟（开板 / 板子安静下来）传 1.5，理由不是精度，
+         而是**别每次打开都改一遍文件**：差 1~2 个世界像素肉眼看不出，
+         而内容是文字度量，KaTeX 的字体换进来前后能量出 1px 上下的差别。
+         实测（2026-09-16）：同一张卡冷启动开一次 h=34.1、热一点开一次 34.9，
+         每次打开都写一次盘 —— 那正是 README 反复念叨的"每天一条假 diff、
+         然后你学会忽略 diff"的开端。留 1.5 的余量，两种度量都落进"不用改"里。 */
+    const tol = opts.tol || 0.6
+    /* 把"这一趟量到了什么"写在 DOM 上 —— 和画布那几个 dataset.strokes/pts/flat 一个道理：
+       "卡片为什么是这个尺寸"用眼睛看是看不出来的，而这类问题只有这里能查
+       （量到的宽度、第几趟、算出来的宽高）。自检会读它。
+       ★ 写在"要不要提交"的判断**之前**：不然"量了但觉得不用改"的那一趟不留痕迹，
+         而这正是最需要看的一种状态（"它到底量到几？"）。
+       实测就是靠它查明白的：文字卡那一趟 need=281.3、h=94.4、tries=0 —— 一眼看出
+       高度是**按换行前的窄宽度**算的，而"两趟才收敛"这件事没发生。 */
+    if (cardEl) {
+      cardEl.dataset.fit = JSON.stringify({
+        need: Math.round((opts.measured || 0) * 10) / 10,
+        tries: opts.tries || 0,
+        w: nextW,
+        h: nextH,
+      })
+    }
+    if (Math.abs(nextH - cur.h) < tol && Math.abs(nextW - cur.w) < tol) return 'done'
+    commit(
+      (c) => ({
+        ...c,
+        cards: c.cards.map((x) =>
+          x.id === cardId
+            ? {
+                ...x,
+                w: nextW,
+                h: nextH,
+                /* keepCenterX：写字板那条路是"以中心"把卡片放在视野里的 ——
+                   宽度一收，要让它**从中间缩**，不然卡片会突然往左跳一截。
+                   「框选」那条路是钉在笔迹左上角的，收宽度时左上角不能动。 */
+                x: opts.keepCenterX ? x.x + (cur.w - nextW) / 2 : x.x,
+              }
+            : x
+        ),
+      }),
+      false
+    )
+    return 'done'
+  }
+
+  /* KaTeX 用的是自带字体（dist/assets 里的 woff2）。公式卡的**宽度要在字体就绪之后量**：
+     字体没上时量到的是兜底字体的宽度（实测 58 vs 真正的 76，差 30%），
+     而宽度写的是 `width`（硬约束）—— 卡片会把 `E = mc²` 的 `c²` 当场裁掉。
+     ⚠ 试过两道"等字体"的闸，都不可靠：
+       · `document.fonts.ready` —— 那张卡渲染**触发**的字体加载，可能在它 resolve 之后才开始；
+       · `document.fonts.check('1em KaTeX_Main')` —— 对"还没注册/没加载"的自定义家族，
+         它会当成系统字体返回 true（规范如此），所以闸门形同虚设。
+     所以改成**不猜**：多量几趟（每 150ms 一趟，最多 12 趟），
+     连续两趟量出同一个数才算准 —— 字体换上去会让宽度变一次，那一次必然被抓住。 */
+
+  /* 认出来还没量过尺寸的卡（cardId → 量的选项 + 量到第几趟了）。
+     摘掉的条件：连续两趟量出的需求一样**而且两条轴都一样**（稳定了），
+     或者量满 12 趟，或者这张卡没了。
+
+     ★★ "同一帧里连量两趟"必须挡住，否则会量到一个**还没更新完的 DOM**：
+       实测（2026-09-16，文字卡）：scheduleFits 被几处同时叫，两个 rAF 在同一帧里
+       先后跑 —— 第一趟提交了新的宽度（w 220 → 299），第二趟在**同一毫秒**又量了一次
+       （dom 还是 220 宽），于是它看到的还是"折成三行"的内容，把高度钉在 94.4；
+       而宽度那一趟已经相等了 → 判成"稳定" → 收工。屏幕上就是"卡片比字高出一行"，
+       而且**永远不会自己好**（除非重开文件）。所以：量之前先看 DOM 的宽度对不对得上
+       （'stale' → 下一帧再来），并且稳定性要**两条轴都稳**才算数。
+       记法：**提交完不能立刻再量 —— 你量的是上一次渲染的世界。** */
+  const FIT_MAX_TRIES = 12
+  function runPendingFits() {
+    let retryFrame = false
+    let tryLater = false
+    for (const [id, opts] of [...pendingFitRef.current]) {
+      const state = fitCardSize(id, opts)
+      if (state === 'missing' || state === 'stale') {
+        retryFrame = true // 还没挂上 / DOM 还没跟上上一次提交 —— 下一帧再来
+        continue
+      }
+      if (state === 'wait') continue // 编辑态，等 editingId 一变再来
+
+      const stableH = opts.lastNeedH != null && opts.measuredH != null && Math.abs(opts.measuredH - opts.lastNeedH) < 1
+      const stableW = opts.lastNeed != null && opts.measured != null && Math.abs(opts.measured - opts.lastNeed) < 1
+      opts.lastNeed = opts.measured
+      opts.lastNeedH = opts.measuredH
+      opts.tries = (opts.tries || 0) + 1
+      if ((stableH && stableW) || opts.tries >= FIT_MAX_TRIES) {
+        pendingFitRef.current.delete(id)
+        continue
+      }
+      pendingFitRef.current.set(id, opts)
+      tryLater = true
+    }
+    if (retryFrame) requestAnimationFrame(() => runPendingFits())
+    if (tryLater) setTimeout(() => runPendingFits(), 150)
+  }
+
+  /* 排上量尺寸的头几趟：下一帧、以及字体就绪时（editingId 变化时也会来一趟，见那个 effect）。 */
+  function scheduleFits() {
+    requestAnimationFrame(() => runPendingFits())
+    const fonts = typeof document !== 'undefined' ? document.fonts : null
+    if (fonts && fonts.ready && typeof fonts.ready.then === 'function') {
+      fonts.ready.then(() => requestAnimationFrame(() => runPendingFits()))
+    }
+  }
+
+  /* 把这张板上所有**有内容的公式卡**排进"重新量一次"的队里。
+     两个调用点共用这一份规矩：换文件/重载那一趟（先 clear 再排）、
+     以及板子安静下来之后那一趟（见上面那个 effect）。写成一处的理由很实在 ——
+     这两处一旦各写一份，"量什么、门槛多少"就会慢慢不一样。
+
+     ⚠ **只管公式卡，便签/文字卡不在这里自动收。**
+       刚认出来的文字卡照样贴合内容（那一刻由 insertFromInk 排一次量尺寸，
+       公式卡和文字卡一视同仁）；但"每次开板/板子一静就自动收"这件事只给公式卡做，
+       因为便签卡在这个应用里有个**容器**身份：关系面板那条「公式卡整个落在便签里
+       → 包含（这公式属于这一节）」就是靠"便签比自己的字大一圈"成立的 ——
+       实测（2026-09-16）把便签也一起自动收之后，样板板的 3 条连线当场变成 0 条，
+       关系推理整块塌掉。你要更紧凑的便签，拖右下角那个柄就把它收小。
+     ⚠ 已经排在队里的不覆盖：刚插进来的那张可能带着自己的选项
+       （比如 keepCenterX，写字板那条路要从中间收宽度），覆盖掉就会往左跳。
+     ⚠ 空白卡（"双击写公式"/"双击写字"那个占位）不排 —— 还没有内容可量。
+     ⚠ `scheduleFits()` 由这里自己叫 —— 排了队不开跑，就等于什么都没发生，
+       而且屏幕上完全看不出来（第一版就是这样：卡片纹丝不动，
+       量尺寸那几趟一趟都没跑）。 */
+  function queueFormulaRefits(b) {
+    if (!b) return
+    for (const c of b.cards || []) {
+      if (c.kind !== 'formula') continue
+      if (!String(c.tex || c.src || '').trim()) continue
+      if (pendingFitRef.current.has(c.id)) continue
+      pendingFitRef.current.set(c.id, { fitWidth: true, tol: 1.5 })
+    }
+    scheduleFits()
+  }
+
+  /* 识别结果落成一张卡（文字卡或公式卡）。
+   *
+   * ★ 落点 = 你圈的那块笔迹的左上角，宽度先按那块笔迹算（textCardRect，纯函数、有自检）；
+   *   插进去之后立刻按**真实内容**量一次，收到贴着内容为止 —— 卡片**不去盖**那几笔手写
+   *   （2026-09-16 用户定的：「不用盖住，就让框贴合公式和字就行」）。
+   *   所以原来的手写会露在卡片周围：不想要它了，就勾面板上那个"顺便把原来的手写擦掉"。
+   *
+   * ★ 擦原笔迹是**可选**的（面板上那个勾），而且和"加卡片"合并成**一次 commit**：
+   *   一次 Ctrl+Z 把两件事一起退回去。分开两次 commit 的话，
+   *   用户按一次撤销只退了擦除、卡片还留着，看起来像"撤销坏了"。
+   *
+   * ★ 插完直接进编辑态：识别总会有认错的时候，直接让你改比"先放上去、再双击"少两步
+   *   （和手写公式那条路同一个做法）。 */
+  function insertFromInk({ mode, text, font, src, tex, erase }) {
+    const isFormula = mode === 'formula'
+    if (isFormula ? !String(src || '').trim() : !String(text || '').trim()) return
+    const box = inkBox || { x0: 0, y0: 0, x1: 0, y1: 0 }
+    /* 尺寸先按估算来（真实尺寸下一帧会量出来）。
+       落点用你圈的左上角，宽度先按那块笔迹 —— 这只是"先摆上去"的初值。 */
+    const rect = textCardRect(box, isFormula ? 'x' : text)
+    const card = isFormula
+      ? { ...newCard('formula', 0, 0), ...rect, src: String(src), tex: String(tex || '') }
+      : { ...newCard('note', 0, 0), ...rect, text: String(text), font: font || DEFAULT_CARD_FONT }
+    const kill = erase && inkSel && inkSel.size ? inkSel : null
+    commit((cur) => ({
+      ...cur,
+      cards: [...cur.cards, card],
+      strokes: kill ? cur.strokes.filter((s) => !kill.has(s.id)) : cur.strokes,
+    }))
+    setInkMode(null)
+    setInkSel(null)
+    setSelectedId(card.id)
+    setEditingId(card.id)
+    /* 卡片落进 DOM 之后按真实内容量一次尺寸（"留白太多"就是这一步治的）——
+       两条轴都收，公式卡和文字卡一样（"就让框贴合公式和字"）。
+       勾不勾"擦掉原笔迹"只影响**那几笔还在不在**，不再影响卡片多大。
+       ★ 插完是进编辑态的，所以这一次量不着（编辑器不是内容）——
+         挂进 pendingFitRef，等退出编辑时由 runPendingFits 量。 */
+    pendingFitRef.current.set(card.id, { fitWidth: true })
+    scheduleFits()
+    flash(
+      (isFormula ? '公式卡放上去了' : '放上去了') +
+        (erase ? '，原来那几笔已擦掉（Ctrl+Z 能退回）' : '，原来那几笔还留在板上（卡片不盖它）')
+    )
+  }
+
+  /* 拖右下角放大缩小一张卡。手势的 move/up 挂在 window 上（见下面的说明）。 */
+  function startResize(cardId, rectW, startX) {
+    const c0 = boardRef.current.cards.find((x) => x.id === cardId)
+    if (!c0) return
+    const st = { id: cardId, rectW: rectW || c0.w, startX, scale: c0.scale || 1, w: c0.w, moved: false }
+
+    const onMove = (e) => {
+      const dx = e.clientX - st.startX
+      if (Math.abs(dx) < 1.5) return
+      st.moved = true
+      const k = (st.rectW + dx) / st.rectW
+      const next = nextCardScale({ w: st.w, scale: st.scale }, k)
+      commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === st.id ? { ...x, scale: next } : x)) }), false)
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove, true)
+      window.removeEventListener('pointerup', onUp, true)
+      window.removeEventListener('pointercancel', onUp, true)
+      if (!st.moved) return
+      // 一次缩放 = 一步撤销（和拖动同一个做法：把"按下那一刻"补进栈）
+      const before = {
+        ...boardRef.current,
+        cards: boardRef.current.cards.map((x) => (x.id === st.id ? { ...x, scale: st.scale } : x)),
+      }
+      undoRef.current.push(before)
+      if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
+      redoRef.current = []
+      setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
+    }
+    window.addEventListener('pointermove', onMove, true)
+    window.addEventListener('pointerup', onUp, true)
+    window.addEventListener('pointercancel', onUp, true)
+  }
+
+  /* stageProps 里那些东西要一起传给画布：卡片层作为 children（同一个世界原点）。 */
   const stageProps = {
     sceneRef, liveRef, view: board.view, size,
     strokes: board.strokes, relations, cardById,
-    cardsForInk: inkPairs, selectedId, hoverEdge, eraserAt,
+    cardsForInk: inkPairs, hoverEdge, eraserAt,
+    links, selLink, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
+    onLinkHover: (inside) => {
+      linkLeftRef.current = inside
+    },
     onPointerDown, onPointerMove, onPointerUp,
     lasso, inkBox, onDeleteInk: deleteInkSel,
+    onFormulaInk: () => openInkPanel('formula'),
+    onBeautifyInk: () => openInkPanel('text'),
     /* 卡片层作为 children 传进画布组件 —— 它必须和两层 canvas 待在**同一个**
        .bd-stage 里面（同一个世界原点）。理由见 BoardCanvas 里那段说明。
        注意这里**不要再套一层带 translate / scale 的容器**：世界变换不靠 CSS，
@@ -746,6 +1372,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
               redoRef.current = []
               setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
             }}
+            /* ── 放大缩小（拖右下角那个柄）──
+               ★ 手势的移动/松手**挂在 window 上**，不靠 setPointerCapture、也不靠
+                 "指针还在手柄上"。两个理由，都是踩出来的：
+                 ① 手柄只有 18px，鼠标拖两下就出去了，靠元素自己的 onPointerMove
+                    会当场收不到事件（自检里实测：拖了 120px，倍率纹丝不动）；
+                 ② 卡片本身会 stopPropagation，窗口级 + 捕获阶段最省事。
+               这个手势和"拖动"是同一种东西：中途 commit(..., false) 不进撤销栈，
+               松手时把"按下那一刻的倍率"补成**一步**撤销。 */
+            onStartResize={(rectW, startX) => startResize(c.id, rectW, startX)}
+            onToggleLock={() => toggleLock(c.id)}
             onDelete={() => {
               commit((cur) => ({ ...cur, cards: cur.cards.filter((x) => x.id !== c.id) }))
               setSelectedId(null)
@@ -757,10 +1393,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }
 
   const panel = (
-    <RelationPanel
-      board={board}
+    <RelationPanel      board={board}
       relations={relations}
       inkPairs={inkPairs}
+      links={links}
       selectedId={selectedId}
       onSelect={setSelectedId}
       onHoverEdge={setHoverEdge}
@@ -779,7 +1415,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       tool={tool} setTool={setTool}
       color={color} setColor={setColor}
       width={width} setWidth={setWidth}
+      paper={paper} onPaper={pickPaper}
       onWriteFormula={() => setPadOpen(true)}
+      onBeautify={() => openInkPanel('text')}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
       onFit={() => {
@@ -800,9 +1438,34 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     />
   )
 
+  /* 用**笔**的时候，卡片整个让开指针事件（对应 CSS 里的 .bd.penink .bd-card）。
+     笔的语义是"在纸上写"：笔尖落在卡片上应该写得出字，而不是把卡片拖走
+     （用户 2026-09-16 报的「无法在卡片上写字」就是这一条）。
+     鼠标不适用 —— 鼠标没法写字，而拖卡片 / 缩放 / 双击改内容对鼠标必须一直顺手。
+     「⬚ 框选」是例外：切到它，卡片对所有设备都可交互，用笔的人靠它管理卡片。 */
+  const penInk = penMode && tool !== 'select'
+
+  /* 纸面的类挂在**最外层 .bd 上**（不是 .bd-stagewrap）：
+     写字板那块小板也要跟着换纸，而它是 .bd 的兄弟分支，不是 stagewrap 的孩子。
+     挂在根上，一条 `.paper-grid .bd-stagewrap, .paper-grid .wp-padwrap` 就都管得住。 */
   return (
-    <div className={'bd variant-' + variant + (fullscreen ? ' bd-fs' : '')}>
-      <div className={'bd-stagewrap' + (penMode ? ' nocursor' : '')} ref={wrapRef}>
+    <div className={'bd variant-' + variant + ' paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '')}>
+      {/* ★ 指针种类在**捕获阶段**就记下来（挂在最外层，卡片上的事件也会先经过这里）。
+          为什么不能只在 .bd-hit 上记：笔悬停到**卡片**上时，事件被卡片接走了，
+          .bd-hit 上的监听收不到 —— 于是"上一次是笔"要等按下才知道，
+          而那一下就变成拖卡片了。挂在最外层，悬停即生效。 */}
+      <div
+        className={'bd-stagewrap' + (penMode ? ' nocursor' : '')}
+        ref={wrapRef}
+        /* ★ 底纹的格距和原点由**这一层的视图**算出来（见 paperGeometry）。
+           放在这里（而不是 CSS 里写死）是为了让格线和墨迹共用同一个变换：
+           平移、缩放、装回屏幕时，两者一起动，纸上的字才像"写在纸上"。
+           写在 .bd-stagewrap 上而不是 .bd 上：这几个变量只有底纹用得到，
+           写字板那块小板是另一个坐标系（它不跟着视图走）。 */
+        style={paperGeometry(board.view, paper)}
+        onPointerMoveCapture={trackPointerKind}
+        onPointerDownCapture={trackPointerKind}
+      >
         {/* 画布、连线、卡片都在 BoardCanvas 里面 —— 它们必须是同一个世界原点。
             卡片通过 children 传进去，就是为了让"世界原点"这件事只有一个地方说话。 */}
         <BoardCanvas {...stageProps} />
@@ -841,21 +1504,39 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         />
       )}
       {settingsOpen && <OcrSettings onClose={() => setSettingsOpen(false)} flash={flash} onSaved={() => {}} />}
+      {inkMode && (
+        <InkToCard
+          mode={inkMode}
+          strokes={inkStrokes}
+          onInsert={insertFromInk}
+          onClose={() => setInkMode(null)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          flash={flash}
+        />
+      )}
     </div>
   )
 }
 
 // ────────────────────────────── 卡片 ──────────────────────────────
 
-function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, onStartDrag, onCommit, onCloseEdit, onDrag, onDragEnd, onDelete }) {
+function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, onStartDrag, onCommit, onCloseEdit, onDrag, onDragEnd, onDelete, onStartResize, onToggleLock }) {
   const dragRef = useRef(null)
   const taRef = useRef(null)
   const [draft, setDraft] = useState('')
+  const [draftFont, setDraftFont] = useState(DEFAULT_CARD_FONT)
   const isFormula = card.kind === 'formula'
+  /* 固定（钉住）：这张卡不再收指针事件 —— 见下面 .bd-card.locked 和 pinCard 的说明。 */
+  const locked = card.locked === true
+  /* 卡片的"放大缩小"倍率（见 lib/board.js 的 nextCardScale）。
+     一个数管全部：字号、内边距、圆角、宽高都乘它 ——
+     只改宽高不把字号跟着变的话，卡片越拉越大、字还是那么小，看着像坏了。 */
+  const k = Number(card.scale) > 0 ? Number(card.scale) : 1
 
   useEffect(() => {
     if (!editing) return
     setDraft(isFormula ? card.src || '' : card.text || '')
+    setDraftFont(card.font || DEFAULT_CARD_FONT)
     const raf = requestAnimationFrame(() => {
       const el = taRef.current
       if (!el) return
@@ -863,7 +1544,7 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       el.setSelectionRange(el.value.length, el.value.length)
     })
     return () => cancelAnimationFrame(raf)
-  }, [editing, isFormula, card.src, card.text])
+  }, [editing, isFormula, card.src, card.text, card.font])
 
   function commitEdit() {
     if (isFormula) {
@@ -879,7 +1560,9 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       }
       onCommit({ src: draft, tex: toTex(draft) })
     } else {
-      onCommit({ text: draft })
+      /* 文字卡不一样：这里**允许清空**（清空就是"这张卡不要了，但先留着框"）。
+         但字体要一起提交 —— 用户可能只想换个字体，一个字都没动。 */
+      onCommit({ text: draft, font: draftFont })
     }
     onCloseEdit()
   }
@@ -893,6 +1576,9 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
           value={draft}
           spellCheck={false}
           rows={1}
+          /* 文字卡的编辑框里直接用它自己的字体写 —— 你在这儿选字体，
+             看到的就该是那个字体的样子（而不是先保存、再看出效果）。 */
+          style={isFormula ? undefined : { fontFamily: fontCss(draftFont) }}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             e.stopPropagation()
@@ -906,6 +1592,25 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
           }}
           placeholder={isFormula ? 'F = ma  ·  dS/dt  ·  sqrt(x^2+y^2)' : '一句话'}
         />
+        {!isFormula && (
+          <div className="bd-fonts">
+            {CARD_FONTS.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                className={'bd-font' + (draftFont === f.id ? ' on' : '')}
+                style={{ fontFamily: f.css }}
+                /* 不让按钮抢走焦点：在 textarea 里改字改到一半去点字体，
+                   焦点一跳就没有光标了，回来还得再点一次输入框。 */
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => setDraftFont(f.id)}
+                title={f.note}
+              >
+                {f.name}
+              </button>
+            ))}
+          </div>
+        )}
         {isFormula && (
           <div className="bd-mini-preview">
             {draft.trim() ? <Tex tex={toTex(draft)} block /> : <span className="dim small">上面写的会变成这样</span>}
@@ -946,12 +1651,27 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
     const tex = displayTex(card)
     body = tex ? <div className="bd-tex"><Tex tex={tex} block /></div> : <div className="bd-card-empty">双击写公式</div>
   } else {
-    body = card.text ? <div className="bd-note">{card.text}</div> : <div className="bd-card-empty">双击写字</div>
+    /* 文字卡按它自己选的字体渲染 —— "字变好看"就落在这一行上。
+       字体是一串候选（见 board.js 的 CARD_FONTS），系统里装了哪个用哪个，
+       一个字体文件都不下载。 */
+    body = card.text
+      ? <div className="bd-note" style={{ fontFamily: fontCss(card.font) }}>{card.text}</div>
+      : <div className="bd-card-empty">双击写字</div>
   }
 
   return (
     <div
-      className={'bd-card' + (isFormula ? ' is-formula' : ' is-note') + (selected ? ' on' : '') + (dimmed ? ' dim' : '') + (editing ? ' editing' : '')}
+      className={'bd-card' + (isFormula ? ' is-formula' : ' is-note') + (locked ? ' locked' : '') + (selected ? ' on' : '') + (dimmed ? ' dim' : '') + (editing ? ' editing' : '')}
+      /* 这两条 dataset 是给自检看的（浏览器里看不到卡片数据，
+         而"插进去的是不是文字卡、字体对不对"只有真 DOM 能证明）。
+         和画布那三个 dataset.strokes/pts/flat 是同一个道理。
+         data-card-locked 也一样：锁定是个**行为**，自检要能一眼读到它。 */
+      data-card-kind={card.kind}
+      data-card-font={card.kind === 'note' ? card.font || DEFAULT_CARD_FONT : undefined}
+      data-card-locked={locked ? '1' : undefined}
+      /* data-card-id 是给"插完量一下真实高度"用的（fitCardHeight 靠它找内容元素）。
+         id 只在文件内唯一，DOM 里也够用。 */
+      data-card-id={card.id}
       /* ★ 位置用 JS 算，不用 CSS transform。公式就是世界坐标那一个映射：
              屏幕 = 世界 * s + t
          四个数（left/top/width/字号缩放）一起算，缩放才能"整体一致地"变小 ——
@@ -959,16 +1679,30 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       style={{
         left: card.x * view.s + view.tx,
         top: card.y * view.s + view.ty,
-        width: card.w * view.s,
-        minHeight: card.h * view.s,
+        width: card.w * view.s * k,
+        minHeight: card.h * view.s * k,
         /* 字号和内边距也按缩放走，卡片才是"整体一致地"变大变小。
-           只缩 left/top/width 而不缩字号，卡片会跑到正确的位置却保持原来的大小。 */
-        '--bd-card-scale': view.s,
-        padding: `${10 * view.s}px ${12 * view.s}px`,
-        borderRadius: Math.max(3, 10 * view.s),
+           只缩 left/top/width 而不缩字号，卡片会跑到正确的位置却保持原来的大小。
+           倍率有两种：view.s 是"这张纸的缩放"（大家共享），k 是"这张卡自己的放大缩小"。
+           CSS 里只有一个 --bd-card-scale，所以在这里乘好再写出去。 */
+        '--bd-card-scale': view.s * k,
+        /* 内边距从 10/12 收到 4/8（用户 2026-09-16：「边缘留白太多了」）。
+           为什么不干脆给 0：字贴着边框线看着像画坏了，而且卡片一选中、
+           边框一加粗就会压到字上。4px 是"看着贴、但不顶边"的那个数。 */
+        padding: `${4 * view.s * k}px ${8 * view.s * k}px`,
+        borderRadius: Math.max(3, 10 * view.s * k),
       }}
       onPointerDown={(e) => {
-        if (editing) return
+        /* ★ 固定住的卡片**什么都不接**：不选中、不拖动。
+           CSS 那边已经给了 pointer-events: none（事件会落到下面的 .bd-hit，
+           于是笔在这上面能写字、手指在这上面能平移），这里是第二道闸 ——
+           万一以后有人给卡片加了个自己的可点区域，拖动的入口也不会漏。 */
+        if (locked) return
+        /* ★ 编辑态里**也能拖**，只要不是按在输入框/按钮上。
+           原来这里是 `if (editing) return` —— 而"放到白板上"之后卡片就在编辑态，
+           于是用户按它毫无反应，报的就是「卡片应该能够移动」（2026-09-16）。
+           编辑器占的只是卡片中间那一块，四周的边留给人拖。 */
+        if (editing && e.target.closest('textarea, button, input, .bd-snips')) return
         e.stopPropagation()
         onSelect()
         onStartDrag?.()
@@ -977,7 +1711,7 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       }}
       onPointerMove={(e) => {
         const d = dragRef.current
-        if (!d || editing) return
+        if (!d || editing || locked) return
         /* 这里只报**屏幕位移**，换算成世界坐标由 Board 按当前缩放做 ——
            在这个闭包里读 view.s 会读到"按下那一刻"的缩放，
            缩放过一次之后拖动就会跑得比手指快/慢。 */
@@ -995,23 +1729,76 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       }}
       onDoubleClick={(e) => {
         e.stopPropagation()
+        /* 固定的卡片双击也不进编辑态：用笔的时候双击太容易误触，
+           而"我把它钉住了"这句话的意思就是"别动它"。
+           想改内容就点一下 📌 解开 —— 那是个明确的动作。 */
+        if (locked) return
         onStartEdit()
       }}
-      title="拖动挪位置 · 双击改内容 · Delete 删掉"
+      title={
+        locked
+          ? '这张卡固定住了：拖不动、也不会误触（点左下角 📌 解开）'
+          : '拖动挪位置 · 拖右下角放大缩小 · 双击改内容 · Delete 删掉 · 左下角 📌 固定住防误触（用笔时卡片让路，写在卡片上也画得出）'
+      }
     >
-      {body}
-      {selected && !editing && (
+      {/* 内容包一层：fitCardHeight 量的就是它的高度（量卡片自己等于量 min-height，
+          永远量不出"其实只有一行字"）。这一层不参与任何布局计算，只是给量高度一个准星。 */}
+      <div className="bd-card-body">{body}</div>
+
+      {/* 固定：**锁定之后整张卡只剩这一个能点**（它自己带 pointer-events: auto），
+          所以"钉死了拿不下来"这件事不会发生。
+          没锁的时候只在你选中它时出现 —— 和 × / 缩放柄同一个规矩：
+          不选中时卡片上一个手柄都不该有（这条也是踩过的，见 README 第 14 条）。
+          ⚠ 位置在**左下角**（.bd-card-pin 的 CSS）：左上角是"抓住卡片拖走"最顺手的
+            那一点，放个按钮在那儿就等于把拖动变成点按钮 —— 这条真踩过，
+            `check-ocr-browser` 的拖动断言当场变成"拖不动（0, 0）"。 */}
+      {(locked || (selected && !editing)) && (
         <button
-          className="bd-card-del"
+          className={'bd-card-pin' + (locked ? ' on' : '')}
+          /* 给自检用的钩子：这个按钮**点了会发生什么**（lock / unlock）。
+             光看 📌 和 📍 两个 emoji 分不出状态，而"锁定/解锁"正是要断言的。 */
+          data-card-pin={locked ? 'unlock' : 'lock'}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation()
-            onDelete()
+            onToggleLock?.()
           }}
-          title="删掉这张"
+          title={locked ? '解开：解开就又能拖了' : '固定住：拖不动、双击也不会进编辑（防误触）'}
         >
-          ×
+          {locked ? '📌' : '📍'}
         </button>
+      )}
+
+      {selected && !editing && !locked && (
+        <>
+          <button
+            className="bd-card-del"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation()
+              onDelete()
+            }}
+            title="删掉这张（Ctrl+Z 能撤销）"
+          >
+            ×
+          </button>
+          {/* 缩放柄：拖它按比例放大缩小**整张卡**（字跟着一起变）。
+              手势本身在 startResize 里（window 级监听）—— 这里只负责"按下"。
+              手柄这么小，靠它自己的 onPointerMove 收后续事件是收不到的。 */}
+          <div
+            className="bd-card-resize"
+            title="拖这里放大缩小：字会跟着一起变（双击卡片可以改内容）"
+            onPointerDown={(e) => {
+              e.stopPropagation()
+              e.preventDefault()
+              const host = e.currentTarget.closest('.bd-card')
+              const rectW = host ? host.getBoundingClientRect().width : card.w * view.s * k
+              onStartResize?.(rectW, e.clientX)
+            }}
+          >
+            ⤡
+          </div>
+        </>
       )}
     </div>
   )
@@ -1024,7 +1811,7 @@ const SNIP_LABEL = { frac: 'a/b', sqrt: '√', sup: 'xⁿ', sub: 'xₙ', mu0: '�
 
 // ────────────────────────────── 工具条 ──────────────────────────────
 
-function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormula, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen }) {
+function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen }) {
   return (
     <div className="bd-tools">
       <div className="bd-group">
@@ -1037,6 +1824,9 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormu
         <button className={'bd-t' + (tool === 'eraser' ? ' on' : '')} onClick={() => setTool('eraser')} title="橡皮（E）：碰到哪一笔就擦掉整笔">
           ◻ 橡皮
         </button>
+        {/* 框选（S）：拖一个矩形圈住笔迹。原来只有"笔杆侧键"这一条路，
+            所以用鼠标、或者笔上没有侧键的人根本选不中笔迹 —— 认公式/美化也就无从谈起。 */}
+        <button className={'bd-t' + (tool === 'select' ? ' on' : '')} onClick={() => setTool('select')} title="框选（S）：拖一个框圈住要认的手写 —— 圈住之后框上方浮出「∑ 公式」「✨ 美化」「✕ 删除」。★ 用笔时卡片会给笔让路，想拖卡片 / 缩放 / 双击改字就切到这个工具">⬚ 框选</button>
       </div>
 
       <div className="bd-group">
@@ -1065,6 +1855,15 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormu
         <button className="bd-t" onClick={onWriteFormula} title="手写一个公式，认出来变成好看的式子（也可以用键盘打）">
           ✍ 手写公式
         </button>
+        {/* 字写得不好看就走这条：框住你写的字 → 认成文字 → 用好看的字体排成一张卡。
+            和「手写公式」并列放，因为它们是同一件事的两半：一个认式子，一个认字。
+            ★ 没框选时**不做成灰的**：灰按钮点不动、也不教人下一步该干什么，
+              而这条路的入口恰恰是"先用框选圈住字"这件反直觉的事。
+              可点 + 当场提示「先用「⬚ 框选」圈住要认的手写」才是最省事的说明书。
+            ★ 框住之后浮层上还会多一个「∑ 公式」——已经写在板上的式子不用重抄一遍。 */}
+        <button className="bd-t" onClick={onBeautify} title="美化手写：先框住你写的字（点「⬚ 框选」拖一个框，或按住笔杆键拖），再点这里">
+          ✨ 美化手写
+        </button>
       </div>
 
       <div className="bd-group">
@@ -1084,6 +1883,26 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormu
           {Math.round((scale || 1) * 100)}%
         </button>
         <button className="bd-t icon" onClick={() => onScale(0.05)} disabled={scale >= 2} title="界面字号大一点">A+</button>
+      </div>
+
+      {/* 纸面：四种纸直接**画在按钮上**（所点即所得，不用看名字猜）。
+          为什么不做成下拉菜单：工具条上同类的东西（颜色、粗细）都是当场摆出来的，
+          纸面是同一类选择，多一层展开只多一次点击。
+          ⚠ 别和右边那组混：那个 `纸` 是**画布缩放**（把纸放大缩小），
+            这里是**纸长什么样** —— 所以这里的标签写"背景"，两个字不一样。 */}
+      <div className="bd-group">
+        <span className="bd-zoomlabel">背景</span>
+        {PAPERS.map((p) => (
+          <button
+            key={p.id}
+            data-paper={p.id}
+            className={'bd-paper p-' + p.id + (paper === p.id ? ' on' : '')}
+            onClick={() => onPaper(p.id)}
+            title={'纸面 · ' + p.name + '：' + p.hint}
+            aria-label={'纸面：' + p.name}
+            aria-pressed={paper === p.id}
+          />
+        ))}
       </div>
 
       <div className="bd-group right">
@@ -1108,7 +1927,7 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, onWriteFormu
 
 // ────────────────────────────── 关系面板 ──────────────────────────────
 
-function RelationPanel({ board, relations, inkPairs, selectedId, onSelect, onHoverEdge, onFocus }) {
+function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus }) {
   const byId = new Map(board.cards.map((c) => [c.id, c]))
   const label = (c) => {
     if (!c) return '(没了)'
@@ -1137,6 +1956,35 @@ function RelationPanel({ board, relations, inkPairs, selectedId, onSelect, onHov
           <TreeNode key={r.id} node={r} depth={0} relations={relations} byId={byId} label={label} selectedId={selectedId} onSelect={onSelect} onFocus={onFocus} />
         ))}
       </div>
+
+      {/* ★ 你亲手画出来的那些连接 —— 和上面的"按位置读出来的"分开列。
+          为什么要单独一节：连线的两张卡常常离得很远（位置推断根本不会把它俩凑一对），
+          而"我画过线"恰恰是最确定的一句话，它不该因为离得远就从面板上消失。 */}
+      {links.length > 0 && (
+        <div className="bd-links-list">
+          <div className="bd-rel-sub">你画过的（{links.length} 条）</div>
+          {links.map((l) => (
+            <button
+              key={l.strokeId}
+              className={'bd-link-row' + (l.dir ? ' dir' : '')}
+              onClick={() => onFocus(l.a)}
+              title={l.manual ? '你标过的：' + l.name : '按笔迹形状读出来的：' + l.name}
+            >
+              <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
+                {l.name}
+                {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
+              </span>
+              <span className="bd-er">{label(byId.get(l.a))}</span>
+              <span className="dim">{l.dir ? '→' : '—'}</span>
+              <span className="bd-er">{label(byId.get(l.b))}</span>
+            </button>
+          ))}
+          <div className="dim small pad">
+            形状读出来的（直线=相关、带箭头=因果）**不写进文件**；
+            你点过词的那几条才会记住。
+          </div>
+        </div>
+      )}
 
       {relations.orphans.length > 0 && (
         <div className="bd-islands">
@@ -1213,6 +2061,10 @@ function Hint() {
         它会认成排好的样子，再放到板上。
       </div>
       <div className="bd-hint-s dim">
+        觉得自己字丑：点「⬚ 框选」把你写的字圈起来，再点「✨ 美化手写」——
+        它会认成文字，用好看的字体排一张卡盖在原处（原笔迹不删，拖开就回来）。
+      </div>
+      <div className="bd-hint-s dim">
         笔尖写字，翻过来就是橡皮。触屏：两根手指拖 = 平移，捏 = 缩放。
       </div>
     </div>
@@ -1264,6 +2116,28 @@ function readVariant() {
   if (typeof window === 'undefined') return 'A'
   const m = /[?&]variant=([ABC])/i.exec(window.location.search)
   return m ? m[1].toUpperCase() : 'A'
+}
+
+/* 打开时用哪种纸：**地址栏 > 上次选的 > 默认纯白**。
+   地址栏放在最前面是有用的：`?paper=grid` 能一次把纸定死，
+   自检（scripts/check-paper.js）和"把这个链接发给同学"都靠它，
+   而且它**不会**反过来把偏好写模糊 —— 只有点工具条上的按钮才写 localStorage。
+
+   认不出的值一律退回默认 —— 手改地址栏、老版本存下的值是常事，
+   读不出来就崩，或者留一个对不上的 id（CSS 类名也就对不上、纸变成"没有底纹"
+   却显示成选中了某一档），比直接退回默认难查得多。 */
+function readPaper() {
+  if (typeof window === 'undefined') return DEFAULT_PAPER
+  const m = /[?&]paper=([a-z]+)/i.exec(window.location.search)
+  const fromUrl = m ? m[1].toLowerCase() : ''
+  if (PAPERS.some((p) => p.id === fromUrl)) return fromUrl
+  try {
+    const saved = localStorage.getItem(PAPER_KEY)
+    if (PAPERS.some((p) => p.id === saved)) return saved
+  } catch {
+    /* 隐私模式下读不了，用默认 */
+  }
+  return DEFAULT_PAPER
 }
 
 function setVariantAndUrl(v, setVariant) {

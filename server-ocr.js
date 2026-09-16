@@ -51,12 +51,16 @@ export const PROVIDERS = {
   deepseek: {
     label: 'DeepSeek（deepseek-flash，用你已有的 key）',
     needs: 'DeepSeek 的 API Key（sk- 开头）',
-    note: '图片会发到 api.deepseek.com。用你平时那个账号的 key 就行，不用另外申请。',
+    note: '图片会发到 api.deepseek.com。用你平时那个账号的 key 就行，不用另外申请。公式和普通文字都认。',
+    modes: ['formula', 'text'],
   },
   simpletex: {
     label: 'SimpleTex（专门认公式，手写更对路）',
     needs: 'SimpleTex 的鉴权串（UAT / APP）',
-    note: '图片会发到 server.simpletex.net。有每日免费额度，轻量模型每天 2000 次。',
+    note: '图片会发到 server.simpletex.net。有每日免费额度，轻量模型每天 2000 次。**只认公式**，不认普通文字。',
+    modes: ['formula'],
+    // 认普通文字（白板「美化手写」）时，这家用不了 —— 它的接口就只吐 LaTeX
+    formulaOnly: true,
   },
 }
 
@@ -71,6 +75,24 @@ export const FORMULA_PROMPT = [
   '不要加 $ 或 $$ 定界符。',
   '如果图片里根本没有公式，只输出一个词：EMPTY。',
 ].join('\n')
+
+/* 认**普通文字**（白板上随手写的笔记、标题、单词）用的提示词。
+ *
+ * 和认公式是两条不同的路，所以是两段提示词而不是一段加参数：
+ *   · 公式要的是"翻译成 LaTeX"；文字要的是"照抄"。
+ *   · 文字**保留换行** —— 你写了两行，卡片上就该是两行（一坨连在一起没法看）。
+ *   · 明确说"不要把数学符号转成 LaTeX"：转了之后文字卡里会出现一堆
+ *     反斜杠花括号，而文字卡是纯文本、不渲染 LaTeX —— 看起来就像乱码。
+ *     要公式请用「✍ 手写公式」那条路，那里才排得好看。
+ *   · 顺手让它别把中英文之间的空格、标点乱改：抄写任务的正确姿势是"少动手"。 */
+export const TEXT_PROMPT = [
+  '你是手写文字识别工具。图片里是别人手写的一段内容，可能是中文、英文、数字或者混着写。',
+  '把里面的文字**原样抄下来**，保留原来的换行。',
+  '不要翻译、不要改写、不要补充标点、不要加任何解释或客套、不要 Markdown 代码块。',
+  '数学符号按普通字符写出来（比如 x^2 就写 x^2），**不要**转成 LaTeX 命令。',
+  '如果图片里根本没有可辨认的文字，只输出一个词：EMPTY。',
+].join('\n')
+
 
 export function configFile(root) {
   return path.join(root, ...CONFIG_PATH)
@@ -186,11 +208,27 @@ export function cleanLatex(raw) {
 /* ── 真正发请求：按 provider 分派 ── */
 /* 走 src/lib/http.js 而不是内置 fetch：
    fetch（undici）连本机 HTTPS 会挂住（实测），而这条链路以后很可能指向自建/本机代理。
-   超时必须有：识别服务会排队，没超时的话前端一直转圈，用户以为是自己写错了。 */
-export async function callProvider(cfg, imageBytes, { timeoutMs = 30000 } = {}) {
+   超时必须有：识别服务会排队，没超时的话前端一直转圈，用户以为是自己写错了。
+
+   mode —— 'formula'（默认，认公式）| 'text'（认普通文字，白板的「美化手写」用）。
+   ★ SimpleTex 走不通 text 模式：它的接口契约就是"一张图 → 一个 LaTeX"，
+     没有"给我文字"这回事。**在这里挡掉、并且说清楚该换哪一家**，
+     比让它认出一堆 `\text{...}` 再回来强 —— 那种失败用户根本看不懂。
+     这个判断放在服务端而不是前端，是因为"哪家能干什么"是这一层的知识。 */
+export async function callProvider(cfg, imageBytes, { mode = 'formula', timeoutMs = 30000 } = {}) {
+  if (mode === 'text') {
+    if (cfg.provider === 'simpletex') {
+      return {
+        ok: false,
+        kind: 'provider',
+        error: 'SimpleTex 只认公式，认普通文字要用 DeepSeek —— 去「手写识别设置」里把「用哪家识别」换成 DeepSeek，再点一次。',
+      }
+    }
+    return callDeepSeek(cfg, imageBytes, { mode, timeoutMs })
+  }
   return cfg.provider === 'simpletex'
     ? callSimpleTex(cfg, imageBytes, { timeoutMs })
-    : callDeepSeek(cfg, imageBytes, { timeoutMs })
+    : callDeepSeek(cfg, imageBytes, { mode, timeoutMs })
 }
 
 /* 把 http 层的报错/状态码翻译成"用户该干什么"。
@@ -225,8 +263,9 @@ function classifyHttp(status, text) {
      Body:   { model, messages: [ { role:'user', content: [ {type:'text'}, {type:'image_url', image_url:{url:'data:image/png;base64,…'}} ] } ] }
      返回:   { choices: [ { message: { content: "…" } } ] }
    图片用 base64 data URL 内联（官方支持的三种方式里最简单的一种，不用先传 Files）。 */
-export async function callDeepSeek(cfg, imageBytes, { timeoutMs = 30000 } = {}) {
+export async function callDeepSeek(cfg, imageBytes, { mode = 'formula', timeoutMs = 30000 } = {}) {
   if (!hasKey(cfg)) return { ok: false, kind: 'no-key', error: '还没填密钥' }
+  const wantText = mode === 'text'
 
   const body = JSON.stringify({
     model: cfg.model || DEFAULT_CONFIG.model,
@@ -236,7 +275,7 @@ export async function callDeepSeek(cfg, imageBytes, { timeoutMs = 30000 } = {}) 
       {
         role: 'user',
         content: [
-          { type: 'text', text: FORMULA_PROMPT },
+          { type: 'text', text: wantText ? TEXT_PROMPT : FORMULA_PROMPT },
           { type: 'image_url', image_url: { url: 'data:image/png;base64,' + Buffer.from(imageBytes).toString('base64') } },
         ],
       },
@@ -264,6 +303,15 @@ export async function callDeepSeek(cfg, imageBytes, { timeoutMs = 30000 } = {}) 
   }
   const content =
     (parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content) || ''
+
+  if (wantText) {
+    const text = cleanTextOutput(content)
+    if (!text) {
+      return { ok: false, kind: 'empty', error: '模型没认出文字（它回的是一句解释，不是一个词）', raw: String(content).slice(0, 200) }
+    }
+    return { ok: true, text, conf: null, note: '识别来自 ' + (cfg.model || DEFAULT_CONFIG.model) }
+  }
+
   const latex = cleanModelOutput(content)
   if (!latex) return { ok: false, kind: 'empty', error: '模型没认出公式（它回的是一句解释，不是式子）', raw: String(content).slice(0, 200) }
   return { ok: true, latex, conf: null, note: '识别来自 ' + (cfg.model || DEFAULT_CONFIG.model) }
@@ -319,6 +367,43 @@ export function cleanModelOutput(raw) {
 /* "这段像不像 LaTeX"。判据故意宽松：宁可多认一个，也别把真公式误判成人话。 */
 function looksLikeLatex(t) {
   return /\\[a-zA-Z]|[_^={}]|\d\s*[a-zA-Z]/.test(String(t || ''))
+}
+
+/* 模型回话里把**文字**抠出来。
+ *
+ * ★ 为什么不复用上面那个 cleanModelOutput —— 这是这个功能最容易踩的一脚：
+ *   cleanModelOutput 里有一条"一句话里混着前言 + 公式，就取最后一个冒号后面那段"。
+ *   对公式是对的（`图片里的公式是：\oint…`），对**文字是灾难**：
+ *   笔记里本来就到处是冒号（`安培环路定理：只对稳恒电流成立`），
+ *   那一步会把用户写的一整行悄悄砍掉前半句，而**界面上看不出来**
+ *   （卡片里就是少了一段字，你会以为是自己没写全）。
+ *   所以文字这条路只做三件事，一律"宁可留着，不可删掉"：
+ *     ① 剥 ``` 围栏（说了不要它还是会包）
+ *     ② 剥掉整段外面被包上的引号（模型爱说"内容是："再配一对引号）
+ *     ③ 认 EMPTY 哨兵
+ *   多行的取舍也不同：公式取"最像 LaTeX 的那一行"，文字**每一行都留着**。 */
+export function cleanTextOutput(raw) {
+  let s = String(raw == null ? '' : raw).trim()
+  if (!s) return ''
+
+  const fence = /```(?:text|markdown|md|plain|latex|tex)?\s*([\s\S]*?)```/i.exec(s)
+  if (fence) s = fence[1].trim()
+
+  // 整段被一对引号包着（半角 / 中文 / 书名号），且里面没有第二对同样的引号
+  const pairs = [['"', '"'], ['“', '”'], ["'", "'"], ['「', '」'], ['『', '』']]
+  for (const [a, b] of pairs) {
+    if (s.length > 1 && s.startsWith(a) && s.endsWith(b) && !s.slice(1, -1).includes(b)) {
+      s = s.slice(1, -1).trim()
+      break
+    }
+  }
+
+  /* 句末的句号有半角也**有全角**（"这张图里没有文字。"）。
+     这里的 `[.。]?` 不是随手加的：公式那条路漏了全角句号也没暴露 ——
+     因为公式的兜底是"有中文且不像 LaTeX 就当没认出"，中文句子照样被丢掉。
+     文字这条路的中文是**正文**，兜底那条不存在，所以标点必须自己认全。 */
+  if (/^(EMPTY|N\/A|无|没有文字|图片中没有文字|这张图.*没有(文字|内容))[.。]?$/i.test(s)) return ''
+  return s
 }
 
 /* ── SimpleTex：multipart 直接传图 ──

@@ -15,10 +15,24 @@ import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { browserExe } from './lib/browser.js'
+import { newBoard, serializeBoardDocument } from '../src/lib/board.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.join(__dirname, '..')
 const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
+
+/* ── 夹具板：这一条自检**会真的画一笔**（"笔能不能用"只有真画一下才算验过）──────
+   ⚠ 它原来画在"打开时列表里第一个 board-*.md"上 —— 那多半是**用户自己的板**。
+     2026-09-16 实测就出了事：落点算到了底部工具条的按钮上（打印出来是 `bd-t on`），
+     于是那一下不是在画画，是在**点工具** —— 点到橡皮的话，后面那 16 个 mouseMoved
+     就变成了**擦除用户的笔迹**。自检把测试数据写进用户的数据里，是这个仓库反复
+     强调过的红线（check-ocr-browser / check-board-browser 都为它造过夹具板）。
+     现在：造一张自己的板（board- 前缀 + zz- 前缀，跑完删掉），点左栏那一行打开它；
+     而且**落点不是 .bd-hit 就不画**（宁可不测这一条，也不在板上乱点）。 */
+const FIXTURE_NAME = 'board-zz-loaded.md'
+const FIXTURE_TITLE = 'board-zz-loaded'
+const FIXTURE = path.join(ROOT, 'data', FIXTURE_NAME)
+fs.writeFileSync(FIXTURE, serializeBoardDocument(newBoard('自检夹具（跑完自动删除）')), 'utf8')
 
 const exe = browserExe() // Edge 优先，也认 CHROME_PATH，见 scripts/lib/browser.js
 // 服务端现在发的是什么
@@ -30,10 +44,19 @@ fs.rmSync(profile, { recursive: true, force: true })
 const chrome = spawn(exe, ['--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars', '--window-size=1440,900', '--remote-debugging-port=0', `--user-data-dir=${profile}`, APP], {
   stdio: ['ignore', 'ignore', 'pipe'],
 })
-process.on('exit', () => {
+const cleanup = () => {
   try {
     chrome.kill()
   } catch {}
+  // 夹具板是自己的东西，跑完必须删掉（中途崩了也要删）
+  try {
+    fs.rmSync(FIXTURE, { force: true })
+  } catch {}
+}
+process.on('exit', cleanup)
+process.on('SIGINT', () => {
+  cleanup()
+  process.exit(130)
 })
 
 // port=0 时浏览器会把实际端口写进 profile 里的 DevToolsActivePort
@@ -89,6 +112,31 @@ await send('Runtime.enable')
 await send('Page.enable')
 await new Promise((r) => setTimeout(r, 2500))
 
+/* ★ 先换到自己的夹具板再动手。应用打开的是"列表里第一个 board-*.md"，
+   那多半是用户自己的板 —— 而这个自检会真的往上画一笔。 */
+{
+  const pick = await ev(`(() => {
+    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
+    if (cur.trim() === ${JSON.stringify(FIXTURE_NAME)}) return 'already'
+    const row = [...document.querySelectorAll('.filerow')].find(
+      (r) => ((r.querySelector('.fname') || {}).textContent || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
+    )
+    if (!row) return 'no-row'
+    row.click()
+    return 'clicked'
+  })()`)
+  if (pick === 'no-row') {
+    console.error('\n  左栏里找不到夹具板 ' + FIXTURE_TITLE + ' —— 后面会往别人的板上画画，停在这里。\n')
+    cleanup()
+    process.exit(2)
+  }
+  if (pick === 'clicked') {
+    await new Promise((r) => setTimeout(r, 1200))
+    const now = await ev(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)
+    console.log('  （夹具板：' + now + '）')
+  }
+}
+
 /* ★ 真的画一笔。
    用户的抱怨是"笔也用不了"，那就不能只看 DOM 里有没有按钮 ——
    必须真的画一下、看画布上有没有墨。这一条是"仿冒打开"最值钱的部分。
@@ -111,29 +159,41 @@ const countInk = `(() => {
 })()`
 const inkBefore = await ev(countInk)
 
-const box = await ev(`(() => { const r = document.querySelector('.bd-hit')?.getBoundingClientRect(); return r ? { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height), vw: window.innerWidth, vh: window.innerHeight } : null })()`)
+/* 画点必须落在**真正的空白纸面**上，不是"视口内"就行。
+   板上压着两块浮层：右上角的关系面板、底下的工具条。
+   第一版按 left/top 加偏移算出一个点，它正好落在关系面板上 —— 事件被面板吃掉，
+   画布一点墨都没有，看起来就像"笔坏了"。
+   2026-09-16 又踩了一次（这次落在**工具条的按钮**上，打印出来是 `bd-t on`）：
+   那一下不是在画，是**点了一个工具**；点到橡皮的话，后面那 16 个 mouseMoved
+   就变成擦除。所以现在：逐个候选点用 elementFromPoint 验，验不上就**不画**。 */
+const spot = await ev(`(() => {
+  const hit = document.querySelector('.bd-hit')
+  if (!hit) return null
+  const r = hit.getBoundingClientRect()
+  const panel = document.querySelector('.bd-cpanel') ? document.querySelector('.bd-cpanel').getBoundingClientRect() : null
+  const bar = document.querySelector('.bd-tools') ? document.querySelector('.bd-tools').getBoundingClientRect() : null
+  for (const fy of [0.88, 0.8, 0.72, 0.94, 0.62]) {
+    for (const fx of [0.06, 0.12, 0.2, 0.3]) {
+      const x = Math.round(r.left + r.width * fx)
+      const y = Math.round(r.top + r.height * fy)
+      if (panel && x > panel.left - 8) continue
+      if (bar && y > bar.top - 10) continue
+      const el = document.elementFromPoint(x, y)
+      if (el && el.classList && el.classList.contains('bd-hit')) return { x: x, y: y }
+    }
+  }
+  return null
+})()`)
+
 let inkAfter = { scene: -1, live: -1 }
-if (box) {
-  /* ★ 画点必须落在**真正的空白纸面**上，不是"视口内"就行。
-     板上压着两块浮层：右上角的关系面板、底下的工具条。
-     第一版我按 left/top 加偏移算出一个点，它正好落在关系面板上 ——
-     事件被面板吃掉，画布一点墨都没有，看起来就像"笔坏了"。
-     所以我在这里**显式避开**这两块，并断言落点确实是 .bd-hit。 */
-  const zone = await ev(`(() => {
-    const hit = document.querySelector('.bd-hit')?.getBoundingClientRect()
-    if (!hit) return null
-    const panel = document.querySelector('.bd-cpanel')?.getBoundingClientRect()
-    const bar = document.querySelector('.bd-tools')?.getBoundingClientRect()
-    return { hit: { l: hit.left, t: hit.top, r: hit.right, b: hit.bottom }, panel: panel ? { l: panel.left, t: panel.top, b: panel.bottom } : null, bar: bar ? { t: bar.top } : null }
-  })()`)
-  const leftEdge = zone ? Math.max(zone.hit.l, box.x) + 40 : box.x + 40
-  const x0 = Math.round(leftEdge)
-  const y0 = Math.round(zone ? Math.min(zone.hit.b - (zone.bar ? zone.hit.b - zone.bar.t : 120) + 10, zone.hit.b - 130) + 60 : box.y + 200)
-  const okSpot = await ev(`(() => {
-    const el = document.elementFromPoint(${x0}, ${y0})
-    return el ? (el.className || el.tagName) : 'none'
-  })()`)
-  console.log('  落点检查     ：(' + x0 + ',' + y0 + ') 上是 ' + okSpot)
+let skipped = false
+if (!spot) {
+  console.log('  落点检查     ：浮层把这一带占满了，找不到真正的空白纸面 —— 这一条跳过（不画）')
+  skipped = true
+} else {
+  const x0 = spot.x
+  const y0 = spot.y
+  console.log('  落点检查     ：(' + x0 + ',' + y0 + ') 上确实是 bd-hit（空白纸面）')
   await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: x0, y: y0, button: 'left', buttons: 1, clickCount: 1 })
   for (let i = 1; i <= 16; i++) {
     await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x0 + i * 8, y: y0 + Math.sin(i / 2) * 12, button: 'left', buttons: 1 })
@@ -188,7 +248,7 @@ console.log('  画一笔       ：笔迹层 ' + inkBefore.scene + '→' + inkAft
 console.log('')
 const fresh = info.js.includes(served)
 const hasBtn = info.toolbar.some((t) => t.includes('手写公式'))
-const canDraw = inkBefore.scene < 0 || inkAfter.scene > inkBefore.scene
+const canDraw = skipped || inkBefore.scene < 0 || inkAfter.scene > inkBefore.scene
 if (fresh && hasBtn && canDraw) {
   console.log('  ✓ 全新打开完全正常：最新 js + 有「手写公式」+ 笔能画')
   console.log('    → 你那个窗口是缓存了旧版。硬刷一次就好：Ctrl+Shift+R（或 Ctrl+F5）')
@@ -201,6 +261,5 @@ if (fresh && hasBtn && canDraw) {
   console.log('    → 这不是缓存问题。先 npm run build，再跑 npm run check:board-browser')
 }
 
-ws.close()
-chrome.kill()
+cleanup()
 process.exit(0)
