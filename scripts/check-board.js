@@ -11,9 +11,11 @@ import {
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
   chainOfStroke, descendantsOf, deriveChains, findTip, freezeGroup, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
-  parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
-  strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
+  parseBoardDocument, pointSegDist, readArrowHead, relationCurve, serializeBoardDocument, simplifyPoints,
+  strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints,
 } from '../src/lib/board.js'
+/* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
+import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 
@@ -252,6 +254,58 @@ console.log('\n[3] 几何：距离 / 命中 / 视图变换')
   const after = screenToWorld(500, 300, zoomed)
   near(after.x, before.x, 1e-6, '滚轮缩放：光标下的世界点不跑')
   near(after.y, before.y, 1e-6, '滚轮缩放：光标下的世界点不跑（纵向）')
+
+  /* ── 视图映射 module（src/lib/view.js）自己的断言 ──
+     2026-09-16 把它从"手抄 14 处"收成一个 module 时补的：这里钉的是
+     **口径**（纯浮点、谁 round、dpr 怎么叠、捏合的锚点怎么跟）。 */
+  {
+    /* ① 纯浮点：非整格的视图也不能被悄悄 round —— 早 round 是"看着有点歪"的根源 */
+    const v = { s: 0.643, tx: 12.4, ty: 174.8 }
+    const p = worldToScreen({ x: 367.5, y: 337.5 }, v)
+    near(p.x, 367.5 * 0.643 + 12.4, 1e-9, '映射是纯浮点（不 round）')
+    near(p.y, 337.5 * 0.643 + 174.8, 1e-9, '映射是纯浮点（不 round，纵向）')
+
+    /* ② 世界矩形 → CSS 盒子：位置是映射、宽高是"长度 × s"，两条轴都要对 */
+    const box = worldRectToScreen({ x0: 10, y0: 20, x1: 110, y1: 70 }, v, 7)
+    near(box.left, 10 * v.s + v.tx - 7, 1e-9, '矩形左边界 = 映射 − pad')
+    near(box.width, 100 * v.s + 14, 1e-9, '矩形宽 = 世界宽 × s + 2×pad')
+
+    /* ③ clamp：NaN / 0 / 空 都退回 1，且夹在 [0.15, 6] */
+    eq(clampViewScale(NaN), 1, 'clamp：NaN → 1（一次脏输入不该把板缩没）')
+    eq(clampViewScale(0), 1, 'clamp：0 → 1')
+    eq(clampViewScale(99), 6, 'clamp：上限 6')
+    eq(clampViewScale(0.01), 0.15, 'clamp：下限 0.15')
+
+    /* ④ 捏合：锚点会动 —— 开始时两指中点下的世界点，要落在**现在的**中点下 */
+    const v0 = { s: 1, tx: 0, ty: 0 }
+    const from = { x: 100, y: 100 }
+    const to = { x: 160, y: 130 }
+    const worldUnderFrom = screenToWorld(from.x, from.y, v0)
+    const pinched = zoomBetween(v0, 2, from, to)
+    const whereItLanded = worldToScreen(worldUnderFrom, pinched)
+    near(whereItLanded.x, to.x, 1e-9, '捏合：开始时锚点下的世界点落到**新的**中点（横）')
+    near(whereItLanded.y, to.y, 1e-9, '捏合：开始时锚点下的世界点落到**新的**中点（纵）')
+    /* zoomAt 是 zoomBetween 的特例（锚点不动）—— 两条手势走同一个公式 */
+    eq(JSON.stringify(zoomAt(v0, 2, 100, 100)), JSON.stringify(zoomBetween(v0, 2, from, from)), 'zoomAt ≡ zoomBetween(同一个锚点)')
+
+    /* ⑤ 平移：屏幕位移原样加到 t 上，和缩放无关 */
+    const panned = panBy({ s: 3, tx: 5, ty: 6 }, -70, 45)
+    eq([panned.s, panned.tx, panned.ty], [3, -65, 51], '平移：屏幕位移原样加到 tx/ty')
+
+    /* ⑥ 居中：容器中心那个屏幕点映回去就是它 */
+    const centered = centerOn({ s: 2, tx: 0, ty: 0 }, { x: 33, y: -12 }, 800, 600)
+    const back2 = screenToWorld(400, 300, centered)
+    near(back2.x, 33, 1e-9, 'centerOn：容器中心映回去就是那个世界点（横）')
+    near(back2.y, -12, 1e-9, 'centerOn：容器中心映回去就是那个世界点（纵）')
+
+    /* ⑦ canvas 变换：dpr 必须乘进去，返回的三个数就是写进去的那三个 */
+    const calls = []
+    const fakeCtx = { setTransform: (...a) => calls.push(a) }
+    const nums = applyViewTo(fakeCtx, { s: 1.5, tx: 10, ty: -4 }, 2)
+    eq(nums, { s: 3, tx: 20, ty: -8 }, 'applyViewTo 返回实际写进去的三个数')
+    eq(calls[0], [3, 0, 0, 3, 20, -8], 'applyViewTo：setTransform(dpr×s, …)（dpr 乘进去了）')
+    eq(viewTransformAttr({ s: 1.5, tx: 10, ty: -8.5 }), 'translate(10 -8.5) scale(1.5)', 'SVG 变换和 canvas 变换同源')
+  }
 }
 
 // ═════════════════════ 4. 关系推理 ═════════════════════

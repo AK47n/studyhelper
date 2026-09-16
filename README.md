@@ -990,6 +990,24 @@ Body:   multipart/form-data，字段名固定 file（PNG/JPEG）
       ② 自动判定那类代码的 bug 只在"内容更密更杂"的输入上暴露（拿 `board-baseline.md` 当对手盘）；
       ③ 缓存键必须跟着**排除集**走，"忘了给 key"要退化成不缓存。
 
+26. **一条公式被手抄 14 处时，"导出的那份有自检、手指走的是复制品"。**
+    2026-09-16 做架构 review 时，另一个独立走查指出：`worldToScreen` 存在但**在 `src/` 里零调用者**，
+    而「屏幕 = 世界 × s + t」被手抄了 **14 处**（`BoardCanvas.jsx` 12、`Board.jsx` 2），
+    `ctx.setTransform(dpr*s, …)` 同一公式写了两份，**捏合缩放还把 `clampViewScale` 与
+    "以锚点缩放"的前馈公式又抄了一遍** —— 于是导出的 `zoomAt/clampViewScale` 有自检，
+    真手指走的那条路却没有。这一类"口径不一致"**已经真的出过 bug**
+    （框选"点线即选中"把世界像素当屏幕像素用，见上一节）。
+    做法：收成一个 module `src/lib/view.js`（`worldToScreen` / `screenToWorld` /
+    `worldRectToScreen` / `applyViewTo` / `viewTransformAttr` / `zoomAt` / `zoomBetween` /
+    `panBy` / `centerOn` / `clampViewScale`），口径三条规矩写死在它的文件头：
+    **一律纯浮点**（round 是"写 DOM"那一步的事）、**dpr 由 `applyViewTo` 乘**、
+    **捏合的锚点用 `zoomBetween`（起点和落点是两个坐标）**。`board.js` 不再导出这四个函数。
+    ⚠ 收口当场踩到一个坑，值得记：`worldToScreen` 返回的是 **`{x, y}` 不是 `{left, top}`**，
+    我把它 `...` 展开进卡片的 `style` —— 卡片**没有 left/top**、静默退回 CSS 定位，整版错位。
+    抓住它的是新加的那条跨层断言（拿 canvas 的变换反推视图，再用**同一个 module**
+    算卡片该在哪，和它的 CSS `left/top` 比，Δ ≤ 1px；换一档缩放再比一次）。
+    **记法**：同一个公式出现第二份时，就要问"测试打的是哪一份、手指走的是哪一份"。
+
 ---
 
 ## 荧光笔为什么是"一条路径一次描"
@@ -1281,9 +1299,11 @@ npm run check:mount   # 真挂载：jsdom 里跑"打开 → 编辑 → 阅读 �
 npm run check:browser # 真浏览器：逐行比对着色层和编辑框的坐标（需先 npm start）
 
 # 白板
-npm run check:board          # 纯逻辑：坐标/抽稀/关系推理/存取往返/公式转化/文字卡的字体、落点、缩放倍率、尺寸贴内容、固定字段、连接与形状判定、★ 真手画箭头、★ 墨迹块当端点、「不算连接」、框选固化、条件与推导链（335 项）
+npm run check:board          # 纯逻辑：坐标/抽稀/关系推理/存取往返/公式转化/文字卡的字体、落点、缩放倍率、尺寸贴内容、固定字段、连接与形状判定、★ 真手画箭头、★ 墨迹块当端点、「不算连接」、框选固化、条件与推导链、★ 视图映射（352 项）
 npm run check:default        # 真浏览器：data/ 里一张板都没有时，打开必须是白板（会自动补一张空的）
 npm run check:board-browser  # 真浏览器：画得出来、存得对、卡片**点得到**、两层坐标对齐、三种摆法
+                             # ★ 对齐是**数值**的：拿 canvas 记下的变换反推视图，用 view.js 算一张卡
+                             #   该在屏幕哪里，和它的 CSS left/top 比（Δ ≤ 1px）——换一档缩放再比一次
 npm run check:paper          # 真浏览器：纸面四档（纯白/方格/横线/点阵）—— 换了真的变、重开还记得、
                              # 像素证明底纹真的画出来了、★ 平移缩放时格线跟墨迹一起动
                              # （格距 = 世界格距 × 缩放 + 原点锚在世界原点上）、
@@ -1422,6 +1442,8 @@ studyhelper/
       board.js         白板：数据模型 + 几何 + 关系推理 + 存取（不碰 DOM，可纯 node 测）
                        还有文字卡的**字体预设**和**落点算法**（卡片落在你圈的那块左上角）
       formula.js       白板：随手写的公式 → 好看 LaTeX（幂等、认不出就原样留着）
+      view.js          视图映射：屏幕 = 世界 × s + t —— **只有这一份实现**（DOM 浮层位置 /
+                       canvas 变换 / SVG 变换 / 缩放锚点 / 平移 / 居中都在这里；一律纯浮点）
       ink.js           笔迹怎么画（白板画布和"导出给识别"共用；不含 React）
       ocr.js           手写识别的前端：笔迹转 PNG、调本地服务、错误分类
                        两条路：认公式（formula）和认普通文字（text，美化手写用）
@@ -1444,7 +1466,7 @@ studyhelper/
     board-*.md         白板（内容其实是 JSON，但仍是 .md，见「白板 → 数据长什么样」）
   config/              ocr.json：手写识别的密钥（在 .gitignore 里，不进 Git）
   scripts/             自检脚本 + sync.js（一键备份到 GitHub）
-    check-board.js         白板纯逻辑自检（335 项，含每条踩过的坑）
+    check-board.js         白板纯逻辑自检（352 项，含每条踩过的坑）
     check-board-browser.js 白板真浏览器自检（含"墨迹和卡片必须对齐"）
     check-paper.js         纸面自检（纯白/方格/横线/点阵 + 像素证明；自己起服务和浏览器）
     check-lock.js          卡片「固定」自检（真鼠标 + elementFromPoint；自己起服务和浏览器）

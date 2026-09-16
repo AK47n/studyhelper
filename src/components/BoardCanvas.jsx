@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react'
 import { LINK_KINDS, LINK_NONE, relationCurve } from '../lib/board.js'
+import { applyViewTo, viewTransformAttr, worldRectToScreen, worldToScreen } from '../lib/view.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
  *
@@ -38,7 +39,7 @@ export default function BoardCanvas({
     const ctx = cv.getContext('2d')
     ctx.setTransform(1, 0, 0, 1, 0, 0)
     ctx.clearRect(0, 0, cv.width, cv.height)
-    ctx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.tx, dpr * view.ty)
+    const xform = applyViewTo(ctx, view, dpr)
     ctx.lineCap = 'round'
     ctx.lineJoin = 'round'
     for (const s of strokes) drawStroke(ctx, s)
@@ -46,7 +47,9 @@ export default function BoardCanvas({
        为什么值得占一行代码：白板"画了看不见"的原因太多了（容器高度为 0、
        变换把内容推到屏幕外、dpr 没乘、笔迹为空……），光看画面全是"一片空白"。
        有这三个数，一眼就能分清是"没送进来"还是"送进来了没画出来"。
-       scripts/check-board-browser.js 会读它们。 */
+       scripts/check-board-browser.js 会读它们。
+       ★ 这三个数是 `applyViewTo` **返回的**（就是真写进 canvas 的那三个），
+         不是这里再算一遍 —— 免得诊断数字和实际变换各说各话。 */
     cv.dataset.strokes = String(strokes.length)
     cv.dataset.pts = JSON.stringify(strokes.map((s) => (s && s.points ? s.points.length : -1)))
     cv.dataset.flat = JSON.stringify(
@@ -57,7 +60,7 @@ export default function BoardCanvas({
         return 'num'
       })
     )
-    cv.dataset.xform = `${dpr * view.s},${dpr * view.tx},${dpr * view.ty}`
+    cv.dataset.xform = `${xform.s},${xform.tx},${xform.ty}`
   }, [strokes, view, size.w, size.h, dpr, sceneRef])
 
   // ── 上面那层：正在画的那一笔（每次移动都重画，所以只放这一笔）──
@@ -88,7 +91,7 @@ export default function BoardCanvas({
         viewBox={`0 0 ${size.w} ${size.h}`}
         style={{ width: size.w, height: size.h }}
       >
-        <g transform={`translate(${view.tx} ${view.ty}) scale(${view.s})`}>
+        <g transform={viewTransformAttr(view)}>
           {relations.edges.map((e) => {
             const a = cardById.get(e.a)
             const b = cardById.get(e.b)
@@ -147,8 +150,7 @@ export default function BoardCanvas({
         <div
           className="bd-eraser"
           style={{
-            left: eraserAt.x * view.s + view.tx,
-            top: eraserAt.y * view.s + view.ty,
+            ...worldToScreen(eraserAt, view),
             width: 2 * eraserAt.r * view.s,
             height: 2 * eraserAt.r * view.s,
           }}
@@ -159,12 +161,10 @@ export default function BoardCanvas({
       {lasso && (
         <div
           className="bd-lasso"
-          style={{
-            left: lasso.x0 * view.s + view.tx,
-            top: lasso.y0 * view.s + view.ty,
-            width: Math.max(1, (lasso.x1 - lasso.x0) * view.s),
-            height: Math.max(1, (lasso.y1 - lasso.y0) * view.s),
-          }}
+          style={(() => {
+            const box = worldRectToScreen(lasso, view)
+            return { ...box, width: Math.max(1, box.width), height: Math.max(1, box.height) }
+          })()}
         />
       )}
 
@@ -183,12 +183,7 @@ export default function BoardCanvas({
                自检要判断"卡片有没有盖住笔迹"就得把这一圈让出去，
                而它不该在自检里再抄一份数字（抄一份就是两处会各自变的常量）。 */
             data-pad={INK_PAD}
-            style={{
-              left: inkBox.x0 * view.s + view.tx - INK_PAD,
-              top: inkBox.y0 * view.s + view.ty - INK_PAD,
-              width: (inkBox.x1 - inkBox.x0) * view.s + INK_PAD * 2,
-              height: (inkBox.y1 - inkBox.y0) * view.s + INK_PAD * 2,
-            }}
+            style={worldRectToScreen(inkBox, view, INK_PAD)}
           />
           {/* 三个动作摆在**一条横排**里、钉在包围框上方（translateY(-100%)）。
               ★ 原来是各自绝对定位的：删除在右上角、美化在**左下角的外面**。
@@ -202,10 +197,10 @@ export default function BoardCanvas({
                 用户 2026-09-16 说"公式也该能框出来认，不用先在写字板里重写一遍"。 */}
           <div
             className="bd-inkacts"
-            style={{
-              left: inkBox.x0 * view.s + view.tx,
-              top: inkBox.y0 * view.s + view.ty - INK_PAD,
-            }}
+            style={(() => {
+              const box = worldRectToScreen(inkBox, view, INK_PAD)
+              return { left: box.left, top: box.top }
+            })()}
           >
             <button
               className="bd-inkformula"
@@ -384,8 +379,7 @@ export default function BoardCanvas({
           {links
             .filter((l) => l.dir && !l.headInk)
             .map((l) => {
-              const ax = l.to.x * view.s + view.tx
-              const ay = l.to.y * view.s + view.ty
+              const { x: ax, y: ay } = worldToScreen(l.to, view)
               const r = 10
               const a1 = l.angle + Math.PI - 0.5
               const a2 = l.angle + Math.PI + 0.5
@@ -408,8 +402,9 @@ export default function BoardCanvas({
           .map((l) => {
             /* 词放在线的**旁边**（沿法线让开 16px），不是正中间 ——
                线的中段常常写着你顺手写的条件（"仅当…"），压上去就挡住了。 */
-            const mx = l.mid.x * view.s + view.tx + -Math.sin(l.angle) * 16
-            const my = l.mid.y * view.s + view.ty + Math.cos(l.angle) * 16
+            const at = worldToScreen(l.mid, view)
+            const mx = at.x + -Math.sin(l.angle) * 16
+            const my = at.y + Math.cos(l.angle) * 16
             return (
               <button
                 key={'pill' + l.strokeId}

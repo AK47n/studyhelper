@@ -24,6 +24,9 @@
 import fs from 'node:fs'
 import { buildSeedBoard } from '../src/seed-board.js'
 import { serializeBoardDocument, BOARD_PREFIX } from '../src/lib/board.js'
+/* 视图映射只有一份实现（src/lib/view.js）：自检和 app 走同一个 module ——
+   这样"卡片 CSS 位置"和"canvas 变换"这两条路才算被同一个公式钉住。 */
+import { worldToScreen } from '../src/lib/view.js'
 
 const CDP = process.env.CDP_URL || 'http://127.0.0.1:9223'
 const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
@@ -447,6 +450,71 @@ console.log('\n[5] 双击公式卡 → 能编辑 → 写 dS/dt 就排成分式')
 
 console.log('\n[6] ★ 对齐：墨迹和卡片必须落在同一处')
 {
+  /* ── ★ 数值版："两层坐标是同一套" ──
+     2026-09-16 把视图映射收进 `src/lib/view.js` 时补的哨兵：
+     canvas 记下的 `dataset.xform` 就是 app **真写进去**的那三个数（applyViewTo 返回的），
+     拿它反推出视图，再用**同一个 module** 算一张卡该在屏幕的哪里，
+     和它的 CSS left/top 比 —— 差超过 1px 就说明有人又手抄了一份映射
+     （收口之前这句话被手抄了 14 处、canvas 变换写了两份、捏合还复制了一份）。
+     为什么用 canvas 的 dataset 反推视图：视图本身没有别的 DOM 出口，
+     而这三个数不是另算的，是 module 的返回值。 */
+  const readAlign = () => s.eval(`(() => {
+    const ink = document.querySelector('canvas.bd-ink')
+    const card = document.querySelector('.bd-card')
+    if (!ink || !card) return null
+    return {
+      xform: ink.dataset.xform,
+      dpr: window.devicePixelRatio,
+      id: card.dataset.cardId,
+      left: parseFloat(card.style.left),
+      top: parseFloat(card.style.top),
+    }
+  })()`)
+  const checkAlign = async (tag) => {
+    const a = await readAlign()
+    if (!a || !a.xform) {
+      bad(`${tag}：读不到 canvas 的 dataset.xform / 卡片`)
+      return
+    }
+    const [xs, xtx, xty] = String(a.xform).split(',').map(Number)
+    const view = { s: xs / a.dpr, tx: xtx / a.dpr, ty: xty / a.dpr }
+    const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+    const card = (doc.cards || []).find((c) => c.id === a.id)
+    if (!card) {
+      bad(`${tag}：DOM 里那张卡 ${a.id} 不在夹具文件里`)
+      return
+    }
+    const want = worldToScreen({ x: card.x, y: card.y }, view)
+    const dx = Math.abs(want.x - a.left)
+    const dy = Math.abs(want.y - a.top)
+    if (dx <= 1 && dy <= 1) {
+      ok(`${tag}：module 算出的卡片位置 = CSS 实际位置（Δ ${dx.toFixed(2)} / ${dy.toFixed(2)} px，视图 s=${view.s.toFixed(3)} tx=${view.tx.toFixed(1)}）`)
+    } else {
+      bad(`${tag}：module 算 ${JSON.stringify({ x: +want.x.toFixed(2), y: +want.y.toFixed(2) })} vs CSS ${JSON.stringify({ x: a.left, y: a.top })} —— 有人抄了一份映射`)
+    }
+    return view
+  }
+  await checkAlign('刚打开')
+  /* 换一个视图再验一次 —— 确保结论不只在某一个缩放下成立。
+     ⚠ 工具条上 `A−`/`A+` 是**界面字号**，画布缩放是「纸」那一组（标题写着"画布缩小"）。
+       按标题找，别按字符猜（第一次写成了 A−，视图根本没变，等于没验）。 */
+  {
+    const zoomed = await s.eval(`(() => {
+      const b = [...document.querySelectorAll('.bd-tools .bd-t')].find((x) => /画布缩小/.test(x.title || ''))
+      if (!b) return false
+      b.click()
+      return true
+    })()`)
+    if (zoomed) {
+      await s.sleep(250)
+      const v0 = await checkAlign('画布缩小一档之后')
+      if (v0 && Math.abs(v0.s - 1) > 0.001) ok(`视图真的换了（s=${v0.s.toFixed(3)}）`)
+      else bad('点了"画布缩小"但视图没变 —— 这一条等于没验')
+    } else {
+      bad('找不到工具条上的"画布缩小"按钮（按标题找的）')
+    }
+  }
+
   /* 今天栽了三次的 bug 的哨兵：canvas 的变换和卡片的定位一旦用了不同的原点
      （一个相对画布容器、一个相对页面），卡片就会整体偏移
      "侧栏宽 + 顶上文件名那一行高"那么多 —— 表现是"线和公式卡对不上、内容跑出屏幕"。

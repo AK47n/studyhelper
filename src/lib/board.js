@@ -14,6 +14,10 @@
  * 就变成了数据的一部分，改缩放等于改内容，撤销栈、Git 备份全跟着脏。
  */
 
+/* 视图映射（屏幕 = 世界 × s + t）在 `./view.js` 里 —— 只有那一份实现。
+   这里只用得到两件：`clampViewScale`（读盘时归一化缩放）和 `centerOn`（fitView 摆内容）。 */
+import { centerOn, clampViewScale } from './view.js'
+
 export const BOARD_VERSION = 3
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
 export const CARD_KINDS = ['formula', 'note']
@@ -1933,31 +1937,11 @@ function dedupePoints(points) {
   return out
 }
 
-/* 视图变换。屏幕 = 世界 * s + t；反过来要减 t 再除 s。
-   wheel 缩放必须用"光标的那个世界点最后还在光标底下"的算法（见 zoomAt），
-   否则每次滚轮画面都会往一角漂——那种错一开始小，滚十下就离谱了。 */
-export function worldToScreen(pt, view) {
-  return { x: pt.x * view.s + view.tx, y: pt.y * view.s + view.ty }
-}
-
-export function screenToWorld(x, y, view) {
-  return { x: (x - view.tx) / view.s, y: (y - view.ty) / view.s }
-}
-
-export function zoomAt(view, factor, screenX, screenY) {
-  const s = clampViewScale(view.s * factor)
-  const k = s / view.s
-  return {
-    s,
-    tx: screenX - (screenX - view.tx) * k,
-    ty: screenY - (screenY - view.ty) * k,
-  }
-}
-
-export function clampViewScale(s) {
-  const n = Number(s) || 1
-  return Math.min(6, Math.max(0.15, n))
-}
+/* 视图映射（屏幕 = 世界 × s + t）整体搬去了 `src/lib/view.js` —— 2026-09-16。
+   为什么搬：这条公式以前被手抄 14 处、canvas 变换写了两份、捏合还复制了一份
+   导出逻辑，而**导出那份有自检、手指走的是复制品**。现在口径只在一个文件里，
+   调用方（Board.jsx / BoardCanvas.jsx / 自检）都从 view.js 取。
+   `fitView` 留在这里：它要算"内容包围盒"，属于板的几何，不属于视图映射。 */
 
 // ─────────────────────── 关系：就近归属 / 枢纽 / 孤岛 ───────────────────────
 /* 「关系」不是让你填的字段，是**从你画的位置里读出来的**。
@@ -2081,11 +2065,8 @@ export function fitView(board, screenW, screenH, pad = 60) {
   if (!all || all.w <= 0 || all.h <= 0) return { s: 1, tx: screenW / 2, ty: screenH / 2 }
   const raw = Math.min((screenW - pad * 2) / all.w, (screenH - pad * 2) / all.h)
   const s = clampViewScale(Math.max(READABLE_FIT_S, Math.min(raw, 2)))
-  return {
-    s,
-    tx: screenW / 2 - (all.x + all.w / 2) * s,
-    ty: screenH / 2 - (all.y + all.h / 2) * s,
-  }
+  /* 把内容包围盒的中心摆进容器中心 —— 和"聚焦到一张卡"是同一件事，走同一个函数。 */
+  return centerOn({ s, tx: 0, ty: 0 }, { x: all.x + all.w / 2, y: all.y + all.h / 2 }, screenW, screenH)
 }
 
 /* 卡片之间有没有笔迹连着 —— "这条关系是我画了线的"。

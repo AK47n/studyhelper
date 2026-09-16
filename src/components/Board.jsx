@@ -14,8 +14,13 @@ import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
   buildRelations, createInkIndex, deriveChains, chainOfStroke, descendantsOf, freezeGroup, fitView, newCard, newStroke, parseBoardDocument,
-  screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
+  serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../lib/board.js'
+/* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
+   从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
+   （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
+   滚动/捏合/平移/居中全走这里。 */
+import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
@@ -624,29 +629,21 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const st = pinchRef.current
         const rect = wrapRef.current.getBoundingClientRect()
         const k = st.d > 8 ? d / st.d : 1
-        const s2 = Math.min(6, Math.max(0.15, st.view.s * k))
-        const kk = s2 / st.view.s
         // 全部换算成"相对画布容器"的坐标（和 tx/ty 同一个基准）
         const cx0 = st.mid.x - rect.left
         const cy0 = st.mid.y - rect.top
         const cx1 = mid.x - rect.left
         const cy1 = mid.y - rect.top
-        // 锚点：开始时两指中点下的那个世界点，缩放后还要落在**现在的**中点下
-        setView({
-          s: s2,
-          tx: cx1 - (cx0 - st.view.tx) * kk,
-          ty: cy1 - (cy0 - st.view.ty) * kk,
-        })
+        /* 锚点：开始时两指中点下的那个世界点，缩放后还要落在**现在的**中点下。
+           两指中点会动 —— 所以走 `zoomBetween`（起点和落点是两个坐标），
+           不是 `zoomAt`（锚点不动）。夹上下限也在 view.js 里，这里不再抄一份。 */
+        setView(zoomBetween(st.view, clampViewScale(st.view.s * k), { x: cx0, y: cy0 }, { x: cx1, y: cy1 }))
         return
       }
 
       if (panRef.current) {
         const lp = localPoint(e)
-        setView((v) => ({
-          ...v,
-          tx: panRef.current.tx + (lp.x - panRef.current.lp.x),
-          ty: panRef.current.ty + (lp.y - panRef.current.lp.y),
-        }))
+        setView(panBy({ ...boardRef.current.view, tx: panRef.current.tx, ty: panRef.current.ty }, lp.x - panRef.current.lp.x, lp.y - panRef.current.lp.y))
         return
       }
 
@@ -1530,8 +1527,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           ? { x: c.x + c.w / 2, y: c.y + c.h / 2 }
           : (links.find((l) => l.a === id || l.b === id) || {}).mid
         if (!center) return
-        const v = boardRef.current.view
-        setView({ ...v, tx: el.clientWidth / 2 - center.x * v.s, ty: el.clientHeight / 2 - center.y * v.s })
+        /* 缩放不变，只把这个世界点摆到容器正中 —— 就是 screenToWorld 的逆运算，
+           收在 view.js 的 `centerOn` 里（原来这里是手写的一行）。 */
+        setView(centerOn(boardRef.current.view, center, el.clientWidth, el.clientHeight))
       }}
     />
   )
@@ -1785,6 +1783,11 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       : <div className="bd-card-empty">双击写字</div>
   }
 
+  /* 卡片左上角的屏幕位置：世界 → 屏幕，走 `view.js` 那一道缝（只有一份实现）。
+     ⚠ `worldToScreen` 返回 `{x, y}`，**不是** `{left, top}` —— 直接展开进 style
+       卡片会没有 left/top、静默退回 CSS 定位（整版错位，自检 [6] 当场抓到过）。 */
+  const at = worldToScreen({ x: card.x, y: card.y }, view)
+
   return (
     <div
       className={'bd-card' + (isFormula ? ' is-formula' : ' is-note') + (locked ? ' locked' : '') + (selected ? ' on' : '') + (dimmed ? ' dim' : '') + (editing ? ' editing' : '')}
@@ -1803,8 +1806,12 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
          四个数（left/top/width/字号缩放）一起算，缩放才能"整体一致地"变小 ——
          只缩 left/top 不缩字号，卡片会一边跑到正确位置、一边保持原来的大小。 */
       style={{
-        left: card.x * view.s + view.tx,
-        top: card.y * view.s + view.ty,
+        /* 位置 = 世界 → 屏幕（只跟视图缩放走）；
+           宽高/字号 = 再乘"这张卡自己的倍率 k" —— 两件事，别混。
+           ⚠ `worldToScreen` 返回的是 `{x, y}`，不是 `{left, top}` ——
+             直接展开进 style 的话卡片会**没有 left/top**（静默退回 CSS 定位，整版错位）。 */
+        left: at.x,
+        top: at.y,
         width: card.w * view.s * k,
         minHeight: card.h * view.s * k,
         /* 字号和内边距也按缩放走，卡片才是"整体一致地"变大变小。
@@ -2410,6 +2417,6 @@ function paintLive(liveRef, stroke, view) {
   const ctx = cv.getContext('2d')
   ctx.setTransform(1, 0, 0, 1, 0, 0)
   ctx.clearRect(0, 0, cv.width, cv.height)
-  ctx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.tx, dpr * view.ty)
+  applyViewTo(ctx, view, dpr)
   drawStroke(ctx, stroke)
 }
