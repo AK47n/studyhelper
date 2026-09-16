@@ -19,6 +19,8 @@
  *       而且屏幕上**不叠合成箭头**（尖是他自己画的）；顺带验世界→屏幕的映射对得上
  *   [7] 在空白处乱画一笔 → 不算连接、也不浮词
  *   [8] 重开一次 → 你标过的那个词还在（存在笔迹上）
+ *   [9] 「这条不算连接」：点它 → 不再是关系、文件里写 link:"none"、重开还在；
+ *       再框住那一笔 → 浮层里「又算回连接」→ 点回去，文件里那个字段也去掉
  *
  * 自己起服务（5203）和 headless Edge（9233），跑完都收掉；
  * 只碰自己造的夹具板 board-zz-linkcheck.md（跑完删）。
@@ -273,6 +275,8 @@ const readBoard = () => s.eval(`(() => {
     ink: Number(document.querySelector('canvas.bd-ink').dataset.strokes),
     selLink: !!document.querySelector('[data-sel-link]'),
     selChips: [...document.querySelectorAll('[data-sel-link] .bd-linkchip')].map((b) => b.dataset.linkKind || 'rev'),
+    /* 框住的笔里有"你说过不算连接"的那些 → 浮层里会给一条回头路 */
+    inkNoLink: !!document.querySelector('[data-ink-nolink]'),
     a: card('lk-a'),
     b: card('lk-b'),
     toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
@@ -633,8 +637,88 @@ console.log('\n[8] 重开一次：你标过的那个词还在')
   else bad(`形状读出来的词丢了：${JSON.stringify(now.kinds)}`)
 }
 
-/* ═════════════════ 9. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[9] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 9. 「这条不算连接」：读错了要能一键改回来 ═════════════════ */
+console.log('\n[9] 「不算连接」：自动读错了能一键改回来（点错了还能改回去）')
+{
+  /* 为什么这一条这么要紧：形状/位置读出来的连接**会读错**（实测：一条 121px 的手写竖笔
+     正好跨过两坨字就被读成连接）。没有这个口子的话，猜错了只能擦掉那一笔重画 ——
+     那就成了"猜错还锁死"。这里走一遍真实路径：画一条线 → 点「不算连接」→ 它不再是关系、
+     文件里写着 link:"none" → 再框住它 → 点「又算回连接」→ 它又回来了。 */
+  const st5 = await readBoard()
+  if (st5.count === 3) ok(`开始这一步时有 ${st5.count} 条连接`)
+  else bad(`开始这一步时应该是 3 条连接，实际 ${st5.count}`)
+
+  /* ① 再画一条 A→B 的线（从卡片里偏一点起手，免得和 [1] 那条完全重合） */
+  const from = { x: st5.a.cx - Math.round(st5.a.w * 0.25), y: st5.a.cy }
+  const to = { x: st5.b.cx + Math.round(st5.b.w * 0.25), y: st5.b.cy }
+  await pickTool('笔')
+  await s.sleep(150)
+  await s.penStroke(from, to, { steps: 10, hover: true })
+  const drew = await readBoard()
+  if (drew.count === 4) ok('新画的这条也成了连接（4 条）')
+  else bad(`画完应该是 4 条连接，实际 ${drew.count}`)
+  if (drew.chipsOpen) ok('那排词浮出来了（「不算连接」就在这排里）')
+  else bad('没浮出那排词，后面点不到「不算连接」')
+
+  /* ② 点那排词里的「不算连接」 */
+  const clicked = await s.eval(`(() => {
+    const chips = document.querySelector('.bd-linkchips')
+    if (!chips) return 'no-chips'
+    const b = chips.querySelector('.bd-linkchip[data-link-kind="none"]')
+    if (!b) return 'no-btn'
+    b.click()
+    return 'ok'
+  })()`)
+  if (clicked === 'ok') ok('点了「不算连接」')
+  else bad(`点不到「不算连接」那颗（${clicked}）`)
+  await s.sleep(400)
+  const after = await readBoard()
+  if (after.count === 3) ok('它不再是连接了（回到 3 条）')
+  else bad(`点完还剩下 ${after.count} 条连接，应该是 3 条`)
+  const links9 = await fileLinks()
+  if (links9 && links9.includes('none')) ok('文件里那一笔写着 link: "none"（重开也丢不了）')
+  else bad(`文件里没有 link: "none"：${JSON.stringify(links9)}`)
+
+  /* ③ 重开一次：这句"不算连接"还在 */
+  await s.send('Page.navigate', { url: APP })
+  await openFixture()
+  const reopened = await readBoard()
+  if (reopened.count === 3) ok('重开之后它仍然不算连接（那句话是存在笔迹上的）')
+  else bad(`重开之后连接数变成 ${reopened.count}`)
+
+  /* ④ 回头路：框住那一笔 → 浮层里出现「又算回连接」→ 点它 → 它又回来了 */
+  await pickTool('框选')
+  await s.sleep(200)
+  const st6 = await readBoard()
+  /* ⚠ 框子要从**卡片外面的空白**起手、一路框过两张卡（和 [5] 同一套写法）：
+     起点落在卡片上就成了"拖卡片"，画不出框 —— 第一次写这一步时框了 80×80 的小框、
+     起点正好在卡上，于是"[data-ink-nolink] 没出现"，看起来像功能坏了。
+     框大一点没关系：选中一条 noLink 的笔就够了（清的时候只清它）。 */
+  const f2 = { x: st6.a.x - 70, y: st6.a.y - 60 }
+  const t2 = { x: st6.b.x + st6.b.w + 70, y: st6.b.y + st6.b.h + 60 }
+  await s.mouse(f2.x, f2.y, { steps: 8, dx: t2.x - f2.x, dy: t2.y - f2.y })
+  const sel = await readBoard()
+  if (sel.inkNoLink) ok('框住它之后，浮层里出现了「又算回连接」')
+  else bad('框住之后没看到回头路（[data-ink-nolink]）')
+  const back = await s.eval(`(() => {
+    const b = document.querySelector('[data-ink-nolink] .bd-linkchip')
+    if (!b) return 'no-btn'
+    b.click()
+    return 'ok'
+  })()`)
+  if (back === 'ok') ok('点了「又算回连接」')
+  else bad(`点不到「又算回连接」（${back}）`)
+  await s.sleep(400)
+  const restored = await readBoard()
+  if (restored.count === 4) ok('它又算回连接了（4 条）')
+  else bad(`恢复之后是 ${restored.count} 条，应该是 4 条`)
+  const links9b = await fileLinks()
+  if (links9b && !links9b.includes('none')) ok('文件里那个 link: "none" 也去掉了')
+  else bad(`文件里还留着 link: "none"：${JSON.stringify(links9b)}`)
+}
+
+/* ═════════════════ 10. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[10] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 

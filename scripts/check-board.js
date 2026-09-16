@@ -10,7 +10,7 @@ import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  descendantsOf, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
+  descendantsOf, findTip, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, readArrowHead, relationCurve, screenToWorld, serializeBoardDocument, simplifyPoints,
   strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints, worldToScreen, zoomAt,
 } from '../src/lib/board.js'
@@ -1025,6 +1025,43 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
   }
 }
 
+// ═════════════════════════ 6g. 「这条不算连接」 ═════════════════════════
+console.log('\n[6g] 「不算连接」：自动读错了要有一条一键改回来的路')
+{
+  /* 为什么要有这一节：形状/位置自动读出来的连接**会读错**（实测：一条 121px 的手写竖笔
+     正好跨过两坨字就被读成了连接）。在那之前认错了只能擦掉那一笔重画 ——
+     "猜错还锁死"正是这套设计最怕的事。所以：`stroke.link = 'none'` = 你说了它不是连接。 */
+  const blob = (cx, cy) => [0, 1, 2].map((i) => toFlat([{ x: cx + i * 9, y: cy }, { x: cx + i * 9 + 6, y: cy + 7 }]))
+  const strokes = [
+    ...blob(0, 0).map((f, i) => ['a' + i, f]),
+    ...blob(500, 0).map((f, i) => ['b' + i, f]),
+    ['lnk', toFlat([{ x: 6, y: 3 }, { x: 506, y: 3 }])],
+  ]
+  const build = (link) => {
+    const b = makeBoard()
+    b.strokes = strokes.map(([id, flat]) => {
+      const st = { ...newStroke('pen', flat), id }
+      if (id === 'lnk' && link) st.link = link
+      return st
+    })
+    return b
+  }
+  eq(buildLinks(build(null)).length, 1, '先确认这条线本来是会被读成连接的')
+  eq(buildLinks(build(LINK_NONE)).length, 0, '标了「不算连接」→ 不再读成连接')
+  eq(buildLinks(build('cause')).length, 1, '标成「因果」当然还是连接（这两个不是一回事）')
+
+  /* 存盘：这句话要活得下去（不然重开之后那条假连接自己回来了） */
+  const text = serializeBoardDocument(build(LINK_NONE))
+  if (/"link":\s*"none"/.test(text)) ok('存盘里写着 link: "none"')
+  else bad('「不算连接」没写进文件 —— 重开就丢了')
+  const back = parseBoardDocument(text, 'x')
+  eq(buildLinks(back).length, 0, '读回来还是"不算连接"')
+  eq(back.strokes.find((s) => s.id === 'lnk').link, LINK_NONE, '字段原样保留')
+  /* 只有你说过的那一笔有这个字段：别的笔、以及没标过的板，一个字节都不多 */
+  const plain = serializeBoardDocument(build(null))
+  if (!/link/.test(plain)) ok('没标过的板一个 link 字段都不写（不造假 diff）')
+  else bad('没标过的板里出现了 link 字段')
+}
 // ═════════════════════ 7. 装进视口 ═════════════════════
 console.log('\n[7] 打开时把所有内容装进屏幕')
 {

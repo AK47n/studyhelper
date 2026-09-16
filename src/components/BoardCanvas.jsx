@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { LINK_KINDS, relationCurve } from '../lib/board.js'
+import { LINK_KINDS, LINK_NONE, relationCurve } from '../lib/board.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
  *
@@ -26,6 +26,7 @@ export default function BoardCanvas({
   hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
   lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk,
   links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
+  inkNoLink = false, onClearNoLink,
   children,
 }) {
   const dpr = typeof window === 'undefined' ? 1 : Math.min(2.5, window.devicePixelRatio || 1)
@@ -275,6 +276,37 @@ export default function BoardCanvas({
                     ⇄
                   </button>
                 )}
+                {/* 「这条不算连接」：自动读出来的关系会读错（一条长竖笔正好跨过两坨字）。
+                    没有这个口子的话，猜错了只能擦掉那一笔重画 —— 那就成了"猜错还锁死"。 */}
+                <button
+                  className="bd-linkchip none"
+                  data-link-kind={LINK_NONE}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onApplyLink?.(selLink.strokeId, LINK_NONE)
+                  }}
+                  title="它其实不是连接：记在那一笔上，以后不再读成关系（Ctrl+Z 能退回）"
+                >
+                  不算连接
+                </button>
+              </span>
+            )}
+            {/* 框住的笔里有"你说过不算连接"的 → 给一条回头路。
+                那句话点下去之后，唯一的另一条路是 Ctrl+Z；重开之后连它也没了。 */}
+            {inkNoLink && (
+              <span className="bd-inklink" data-ink-nolink="1">
+                <button
+                  className="bd-linkchip"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onClearNoLink?.()
+                  }}
+                  title="去掉「不算连接」，让它按形状重新判"
+                >
+                  又算回连接
+                </button>
               </span>
             )}
           </div>
@@ -423,6 +455,17 @@ function LinkChips({ at, onPick, onReverse, onHover }) {
           ⇄
         </button>
       )}
+      <button
+        className="bd-linkchip none"
+        data-link-kind={LINK_NONE}
+        onClick={(e) => {
+          e.stopPropagation()
+          onPick(LINK_NONE)
+        }}
+        title="它其实不是连接（按 0）：记在那一笔上，以后不再读成关系"
+      >
+        不算连接
+      </button>
       <span className="bd-linkchips-x">不点也行</span>
     </div>
   )

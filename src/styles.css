@@ -1175,6 +1175,9 @@ kbd {
 }
 .bd-linkchip:hover { background: rgba(255, 255, 255, 0.16); }
 .bd-linkchip.rev { color: #cfd6e4; border-color: #3a4457; }
+/* 「不算连接」不是那五个词之一，是"这条线根本不是关系" —— 用中性的灰、
+   和它们分开一点，免得看着像"第六种关系"（见 lib/board.js 的 LINK_NONE）。 */
+.bd-linkchip.none { color: #98a2b3; border-color: #3a4457; margin-left: 6px; }
 /* 框选住一条连接线时，这一排加在那个已有的浮层里（.bd-inkacts 是个横排） */
 .bd-inklink { display: flex; align-items: center; gap: 4px; }
 .bd-inklink .bd-linkchip { background: rgba(22, 26, 34, 0.92); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3); }

@@ -289,6 +289,22 @@ export function isLinkKind(id) {
   return LINK_KIND_IDS.includes(id)
 }
 
+/* 「这条不算连接」—— 2026-09-16 加的第二个手动口子。
+ *
+ * 为什么必须有：形状/位置自动读出来的连接**会读错**（一条长竖笔正好跨过两坨字、
+ * 或者你的箭头指着一块字迹但它其实什么都不是）。在那之前，认错了只能**擦掉那一笔**重画 ——
+ * 那就成了"猜错还锁死"，正是这套设计最怕的事。
+ *
+ * 存法：还是 `stroke.link`，值是 `'none'`（不是新增字段，也不是往 LINK_KINDS 里加一项 ——
+ * 那一排词是给"这条线是什么关系"用的，而这个是"它根本不是连接"）。
+ * 读盘只认这个字面值；`isLinkKind('none')` 是 false，所以别的代码路径
+ * （比如"手动标过的词"）不会把它当成一个词。 */
+export const LINK_NONE = 'none'
+
+export function isNoLink(stroke) {
+  return !!stroke && stroke.link === LINK_NONE
+}
+
 export function linkKind(id) {
   return LINK_KINDS.find((k) => k.id === (isLinkKind(id) ? id : DEFAULT_LINK))
 }
@@ -966,6 +982,10 @@ export function buildLinks(board, inkInput = null) {
   const out = []
   for (let ci = 0; ci < chains.length; ci++) {
     const ch = chains[ci]
+    /* ★ 「你说了它不是连接」的笔：整条跳过（见 LINK_NONE）。
+       放在最前面 —— 它连"两头落在谁身上"都不用判。
+       （它仍然会进 dropIdx：那是一根线，不该被聚进旁边那一坨字里。） */
+    if (ch.ids.some((id) => isNoLink(byId.get(id)))) continue
     const pts = ch.points
     const first = pts[0]
     const last = pts[pts.length - 1]
@@ -1188,8 +1208,10 @@ function normalizeStroke(s) {
          "Cause"、或者别的版本的 id，都不该让这一笔变成"手动标过 rel"；
          丢掉之后它就回到"按形状自动判"，屏幕上的表现是对的。
        ★ 而且这里**不补默认值**：绝大多数笔迹没有这个字段（也永远不该有），
-         补一个 `link: 'rel'` 出去就等于给整本板子造一次假 diff。 */
-    ...(isLinkKind(s.link) ? { link: s.link } : {}),
+         补一个 `link: 'rel'` 出去就等于给整本板子造一次假 diff。
+       ★ `'none'`（"这条不算连接"）要原样保留 —— 它是你明确说过的一句话，
+         丢了它，下次打开那条假连接就自己回来了。 */
+    ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
     points: pts,
   }
 }
@@ -1269,8 +1291,9 @@ export function serializeBoardDocument(board) {
       /* 连线的类型：**只有你手动标过才写**。
          形状读出来的（直线 = 相关、带箭头 = 因果）不写 —— 那是从点算出来的，
          随时能重算；写出去反而会和笔迹对不上（后来把箭头擦掉、补一笔直线，
-         文件里那个"因果"就成了谎话）。老文件里没有这个字段，所以往返仍然字节级一致。 */
-      ...(isLinkKind(s.link) ? { link: s.link } : {}),
+         文件里那个"因果"就成了谎话）。老文件里没有这个字段，所以往返仍然字节级一致。
+         `'none'`（"这条不算连接"）同样只在你说过时才写。 */
+      ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
       // ★ 必须过 toFlat，不能直接 Array.from 遍历。
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
       //   直接遍历再用 Number(n) 读，每个点都会变成 0 —— 又一次静默毁数据。

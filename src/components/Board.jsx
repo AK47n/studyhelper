@@ -12,7 +12,7 @@ import { Tex } from './Tex.jsx'
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
-  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
+  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
   buildRelations, createInkIndex, descendantsOf, fitView, newCard, newStroke, parseBoardDocument,
   screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
@@ -397,6 +397,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     for (const id of inkSel) return linkByStroke.get(id) || null
     return null
   }, [inkSel, linkByStroke])
+  /* 框住的笔里有没有"你说过不算连接"的（见 LINK_NONE）——
+     有就给它一条回头路（不然那句话是单向门：点完只能 Ctrl+Z，重开之后就没路可走了）。 */
+  const inkNoLink = useMemo(() => {
+    if (!inkSel || !inkSel.size) return false
+    for (const id of inkSel) {
+      const s = board.strokes.find((x) => x.id === id)
+      if (s && s.link === LINK_NONE) return true
+    }
+    return false
+  }, [inkSel, board.strokes])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
     const set = descendantsOf(relations, selectedId)
@@ -819,6 +829,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           return
         }
       }
+      /* `0` = 这条不算连接（和 1~5 同一排，手不用离开键盘）。 */
+      if (linkPick && e.key === '0') {
+        e.preventDefault()
+        applyLink(linkPick.strokeId, LINK_NONE)
+        return
+      }
       if (linkPick && e.key === 'Escape') {
         setLinkPick(null)
         return
@@ -962,6 +978,23 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    * 那就必须有一条"一句话改回来"的路，否则猜错了只能重画。
    */
   function applyLink(strokeId, kind, opt = {}) {
+    /* ★ 「不算连接」：你说了它不是连接 —— 存在**这一笔**上（`link: 'none'`），
+       buildLinks 见到就跳过（见 lib/board.js 的 LINK_NONE）。
+       为什么必须有这条路：自动读出来的连接会读错（一条长竖笔正好跨过两坨字），
+       在那之前认错了只能擦掉那一笔重画 —— 那就成了"猜错还锁死"。
+       它是**一步正常的撤销**（Ctrl+Z 就回来了），不是不可逆的标记。 */
+    if (kind === LINK_NONE) {
+      const known = linkByStroke.get(strokeId)
+      const ids = new Set(known ? known.ids : [strokeId])
+      commit((cur) => ({
+        ...cur,
+        strokes: cur.strokes.map((st) => (ids.has(st.id) ? { ...st, link: LINK_NONE } : st)),
+      }))
+      setLinkPick(null)
+      setInkSel(null)
+      flash('这条不算连接了（框住它还能恢复；Ctrl+Z 也能）', 'ok')
+      return
+    }
     if (!isLinkKind(kind)) return
     commit((cur) => ({
       ...cur,
@@ -989,6 +1022,24 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     }))
     setLinkPick(null)
     flash(opt.reverse ? `方向反过来了：${linkKind(kind).name}` : `这条线：${linkKind(kind).name}`, 'ok')
+  }
+
+  /* 把选中的那几笔从"不算连接"改回来：去掉 `link: 'none'` → 回到按形状自动判。
+     这是那道单向门的回头路（见 applyLink 里的 LINK_NONE）。 */
+  function clearNoLink() {
+    if (!inkSel || !inkSel.size) return
+    const ids = inkSel
+    commit((cur) => ({
+      ...cur,
+      strokes: cur.strokes.map((st) => {
+        if (!ids.has(st.id) || st.link !== LINK_NONE) return st
+        const next = { ...st }
+        delete next.link
+        return next
+      }),
+    }))
+    setInkSel(null)
+    flash('又算回连接了（按形状重新判）', 'ok')
   }
 
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
@@ -1332,6 +1383,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, hoverEdge, eraserAt,
     links, selLink, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
+    inkNoLink, onClearNoLink: clearNoLink,
     onLinkHover: (inside) => {
       linkLeftRef.current = inside
     },
