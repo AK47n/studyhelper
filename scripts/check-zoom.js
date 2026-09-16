@@ -7,79 +7,23 @@
  * 所以这里把两个方向都点一遍，并且断言 --s 真的变了。
  *
  * 跑：node scripts/check-zoom.js
+ *
+ * 胶水（起服务 + 起浏览器 + CDP 会话 + 夹具板 + 用户数据守卫）都在
+ * scripts/lib/board-check.js 的 withBoard 里。从前它只起浏览器、**指望着 5177 上
+ * 已经有个应用在跑** —— 那是条没写出来的前提（跑不起来时报的是"没有 A− 按钮"）。
  */
-import fs from 'node:fs'
-import path from 'node:path'
-import { spawn } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
-import { browserExe } from './lib/browser.js'
+import { withBoard } from './lib/board-check.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const ROOT = path.join(__dirname, '..')
-const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
-const CDP_PORT = Number(process.env.CDP_PORT || 9228)
-const CHROME = browserExe()
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const fails = await withBoard({ tag: 'zoomcheck', port: 5206, cdpPort: 9236 }, async ({ s, open, ok, bad }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
-let fails = 0
-const ok = (m) => console.log('  ✓ ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  ✗ ' + m)
-}
-
-const profile = path.join(ROOT, '.cache', 'zoom-cdp')
-fs.rmSync(profile, { recursive: true, force: true })
-const chrome = spawn(
-  CHROME,
-  ['--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars', '--window-size=1440,900', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, APP],
-  { stdio: 'ignore' }
-)
-process.on('exit', () => {
-  try {
-    chrome.kill()
-  } catch {}
-})
-
-let targets = null
-for (let i = 0; i < 40; i++) {
-  targets = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`).then((r) => r.json()).catch(() => null)
-  if (targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))) break
-  await sleep(300)
-}
-const page = targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))
-if (!page) {
-  console.error('  Chrome 没起来')
-  process.exit(2)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((r) => ws.addEventListener('open', r))
-let id = 0
-const pend = new Map()
-ws.addEventListener('message', (e) => {
-  const m = JSON.parse(e.data)
-  if (m.id && pend.has(m.id)) {
-    pend.get(m.id)(m.result)
-    pend.delete(m.id)
-  }
-})
-const send = (method, params = {}) =>
-  new Promise((res) => {
-    const i = ++id
-    pend.set(i, res)
-    ws.send(JSON.stringify({ id: i, method, params }))
-  })
-const ev = (expr) => send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }).then((r) => r.result?.value)
-
-await send('Runtime.enable')
-await send('Page.enable')
-await send('Page.navigate', { url: APP })
-await sleep(2600)
+const ev = (expr) => s.eval(expr)
+const send = s.send.bind(s)
+const sleep = (ms) => s.sleep(ms)
 
 // 每次都从默认值开始，免得受上次（localStorage 记着）影响
 await ev(`(() => { localStorage.removeItem('studyhelper.scale'); return 1 })()`)
-await send('Page.navigate', { url: APP })
-await sleep(2600)
+await open()
 
 const readS = () => ev(`getComputedStyle(document.documentElement).getPropertyValue('--s').trim()`)
 const readPct = () => ev(`(() => { const e = document.querySelector('.bd-t.zoomish'); return e ? e.textContent.trim() : null })()`)
@@ -195,8 +139,4 @@ console.log('\n[4] 键盘也能两个方向（Ctrl+Shift+加号/减号）')
   else bad(`键盘缩放出问题：${s0} → ${s1} → ${s2}`)
 }
 
-console.log('\n' + '─'.repeat(52))
-console.log(fails ? `  ${fails} 项失败` : '  全部通过')
-ws.close()
-chrome.kill()
-process.exit(fails ? 1 : 0)
+})

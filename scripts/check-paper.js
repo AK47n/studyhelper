@@ -21,32 +21,12 @@
  *
  * 它自己起服务（5201）和 headless Edge（9231），跑完都收掉；
  * 全程只碰自己造的夹具板 board-zz-papercheck.md，用户的板一个字节都不动。
+ * 胶水都收在 scripts/lib/board-check.js 的 withBoard 里（夹具/服务/浏览器/CDP/守卫）。
  *
  * 用法：node scripts/check-paper.js    （或 npm run check:paper）
  */
-import { spawn } from 'node:child_process'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
-import { browserExe } from './lib/browser.js'
-import { waitForAppPage } from './lib/cdp.js'
-import { BOARD_PREFIX, parseBoardDocument, serializeBoardDocument } from '../src/lib/board.js'
-
-const ROOT = path.resolve(import.meta.dirname, '..')
-const DATA = path.join(ROOT, 'data')
-const PORT = Number(process.env.TEST_PORT || 5201)
-const CDP_PORT = Number(process.env.TEST_CDP || 9231)
-const CDP = `http://127.0.0.1:${CDP_PORT}`
-const APP = `http://127.0.0.1:${PORT}/`
-
-let fails = 0
-const ok = (m) => console.log('  \u2713 ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  \u2717 ' + m)
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const near = (a, b, tol) => Math.abs(a - b) <= tol
+import { withBoard } from './lib/board-check.js'
+import { parseBoardDocument, serializeBoardDocument } from '../src/lib/board.js'
 
 /* 四档纸的"应该长什么样"。和 Board.jsx 的 PAPERS / styles.css 的 .paper-* 一一对应。
  * gradients：computed backgroundImage 里应该出现几个 gradient（纯白是 0 = none）。
@@ -62,138 +42,22 @@ const PAPERS = [
 /* ── 夹具板：一张**空**板（0 笔 0 卡）──
  * 故意要空的：底纹要在真的空白处才量得准。板上有卡片时那些浮层会挡住采样点，
  * 而且量到的可能是卡片的底色（白）而不是纸的颜色。
- * board- 前缀 + zz 保证排在 data/ 里所有文件前面；跑完删掉，中途报错也删。 */
-const FIXTURE_NAME = BOARD_PREFIX + 'zz-papercheck.md'
-const FIXTURE_TITLE = BOARD_PREFIX + 'zz-papercheck'
-const FIXTURE = path.join(DATA, FIXTURE_NAME)
-fs.writeFileSync(FIXTURE, serializeBoardDocument(parseBoardDocument('', '纸面自检夹具（跑完自动删除）')), 'utf8')
-process.on('exit', () => {
-  try {
-    fs.rmSync(FIXTURE, { force: true })
-  } catch {}
-})
+ * 夹具的造/删、"打开的就是夹具"、以及"跑完 data/ 里原有文件一个字节都不许变"
+ * 这道守卫，都在 scripts/lib/board-check.js 的 withBoard 里。 */
+const fails = await withBoard(
+  {
+    tag: 'papercheck',
+    port: 5201,
+    cdpPort: 9231,
+    make: () => serializeBoardDocument(parseBoardDocument('', '纸面自检夹具（跑完自动删除）')),
+  },
+  async ({ s, ok, bad, open, read }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
-class Session {
-  constructor(ws) {
-    this.ws = ws
-    this.id = 0
-    this.pending = new Map()
-    this.exceptions = []
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data)
-      if (msg.method === 'Runtime.exceptionThrown') {
-        const d = msg.params.exceptionDetails
-        this.exceptions.push((d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))
-      }
-      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-        this.exceptions.push('console.error：' + msg.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 160))
-      }
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)
-        this.pending.delete(msg.id)
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)))
-        else resolve(msg.result)
-      }
-    })
-  }
-  send(method, params = {}) {
-    const id = ++this.id
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      this.ws.send(JSON.stringify({ id, method, params }))
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error('CDP 超时: ' + method))
-        }
-      }, 20000)
-    })
-  }
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
-    return r.result.value
-  }
-  /* 真鼠标：平移靠它。⚠ 不沾指针的东西用 eval 就够了，
-     但"拖一下能不能推动视图"只有真事件能证明（见 README 第 11 条）。 */
-  async drag(x0, y0, dx, dy, { steps = 8, button = 'middle' } = {}) {
-    const buttons = button === 'middle' ? 4 : 1
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: x0, y: y0, button, buttons, clickCount: 1 })
-    for (let i = 1; i <= steps; i++) {
-      await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x0 + (dx * i) / steps, y: y0 + (dy * i) / steps, button, buttons })
-      await sleep(12)
-    }
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x0 + dx, y: y0 + dy, button, buttons: 0 })
-    await sleep(260)
-  }
-  sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms))
-  }
-}
+const sleep = (ms) => s.sleep(ms)
+const near = (a, b, tol) => Math.abs(a - b) <= tol
 
-const server = spawn(process.execPath, ['server.js', '--no-auto-exit', '--no-open'], {
-  cwd: ROOT,
-  env: { ...process.env, STUDYHELPER_PORT: String(PORT) },
-  stdio: 'ignore',
-})
-let edge = null
-const cleanup = () => {
-  for (const p of [edge, server]) {
-    try {
-      if (p && !p.killed) p.kill()
-    } catch {}
-  }
-}
-process.on('exit', cleanup)
 
-async function waitServer() {
-  for (let i = 0; i < 60; i++) {
-    const r = await fetch(APP + 'api/list').then((x) => x.ok).catch(() => false)
-    if (r) return true
-    await sleep(200)
-  }
-  return false
-}
-
-/* 每次都用**全新的浏览器档案**：纸面存在 localStorage 里，
-   老档案留着偏好，就量不到"第一次打开默认是纯白"这一条。 */
-const profile = path.join(os.tmpdir(), `studyhelper-paper-${CDP_PORT}`)
-try {
-  fs.rmSync(profile, { recursive: true, force: true })
-} catch {}
-edge = spawn(
-  browserExe(),
-  [
-    '--headless=new',
-    '--disable-gpu',
-    '--no-sandbox',
-    '--hide-scrollbars',
-    '--window-size=1440,900',
-    `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${profile}`,
-    APP,
-  ],
-  { stdio: 'ignore' }
-)
-
-if (!(await waitServer())) bad('服务没起来（' + APP + '）')
-else ok('服务起来了：' + APP)
-
-const page = await waitForAppPage(CDP, { appUrl: APP })
-if (!page) {
-  bad('等不到浏览器里的应用页（CDP ' + CDP + '）')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
-}
-
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((res, rej) => {
-  ws.addEventListener('open', res, { once: true })
-  ws.addEventListener('error', rej, { once: true })
-})
-const s = new Session(ws)
-await s.send('Runtime.enable')
-await s.send('Page.enable')
 
 /* 页面里读一次"纸面现在长什么样"。
    格距和原点用 **computed style**（那才是真正画出来的值，不是我们写进去的字符串）；
@@ -305,41 +169,17 @@ async function findPaperSpot(half) {
   })()`)
 }
 
-let st = null
-for (let i = 0; i < 60; i++) {
-  st = await s.eval(PROBE).catch(() => null)
-  if (st && !st.cover) break
-  await sleep(250)
-}
+/* 打开夹具板。★ 从前是"进界面之后从左栏点夹具那一行"（应用开的是列表里第一个
+   board-*.md，用户那张中文名的板排在前头）。现在应用从 ?file= 直接开夹具 ——
+   用户那张板根本不会被读到，而这一条对这份自检尤其要紧：
+   纸面存在 localStorage 里，浏览器档案必须是全新的，夹具必须是空的。 */
+await open()
+let st = await s.eval(PROBE)
 if (!st) {
   bad('白板界面没挂上（找不到 .bd-stagewrap）—— 后面的断言都没意义了')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
+  return
 }
-
-/* 先把打开的板换成夹具 —— 应用打开时挑"列表里第一个 board-*.md"，
-   而"data/ 里一张板都没有"时它会自己补一张 board-新白板.md（中文名排序在前），
-   夹具就选不上。从左栏点它一行：这是用户真实的操作路径，不依赖排序。 */
-{
-  const pick = await s.eval(`(() => {
-    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
-    if (cur.trim() === ${JSON.stringify(FIXTURE_TITLE + '.md')}) return 'already'
-    const row = [...document.querySelectorAll('.filerow')].find(
-      (r) => (((r.querySelector('.fname') || {}).textContent) || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
-    )
-    if (!row) return 'no-row'
-    row.click()
-    return 'clicked'
-  })()`)
-  if (pick === 'no-row') {
-    bad('左栏里找不到夹具 ' + FIXTURE_TITLE + ' —— 后面的断言都没意义了')
-    console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-    process.exit(1)
-  }
-  if (pick === 'clicked') await s.sleep(1000)
-  st = await s.eval(PROBE)
-  console.log(`\n  （打开的是：${st.file || '(空)'}；视图缩放 ${st.s.toFixed(3)}，平移 ${st.tx.toFixed(1)}, ${st.ty.toFixed(1)}）`)
-}
+console.log(`\n  （打开的是：${st.file || '(空)'}；视图缩放 ${st.s.toFixed(3)}，平移 ${st.tx.toFixed(1)}, ${st.ty.toFixed(1)}）`)
 
 /* ═════════════════ 1. 四个纸面按钮 + 默认是纯白 ═════════════════ */
 console.log('\n[1] 工具条上能挑纸，第一次打开是纯白')
@@ -571,11 +411,11 @@ console.log('\n[6] 「✍ 手写公式」那块写字板跟着换同一张纸')
 console.log('\n[7] 重开一次：还是上次选的那张纸')
 {
   const want = await s.eval(`localStorage.getItem('studyhelper.paper')`)
-  await s.send('Page.navigate', { url: APP })
+  await open()
   let now = null
   for (let i = 0; i < 80; i++) {
     now = await s.eval(PROBE).catch(() => null)
-    if (now && !now.cover && now.cls.includes('paper-')) break
+    if (now && now.cls.includes('paper-')) break
     await sleep(250)
   }
   await s.sleep(400)
@@ -591,13 +431,10 @@ console.log('\n[7] 重开一次：还是上次选的那张纸')
 console.log('\n[8] 地址栏的 ?paper= 优先于偏好，而且不改偏好')
 {
   await s.eval(`localStorage.setItem('studyhelper.paper', 'grid')`)
-  await s.send('Page.navigate', { url: APP + '?paper=dots' })
-  let now = null
-  for (let i = 0; i < 60; i++) {
-    now = await s.eval(PROBE).catch(() => null)
-    if (now && !now.cover) break
-    await s.sleep(250)
-  }
+  /* ⚠ ?paper= 得**和 ?file= 一起**挂在地址栏上（open 会带上夹具那一段）——
+     自己拼 APP + '?paper=dots' 会把 ?file= 丢掉，那样应用就退回"列表里第一个"了。 */
+  await open({ params: { paper: 'dots' } })
+  const now = await s.eval(PROBE)
   await s.sleep(300)
   if (now && now.cls.includes('paper-dots')) ok('?paper=dots 把纸定成了点阵（自检和"发给同学看"都靠它）')
   else bad(`?paper=dots 没生效（类里是 "${now && now.cls}"）`)
@@ -610,7 +447,7 @@ console.log('\n[9] 换纸没有碰板文件（纸是"我怎么看"，不是板�
 {
   let parsed = null
   try {
-    parsed = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+    parsed = await read()
   } catch (e) {
     bad('夹具板读不出来了：' + e.message)
   }
@@ -626,7 +463,4 @@ console.log('\n[9] 换纸没有碰板文件（纸是"我怎么看"，不是板�
 console.log('\n[10] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
-
-console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-cleanup()
-process.exit(fails ? 1 : 0)
+})

@@ -22,214 +22,47 @@
  *   [11] 重开一次 → 它还是锁着的
  *
  * 自己起服务（5202）和 headless Edge（9232），跑完都收掉；
- * 只碰自己造的夹具板 board-zz-lockcheck.md（用样板内容，跑完删）。
+ * 只碰自己造的夹具板 board-zz-lockcheck.md（跑完删）。
+ * 胶水都收在 scripts/lib/board-check.js 的 withBoard 里：夹具的造/删、服务+浏览器、
+ * CDP 会话、还有"跑完 data/ 里原有文件一个字节都不许变"那道守卫。
  *
  * 用法：node scripts/check-lock.js   （或 npm run check:lock）
  */
-import { spawn } from 'node:child_process'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
-import { browserExe } from './lib/browser.js'
-import { waitForAppPage } from './lib/cdp.js'
+import { withBoard } from './lib/board-check.js'
 import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument } from '../src/lib/board.js'
-
-const ROOT = path.resolve(import.meta.dirname, '..')
-const DATA = path.join(ROOT, 'data')
-const PORT = Number(process.env.TEST_PORT || 5202)
-const CDP_PORT = Number(process.env.TEST_CDP || 9232)
-const CDP = `http://127.0.0.1:${CDP_PORT}`
-const APP = `http://127.0.0.1:${PORT}/`
-
-let fails = 0
-const ok = (m) => console.log('  \u2713 ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  \u2717 ' + m)
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 /* 夹具：两张**文字卡**（我自己造的，**不动用户自己那张板**）。
    为什么不用样板板：样板里第一张是公式卡，而关系面板里显示的"标签"是
    渲染后的式子（displayTex），跟 DOM 里的文字对不上 —— 第 7 步要在面板里
    按文字找那一行，所以夹具得是**文字可预测**的卡。
-   两张卡隔得远，第 6 步"在锁定的卡上画一笔"不会碰到另一张。
-   board- 前缀 + zz 保证排在 data/ 前面；跑完删掉，中途报错也删。 */
-const FIXTURE_NAME = BOARD_PREFIX + 'zz-lockcheck.md'
-const FIXTURE_TITLE = BOARD_PREFIX + 'zz-lockcheck'
-const FIXTURE = path.join(DATA, FIXTURE_NAME)
+   两张卡隔得远，第 6 步"在锁定的卡上画一笔"不会碰到另一张。 */
 const CARD_A = 'lockcheck-a'
 const TEXT_A = '固定自检甲的卡片'
+
+const fails = await withBoard(
+  {
+    tag: 'lockcheck',
+    port: 5202,
+    cdpPort: 9232,
+    make: () => {
+      const b = newBoard('固定自检夹具（跑完自动删除）')
+      const a = { ...newCard('note', 120, 120), id: CARD_A, text: TEXT_A, w: 260, h: 70 }
+      const c = { ...newCard('note', 620, 120), id: 'lockcheck-b', text: '固定自检乙的卡片', w: 260, h: 70 }
+      b.cards.push(a, c)
+      return serializeBoardDocument(b)
+    },
+  },
+  async ({ s, ok, bad, board, open, read }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
+
+const sleep = (ms) => s.sleep(ms)
+
+/* 打开夹具板。★ 从前是"等界面挂上，再从左边栏点夹具那一行" —— 因为应用打开的是
+   列表里第一个 board-*.md，而用户那张中文名的板排在前头。
+   现在应用从 ?file= 直接开夹具（withBoard 里带的），用户那张板根本不会被读到。 */
 {
-  const b = newBoard('固定自检夹具（跑完自动删除）')
-  const a = { ...newCard('note', 120, 120), id: CARD_A, text: TEXT_A, w: 260, h: 70 }
-  const c = { ...newCard('note', 620, 120), id: 'lockcheck-b', text: '固定自检乙的卡片', w: 260, h: 70 }
-  b.cards.push(a, c)
-  fs.writeFileSync(FIXTURE, serializeBoardDocument(b), 'utf8')
-}
-process.on('exit', () => {
-  try {
-    fs.rmSync(FIXTURE, { force: true })
-  } catch {}
-})
-
-class Session {
-  constructor(ws) {
-    this.ws = ws
-    this.id = 0
-    this.pending = new Map()
-    this.exceptions = []
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data)
-      if (msg.method === 'Runtime.exceptionThrown') {
-        const d = msg.params.exceptionDetails
-        this.exceptions.push((d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))
-      }
-      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-        this.exceptions.push('console.error：' + msg.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 160))
-      }
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)
-        this.pending.delete(msg.id)
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)))
-        else resolve(msg.result)
-      }
-    })
-  }
-  send(method, params = {}) {
-    const id = ++this.id
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      this.ws.send(JSON.stringify({ id, method, params }))
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error('CDP 超时: ' + method))
-        }
-      }, 20000)
-    })
-  }
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
-    return r.result.value
-  }
-  /* 真鼠标：按下 → 若干次移动 → 松开。点一下就是 steps=0。 */
-  async mouse(x, y, { steps = 0, dx = 0, dy = 0, button = 'left' } = {}) {
-    const buttons = button === 'left' ? 1 : button === 'middle' ? 4 : 2
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, buttons, clickCount: 1 })
-    for (let i = 1; i <= steps; i++) {
-      await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + (dx * i) / steps, y: y + (dy * i) / steps, button, buttons })
-      await sleep(12)
-    }
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + dx, y: y + dy, button, buttons: 0 })
-    await sleep(220)
-  }
-  /* 双击：CDP 里靠 clickCount 表达（两次 pressed/released，第二次 clickCount=2）。
-     ⚠ 别用元素上的 dispatchEvent('dblclick')：那绕过命中测试，
-     证明不了"用户双击得到它"（这条在 README 第 11 条里写得很清楚）。 */
-  async doubleClick(x, y) {
-    for (const clickCount of [1, 2]) {
-      await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount })
-      await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount })
-      await sleep(40)
-    }
-    await sleep(320)
-  }
-  sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms))
-  }
-}
-
-const server = spawn(process.execPath, ['server.js', '--no-auto-exit', '--no-open'], {
-  cwd: ROOT,
-  env: { ...process.env, STUDYHELPER_PORT: String(PORT) },
-  stdio: 'ignore',
-})
-let edge = null
-const cleanup = () => {
-  for (const p of [edge, server]) {
-    try {
-      if (p && !p.killed) p.kill()
-    } catch {}
-  }
-}
-process.on('exit', cleanup)
-
-async function waitServer() {
-  for (let i = 0; i < 60; i++) {
-    const r = await fetch(APP + 'api/list').then((x) => x.ok).catch(() => false)
-    if (r) return true
-    await sleep(200)
-  }
-  return false
-}
-
-const profile = path.join(os.tmpdir(), `studyhelper-lock-${CDP_PORT}`)
-try {
-  fs.rmSync(profile, { recursive: true, force: true })
-} catch {}
-edge = spawn(
-  browserExe(),
-  [
-    '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
-    '--window-size=1440,900', `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${profile}`, APP,
-  ],
-  { stdio: 'ignore' }
-)
-
-if (!(await waitServer())) bad('服务没起来（' + APP + '）')
-else ok('服务起来了：' + APP)
-
-const page = await waitForAppPage(CDP, { appUrl: APP })
-if (!page) {
-  bad('等不到浏览器里的应用页（CDP ' + CDP + '）')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((res, rej) => {
-  ws.addEventListener('open', res, { once: true })
-  ws.addEventListener('error', rej, { once: true })
-})
-const s = new Session(ws)
-await s.send('Runtime.enable')
-await s.send('Page.enable')
-
-/* 等白板挂上，然后切到夹具。
- * ★ 这一步要做两次（开头一次、重开之后一次），所以抽成函数。
- *   为什么不能指望"打开的就是夹具"：应用打开时挑的是**列表里第一个 board-*.md**，
- *   而这台机器上用户自己那张 `board-新白板.md` 常常排在前面（中文名排序）。
- *   所以每次都从左栏点夹具那一行 —— 这也是用户真实的操作路径，不依赖排序。 */
-async function openFixture() {
-  for (let i = 0; i < 80; i++) {
-    const ready = await s.eval(`!!document.querySelector('.bd-stagewrap') && !document.querySelector('.cover')`).catch(() => false)
-    if (ready) break
-    await sleep(250)
-  }
-  const pick = await s.eval(`(() => {
-    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
-    if (cur.trim() === ${JSON.stringify(FIXTURE_TITLE + '.md')}) return 'already'
-    const row = [...document.querySelectorAll('.filerow')].find(
-      (r) => (((r.querySelector('.fname') || {}).textContent) || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
-    )
-    if (!row) return 'no-row'
-    row.click()
-    return 'clicked'
-  })()`)
-  if (pick === 'clicked') await sleep(1400)
-  await sleep(500)
-  return pick
-}
-
-{
-  const pick = await openFixture()
-  if (pick === 'no-row') {
-    bad('左栏里找不到夹具 ' + FIXTURE_TITLE + ' —— 后面的断言都没意义了')
-    console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-    process.exit(1)
-  }
+  await open()
+  if (!board) bad('没有夹具板 —— 这一份自检必须有自己的板')
 }
 
 /* 页面侧的读卡器：位置、锁定、以及那几个手柄在不在。
@@ -272,8 +105,7 @@ const first = await s.eval(`(() => {
 })()`)
 if (!first) {
   bad('夹具里那张卡没渲染出来 —— 后面的断言都没意义了')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
+  return
 }
 console.log(`\n  （拿这张卡做实验：${first}）`)
 
@@ -450,13 +282,8 @@ console.log('\n[9] 落盘：只有那张卡带 locked，别的卡不多这个字
   /* 先重新锁上，再看文件（前面第 8 步解开了）。 */
   const c = await readCard(first)
   await s.mouse(c.pinCx, c.pinCy)
-  await sleep(1200) // 等自动存盘（停笔 700ms）
-  let doc = null
-  try {
-    doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
-  } catch (e) {
-    bad('夹具板读不出来：' + e.message)
-  }
+  const doc = await read({ wait: 1200 }) // 等自动存盘（停笔 700ms）
+  if (!doc) bad('夹具板读不出来（落盘那一步没写成？）')
   if (doc) {
     const withLock = doc.cards.filter((x) => x.locked === true)
     if (withLock.length === 1 && withLock[0].id === first) ok('文件里正好一张卡是 locked: true，就是这张')
@@ -470,11 +297,9 @@ console.log('\n[9] 落盘：只有那张卡带 locked，别的卡不多这个字
 /* ═════════════════ 10. 重开还在 ═════════════════ */
 console.log('\n[10] 重开一次：它还是锁着的')
 {
-  await s.send('Page.navigate', { url: APP })
-  /* ★ 重开之后要**再切一次夹具**：应用打开时挑的是"列表里第一个 board-*.md"，
-     而用户那张 board-新白板.md 常排在前面（第 8 步那次踩过这个：站在别人的板上
-     找一个不存在的卡片 id，报出来是" 📌 不见了"这种看不懂的假错）。 */
-  await openFixture()
+  /* 重开 = 再导航一次到 ?file=<夹具> —— 还是直接开夹具那张板
+     （从前这儿得"重开之后再从左栏点一次夹具"，因为应用开的是列表里第一个）。 */
+  await open()
   const c = await readCard(first)
   if (!c) {
     bad(`重开并切回夹具之后，卡片 ${first} 不在 DOM 里 —— 这一条没验成`)
@@ -490,7 +315,4 @@ console.log('\n[10] 重开一次：它还是锁着的')
 console.log('\n[11] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
-
-console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-cleanup()
-process.exit(fails ? 1 : 0)
+})

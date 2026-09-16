@@ -12,127 +12,45 @@
  * 白板恰恰全靠这三样。单元测试（check-board.js）能保证"算得对"，
  * 只有这里能保证"真的画得出来、而且画在对的地方"。
  *
- * 前提：服务跑着（默认 http://127.0.0.1:5177/），浏览器带
- *       --remote-debugging-port=9223 起着。都不想手动起就用：
- *       npm run check:board-browser
- *
- * ⚠ 端口：这里和 package.json 里起的必须是**同一个**（都是 9223）。
- *   这两处曾经不一致 —— package.json 起在 9223，而本文件默认连 9222，
- *   于是 `npm run check:board-browser` 永远报"连不上调试端口"。
- *   （9222 是 check:browser 用的，所以这条留在 9223，别改回去。）
+ * ★ 2026-09-16 起它**自足**了：自己起服务（5205）+ headless Edge（9235），
+ *   夹具板从 ?file= 直接打开。从前它要求"5177 上已经有个 app 在跑、9223 上有个
+ *   浏览器开着"（package.json 里那串 `cdp-open.js 9223 && timeout 5`），
+ *   那是条没写出来的前提 —— 连错页面/连到旧进程时报的是"没找到白板"这种假错。
+ *   胶水统一在 scripts/lib/board-check.js 的 withBoard 里。
  */
 import fs from 'node:fs'
+import { withBoard } from './lib/board-check.js'
 import { buildSeedBoard } from '../src/seed-board.js'
-import { serializeBoardDocument, BOARD_PREFIX } from '../src/lib/board.js'
+import { serializeBoardDocument } from '../src/lib/board.js'
 /* 视图映射只有一份实现（src/lib/view.js）：自检和 app 走同一个 module ——
    这样"卡片 CSS 位置"和"canvas 变换"这两条路才算被同一个公式钉住。 */
 import { worldToScreen } from '../src/lib/view.js'
 
-const CDP = process.env.CDP_URL || 'http://127.0.0.1:9223'
-const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
 const SHOT = process.env.SHOT_PATH || '.cache/board-shot.png'
 
 /* ── 自检夹具：自己造一个白板文件，跑完删掉 ──────────────────────────────
-   为什么必须这样。这个自检靠"应用打开时载入列表里第一个文件"来决定进哪个模式
-   （见 App.jsx：打开的是 board-*.md 就进白板），而且它中途会**真的画一笔、
-   双击卡片改成 dS/dt** —— 也就是说它会改动自己打开的那个板。
+   它中途会**真的画一笔、双击卡片改成 dS/dt** —— 也就是说它会改动自己打开的那个板。
+   以前它指向 data/ 里一个手工留下的 board-test.md，两头都错（文件不在 → 整条跑不了；
+   文件在 → 每跑一次就被改一次，卡片从 5 张掉到 3 张）。
+   现在夹具由 withBoard 造、应用从 ?file= 直接开它，用户的板一个字节都不会被读。 */
+const fails = await withBoard(
+  {
+    tag: 'check',
+    port: 5205,
+    cdpPort: 9235,
+    make: () => {
+      const seed = buildSeedBoard()
+      seed.title = '自检夹具（跑完自动删除）'
+      return serializeBoardDocument(seed)
+    },
+  },
+  async ({ s, ok, bad, board, open, read, appUrl }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
-   以前它指向 data/ 里一个手工留下的 board-test.md，于是两头都错：
-     · 那个文件不在（或没排第一）→ 报"没找到白板（是不是又打开成笔记了）"，
-       整条自检一步都跑不了；
-     · 那个文件在 → 每跑一次就被改一次，卡片一张张少下去。
-       实测它已经从 5 张掉到 3 张，然后开始报"只渲染了 3 张卡片（样板是 5 张）"
-       这种看不懂的假错 —— 错在夹具烂了，不在白板代码。
+const sleep = (ms) => s.sleep(ms)
 
-   现在：跑之前用 src/seed-board.js 的样板写一个 board-zz-check.md
-   （board- 前缀 + zz 保证它排在 data/ 里所有文件前面，于是必然进白板模式），
-   跑完删掉，中途报错退出也删（挂在 process.on('exit') 上）。
-   自检不再依赖环境里碰巧有什么文件。
-   —— 这正是 check:mount 当年踩过的同一个坑（用 readdirSync(data)[0] 取样本，
-      多一个 .md 就选错样本，报出来全是假错）。 */
-const FIXTURE_NAME = BOARD_PREFIX + 'zz-check.md'
-/* 左栏文件列表显示的是去掉 .md 的标题（App.jsx 的 f.title），点它要用这个 */
-const FIXTURE_TITLE = BOARD_PREFIX + 'zz-check'
-const FIXTURE = 'data/' + FIXTURE_NAME
-{
-  const seed = buildSeedBoard()
-  seed.title = '自检夹具（跑完自动删除）'
-  fs.writeFileSync(FIXTURE, serializeBoardDocument(seed), 'utf8')
-}
-process.on('exit', () => {
-  try {
-    fs.rmSync(FIXTURE, { force: true })
-  } catch {}
-})
-
-let fails = 0
-const ok = (m) => console.log('  ✓ ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  ✗ ' + m)
-}
-
-class Session {
-  constructor(ws) {
-    this.ws = ws
-    this.id = 0
-    this.pending = new Map()
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data)
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)
-        this.pending.delete(msg.id)
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)))
-        else resolve(msg.result)
-      }
-    })
-  }
-  send(method, params = {}) {
-    const id = ++this.id
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      this.ws.send(JSON.stringify({ id, method, params }))
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error('CDP 超时: ' + method))
-        }
-      }, 20000)
-    })
-  }
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
-    return r.result.value
-  }
-  sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms))
-  }
-}
-
-const targets = await fetch(CDP + '/json/list')
-  .then((r) => r.json())
-  .catch(() => null)
-if (!targets) {
-  console.error(`\n  连不上浏览器的调试端口 ${CDP}。先起一个（或者用 npm run check:board-browser）：`)
-  console.error(`    npm run check:board-browser   —— 它会自己按 9223 起好浏览器`)
-  console.error(`    手动起：node scripts/cdp-open.js 9223 1440,900\n`)
-  process.exit(2)
-}
-const page = targets.find((t) => t.type === 'page' && t.url.startsWith('http'))
-if (!page) {
-  console.error('  找不到可用的页面 target（Chrome 起来的时候要带上 ' + APP + '）')
-  process.exit(2)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((res, rej) => {
-  ws.addEventListener('open', res)
-  ws.addEventListener('error', rej)
-})
-const s = new Session(ws)
-await s.send('Runtime.enable')
-await s.send('Page.enable')
-await s.send('Log.enable')
+/* 打开夹具板：应用从 ?file= 直接开（open 自己会导航 + 等它挂上）。 */
+await open()
 
 /* 在画布区里找一段**真的空白**（`.bd-hit` 命中的地方）。
  *
@@ -178,56 +96,6 @@ async function emptyXOnRow(y, from, to) {
   })()`)
 }
 
-/* ★ 把页面里的报错全收下来。
-   为什么必须有这一条：曾经有一个 `ReferenceError: drawStroke is not defined`
-   活了很久 —— 它只在**鼠标按下的那一刻**才炸，所以
-   "模块加载正常、构建正常、工具条按钮都在、状态栏数字也对"，
-   唯一的症状是"笔点不动"。这种"某个标识符没定义"的错，
-   光看代码、光看构建产物都发现不了。
-   这个自检本来就会真的按下去画一笔，所以它撞得上这个错 ——
-   加上这一条之后，它会**直接报出是哪一行**，而不是只说"没画出墨"。 */
-const pageErrors = []
-ws.addEventListener('message', (e) => {
-  const m = JSON.parse(e.data)
-  if (m.method === 'Runtime.exceptionThrown') {
-    const d = m.params.exceptionDetails
-    pageErrors.push('异常：' + (d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))
-  }
-  if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
-    pageErrors.push('console.error：' + m.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 200))
-  }
-})
-
-await s.send('Page.navigate', { url: APP })
-await s.sleep(2800)
-
-/* ★ 先确保打开的是**我们自己造的夹具**那张板。
-   为什么要这一步：应用打开时挑"列表里第一个 board-*.md"，而这个文件不一定是夹具 ——
-   比如"data/ 里一张板都没有"时应用会自己补一张 board-新白板.md（App.jsx 的 ensureBoard），
-   而中文名在排序上排在 board-zz-check 前面（实测），于是夹具永远选不上，
-   报出来是"只渲染了 0 张卡片（样板是 5 张）""找不到公式卡"这种看不懂的假错 ——
-   和当年 board-test.md 那次的症状一模一样：**错在夹具没被打开，不在白板代码**。
-   做法：从左栏文件列表里点夹具那一行。这是用户真实的操作路径，不依赖任何排序。 */
-{
-  const pick = await s.eval(`(() => {
-    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
-    if (cur.trim() === ${JSON.stringify(FIXTURE_TITLE + '.md')}) return 'already'
-    const row = [...document.querySelectorAll('.filerow')].find(
-      (r) => ((r.querySelector('.fname') || {}).textContent || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
-    )
-    if (!row) return 'no-row'
-    row.click()
-    return 'clicked'
-  })()`)
-  if (pick === 'already') console.log('  （打开的就是夹具）')
-  else if (pick === 'clicked') {
-    await s.sleep(1200)
-    const now = await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)
-    console.log('  （换到夹具：' + now + '）')
-  } else {
-    bad('左栏里找不到夹具文件 ' + FIXTURE_TITLE + ' —— 后面的断言都没意义了')
-  }
-}
 
 console.log('\n[1] 打开就是白板')
 {
@@ -340,17 +208,17 @@ console.log('\n[3] 画一笔：合成指针事件 → 真的落到数据里')
 
 console.log('\n[4] 落盘的内容是合法的白板文件')
 {
-  const list = await (await fetch(new URL('/api/list', APP))).json()
+  const list = await (await fetch(new URL('/api/list', appUrl))).json()
   /* ★ 读**页面上正开着的那个**文件，而不是"列表里第一个 board-*"。
      这两个不是一回事：data/ 里一张板都没有时，应用打开会自己补一张 board-新白板.md
      （App.jsx 的 ensureBoard），而它按字典序排在夹具前面 —— 于是这里会去读那张空板，
      报出「画的笔画是空的（指针事件没被收下）」，把人往白板代码上带（其实画得好好的）。 */
-  const openName = (await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)) || FIXTURE_NAME
+  const openName = (await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)) || board.name
   const boardFile = (list.files || []).find((f) => f.name === openName)
   if (boardFile) ok('服务端能看到白板文件：' + boardFile.name)
   else bad('服务端列表里找不到正在看的 ' + openName + '（看到的板不在 data/ 里？）')
   if (boardFile) {
-    const got = await (await fetch(new URL('/api/file/' + encodeURIComponent(boardFile.name), APP))).json()
+    const got = await (await fetch(new URL('/api/file/' + encodeURIComponent(boardFile.name), appUrl))).json()
     let parsed = null
     try {
       parsed = JSON.parse(got.text)
@@ -478,7 +346,7 @@ console.log('\n[6] ★ 对齐：墨迹和卡片必须落在同一处')
     }
     const [xs, xtx, xty] = String(a.xform).split(',').map(Number)
     const view = { s: xs / a.dpr, tx: xtx / a.dpr, ty: xty / a.dpr }
-    const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+    const doc = await read()
     const card = (doc.cards || []).find((c) => c.id === a.id)
     if (!card) {
       bad(`${tag}：DOM 里那张卡 ${a.id} 不在夹具文件里`)
@@ -701,7 +569,7 @@ console.log('\n[9] ★ 页面上不许有报错')
   /* 这一节是"笔点不动"那个 bug 的哨兵。
      那种 bug 的症状是"某个标识符没定义"，而且只在某个交互被触发时才炸 ——
      前面几节都在真的交互（画、双击、切摆法），所以错误都会被这里收上来。 */
-  const real = pageErrors.filter((e) => !/favicon|Failed to load resource/i.test(e))
+  const real = s.errors().filter((e) => !/favicon|Failed to load resource/i.test(e))
   if (!real.length) ok('整个流程跑下来，页面里没有任何 JS 报错')
   else {
     bad(`页面里有 ${real.length} 条报错：`)
@@ -709,8 +577,4 @@ console.log('\n[9] ★ 页面上不许有报错')
     console.log('      ← 这种错往往就是"某个按钮点了没反应 / 笔点不动"的真正原因')
   }
 }
-
-console.log('\n' + '─'.repeat(56))
-console.log(fails ? `  ${fails} 项失败` : '  全部通过')
-ws.close()
-process.exit(fails ? 1 : 0)
+})

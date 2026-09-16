@@ -10,79 +10,21 @@
  * 同时用"旧的逐段画法"画同样的点做对照，让差值有说服力。
  *
  * 跑：node scripts/check-highlighter.js
+ *
+ * 胶水（起服务 + 起浏览器 + CDP 会话 + 夹具板 + 用户数据守卫）都在
+ * scripts/lib/board-check.js 的 withBoard 里 —— 这一节**用不到白板上的内容**
+ * （它自己在页面里造两块 canvas 对照着画），夹具板只是为了"别打开用户那张板"。
  */
-import fs from 'node:fs'
-import path from 'node:path'
-import { spawn } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
-import { browserExe } from './lib/browser.js'
+import { withBoard } from './lib/board-check.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const ROOT = path.join(__dirname, '..')
-const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
-const CDP_PORT = Number(process.env.CDP_PORT || 9229)
-const CHROME = browserExe()
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-let fails = 0
-const ok = (m) => console.log('  ✓ ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  ✗ ' + m)
-}
-
-const profile = path.join(ROOT, '.cache', 'hl-cdp')
-fs.rmSync(profile, { recursive: true, force: true })
-const chrome = spawn(
-  CHROME,
-  ['--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars', '--window-size=1200,800', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, APP],
-  { stdio: 'ignore' }
-)
-process.on('exit', () => {
-  try {
-    chrome.kill()
-  } catch {}
-})
-
-let targets = null
-for (let i = 0; i < 40; i++) {
-  targets = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`).then((r) => r.json()).catch(() => null)
-  if (targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))) break
-  await sleep(300)
-}
-const page = targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))
-if (!page) {
-  console.error('  Chrome 没起来')
-  process.exit(2)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((r) => ws.addEventListener('open', r))
-let id = 0
-const pend = new Map()
-ws.addEventListener('message', (e) => {
-  const m = JSON.parse(e.data)
-  if (m.id && pend.has(m.id)) {
-    pend.get(m.id)(m.result)
-    pend.delete(m.id)
-  }
-})
-const send = (method, params = {}) =>
-  new Promise((res) => {
-    const i = ++id
-    pend.set(i, res)
-    ws.send(JSON.stringify({ id: i, method, params }))
-  })
-const ev = (expr) => send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }).then((r) => r.result?.value)
-
-await send('Runtime.enable')
-await send('Page.enable')
-await send('Page.navigate', { url: APP })
-await sleep(2600)
+const fails = await withBoard({ tag: 'hlcheck', port: 5207, cdpPort: 9237, window: '1200,800' }, async ({ s, ok, bad }) => {
+/* ── 下面整段原来是顶层代码，现在挪进 withBoard 的回调里；
+      缩进没动 —— 几百行一起缩一遍只是假 diff，review 的时候反而看不清改了什么。 */
 
 /* 在页面里跑一段测量脚本。
    新版：调**应用自己的** drawStroke（页面上加载的就是那一份）
    旧版：照抄早先的实现（逐段 stroke + 圆头 + alpha 0.32）做对照 */
-const result = await ev(`(async () => {
+const result = await s.eval(`(async () => {
   // 从应用的 bundle 里拿不到具名导出，所以这里按同样的算法重画。
   // 新版这一段必须和 src/lib/ink.js 的荧光笔分支保持同一个形状：
   //   一条 path、一次 stroke、宽度恒定、alpha 只叠一次。
@@ -177,8 +119,4 @@ if (result.old.sd > result.fresh.sd * 1.5) {
   bad(`新旧差别不明显（旧 ${result.old.sd} vs 新 ${result.fresh.sd}）—— 这条测量可能没测到真东西`)
 }
 
-console.log('\n' + '─'.repeat(52))
-console.log(fails ? `  ${fails} 项失败` : '  全部通过')
-ws.close()
-chrome.kill()
-process.exit(fails ? 1 : 0)
+})

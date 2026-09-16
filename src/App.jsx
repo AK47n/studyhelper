@@ -247,18 +247,34 @@ export default function App() {
       }
       setFiles(list.files || [])
       if (list.files && list.files.length) {
-        // 打开哪一个？优先白板 —— 这是"打开就能画"的默认入口。
-        // 排序在服务端钉死了（见 server.js 的 /api/list），所以这里的结果是稳定的。
-        const firstBoard = list.files.find((f) => isBoardName(f.name))
-        if (firstBoard) {
-          await open(firstBoard.name)
+        /* ?file=<名字> —— **自检用的入口**：直接从 URL 打开指定的那一张板。
+           ★ 为什么不走下面那条"列表里第一个"：自检要打开的是它自己造的夹具板，
+             而列表第一个常常是用户自己那张（中文名在 zh 排序里排在 board-zz-* 前面），
+             于是应用会先把用户的板读进来、冷字体缓存下还会重量卡片尺寸再写回去一次 ——
+             每次自检都动一下用户的数据（README 自检那一节记着这条）。
+             从这里进，用户那张板根本不会被读到。
+           ★ 找不到就**什么都不打开**（只给一句话）：自检要躲的正是"退回列表里第一个"，
+             退回等于把上面这条又踩一遍。这个参数不是给用户的功能，不用兜底到好看。
+           ★ 名字只跟 /api/list 里的名字比，绝不当路径用（服务端另有 SAFE_NAME 那道闸）。 */
+        const want = new URLSearchParams(window.location.search).get('file')
+        if (want) {
+          const hit = list.files.find((f) => f.name === want)
+          if (hit) await open(hit.name, { force: true })
+          else flash('?file= 说的那个文件不在列表里：' + want, 'err')
         } else {
-          /* 一张板都没有（笔记还在、板被删干净了）。
-             ★ 这里以前是直接打开第一个笔记 —— 用户看到的就是"怎么打开是笔记界面"。
-             现在：补一张空板再进去；真的建不出来（名字探完了 / 写盘失败）才退回笔记。 */
-          const made = await ensureBoard({ files: list.files, refresh: refreshList, flash })
-          await open(made || list.files[0].name, { force: true })
-          if (made) flash('没有白板，先给你开了一张空的：' + made)
+          // 打开哪一个？优先白板 —— 这是"打开就能画"的默认入口。
+          // 排序在服务端钉死了（见 server.js 的 /api/list），所以这里的结果是稳定的。
+          const firstBoard = list.files.find((f) => isBoardName(f.name))
+          if (firstBoard) {
+            await open(firstBoard.name)
+          } else {
+            /* 一张板都没有（笔记还在、板被删干净了）。
+               ★ 这里以前是直接打开第一个笔记 —— 用户看到的就是"怎么打开是笔记界面"。
+               现在：补一张空板再进去；真的建不出来（名字探完了 / 写盘失败）才退回笔记。 */
+            const made = await ensureBoard({ files: list.files, refresh: refreshList, flash })
+            await open(made || list.files[0].name, { force: true })
+            if (made) flash('没有白板，先给你开了一张空的：' + made)
+          }
         }
       }
       setBusy(false)

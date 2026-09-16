@@ -16,47 +16,21 @@
  * 这样这里能断言"密钥确实带上了"，而真密钥一次都没出过这台机器。
  *
  * 跑：npm run check:ocr-browser
+ *
+ * 胶水（起服务 + 起浏览器 + CDP 会话 + 夹具板 + 用户数据守卫）都在
+ * scripts/lib/board-check.js 的 withBoard 里。这一条还多两件自己的事：
+ *   ① 起一个**假的识别服务**（这是我们自己的进程，不是夹具那套）；
+ *   ② 把 config/ocr.json 先挪开、跑完放回去（"删的是谁的"那条规矩，见下面 cleanup）。
  */
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
-import { browserExe } from './lib/browser.js'
-import { newBoard, serializeBoardDocument } from '../src/lib/board.js'
+import { withBoard, ROOT } from './lib/board-check.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const ROOT = path.join(__dirname, '..')
 const APP_PORT = Number(process.env.OCR_TEST_APP_PORT || 5179)
 const MOCK_PORT = Number(process.env.OCR_TEST_MOCK_PORT || 5198)
 const CDP_PORT = Number(process.env.OCR_TEST_CDP_PORT || 9223)
-const APP = `http://127.0.0.1:${APP_PORT}/`
-const CHROME = browserExe()
 const TEST_TOKEN = 'test-uat-token-abcdefgh'
-
-/* ── 夹具板：绝不动用户自己的板 ──────────────────────────────────────────
-   这个自检中途会**真的往白板上插一张公式卡**，而应用打开的是
-   "列表里第一个 board-*.md" —— 那多半是用户自己的板（今天那次就是
-   `board-新白板.md`），于是跑一次自检就往人家板里塞一张 E = mc²。
-   实测：跑两遍，用户板上多了两张一模一样的 E = mc²。
-   这和 check-board-browser 当年的教训是同一个：**自检不许写进用户的数据**。
-
-   所以先造一张自己的板（board- 前缀 + zz-ocr 前缀，跑完删），
-   再从左栏文件列表里点开它 —— 不依赖任何排序。
-   `process.on('exit')` 保证中途报错退出也会删。 */
-const FIXTURE_NAME = 'board-zz-ocrcheck.md'
-const FIXTURE_TITLE = 'board-zz-ocrcheck'
-const FIXTURE = path.join(ROOT, 'data', FIXTURE_NAME)
-fs.writeFileSync(FIXTURE, serializeBoardDocument(newBoard('自检夹具（跑完自动删除）')), 'utf8')
-
-let fails = 0
-const ok = (m) => console.log('  ✓ ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  ✗ ' + m)
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ═════════════ 1. 假的识别服务（DeepSeek 形状）═════════════
 /* default provider 现在是 deepseek，所以这个假服务回 OpenAI 兼容的形状：
@@ -115,27 +89,9 @@ if (fs.existsSync(realConfig)) {
   stashed = true
 }
 
-const serverLog = []
-const server = spawn(process.execPath, ['server.js', '--no-open', '--no-auto-exit'], {
-  cwd: ROOT,
-  env: {
-    ...process.env,
-    STUDYHELPER_PORT: String(APP_PORT),
-    // 默认 provider 就是 deepseek，这里把它的接口地址指到假服务上
-    STUDYHELPER_OCR_PROVIDER: 'deepseek',
-    STUDYHELPER_OCR_DS_BASE: `http://127.0.0.1:${MOCK_PORT}/chat/completions`,
-    STUDYHELPER_OCR_MODEL: 'deepseek-flash',
-    STUDYHELPER_OCR_TOKEN: TEST_TOKEN,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-})
-server.stdout.on('data', (d) => serverLog.push(String(d)))
-server.stderr.on('data', (d) => serverLog.push(String(d)))
-
+/* 收尾：只收**这一条自检自己的**东西 —— 假识别服务和那份被挪开的配置。
+   服务 / 浏览器 / 夹具板都由 withBoard 收（它还会查"data/ 里原有文件变没变"）。 */
 const cleanup = () => {
-  try {
-    server.kill()
-  } catch {}
   try {
     mock.close()
   } catch {}
@@ -167,9 +123,6 @@ const cleanup = () => {
       fs.rmdirSync(path.join(ROOT, 'config'))
     }
   } catch {}
-  try {
-    fs.rmSync(FIXTURE, { force: true })
-  } catch {}
 }
 process.on('exit', cleanup)
 process.on('SIGINT', () => {
@@ -177,137 +130,31 @@ process.on('SIGINT', () => {
   process.exit(130)
 })
 
-// 等服务起来
-let up = false
-for (let i = 0; i < 40; i++) {
-  try {
-    const r = await fetch(APP + 'api/list')
-    if (r.ok) {
-      up = true
-      break
-    }
-  } catch {}
-  await sleep(250)
-}
-if (!up) {
-  console.error('\n  本地服务没起来。它的输出：\n' + serverLog.join(''))
-  cleanup()
-  process.exit(2)
-}
+/* ═════════════════ 3. 应用 + 浏览器 + 夹具板（withBoard 管）═════════════
+   夹具板：这个自检中途会**真的往白板上插一张公式卡**，所以它必须开在自己的板上。
+   以前是"进界面之后从左栏点夹具那一行"（应用开的是列表里第一个 board-*.md，
+   那多半是用户自己的板 —— 实测跑两遍，用户板上多了两张一模一样的 E = mc²）；
+   现在应用从 ?file= 直接开夹具，用户那张板根本不会被读到。 */
+const fails = await withBoard(
+  {
+    tag: 'ocrcheck',
+    port: APP_PORT,
+    cdpPort: CDP_PORT,
+    env: {
+      // 默认 provider 就是 deepseek，这里把它的接口地址指到假服务上
+      STUDYHELPER_OCR_PROVIDER: 'deepseek',
+      STUDYHELPER_OCR_DS_BASE: `http://127.0.0.1:${MOCK_PORT}/chat/completions`,
+      STUDYHELPER_OCR_MODEL: 'deepseek-flash',
+      STUDYHELPER_OCR_TOKEN: TEST_TOKEN,
+    },
+  },
+  async ({ s, ok, bad, open, read }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
-// ═════════════ 3. Chrome + CDP ═════════════
-const userDataDir = path.join(ROOT, '.cache', 'ocr-cdp')
-fs.rmSync(userDataDir, { recursive: true, force: true })
-const chrome = spawn(
-  CHROME,
-  [
-    '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
-    '--window-size=1440,900',
-    `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${userDataDir}`,
-    APP,
-  ],
-  { stdio: 'ignore' }
-)
-process.on('exit', () => {
-  try {
-    chrome.kill()
-  } catch {}
-})
+const sleep = (ms) => s.sleep(ms)
 
-class Session {
-  constructor(ws) {
-    this.ws = ws
-    this.id = 0
-    this.pending = new Map()
-    /* 页面里的 JS 报错也收下来。
-       为什么要它：这一节碰的全是事件处理（拖动/缩放/指针捕获），
-       "处理器里抛了个异常"和"处理器压根没跑"在界面上长得一模一样 ——
-       都是"拖了没反应"。有了这个，才不用靠猜。 */
-    this.exceptions = []
-    ws.addEventListener('message', (ev) => {
-      const m = JSON.parse(ev.data)
-      if (m.method === 'Runtime.exceptionThrown') {
-        const d = m.params && m.params.exceptionDetails
-        this.exceptions.push((d && ((d.exception && d.exception.description) || d.text)) || 'unknown')
-      }
-      if (m.id && this.pending.has(m.id)) {
-        const { resolve, reject } = this.pending.get(m.id)
-        this.pending.delete(m.id)
-        if (m.error) reject(new Error(JSON.stringify(m.error)))
-        else resolve(m.result)
-      }
-    })
-  }
-  send(method, params = {}) {
-    const id = ++this.id
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      this.ws.send(JSON.stringify({ id, method, params }))
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error('CDP 超时: ' + method))
-        }
-      }, 20000)
-    })
-  }
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
-    return r.result.value
-  }
-  sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms))
-  }
-}
-
-let targets = null
-for (let i = 0; i < 40; i++) {
-  targets = await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`).then((r) => r.json()).catch(() => null)
-  if (targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))) break
-  await sleep(300)
-}
-const page = targets && targets.find((t) => t.type === 'page' && t.url.startsWith('http'))
-if (!page) {
-  console.error('\n  Chrome 没起来或没打开页面。CHROME_PATH=' + CHROME)
-  cleanup()
-  process.exit(2)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((res, rej) => {
-  ws.addEventListener('open', res)
-  ws.addEventListener('error', rej)
-})
-const s = new Session(ws)
-await s.send('Runtime.enable')
-await s.send('Page.enable')
-await s.send('Page.navigate', { url: APP })
-await s.sleep(2600)
-
-/* ★ 先换到自己的夹具板再开始。应用打开的是"列表里第一个 board-*.md"，
-   那个多半是用户自己的板 —— 本自检会往里插卡片，不能插到别人板上。 */
-{
-  const pick = await s.eval(`(() => {
-    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
-    if (cur.trim() === ${JSON.stringify(FIXTURE_NAME)}) return 'already'
-    const row = [...document.querySelectorAll('.filerow')].find(
-      (r) => ((r.querySelector('.fname') || {}).textContent || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
-    )
-    if (!row) return 'no-row'
-    row.click()
-    return 'clicked'
-  })()`)
-  if (pick === 'no-row') {
-    console.error('\n  左栏里找不到夹具板 ' + FIXTURE_TITLE + ' —— 后面会往别人的板上插卡片，停在这里。\n')
-    process.exit(2)
-  }
-  if (pick === 'clicked') {
-    await s.sleep(1200)
-    const now = await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)
-    console.log('  （夹具板：' + now + '）')
-  }
-}
+/* 打开夹具板，开始断言。 */
+await open()
 
 // ═════════════════════ 开始断言 ═════════════════════
 console.log('\n[1] 工具条上有「手写公式」这个入口')
@@ -1327,8 +1174,8 @@ console.log('\n[9] 卡片交互：移动 / 缩放 / 非选中 / 笔能在卡片�
   /* ★ 整个流程跑下来，页面里不许有 JS 报错。
      拖动/缩放/指针捕获这些地方，"处理器抛异常"和"处理器没跑"在屏幕上是同一个样子
      （拖了没反应），所以这一条不是洁癖，是这一节唯一的兜底。 */
-  if (!s.exceptions.length) ok('整个流程跑下来，页面里没有任何 JS 报错')
-  else bad(`页面里有 JS 报错（${s.exceptions.length} 条）：` + s.exceptions.slice(0, 3).join(' ｜ '))
+  if (!s.errors().length) ok('整个流程跑下来，页面里没有任何 JS 报错')
+  else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
 }
 
 // ═════════════════════ 10. 框住已有的手写 → 认成公式 + 卡片留白 ═════════════════════
@@ -1492,12 +1339,10 @@ console.log('\n[10] 框选 → 认公式；顺带量卡片的留白')
   const shot = await s.send('Page.captureScreenshot', { format: 'png' })
   fs.writeFileSync(path.join(ROOT, '.cache', 'formula-from-ink.png'), Buffer.from(shot.data, 'base64'))
   console.log('  （截图存到 .cache/formula-from-ink.png）')
-  if (!s.exceptions.length) ok('整个流程跑下来，页面里没有任何 JS 报错')
-  else bad(`页面里有 JS 报错（${s.exceptions.length} 条）：` + s.exceptions.slice(0, 3).join(' ｜ '))
+  if (!s.errors().length) ok('整个流程跑下来，页面里没有任何 JS 报错')
+  else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
 }
+})
 
-console.log('\n' + '─'.repeat(56))
-console.log(fails ? `  ${fails} 项失败` : '  全部通过')
-ws.close()
+/* 收自己的两件东西：假识别服务 + 那份被挪开的配置（服务/浏览器/夹具由 withBoard 收）。 */
 cleanup()
-process.exit(fails ? 1 : 0)

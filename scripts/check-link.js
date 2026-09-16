@@ -27,223 +27,41 @@
  *
  * 用法：node scripts/check-link.js   （或 npm run check:link）
  */
-import { spawn } from 'node:child_process'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
-import { browserExe } from './lib/browser.js'
-import { waitForAppPage } from './lib/cdp.js'
+import { withBoard } from './lib/board-check.js'
 import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument, toPoints } from '../src/lib/board.js'
 
-const ROOT = path.resolve(import.meta.dirname, '..')
-const DATA = path.join(ROOT, 'data')
-const PORT = Number(process.env.TEST_PORT || 5203)
-const CDP_PORT = Number(process.env.TEST_CDP || 9233)
-const CDP = `http://127.0.0.1:${CDP_PORT}`
-const APP = `http://127.0.0.1:${PORT}/`
-
-let fails = 0
-const ok = (m) => console.log('  \u2713 ' + m)
-const bad = (m) => {
-  fails++
-  console.log('  \u2717 ' + m)
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-/* 夹具：两张文字卡、**一笔都没有**。两张卡**上下摆**，不是左右摆 ——
+/* ── 夹具板：两张文字卡、**一笔都没有**，而且是**上下摆**不是左右摆 ──
  * ★ 左右摆踩过：屏幕右边 ~330px 是关系面板（.bd-cpanel，覆盖在画布上面），
  *   而"装回屏幕"会把这两张卡居中，于是右边那张正好钻到面板底下。
  *   症状是"第二笔怎么画都不出墨"，报出来像"画不出来"，其实是**在面板上按的**
  *   （面板在 .bd-stagewrap 外面，捕获阶段的监听都收不到 pointerdown）。
  *   上下摆之后两张卡都落在画布中轴附近，离面板远远的。
  * 为什么板上一笔都没有：第 5 步要"框住那条线"，而浮层只在
- *   "框里正好一条连接线"时出现（inkSel.size === 1）—— 板上多一笔就测不到那条路了。 */
-const FIXTURE_NAME = BOARD_PREFIX + 'zz-linkcheck.md'
-const FIXTURE_TITLE = BOARD_PREFIX + 'zz-linkcheck'
-const FIXTURE = path.join(DATA, FIXTURE_NAME)
-{
-  const b = newBoard('连接自检夹具（跑完自动删除）')
-  b.cards.push(
-    { ...newCard('note', 500, 120), id: 'lk-a', text: '原因这一块', w: 220, h: 90 },
-    { ...newCard('note', 500, 560), id: 'lk-b', text: '结果这一块', w: 220, h: 90 }
-  )
-  fs.writeFileSync(FIXTURE, serializeBoardDocument(b), 'utf8')
-}
-process.on('exit', () => {
-  try {
-    fs.rmSync(FIXTURE, { force: true })
-  } catch {}
-})
+ *   "框里正好一条连接线"时出现（inkSel.size === 1）—— 板上多一笔就测不到那条路了。
+ * 夹具的造/删、"打开的就是夹具"、"跑完 data/ 原有文件一字节不变"都由 withBoard 管。 */
+const fails = await withBoard(
+  {
+    tag: 'linkcheck',
+    port: 5203,
+    cdpPort: 9233,
+    make: () => {
+      const b = newBoard('连接自检夹具（跑完自动删除）')
+      b.cards.push(
+        { ...newCard('note', 500, 120), id: 'lk-a', text: '原因这一块', w: 220, h: 90 },
+        { ...newCard('note', 500, 560), id: 'lk-b', text: '结果这一块', w: 220, h: 90 }
+      )
+      return serializeBoardDocument(b)
+    },
+  },
+  async ({ s, ok, bad, board, open, read }) => {
+/* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
-class Session {
-  constructor(ws) {
-    this.ws = ws
-    this.id = 0
-    this.pending = new Map()
-    this.exceptions = []
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data)
-      if (msg.method === 'Runtime.exceptionThrown') {
-        const d = msg.params.exceptionDetails
-        this.exceptions.push((d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))
-      }
-      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-        this.exceptions.push('console.error：' + msg.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 160))
-      }
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)
-        this.pending.delete(msg.id)
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)))
-        else resolve(msg.result)
-      }
-    })
-  }
-  send(method, params = {}) {
-    const id = ++this.id
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      this.ws.send(JSON.stringify({ id, method, params }))
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id)
-          reject(new Error('CDP 超时: ' + method))
-        }
-      }, 20000)
-    })
-  }
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
-    return r.result.value
-  }
-  /* 用**笔**画（pointerType: 'pen'）。
-   * ★ 为什么必须是笔、不能是鼠标：卡片是 DOM、会收指针事件（鼠标按上去是**拖卡片**）。
-   *   用笔时卡片让路（.bd.penink .bd-card），笔尖才能从卡片上写过去 ——
-   *   而这正是用户的真实姿势（他就是要在两张卡之间画线）。
-   * ★ 而且**先悬停一下**：应用靠"最近一次是什么设备"来判断要不要加 .penink，
-   *   直接按下去的话，那一下还是会被卡片接走（悬停即生效，见 Board.jsx 的注释）。 */
-  async penStroke(from, to, { steps = 10, hover = true } = {}) {
-    if (hover) {
-      await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none', buttons: 0, pointerType: 'pen' })
-      await sleep(140)
-    }
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'pen' })
-    for (let i = 1; i <= steps; i++) {
-      const x = Math.round(from.x + ((to.x - from.x) * i) / steps)
-      const y = Math.round(from.y + ((to.y - from.y) * i) / steps)
-      await this.send('Input.dispatchMouseEvent', {
-        type: 'mouseMoved', x, y, button: 'left', buttons: 1, pointerType: 'pen',
-      })
-      await sleep(12)
-    }
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'pen' })
-    await sleep(220)
-  }
-  async mouse(x, y, { steps = 0, dx = 0, dy = 0 } = {}) {
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 })
-    for (let i = 1; i <= steps; i++) {
-      await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x + (dx * i) / steps, y: y + (dy * i) / steps, button: 'left', buttons: 1 })
-      await sleep(12)
-    }
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + dx, y: y + dy, button: 'left', buttons: 0 })
-    await sleep(220)
-  }
-  async key(k, code, vk) {
-    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code, windowsVirtualKeyCode: vk })
-    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk })
-    await sleep(260)
-  }
-  sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms))
-  }
-}
+const sleep = (ms) => s.sleep(ms)
 
-const server = spawn(process.execPath, ['server.js', '--no-auto-exit', '--no-open'], {
-  cwd: ROOT,
-  env: { ...process.env, STUDYHELPER_PORT: String(PORT) },
-  stdio: 'ignore',
-})
-let edge = null
-const cleanup = () => {
-  for (const p of [edge, server]) {
-    try {
-      if (p && !p.killed) p.kill()
-    } catch {}
-  }
-}
-process.on('exit', cleanup)
-
-async function waitServer() {
-  for (let i = 0; i < 60; i++) {
-    const r = await fetch(APP + 'api/list').then((x) => x.ok).catch(() => false)
-    if (r) return true
-    await sleep(200)
-  }
-  return false
-}
-
-const profile = path.join(os.tmpdir(), `studyhelper-link-${CDP_PORT}`)
-try {
-  fs.rmSync(profile, { recursive: true, force: true })
-} catch {}
-edge = spawn(
-  browserExe(),
-  [
-    '--headless=new', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
-    '--window-size=1440,900', `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${profile}`, APP,
-  ],
-  { stdio: 'ignore' }
-)
-
-if (!(await waitServer())) bad('服务没起来（' + APP + '）')
-else ok('服务起来了：' + APP)
-
-const page = await waitForAppPage(CDP, { appUrl: APP })
-if (!page) {
-  bad('等不到浏览器里的应用页（CDP ' + CDP + '）')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
-}
-const ws = new WebSocket(page.webSocketDebuggerUrl)
-await new Promise((res, rej) => {
-  ws.addEventListener('open', res, { once: true })
-  ws.addEventListener('error', rej, { once: true })
-})
-const s = new Session(ws)
-await s.send('Runtime.enable')
-await s.send('Page.enable')
-
-/* 切到夹具（应用打开时挑的是"列表里第一个 board-*.md"，那常常是用户自己那张板）。 */
-async function openFixture() {
-  for (let i = 0; i < 80; i++) {
-    const ready = await s.eval(`!!document.querySelector('.bd-stagewrap') && !document.querySelector('.cover')`).catch(() => false)
-    if (ready) break
-    await sleep(250)
-  }
-  const pick = await s.eval(`(() => {
-    const cur = (document.querySelector('.bd-file') || {}).textContent || ''
-    if (cur.trim() === ${JSON.stringify(FIXTURE_TITLE + '.md')}) return 'already'
-    const row = [...document.querySelectorAll('.filerow')].find(
-      (r) => (((r.querySelector('.fname') || {}).textContent) || '').trim() === ${JSON.stringify(FIXTURE_TITLE)}
-    )
-    if (!row) return 'no-row'
-    row.click()
-    return 'clicked'
-  })()`)
-  if (pick === 'clicked') await sleep(1400)
-  await sleep(500)
-  return pick
-}
-
-{
-  const pick = await openFixture()
-  if (pick === 'no-row') {
-    bad('左栏里找不到夹具 ' + FIXTURE_TITLE + ' —— 后面的断言都没意义了')
-    console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-    process.exit(1)
-  }
-}
+/* 打开夹具板（应用从 ?file= 直接开，不再"进界面之后点左栏那一行"） */
+await open()
 
 /* 读板上的情况：面板里那节"你画过的"、浮词那排、屏幕上的词、以及卡片位置。 */
 const readBoard = () => s.eval(`(() => {
@@ -295,7 +113,7 @@ const readBoard = () => s.eval(`(() => {
 async function fileLinks(ms = 1100) {
   await sleep(ms)
   try {
-    const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+    const doc = await read()
     return doc.strokes.filter((x) => x.link).map((x) => x.link)
   } catch {
     return null
@@ -322,8 +140,7 @@ const pickTool = (label) => s.eval(`(() => {
 let st = await readBoard()
 if (!st.a || !st.b) {
   bad('夹具的两张卡没渲染出来 —— 后面的断言都没意义了')
-  console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-  process.exit(1)
+  return
 }
 console.log(`\n  （两张卡在屏幕上：A(${st.a.cx},${st.a.cy}) · B(${st.b.cx},${st.b.cy})）`)
 
@@ -492,7 +309,7 @@ console.log('\n[6b] 用他本人的笔迹（scripts/fixtures/hand-arrows.json）
      这里就是把那两条真实点列**按屏幕映射画一遍**（真笔事件），
      再看应用认不认 —— 判据只在合成图形上验过，是不算数的。
      ⚠ 这条也顺带钉住"合成的箭头不许叠在你自己画的尖上"（headInk）。 */
-  const fix = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/fixtures', 'hand-arrows.json'), 'utf8'))
+  const fix = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'fixtures', 'hand-arrows.json'), 'utf8'))
   const img = fix.images.find((x) => x.key === 'long')
   const role = Object.fromEntries(img.strokes.map((x) => [x.role, toPoints(x.points)]))
   const V = role.barbA.slice().reverse().concat(role.barbB) // 一个 V：臂A 的末端 → 尖 → 臂B 的末端
@@ -566,7 +383,7 @@ console.log('\n[6b] 用他本人的笔迹（scripts/fixtures/hand-arrows.json）
   await sleep(1100)
   let mapOk = null
   try {
-    const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+    const doc = await read()
     const last = doc.strokes[doc.strokes.length - 1]
     const w0 = { x: last.points[0], y: last.points[1] }
     const vi = await s.eval(`(() => {
@@ -634,8 +451,7 @@ console.log('\n[7] 在空白处乱画一笔：不算连接，也不浮词')
 /* ═════════════════ 8. 重开：你标过的词还在 ═════════════════ */
 console.log('\n[8] 重开一次：你标过的那个词还在')
 {
-  await s.send('Page.navigate', { url: APP })
-  await openFixture()
+  await open()
   const now = await readBoard()
   if (now.count === 3) ok('重开之后还是 3 条连接（都是从笔迹现算的）')
   else bad(`重开之后连接数变成 ${now.count}`)
@@ -688,8 +504,7 @@ console.log('\n[9] 「不算连接」：自动读错了能一键改回来（点�
   else bad(`文件里没有 link: "none"：${JSON.stringify(links9)}`)
 
   /* ③ 重开一次：这句"不算连接"还在 */
-  await s.send('Page.navigate', { url: APP })
-  await openFixture()
+  await open()
   const reopened = await readBoard()
   if (reopened.count === 3) ok('重开之后它仍然不算连接（那句话是存在笔迹上的）')
   else bad(`重开之后连接数变成 ${reopened.count}`)
@@ -764,7 +579,7 @@ console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里�
   if (clicked === 'ok') ok('点了「固定成一块」')
   else bad(`点不到那个按钮（${clicked}）`)
   await sleep(1200)
-  const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  const doc = await read()
   if (Array.isArray(doc.groups) && doc.groups.length === 1 && doc.groups[0].ids.length >= 2) {
     ok(`文件里写下了 1 块（${doc.groups[0].ids.length} 笔）`)
   } else {
@@ -783,7 +598,7 @@ console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里�
   if (undone === 'ok') ok('点了「拆开这块」')
   else bad(`点不到「拆开」（${undone}）`)
   await sleep(1200)
-  const doc2 = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  const doc2 = await read()
   if (!doc2.groups || doc2.groups.length === 0) ok('拆开之后文件里那个字段也没了（不留空壳）')
   else bad(`拆开之后 groups 还在：${JSON.stringify(doc2.groups)}`)
 }
@@ -804,7 +619,7 @@ console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上
      条件要过"块的最小个头"（18 世界像素）和"中点在 64 世界像素之内"两条闸，
      而屏幕上看到的距离要乘/除视图缩放。缩放从"两张卡的屏幕距离 ÷ 世界距离"量出来
      （踩过：第一次按屏幕像素画 22px，视图一缩小就只剩 11 世界像素 → 个头不够、条件读不出来）。 */
-  const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  const fixture = await read()
   const ca = fixture.cards.find((c) => c.id === 'lk-a')
   const cb = fixture.cards.find((c) => c.id === 'lk-b')
   const wDist = Math.hypot(ca.x + ca.w / 2 - (cb.x + cb.w / 2), ca.y + ca.h / 2 - (cb.y + cb.h / 2))
@@ -834,7 +649,7 @@ console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上
   if (after.count === before.count) ok('这两笔短笔没有变成新连接（够短 → 不进连接那套判据）')
   else bad(`短笔变成了连接：${before.count} → ${after.count}`)
   /* 条件**不写盘**：它是从位置读出来的，文件里一个字段都不该多 */
-  const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  const doc = await read()
   if (!JSON.stringify(doc).includes('"cond"')) ok('条件没写进文件（位置读出来的，随时能重算）')
   else bad('文件里出现了 cond 字段 —— 位置推断不该存盘')
 }
@@ -843,7 +658,4 @@ console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上
 console.log('\n[12] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
-
-console.log(fails ? `\n  ${fails} 项失败\n` : '\n  全部通过\n')
-cleanup()
-process.exit(fails ? 1 : 0)
+})
