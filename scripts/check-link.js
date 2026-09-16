@@ -277,6 +277,9 @@ const readBoard = () => s.eval(`(() => {
     selChips: [...document.querySelectorAll('[data-sel-link] .bd-linkchip')].map((b) => b.dataset.linkKind || 'rev'),
     /* 框住的笔里有"你说过不算连接"的那些 → 浮层里会给一条回头路 */
     inkNoLink: !!document.querySelector('[data-ink-nolink]'),
+    /* 框选浮层（虚线框 + 那一排动作）在不在 */
+    inkBox: !!document.querySelector('.bd-inkbox'),
+    inkActs: !!document.querySelector('.bd-inkacts'),
     a: card('lk-a'),
     b: card('lk-b'),
     toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
@@ -717,8 +720,59 @@ console.log('\n[9] 「不算连接」：自动读错了能一键改回来（点�
   else bad(`文件里还留着 link: "none"：${JSON.stringify(links9b)}`)
 }
 
-/* ═════════════════ 10. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[10] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 10. 框选固化：固定成一块 / 拆开 ═════════════════ */
+console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里记下来 → 能拆开')
+{
+  /* 自动聚类会把挨得近的并成一块。这一步验的是"纠正它的那个口子"：
+     框住一块 → ⧉ 固定成一块 → 写进 groups；再点 ⧉ 拆开 → 那个字段消失。 */
+  await pickTool('框选')
+  await s.sleep(200)
+  const st7 = await readBoard()
+  const f3 = { x: st7.a.x - 70, y: st7.a.y - 60 }
+  const t3 = { x: st7.a.x + st7.a.w + 70, y: st7.a.y + st7.a.h + 60 }
+  await s.mouse(f3.x, f3.y, { steps: 8, dx: t3.x - f3.x, dy: t3.y - f3.y })
+  const sel = await readBoard()
+  if (sel.inkBox && sel.inkActs) ok('框住了东西（虚线框和那排动作都在）')
+  else bad(`框选没选上东西（inkBox=${sel.inkBox} inkActs=${sel.inkActs}）—— 后面两条没意义`)
+  const hasFreeze = await s.eval(`!!document.querySelector('[data-ink-group="on"]')`)
+  if (hasFreeze) ok('浮层上有「⧉ 固定成一块」')
+  else bad('浮层上没有「固定成一块」那个按钮')
+
+  const clicked = await s.eval(`(() => {
+    const b = document.querySelector('[data-ink-group="on"]')
+    if (!b) return 'no-btn'
+    b.click()
+    return 'ok'
+  })()`)
+  if (clicked === 'ok') ok('点了「固定成一块」')
+  else bad(`点不到那个按钮（${clicked}）`)
+  await sleep(1200)
+  const doc = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  if (Array.isArray(doc.groups) && doc.groups.length === 1 && doc.groups[0].ids.length >= 2) {
+    ok(`文件里写下了 1 块（${doc.groups[0].ids.length} 笔）`)
+  } else {
+    bad(`文件里的 groups 不对：${JSON.stringify(doc.groups)}`)
+  }
+  const flip = await s.eval(`!!document.querySelector('[data-ink-group="off"]')`)
+  if (flip) ok('按钮换成了「⧉ 拆开这块」（说明它认得出这是固定块）')
+  else bad('固定之后按钮没换成「拆开」')
+
+  const undone = await s.eval(`(() => {
+    const b = document.querySelector('[data-ink-group="off"]')
+    if (!b) return 'no-btn'
+    b.click()
+    return 'ok'
+  })()`)
+  if (undone === 'ok') ok('点了「拆开这块」')
+  else bad(`点不到「拆开」（${undone}）`)
+  await sleep(1200)
+  const doc2 = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
+  if (!doc2.groups || doc2.groups.length === 0) ok('拆开之后文件里那个字段也没了（不留空壳）')
+  else bad(`拆开之后 groups 还在：${JSON.stringify(doc2.groups)}`)
+}
+
+/* ═════════════════ 11. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[11] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 

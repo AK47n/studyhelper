@@ -24,7 +24,7 @@ const INK_PAD = 6
 export default function BoardCanvas({
   sceneRef, liveRef, view, size, strokes, relations, cardById, cardsForInk,
   hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
-  lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk,
+  lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk, inkGroup = null, onFreezeInk, onDissolveInk,
   links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
   inkNoLink = false, onClearNoLink,
   children,
@@ -240,6 +240,37 @@ export default function BoardCanvas({
             >
               ✕ 删除
             </button>
+            {/* 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）。
+                自动聚类会把挨得近的两坨并成一块 —— 后果虽然轻（"多连了一个"），
+                但你得有地方纠正它：框住一块 → 固定成一块（写进 groups）。
+                固定之后它永远是独立的一块；两块各自固定 = 把它们**拆开**。 */}
+            {inkGroup ? (
+              <button
+                className="bd-inkgroup"
+                data-ink-group="off"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onDissolveInk?.()
+                }}
+                title="拆开：把这一块恢复成「按邻近自动聚」（它就不再是固定的一块了）"
+              >
+                ⧉ 拆开这块
+              </button>
+            ) : (
+              <button
+                className="bd-inkgroup"
+                data-ink-group="on"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onFreezeInk?.()
+                }}
+                title="固定成一块：圈住的这些笔以后永远是独立的一块（旁边那坨再近也不并起来）"
+              >
+                ⧉ 固定成一块
+              </button>
+            )}
             {/* ★ 框住的**正好是一条连接线**时，多给一排词。
                 这是"事后改词"的路：画完那 3.5 秒没点、或者后来改主意了，
                 框住那条线就能再改一次 —— 不用把线擦掉重画。

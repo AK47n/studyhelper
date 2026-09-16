@@ -1113,7 +1113,7 @@ kbd {
   position: absolute; z-index: 12; transform: translateY(-100%);
   display: flex; align-items: flex-end; gap: 6px; white-space: nowrap;
 }
-.bd-inkdel, .bd-inkfmt, .bd-inkformula {
+.bd-inkdel, .bd-inkfmt, .bd-inkformula, .bd-inkgroup {
   border: 0; color: #fff; border-radius: 8px;
   padding: 5px 10px; cursor: pointer; white-space: nowrap;
   font-size: calc(12px * var(--s)); line-height: 1.2;
@@ -1125,6 +1125,9 @@ kbd {
 .bd-inkfmt:hover { background: #24b463; }
 .bd-inkformula { background: #7048e8; }
 .bd-inkformula:hover { background: #7f5cf0; }
+/* 固定/拆开一块：中性的灰蓝 —— 它不是"把手写变成卡"，是"这一坨算多大"那条线。 */
+.bd-inkgroup { background: #3a4457; }
+.bd-inkgroup:hover { background: #4a566d; }
 
 /* ---------- 画出来的连接（关系）----------
    用户 2026-09-16：「更便捷的显示出两者之间的主次、因果、并列」

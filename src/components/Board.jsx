@@ -13,7 +13,7 @@ import { Tex } from './Tex.jsx'
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, createInkIndex, descendantsOf, fitView, newCard, newStroke, parseBoardDocument,
+  buildRelations, createInkIndex, descendantsOf, fitView, newCard, newId, newStroke, parseBoardDocument,
   screenToWorld, serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints, zoomAt,
 } from '../lib/board.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
@@ -376,7 +376,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      只有"你手动改过的那个词"存在笔迹上（stroke.link）。
      ★ 墨迹索引只依赖 `board.strokes`，按它缓存：拖卡片时 strokes 引用没变，
        那一坨（建索引 + 聚块 + flood fill）就不用重来 —— 否则拖一下卡就是几十毫秒。 */
-  const inkIndex = useMemo(() => createInkIndex(board.strokes), [board.strokes])
+  const inkIndex = useMemo(() => createInkIndex(board.strokes, board.groups), [board.strokes, board.groups])
   const links = useMemo(() => buildLinks(board, inkIndex), [board, inkIndex])
   const inkPairs = useMemo(() => {
     /* ★ 从 `links` 里派生，别再调一次 `inkedEdges(board)` ——
@@ -407,6 +407,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     }
     return false
   }, [inkSel, board.strokes])
+  /* 框住的这些笔**正好就是**某一块固定块吗？（是的话浮层上给「拆开这块」）
+     判据用"集合完全相等"：少一笔都不算 —— 不然框一大片会把某块顺手拆了。 */
+  const inkGroup = useMemo(() => {
+    if (!inkSel || !inkSel.size) return null
+    for (const g of board.groups || []) {
+      if (g.ids.length !== inkSel.size) continue
+      if (g.ids.every((id) => inkSel.has(id))) return g
+    }
+    return null
+  }, [inkSel, board.groups])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
     const set = descendantsOf(relations, selectedId)
@@ -1042,6 +1052,26 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash('又算回连接了（按形状重新判）', 'ok')
   }
 
+  /* ── 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）──
+   * 自动聚类会把挨得近的两坨并成一块。后果虽然轻（"多连了一个"，绝不改你的字），
+   * 但**你得有地方纠正它** —— 这里就是：框住一块 → 固定成一块（写进 `groups`）。
+   * 两块各自固定 = 把它们**拆开**（自动聚类再也不会把它们并起来）。
+   * 只在你说过时才写这个字段：没固定过的板一个字节都不多。 */
+  function freezeInkGroup() {
+    if (!inkSel || !inkSel.size) return
+    const ids = [...inkSel]
+    commit((cur) => ({ ...cur, groups: [...(cur.groups || []), { id: newId('g'), ids }] }))
+    flash(`固定成一块了（${ids.length} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`, 'ok')
+  }
+
+  function dissolveInkGroup() {
+    if (!inkGroup) return
+    const gid = inkGroup.id
+    commit((cur) => ({ ...cur, groups: (cur.groups || []).filter((g) => g.id !== gid) }))
+    setInkSel(null)
+    flash('拆开了 —— 这一块又回到"按邻近自动聚"', 'ok')
+  }
+
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
      线中段常常写着你顺手写的条件（"仅当…"），压在上面会挡住它。
      ★ 还要**夹进画布范围**：浮出来的东西跑到屏幕外或压到底部工具条底下，
@@ -1383,7 +1413,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, hoverEdge, eraserAt,
     links, selLink, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
-    inkNoLink, onClearNoLink: clearNoLink,
+    inkNoLink, onClearNoLink: clearNoLink, inkGroup, onFreezeInk: freezeInkGroup, onDissolveInk: dissolveInkGroup,
     onLinkHover: (inside) => {
       linkLeftRef.current = inside
     },

@@ -1062,6 +1062,66 @@ console.log('\n[6g] 「不算连接」：自动读错了要有一条一键改回
   if (!/link/.test(plain)) ok('没标过的板一个 link 字段都不写（不造假 diff）')
   else bad('没标过的板里出现了 link 字段')
 }
+// ═════════════════════ 6h. 固定成一块 / 拆开 ═════════════════════
+console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方纠正它')
+{
+  /* 自动聚类会把挨得近的两坨并成一块。后果虽然轻（"多连了一个"），
+     但你没地方纠正它就很难受 —— 这个功能就是那个地方：
+     框住一块 → 固定成一块；两块各自固定 = 把它们拆开。 */
+  const blob = (cx, cy) => [0, 1, 2].map((i) => toFlat([{ x: cx + i * 9, y: cy }, { x: cx + i * 9 + 6, y: cy + 7 }]))
+  const mk = (groups) => {
+    const b = makeBoard()
+    b.strokes = [
+      ...blob(0, 0).map((f, i) => ({ ...newStroke('pen', f), id: 'a' + i })),
+      ...blob(30, 0).map((f, i) => ({ ...newStroke('pen', f), id: 'b' + i })),
+    ]
+    b.groups = groups
+    return b
+  }
+  /* 两坨只差 6px（< INK_BLOCK_GAP）→ 自动聚成一块 */
+  eq(inkBlocks(mk([]).strokes).length, 1, '两坨挨得近 → 自动聚成 1 块')
+
+  const fixed = [
+    { id: 'g1', ids: ['a0', 'a1', 'a2'] },
+    { id: 'g2', ids: ['b0', 'b1', 'b2'] },
+  ]
+  const b2 = mk(fixed)
+  const blocks = inkBlocks(b2.strokes, { groups: b2.groups })
+  eq(blocks.length, 2, '两块各自固定 → 2 块（这就是"拆开"）')
+  eq(blocks.map((x) => x.id).sort(), ['grp:g1', 'grp:g2'], '固定块的 id 用组 id（稳定、跨重开一样）')
+  eq(blocks.filter((x) => x.fixed).length, 2, '两块都标着 fixed')
+  if (/固定/.test(blocks[0].label)) ok(`面板上有名字：${blocks[0].label}`)
+  else bad(`固定块的 label 不对：${blocks[0].label}`)
+  /* 固定之后端点认到的是**那一块**（不是自动并出来的大块） */
+  const idx = createInkIndex(b2.strokes, b2.groups)
+  eq(inkNodeAt(idx, { x: 3, y: 3 }).id, 'grp:g1', '落在第一坨上 → 拿到的是固定的那一块')
+  eq(inkNodeAt(idx, { x: 33, y: 3 }).id, 'grp:g2', '落在第二坨上 → 另一块')
+
+  /* 存盘：只在真有固定块时才写这个字段；成员被擦掉的那些不留尸体 */
+  const text = serializeBoardDocument(b2)
+  const back = parseBoardDocument(text, 'x')
+  eq(back.groups.length, 2, '固定块存进文件了')
+  eq(back.groups[0].ids, ['a0', 'a1', 'a2'], '成员原样')
+  const noGroups = serializeBoardDocument(mk([]))
+  if (!/groups/.test(noGroups)) ok('没固定过的板一个 groups 字段都不写（不造假 diff）')
+  else bad('没固定过的板里出现了 groups')
+  const halfDead = serializeBoardDocument({ ...b2, strokes: b2.strokes.filter((s) => s.id !== 'a1') })
+  const hd = JSON.parse(halfDead)
+  eq(hd.groups[0].ids, ['a0', 'a2'], '擦掉一笔之后，组里那个死 id 不再写出去')
+  const allDead = parseBoardDocument(
+    serializeBoardDocument({ ...b2, strokes: b2.strokes.filter((s) => !s.id.startsWith('a')) }),
+    'x'
+  )
+  eq(allDead.groups.map((g) => g.id), ['g2'], '一块的成员被擦光 → 那个组自己消失（不留空壳）')
+
+  /* 同一笔不许进两个组（重复的 id 一律丢掉） */
+  const dup = parseBoardDocument(
+    serializeBoardDocument({ ...b2, groups: [...fixed, { id: 'g3', ids: ['a0', 'a1', 'a2'] }] }),
+    'x'
+  )
+  eq(dup.groups.map((g) => g.id), ['g1', 'g2'], '同一笔不能同时属于两个组（后来那个丢掉）')
+}
+
 // ═════════════════════ 7. 装进视口 ═════════════════════
 console.log('\n[7] 打开时把所有内容装进屏幕')
 {

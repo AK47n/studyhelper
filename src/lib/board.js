@@ -305,6 +305,33 @@ export function isNoLink(stroke) {
   return !!stroke && stroke.link === LINK_NONE
 }
 
+/* ═══════════ 显式分组：「这一坨就是我说的那一块」 ═══════════
+ *
+ * 自动聚类（见下面"墨迹块"那一节）会把挨得近的两坨并成一块 —— 后果虽然轻
+ * （"多连了一个"，绝不改你的字），但**你没地方纠正它**。这里就是那个地方：
+ * 框住一块 → 固定成一块（写进 `groups`）。固定之后：
+ *   ① 它**永远是独立的一块**（旁边那坨再近也不并）；
+ *   ② 两块各自固定 = 把它们**拆开**（自动聚类再也不会把它们并起来）；
+ *   ③ 块 id 变成 `grp:<组 id>` —— 稳定、跨重开还是同一个。
+ * 存盘**只在真有固定块时才写**这个字段：没固定过的板一个字节都不多。
+ *
+ * 规矩：一笔**最多属于一个给组**（重复的、指向已经擦掉的笔的 id 一律丢掉；
+ * 成员全被擦光的组自己消失，不留空壳——不然文件里会攒一堆尸体）。 */
+export function normalizeGroups(raw, strokeIds) {
+  const out = []
+  const used = new Set()
+  for (const g of Array.isArray(raw) ? raw : []) {
+    if (!g || typeof g !== 'object') continue
+    const ids = (Array.isArray(g.ids) ? g.ids : []).filter(
+      (id) => typeof id === 'string' && strokeIds.has(id) && !used.has(id)
+    )
+    if (!ids.length) continue
+    for (const id of ids) used.add(id)
+    out.push({ id: typeof g.id === 'string' && g.id ? g.id : newId('g'), ids })
+  }
+  return out
+}
+
 export function linkKind(id) {
   return LINK_KINDS.find((k) => k.id === (isLinkKind(id) ? id : DEFAULT_LINK))
 }
@@ -733,6 +760,7 @@ export const INK_BLOCK_GAP = 24      // 笔与笔这么近（世界像素）算�
 export const INK_NODE_PAD = 12       // 端点离块的墨这么近，算"落在这块里"
 export const INK_LINK_MIN_LEN = 48   // 比这短的笔不当连接
 export const INK_LINK_MID_GAP = 18   // 中段离别的墨要这么远（降到 12 会误判，实测：见 README 第 22 条）
+export const INK_NODE_MIN_SIZE = 18  // 一块墨的"最小个头"（包围盒对角线）：比这小的不算"一个东西"
 
 const INK_CELL = 32 // 空间格子边长（查"附近有没有墨"用）
 
@@ -749,7 +777,7 @@ function inkKey(cx, cy) {
    一划一大片，端点很容易落在两坨字上，那属于误判（和 joinStrokes 同一条理由）。
    ★ 它是**只依赖 strokes** 的（和卡片无关），所以上层可以按 `board.strokes` 缓存它 ——
      拖卡片时 strokes 引用没变，就不必重建（见 Board.jsx）。 */
-export function createInkIndex(strokes) {
+export function createInkIndex(strokes, groups = []) {
   const grid = new Map()
   const list = []
   for (const s of strokes || []) {
@@ -765,7 +793,42 @@ export function createInkIndex(strokes) {
       else grid.set(k, [{ x: p.x, y: p.y, i }])
     }
   }
-  return { list, grid, owner: new Map(), byId: new Map(list.map((it, i) => [it.id, i])) }
+  const index = {
+    list,
+    grid,
+    owner: new Map(),
+    /* 按"排除集"分开的缓存（见 inkNodeAt 的 cacheKey）：
+       同一个点上，用不同的排除集问出来的块**不是同一个块** ——
+       "尖指着谁"那一次要把箭头自己的尖排除掉，混进同一个 owner 就会串味
+       （实测：目标变成"箭头自己的两撇 + 一个小点"）。 */
+    caches: new Map(),
+    byId: new Map(list.map((it, i) => [it.id, i])),
+    /* 你**固定过**的那些块（见 normalizeGroups）：它们的成员从自动聚类里剔出去，
+       而且一开始就登记进 owner —— 所以端点落在固定块里拿到的一定是这个块，
+       不是"跟旁边那坨自动并起来的大块"。 */
+    groupIdx: new Set(),
+  }
+  for (const g of Array.isArray(groups) ? groups : []) {
+    const ids = []
+    for (const id of (g && g.ids) || []) {
+      const i = index.byId.get(id)
+      if (i !== undefined) ids.push(i)
+    }
+    if (!ids.length) continue
+    const node = {
+      kind: 'ink',
+      id: 'grp:' + (g.id || ids.map((i) => index.list[i].id).sort()[0]),
+      ids: ids.map((i) => index.list[i].id),
+      label: `固定的块（${ids.length} 笔）`,
+      box: inkBounds(index, ids),
+      fixed: true,
+    }
+    for (const i of ids) {
+      index.owner.set(i, node)
+      index.groupIdx.add(i)
+    }
+  }
+  return index
 }
 
 /* 离 (x,y) 最近的墨点距离；`exclude`（笔画下标集合）里的点不算。
@@ -821,7 +884,8 @@ function inkNear(index, x, y, pad, exclude = null) {
   return out
 }
 
-/* 从这几笔出发，把"笔与笔 ≤ gap"连着的笔全聚起来（连通分量）。 */
+/* 从这几笔出发，把"笔与笔 ≤ gap"连着的笔全聚起来（连通分量）。
+   `index.groupIdx`（你固定过的那些块）不参与：固定的块就是块，不该再被并大。 */
 function inkComponentFrom(index, seeds, gap, exclude = null) {
   const seen = new Set(seeds)
   const stack = [...seeds]
@@ -829,7 +893,7 @@ function inkComponentFrom(index, seeds, gap, exclude = null) {
     const i = stack.pop()
     for (const p of index.list[i].pts) {
       for (const j of inkNear(index, p.x, p.y, gap, exclude)) {
-        if (seen.has(j)) continue
+        if (seen.has(j) || index.groupIdx.has(j)) continue
         seen.add(j)
         stack.push(j)
       }
@@ -860,35 +924,65 @@ function inkBounds(index, ids) {
    ★ `index.owner` 是"笔画下标 → 块"的记忆：一块只 flood fill 一次。
      没有它的话每个端点都要重走一遍整块（实测 620 笔的板上 35ms → 4.1s，
      因为一条板书上几百个端点、每块几十笔）。 */
-export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null) {
+export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null, cacheKey = '') {
+  /* ⚠ 缓存必须**按排除集分开**（`cacheKey`）：带额外排除集的查询
+     （"尖指着谁"要把箭头自己的尖排掉）和通用查询问出来的不是同一个块。
+     混用一个 Map 就会读到一个"含箭头自己那两撇"的节点 —— 实测过。 */
+  let store = index.owner
+  if (cacheKey) {
+    store = index.caches.get(cacheKey)
+    if (!store) {
+      store = new Map()
+      index.caches.set(cacheKey, store)
+    }
+  }
   const seeds = [...inkNear(index, p.x, p.y, pad, exclude)]
   if (!seeds.length) return null
-  for (const i of seeds) if (index.owner.has(i)) return index.owner.get(i)
+  for (const i of seeds) if (store.has(i)) return store.get(i)
   const ids = inkComponentFrom(index, seeds, gap, exclude)
   if (!ids.length) return null
   const strokeIds = ids.map((i) => index.list[i].id)
+  const box = inkBounds(index, ids)
+  /* ★ 太小的不算"一个东西"（见 INK_NODE_MIN_SIZE）。
+     实测：他手写公式里有个 **2px 的小点**，旁边一条 121px 的竖笔 + 一个 V 形短笔
+     于是被读成"从公式卡指向那个点的箭头" —— 一个 2px 的点没有可指的对象。
+     这里返回 null = 这一头不算落在块上（那一笔就不是连接）。
+     ⚠ 你**亲手固定过**的块不走这条 —— 它在上面那个 owner 循环里就返回了
+     （"你说它是东西它就是"）。 */
+  if (Math.hypot(box.w, box.h) < INK_NODE_MIN_SIZE) return null
   const node = {
     kind: 'ink',
     id: 'ink:' + strokeIds.slice().sort()[0],
     ids: strokeIds,
     label: `墨迹块（${strokeIds.length} 笔）`,
-    box: inkBounds(index, ids),
+    box,
   }
-  for (const i of ids) index.owner.set(i, node)
+  /* ★ `noCache`（"尖指着谁"那一次查询用）：那种查询带着**额外的排除集**
+     （要把它自己的箭头尖排除掉），算出来的节点和通用缓存里的不是同一个东西 ——
+     写进 `owner` 就会串味。实测：不关缓存时，"公式卡 → 墨迹块（2 笔）"里
+     那 2 笔就是**箭头自己的尖 + 一个小点**（目标里混进了箭头本身）。 */
+  for (const i of ids) store.set(i, node)
   return node
 }
 
-/* 板上所有的墨迹块（给自检和以后的"框选固化"用；不进 buildLinks 的热路径）。 */
-export function inkBlocks(strokes, gap = INK_BLOCK_GAP) {
-  const index = createInkIndex(strokes)
-  const done = new Set()
+/* 板上所有的墨迹块：你**固定过的**先出（`groups`），然后是自动聚出来的。
+   给自检和"框选固化"的界面用；不进 buildLinks 的热路径。 */
+export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, groups = [] } = {}) {
+  const index = createInkIndex(strokes, groups)
   const out = []
+  const fixed = new Set()
+  for (const node of index.owner.values()) {
+    if (!node.fixed || fixed.has(node.id)) continue
+    fixed.add(node.id)
+    out.push(node)
+  }
+  const done = new Set(index.groupIdx)
   for (let i = 0; i < index.list.length; i++) {
     if (done.has(i)) continue
     const ids = inkComponentFrom(index, [i], gap)
     for (const j of ids) done.add(j)
     const strokeIds = ids.map((k) => index.list[k].id)
-    out.push({ id: 'ink:' + strokeIds.slice().sort()[0], ids: strokeIds, box: inkBounds(index, ids) })
+    out.push({ kind: 'ink', id: 'ink:' + strokeIds.slice().sort()[0], ids: strokeIds, box: inkBounds(index, ids) })
   }
   return out
 }
@@ -945,7 +1039,7 @@ export function buildLinks(board, inkInput = null) {
      连接线的两头是**扎在字迹里**的 —— 留着它做连通判定，两块会被它粘成一块，
      于是"两头在两个不同节点里"永远不成立，自己把自己接没了（第一版就这样，一个都不出）。
      判据用"全板"量（链自己的笔排除在外），块用"去掉候选线之后"的笔来聚。 */
-  const ink = inkInput || createInkIndex(all)
+  const ink = inkInput || createInkIndex(all, (board && board.groups) || [])
   const chainOwn = chains.map((ch) => {
     const ex = new Set()
     for (const id of ch.ids) {
@@ -968,6 +1062,7 @@ export function buildLinks(board, inkInput = null) {
   const dropKey = [...dropIdx].sort((a, b) => a - b).join(',')
   if (ink.dropKey !== dropKey) {
     ink.owner.clear()
+    ink.caches.clear()
     ink.dropKey = dropKey
   }
   /* 一个"节点"= 卡片 或 墨迹块。卡片带 label:''（面板拿 src 显示），块自带 label。 */
@@ -1066,18 +1161,26 @@ export function buildLinks(board, inkInput = null) {
           if (i !== undefined) tipEx.add(i)
         }
       }
+      /* 兜底那条也用**同一个排除集 + 同一个缓存键**：不然"我这一笔的另一头"
+         会撞上我自己画的箭尖，于是目标变成箭头自己（实测过）。 */
+      const tipKey = 'h:' + ch.ids.join('+') + '|' + (head ? head.ids.join('+') : '')
       const nb =
         asCard(cardAt(boxes, tip)) ||
         asCard(nearestCard(boxes, tip, TIP_PAD)) ||
-        inkNodeAt(ink, tip, TIP_PAD, INK_BLOCK_GAP, tipEx) ||
-        nodeAt(otherEnd)
+        inkNodeAt(ink, tip, TIP_PAD, INK_BLOCK_GAP, tipEx, tipKey) ||
+        asCard(cardAt(boxes, otherEnd)) ||
+        inkNodeAt(ink, otherEnd, INK_NODE_PAD, INK_BLOCK_GAP, tipEx, tipKey)
       if (usable(na, nb)) {
         aNode = na
         bNode = nb
       }
     }
-    /* ③ 没有尖：两头各落在谁身上（卡片或墨迹块 —— 块那条要过闸） */
-    if (!aNode) {
+    /* ③ 没有尖：两头各落在谁身上（卡片或墨迹块 —— 块那条要过闸）
+       ★ 这一条**只在没尖的时候**走。有尖的链必须由"尖指着谁"定目标：
+         否则轮到这一条时，它会拿**这一笔的末端**去找块 —— 而末端正贴着
+         他自己画的那个箭尖，于是目标变成箭头自己（实测：一条竖笔 + 两撇
+         被读成"卡 → 那两撇"，`ink:smu3re2y15b`）。 */
+    if (!aNode && !tip) {
       const na = nodeAt(first)
       const nb = nodeAt(last)
       if (usable(na, nb)) {
@@ -1174,6 +1277,9 @@ export function parseBoardDocument(text, fallbackTitle = '新白板') {
   b.viewPinned = raw.viewPinned === true
   b.strokes = (Array.isArray(raw.strokes) ? raw.strokes : []).map(normalizeStroke).filter(Boolean)
   b.cards = (Array.isArray(raw.cards) ? raw.cards : []).map(normalizeCard).filter(Boolean)
+  /* 显式分组（"这一坨就是我说的那一块"）：成员被擦掉的、重复的一律丢掉。
+     必须**在 strokes 之后**做 —— 要看得出哪些 id 还活着。 */
+  b.groups = normalizeGroups(raw.groups, new Set(b.strokes.map((s) => s.id)))
   return b
 }
 
@@ -1326,6 +1432,17 @@ export function serializeBoardDocument(board) {
          （"不固定"是绝大多数卡片的状态，写 `locked: false` 出去就是纯噪音。） */
       ...(c.locked === true ? { locked: true } : {}),
     })),
+    /* 显式分组（你框住一块说"它就是一块"，见 normalizeGroups）：
+       **只在你固定过的时候才写** —— 老文件、没固定过的板一个字节都不多。
+       写之前把"已经不在板上的笔"滤掉（这个会话里刚擦掉的那些）：文件里不留尸体。
+       为了让老文件的 diff 最小，它排在最后（新字段追加在尾部）。 */
+    ...(() => {
+      const live = new Set((board.strokes || []).map((s) => s.id))
+      const gs = (board.groups || [])
+        .map((g) => ({ id: g.id, ids: g.ids.filter((id) => live.has(id)) }))
+        .filter((g) => g.ids.length)
+      return gs.length ? { groups: gs } : {}
+    })(),
   }
   return JSON.stringify(out, null, 1) + '\n'
 }
