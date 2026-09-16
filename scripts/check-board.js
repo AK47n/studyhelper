@@ -7,13 +7,21 @@
  * 跑：npm run check:board
  */
 import {
-  CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
-  DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
-  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, createLinkReader, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  chainOfStroke, descendantsOf, deriveChains, findTip, freezeGroup, fitView, fontCss, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
-  parseBoardDocument, pointSegDist, readArrowHead, relationCurve, serializeBoardDocument, simplifyPoints,
-  strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints,
+  CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H,
+  CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP,
+  READABLE_FIT_S, TEXT_CARD_MAX_W, TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, buildRelations,
+  cardHeightFromContent, cardWidthFromContent, clampCardScale, descendantsOf, freezeGroup, fitView,
+  fontCss, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
+  parseBoardDocument, pointSegDist, relationCurve, serializeBoardDocument, simplifyPoints, strokeBounds,
+  strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../src/lib/board.js'
+/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
+import {
+  TIP_MAX_ANGLE, createLinkReader, classifyLinkShape, chainOfStroke, deriveChains, findTip,
+  inkBlocks, inkNodeAt, createInkIndex, readArrowHead, tipNearEnd,
+} from '../src/lib/links.js'
+/* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
+import { LINK_NONE } from '../src/lib/link-kinds.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'

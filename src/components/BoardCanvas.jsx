@@ -1,5 +1,7 @@
 import React, { useEffect, useRef } from 'react'
-import { LINK_KINDS, LINK_NONE, relationCurve } from '../lib/board.js'
+import { relationCurve } from '../lib/board.js'
+/* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
+import { LINK_KINDS, LINK_NONE } from '../lib/link-kinds.js'
 import { applyViewTo, viewTransformAttr, worldRectToScreen, worldToScreen } from '../lib/view.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。

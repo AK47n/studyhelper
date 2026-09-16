@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import BoardCanvas from './BoardCanvas.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
 import InkToCard from './InkToCard.jsx'
-import { Tex } from './Tex.jsx'
+import {
+  Tex } from './Tex.jsx'
 /* ⚠ drawStroke 在这里**不能省**。
    它原来住在 BoardCanvas.jsx 里，后来搬去了 lib/ink.js（为了让"导出给识别"
    也能用它）。搬的时候我只改了 import 列表，文件里 paintLive 还在调用它 ——
@@ -12,10 +13,17 @@ import { Tex } from './Tex.jsx'
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
-  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, createLinkReader, deriveChains, chainOfStroke, descendantsOf, freezeGroup, fitView, newCard, newStroke, parseBoardDocument,
-  serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
+  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH,
+  cardHeightFromContent, cardWidthFromContent, fontCss, nextCardScale, buildRelations, descendantsOf,
+  freezeGroup, fitView, newCard, newStroke, parseBoardDocument, serializeBoardDocument,
+  simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../lib/board.js'
+/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
+import {
+  autoLinkKind, createLinkReader, deriveChains, chainOfStroke,
+} from '../lib/links.js'
+/* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
+import { LINK_KINDS, LINK_NONE, isLinkKind, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、

@@ -1441,6 +1441,11 @@ studyhelper/
       useFormulaEditing.js  笔记界面：插入 / Tab 跳空位 / [[ 补全
       board.js         白板：数据模型 + 几何 + 关系推理 + 存取（不碰 DOM，可纯 node 测）
                        还有文字卡的**字体预设**和**落点算法**（卡片落在你圈的那块左上角）
+                       （2026-09-16 起"连接"那一族搬去了 links.js —— 这个文件 2100 → 860 行）
+      link-kinds.js    关系的**词表**：5 个词 +「不算连接」（LINK_NONE）。单独一个文件是为了
+                       断开 board.js ↔ links.js 的环：两边都只依赖它，谁也不反向依赖谁
+      links.js         连接的**读法**：形状判据 / 接笔 / 箭头尖 / 墨迹块 / 条件 / 推导链。
+                       对外只有 `createLinkReader().read(board)`，其余标着 internal seam
       formula.js       白板：随手写的公式 → 好看 LaTeX（幂等、认不出就原样留着）
       view.js          视图映射：屏幕 = 世界 × s + t —— **只有这一份实现**（DOM 浮层位置 /
                        canvas 变换 / SVG 变换 / 缩放锚点 / 平移 / 居中都在这里；一律纯浮点）
