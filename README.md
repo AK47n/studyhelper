@@ -1299,7 +1299,7 @@ npm run check:mount   # 真挂载：jsdom 里跑"打开 → 编辑 → 阅读 �
 npm run check:browser # 真浏览器：逐行比对着色层和编辑框的坐标（需先 npm start）
 
 # 白板
-npm run check:board          # 纯逻辑：坐标/抽稀/关系推理/存取往返/公式转化/文字卡的字体、落点、缩放倍率、尺寸贴内容、固定字段、连接与形状判定、★ 真手画箭头、★ 墨迹块当端点、「不算连接」、框选固化、条件与推导链、★ 视图映射（352 项）
+npm run check:board          # 纯逻辑：坐标/抽稀/关系推理/存取往返/公式转化/文字卡的字体、落点、缩放倍率、尺寸贴内容、固定字段、连接与形状判定、★ 真手画箭头、★ 墨迹块当端点、「不算连接」、框选固化、条件与推导链、★ 视图映射、★ 连接读法 reader（359 项）
 npm run check:default        # 真浏览器：data/ 里一张板都没有时，打开必须是白板（会自动补一张空的）
 npm run check:board-browser  # 真浏览器：画得出来、存得对、卡片**点得到**、两层坐标对齐、三种摆法
                              # ★ 对齐是**数值**的：拿 canvas 记下的变换反推视图，用 view.js 算一张卡
@@ -1466,7 +1466,7 @@ studyhelper/
     board-*.md         白板（内容其实是 JSON，但仍是 .md，见「白板 → 数据长什么样」）
   config/              ocr.json：手写识别的密钥（在 .gitignore 里，不进 Git）
   scripts/             自检脚本 + sync.js（一键备份到 GitHub）
-    check-board.js         白板纯逻辑自检（352 项，含每条踩过的坑）
+    check-board.js         白板纯逻辑自检（359 项，含每条踩过的坑）
     check-board-browser.js 白板真浏览器自检（含"墨迹和卡片必须对齐"）
     check-paper.js         纸面自检（纯白/方格/横线/点阵 + 像素证明；自己起服务和浏览器）
     check-lock.js          卡片「固定」自检（真鼠标 + elementFromPoint；自己起服务和浏览器）

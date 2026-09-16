@@ -559,14 +559,15 @@ export function classifyLinkShape(points) {
   return backHook(pts) ? 'arrow' : 'line'
 }
 
-/* 形状读出来的词（没手动标过时用这个）。 */
+/* 一笔**实际**算哪种关系：手动标过就用手动标的，否则看形状。
+ * ⚠ 这是给"单笔"用的判断。连接那一层请用 `links[i].auto`（尖是旁边一笔画的时，
+ *   单笔永远读成"相关"，只有链上才知道那个尖是它的）。
+ *
+ * 删掉了 `effectiveLinkKind`（2026-09-16）：它零调用者，而"手动标过就赢、否则按形状读"
+ * 这条规矩在 buildLinks 里已经有一份（选择手动词那几行）—— 两份实现摆在那儿，
+ * 迟早会分叉。 */
 export function autoLinkKind(stroke) {
   return classifyLinkShape(stroke && stroke.points) === 'arrow' ? ARROW_LINK : DEFAULT_LINK
-}
-
-/* 这一笔**实际**算哪种关系：手动标过就用手动标的，否则看形状。 */
-export function effectiveLinkKind(stroke) {
-  return isLinkKind(stroke && stroke.link) ? stroke.link : autoLinkKind(stroke)
 }
 
 /* 点落在哪张卡里（宽容 8px：手画的线常常差一点点才碰到卡片边）。 */
@@ -819,6 +820,9 @@ function inkKey(cx, cy) {
    一划一大片，端点很容易落在两坨字上，那属于误判（和 joinStrokes 同一条理由）。
    ★ 它是**只依赖 strokes** 的（和卡片无关），所以上层可以按 `board.strokes` 缓存它 ——
      拖卡片时 strokes 引用没变，就不必重建（见 Board.jsx）。 */
+/* ⚠ **internal seam**：只给这个 module 自己的测试用（`check-board` 里缓存那几条）。
+   调用方请走 `createLinkReader().read(board)` —— 把索引直接递给 `buildLinks` 的那条路
+   已经收掉了，它就是"内部纪律变成调用方知识"的入口。 */
 export function createInkIndex(strokes, groups = []) {
   const grid = new Map()
   const list = []
@@ -990,6 +994,7 @@ function storeFor(index, exclude, cacheKey) {
   return new Map()
 }
 
+/* ⚠ **internal seam**（同上）：块、排除集、缓存键都是 module 内部的东西。 */
 export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exclude = null, cacheKey = '') {
   /* ⚠ 缓存必须**按排除集分开**：带额外排除集的查询
      （"尖指着谁"要把箭头自己的尖排掉、"线中点旁边是什么"要把这条线自己排掉）
@@ -1037,6 +1042,7 @@ export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exc
 
 /* 板上所有的墨迹块：你**固定过的**先出（`groups`），然后是自动聚出来的。
    给自检和"框选固化"的界面用；不进 buildLinks 的热路径。 */
+/* ⚠ **internal seam**（同上）：给自检看"板上有哪几块"的。 */
 export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, groups = [] } = {}) {
   const index = createInkIndex(strokes, groups)
   const out = []
@@ -1228,12 +1234,54 @@ function inkLinkShapeOK(pts, index, exclude) {
   return true
 }
 
+/* ── 连接读法：这个 module 的 **interface** ──
+ *
+ * 调用方（app 和自检）只该用这一个入口：
+ *
+ *     const reader = createLinkReader()
+ *     reader.read(board)          // → links[]
+ *
+ * 索引、候选线、墨迹块、条件、推导链**都在它后面**：谁按什么记忆化、排除集怎么算、
+ * 缓存什么时候失效，全是它自己的事。
+ *
+ * ★ 为什么要有这一层（2026-09-16 收的口）：在那之前调用方得自己
+ *   `createInkIndex(strokes, groups)` 再把它传给 `buildLinks(board, index)` ——
+ *   于是"什么时候重建索引""排除集变了要不要清缓存"这些**内部纪律**变成了
+ *   调用方必须知道的知识；而自检干脆绕过 `buildLinks` 直接去问 `inkNodeAt`。
+ *   结果就是"怎么被调用"这一层两类测试都盖不住：固定块因为被清掉缓存而**整个失效**
+ *   那条严重 bug 正是这么漏过去的（`[6h]` 当时只直接问了 `inkNodeAt`）。
+ *   `read()` 每次自己判断要不要重建（按 `strokes`/`groups` 的**引用**比），
+ *   所以调用方连"有索引这回事"都不需要知道。
+ *
+ * 想在测试里直接摸内部（`inkNodeAt` / `inkBlocks` / `createInkIndex`）请先看下面
+ * 那几个函数上的 **internal seam** 标注：它们只给这个 module 自己的测试用。 */
+export function createLinkReader() {
+  let ink = null
+  let lastStrokes = null
+  let lastGroups = null
+  return {
+    read(board) {
+      const strokes = (board && board.strokes) || []
+      const groups = (board && board.groups) || []
+      /* 引用没变 = 内容没变（板子的每次改动都会换数组）→ 索引和它那一堆缓存继续用。 */
+      if (!ink || strokes !== lastStrokes || groups !== lastGroups) {
+        lastStrokes = strokes
+        lastGroups = groups
+        ink = createInkIndex(strokes, groups)
+      }
+      return buildLinks(board, ink)
+    },
+  }
+}
+
 /* 板上所有"画出来的连接"。
  * 每一条带着：两端是谁、形状、实际的词、方向、给屏幕用的点（中点放词 / 尖在哪）。
  * **不碰 DOM**，所以能在 node 里断言。
- * `inkInput`（可选）= 上层缓存好的墨迹索引（见 createInkIndex）。传了就用它，
- *   不传就现建一个 —— 纯 node 调用方（自检）照旧只传 board 就行。 */
-export function buildLinks(board, inkInput = null) {
+ *
+ * ⚠ **internal**：调用方请走 `createLinkReader().read(board)`。这个签名要一个
+ *   事先建好的墨迹索引（`inkInput`），那是 module 内部的东西 —— 以前的调用方
+ *   必须自己记着"按 strokes/groups 记忆化再传进来"，那正是上面说的那类 bug 的入口。 */
+function buildLinks(board, inkInput) {
   const all = (board && board.strokes) || []
   const boxes = ((board && board.cards) || []).map((c) => ({ id: c.id, r: cardBounds(c) }))
   const byId = new Map(all.map((s) => [s.id, s]))
@@ -2069,14 +2117,8 @@ export function fitView(board, screenW, screenH, pad = 60) {
   return centerOn({ s, tx: 0, ty: 0 }, { x: all.x + all.w / 2, y: all.y + all.h / 2 }, screenW, screenH)
 }
 
-/* 卡片之间有没有笔迹连着 —— "这条关系是我画了线的"。
- * 给关系面板用：画了线的排前面，纯靠挨着的排后面并标注出来。
- *
- * ⚠ 2026-09-16 起它只是 `buildLinks` 的**薄壳**（老接口，只要 a/b/strokeId）。
- *   判定和"这一笔算什么关系"只有一份实现，就在 buildLinks / linkEnds 里 ——
- *   原来这里自己抄了一份端点判定，加了"形状读类型"之后两边一定会分叉。
- *   注意它现在**跳过荧光笔**：荧光笔是"在字上做记号"，不是画关系，
- *   而它一划一大片，端点很容易正好落在两张卡里，那属于误判。 */
-export function inkedEdges(board) {
-  return buildLinks(board).map((l) => ({ a: l.a, b: l.b, strokeId: l.strokeId }))
-}
+/* `inkedEdges(board)` 删掉了（2026-09-16）。它只是 `buildLinks` 的一行**薄壳**
+ * （老接口，只要 a/b/strokeId），而 deletion test 的答案很清楚：删掉它，复杂度并没有
+ * 散到调用方去 —— 关系面板要的那份"哪两张卡之间有笔迹"直接从 `links` 派生就行
+ * （Board.jsx 早就是这么干的）。留着它只会多一个能绕过 `createLinkReader()` 的入口。 */
+

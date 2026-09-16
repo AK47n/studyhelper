@@ -12,8 +12,8 @@ import { Tex } from './Tex.jsx'
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
-  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, buildLinks, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
-  buildRelations, createInkIndex, deriveChains, chainOfStroke, descendantsOf, freezeGroup, fitView, newCard, newStroke, parseBoardDocument,
+  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, LINK_KINDS, LINK_NONE, autoLinkKind, cardHeightFromContent, cardWidthFromContent, fontCss, isLinkKind, linkKind, nextCardScale,
+  buildRelations, createLinkReader, deriveChains, chainOfStroke, descendantsOf, freezeGroup, fitView, newCard, newStroke, parseBoardDocument,
   serializeBoardDocument, simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../lib/board.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
@@ -376,13 +376,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   // ── 派生：关系和连线都从位置现算，不存进文件 ──
   const relations = useMemo(() => buildRelations(board), [board])
   const cardById = useMemo(() => new Map(board.cards.map((c) => [c.id, c])), [board.cards])
-  /* 画出来的连接（见 lib/board.js 的 buildLinks）。
+  /* 画出来的连接（见 lib/board.js 的 `createLinkReader`）。
      和 relations 一样**每次重算、不进文件** —— 你挪动卡片，连接自己跟着走。
      只有"你手动改过的那个词"存在笔迹上（stroke.link）。
-     ★ 墨迹索引只依赖 `board.strokes`，按它缓存：拖卡片时 strokes 引用没变，
-       那一坨（建索引 + 聚块 + flood fill）就不用重来 —— 否则拖一下卡就是几十毫秒。 */
-  const inkIndex = useMemo(() => createInkIndex(board.strokes, board.groups), [board.strokes, board.groups])
-  const links = useMemo(() => buildLinks(board, inkIndex), [board, inkIndex])
+     ★ 这里只认 reader 这一个入口：墨迹索引（以及它那一堆缓存）什么时候重建、
+       排除集怎么算，都是 module 自己的事 —— 从前这一步要在组件里
+       `useMemo(createInkIndex)` 再传给 `buildLinks`，**调用方得背着 module 的内部纪律**，
+       而"固定块被清缓存而失效"那条严重 bug 就是从那儿漏的。 */
+  const linkReader = useMemo(() => createLinkReader(), [])
+  const links = useMemo(() => linkReader.read(board), [board, linkReader])
   const inkPairs = useMemo(() => {
     /* ★ 从 `links` 里派生，别再调一次 `inkedEdges(board)` ——
        那个函数内部就是 `buildLinks(board)`，等于每次 commit 白跑两遍
@@ -1105,7 +1107,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* 刚画完一笔：如果它正好连上了两个东西，就把那排词浮出来。
      注意这时候连接**已经成立了**（buildLinks 从笔迹现算），浮词只是给你一次改的机会。 */
   function offerLink(stroke) {
-    const hit = buildLinks(boardRef.current).find((l) => l.strokeId === stroke.id)
+    const hit = linkReader.read(boardRef.current).find((l) => l.strokeId === stroke.id)
     if (!hit) return
     const { x, y } = linkPickAt(hit.mid)
     setLinkPick({ strokeId: stroke.id, x, y, kind: hit.kind, dir: hit.dir })

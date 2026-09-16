@@ -9,8 +9,8 @@
 import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H, CARD_MIN_SCALE, CARD_MIN_W,
   DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP, READABLE_FIT_S, TEXT_CARD_MAX_W,
-  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, buildLinks, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
-  chainOfStroke, descendantsOf, deriveChains, findTip, freezeGroup, fitView, fontCss, inkedEdges, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
+  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, TIP_MAX_ANGLE, createLinkReader, buildRelations, cardHeightFromContent, cardWidthFromContent, clampCardScale, classifyLinkShape,
+  chainOfStroke, descendantsOf, deriveChains, findTip, freezeGroup, fitView, fontCss, inkBlocks, inkNodeAt, createInkIndex, isBoardDocument, LINK_NONE, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, readArrowHead, relationCurve, serializeBoardDocument, simplifyPoints,
   strokeBounds, strokeHitsCircle, textCardRect, tipNearEnd, toFlat, toPoints,
 } from '../src/lib/board.js'
@@ -18,6 +18,9 @@ import {
 import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
+
+/* 连接那一层只从这个入口进（module 自己的 internal seam 另说）——见 board.js 的注释。 */
+const reader = createLinkReader()
 
 let fails = 0
 let checks = 0
@@ -412,7 +415,9 @@ console.log('\n[5] 画了线的关系（ink）')
   b.strokes.push(newStroke('pen', toFlat([
     { x: 300, y: 700, p: 0.5 }, { x: 380, y: 760, p: 0.5 },
   ])))
-  const ink = inkedEdges(b)
+  /* 「你画过的那些」= `reader.read()` 的结果本身（`inkedEdges` 那个薄壳删掉了，
+     关系面板要的那份直接从 links 派生）。 */
+  const ink = reader.read(b)
   eq(ink.length, 1, '只有起点终点都在卡里的那笔算连线')
   eq([ink[0].a, ink[0].b], ['k1', 'k2'], '连的是 k1 → k2')
 }
@@ -767,7 +772,7 @@ console.log('\n[6d] 画出来的连接：形状读类型，只有手动标过的
     { x: 60, y: 40 }, { x: 300, y: 40 }, { x: 600, y: 40 }, { x: 580, y: 52 }, { x: 662, y: 38 },
   ]) })
 
-  const links = buildLinks(b)
+  const links = reader.read(b)
   eq(links.length, 2, '两笔连线 → 两条连接')
   eq([links[0].a, links[0].b], ['k1', 'k2'], '第一条连的是 k1 → k2')
   eq(links[0].kind, 'rel', '直线读成"相关"')
@@ -785,8 +790,8 @@ console.log('\n[6d] 画出来的连接：形状读类型，只有手动标过的
   b.strokes = b.strokes.map((x) => (x.id === 'link1' ? { ...x, link: 'derive' } : x))
   const back1 = parseBoardDocument(serializeBoardDocument(b), 'x')
   eq(back1.strokes.find((x) => x.id === 'link1').link, 'derive', '手动标的词读得回来')
-  eq(buildLinks(back1).find((l) => l.strokeId === 'link1').kind, 'derive', '手动标的词压过形状读出来的')
-  eq(buildLinks(back1).find((l) => l.strokeId === 'link1').manual, true, '它被认成"你标过的"')
+  eq(reader.read(back1).find((l) => l.strokeId === 'link1').kind, 'derive', '手动标的词压过形状读出来的')
+  eq(reader.read(back1).find((l) => l.strokeId === 'link1').manual, true, '它被认成"你标过的"')
 
   /* ★ 标回"形状自动读出来那一档"（直线标回 rel）时，字段该**消失**、不是写个 link: "rel"。
      这条规矩的实现落在 UI 那边（Board.jsx 的 applyLink —— 只有它知道"自动读出来的是什么"），
@@ -810,7 +815,7 @@ console.log('\n[6d] 画出来的连接：形状读类型，只有手动标过的
   b4.cards = b.cards
   b4.strokes = [{ ...newStroke('highlighter', straight), id: 'hl1' }]
   b4.strokes[0].points = straight
-  eq(buildLinks(b4).length, 0, '荧光笔不算连接（记号 ≠ 关系）')
+  eq(reader.read(b4).length, 0, '荧光笔不算连接（记号 ≠ 关系）')
 
   /* 方向：把点倒过来，a/b 就换了 —— 箭头方向就是这么表达的（渲染出来一模一样）。 */
   const b5 = parseBoardDocument(serializeBoardDocument(b), 'x')
@@ -820,14 +825,14 @@ console.log('\n[6d] 画出来的连接：形状读类型，只有手动标过的
     return out
   }
   const rev = { ...b5, strokes: b5.strokes.map((x) => (x.id === 'link2' ? { ...x, points: flip(x.points) } : x)) }
-  const l5 = buildLinks(rev).find((l) => l.strokeId === 'link2')
+  const l5 = reader.read(rev).find((l) => l.strokeId === 'link2')
   eq([l5.a, l5.b], ['k2', 'k1'], '把这一笔的点倒过来 → 方向反过来（k1→k2 变成 k2→k1）')
 
   /* 连线两端落在**同一张卡**里不算连接（那是圈了一下自己）。 */
   const b6 = makeBoard()
   b6.cards = [{ ...newCard('note', 0, 0, { w: 400, h: 300 }), x: 0, y: 0, id: 'big', text: '大卡' }]
   b6.strokes = [{ ...newStroke('pen', straight), id: 'in1', points: toFlat([{ x: 20, y: 20 }, { x: 200, y: 20 }]) }]
-  eq(buildLinks(b6).length, 0, '两端在同一张卡里不算连接')
+  eq(reader.read(b6).length, 0, '两端在同一张卡里不算连接')
 }
 
 // ═════════════════════════ 6e. 用户真手画的箭头 ═════════════════════════
@@ -886,7 +891,7 @@ console.log('\n[6e] 真手画箭头：拿用户本人的笔迹当夹具（script
     ]
     for (const [name, strokes, want] of cases) {
       const b = mkBoard(strokes)
-      const links = buildLinks(b)
+      const links = reader.read(b)
       const l = links.find((x) => x.a === 'k1' && x.b === 'k2')
       if (want) {
         if (!l) {
@@ -921,7 +926,7 @@ console.log('\n[6e] 真手画箭头：拿用户本人的笔迹当夹具（script
     { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 660, y: -260 }])), id: 'fan1' },
     { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 660, y: 340 }])), id: 'fan2' },
   ]
-  const fan = buildLinks(b7)
+  const fan = reader.read(b7)
   eq(fan.length, 2, '从同一点拉出去的两根线：各算各的（没被接成一根）')
   eq(fan.map((l) => l.a + '→' + l.b).sort(), ['k1→k2', 'k1→k3'], '两根的目标都对')
 }
@@ -960,7 +965,7 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
   /* ── ① 两块字迹之间画一条直线：这就是"连到没成卡的字迹上" ── */
   {
     const b = mk([...put(), line('lnk', { x: 6, y: 3 }, { x: 506, y: 3 })])
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     eq(ls.length, 1, '两块字迹之间画一条线 → 出来 1 条连接')
     if (ls.length === 1) {
       eq([ls[0].aKind, ls[0].bKind], ['ink', 'ink'], '两端都算"墨迹块"（不是卡片）')
@@ -978,7 +983,7 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
   /* ── ② 同一坨字迹内部：字里的一横，两头落在同一块里 → 不算连接 ── */
   {
     const b = mk([...put(), line('lnk', { x: 2, y: 1 }, { x: 26, y: 8 })])
-    eq(buildLinks(b).length, 0, '同一块内部的一笔（字里的一横）不算连接')
+    eq(reader.read(b).length, 0, '同一块内部的一笔（字里的一横）不算连接')
   }
 
   /* ── ③ 公式的分数线：够长，但中段上下就是分子分母（贴着一堆墨）→ 不算连接 ── */
@@ -990,21 +995,21 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
       ['side', toFlat([{ x: 560, y: 0 }, { x: 574, y: 6 }])],
     ]
     const b = mk([...put(), ...frac])
-    eq(buildLinks(b).length, 0, '分数线中段贴着分子/分母 → 中段不是空白 → 不算连接')
+    eq(reader.read(b).length, 0, '分数线中段贴着分子/分母 → 中段不是空白 → 不算连接')
   }
 
   /* ── ④ 一条长线的中段**穿过**另一坨墨 → 不算连接（中段那一段必须空） ── */
   {
     const mid = blob(250, -6)
     const b = mk([...put(), ...mid.map((f, i) => ['m' + i, f]), line('lnk', { x: 6, y: 3 }, { x: 506, y: 3 })])
-    eq(buildLinks(b).length, 0, '长线的中段压着别的墨 → 不算连接')
+    eq(reader.read(b).length, 0, '长线的中段压着别的墨 → 不算连接')
   }
 
   /* ── ⑤ 卡片 → 字迹：一头卡一头块 ── */
   {
     const card = { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: -320, y: -30, id: 'k1', text: '公式卡' }
     const b = mk([...A.map((f, i) => ['a' + i, f]), line('lnk', { x: -260, y: 3 }, { x: 20, y: 3 })], [card])
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     eq(ls.length, 1, '从卡片画一条线到字迹上 → 出来 1 条连接')
     if (ls.length === 1) eq([ls[0].a, ls[0].aKind, ls[0].bKind], ['k1', 'card', 'ink'], '一头是卡片、一头是墨迹块')
   }
@@ -1014,7 +1019,7 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
     const k1 = { ...newCard('note', 0, 0, { w: 60, h: 40 }), x: 0, y: 0, id: 'k1' }
     const k2 = { ...newCard('note', 0, 0, { w: 60, h: 40 }), x: 100, y: 0, id: 'k2' }
     const b = mk([line('short', { x: 30, y: 20 }, { x: 100, y: 20 })], [k1, k2])
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     eq(ls.length, 1, '两张卡之间的**短线**（比 INK_LINK_MIN_LEN 还短）照样算连接')
     if (ls.length === 1) eq([ls[0].a, ls[0].b], ['k1', 'k2'], '方向按你画的方向')
   }
@@ -1032,7 +1037,7 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
       ...near2.map((f, i) => ['b' + i, f]),
       line('lnk', { x: 10, y: 3 }, { x: 60, y: 3 }), // 50px：够长（≥48），但中段还是贴着两头的墨
     ])
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     if (ls.length === 0) ok('两块贴着、线又画得短 → 认不出（已记在案的代价：把线画长一点就认）')
     else bad(`短距离的两块之间不该出连接，却出了 ${ls.length} 条`)
   }
@@ -1068,7 +1073,7 @@ console.log('\n[6f] 墨迹块：没成卡的字迹、手画的图也能当连接
       ...blob(tipPt.x + 18, tipPt.y - 3).map((f, i) => ['b' + i, f]),
     ]
     const b = mk([...blobs, ['sh', toFlat(shaft)], ['v1', toFlat(role.barbA)], ['v2', toFlat(role.barbB)]])
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     eq(ls.length, 1, '真手画箭头（杆 + 两撇）指着字迹 → 出来 1 条连接')
     if (ls.length === 1) {
       eq([ls[0].aKind, ls[0].bKind, ls[0].kind, ls[0].shape, ls[0].headInk], ['ink', 'ink', 'cause', 'arrow', true],
@@ -1100,16 +1105,16 @@ console.log('\n[6g] 「不算连接」：自动读错了要有一条一键改回
     })
     return b
   }
-  eq(buildLinks(build(null)).length, 1, '先确认这条线本来是会被读成连接的')
-  eq(buildLinks(build(LINK_NONE)).length, 0, '标了「不算连接」→ 不再读成连接')
-  eq(buildLinks(build('cause')).length, 1, '标成「因果」当然还是连接（这两个不是一回事）')
+  eq(reader.read(build(null)).length, 1, '先确认这条线本来是会被读成连接的')
+  eq(reader.read(build(LINK_NONE)).length, 0, '标了「不算连接」→ 不再读成连接')
+  eq(reader.read(build('cause')).length, 1, '标成「因果」当然还是连接（这两个不是一回事）')
 
   /* 存盘：这句话要活得下去（不然重开之后那条假连接自己回来了） */
   const text = serializeBoardDocument(build(LINK_NONE))
   if (/"link":\s*"none"/.test(text)) ok('存盘里写着 link: "none"')
   else bad('「不算连接」没写进文件 —— 重开就丢了')
   const back = parseBoardDocument(text, 'x')
-  eq(buildLinks(back).length, 0, '读回来还是"不算连接"')
+  eq(reader.read(back).length, 0, '读回来还是"不算连接"')
   eq(back.strokes.find((s) => s.id === 'lnk').link, LINK_NONE, '字段原样保留')
   /* 只有你说过的那一笔有这个字段：别的笔、以及没标过的板，一个字节都不多 */
   const plain = serializeBoardDocument(build(null))
@@ -1169,13 +1174,13 @@ console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方�
       return b
     }
     /* 干净板：两头都是自动聚出来的块 */
-    const l0 = buildLinks(mkB([]))[0]
+    const l0 = reader.read(mkB([]))[0]
     eq([l0 && l0.aKind, l0 && l0.bKind], ['ink', 'ink'], '不固定时：两头都是自动聚出来的墨迹块')
 
     /* 固定第一坨 → **buildLinks 必须还给出这条连接**，而且那一头是「固定的块」 */
     const fixed = mkB([{ id: 'gA', ids: ['0_0', '0_1', '0_2'] }])
     const idx = createInkIndex(fixed.strokes, fixed.groups)
-    const l1 = buildLinks(fixed, idx)[0] // ← 走应用真实路径（复用记忆化的索引）
+    const l1 = reader.read(fixed, idx)[0] // ← 走应用真实路径（复用记忆化的索引）
     if (l1) {
       eq(l1.a, 'grp:gA', '固定之后：那一头是固定的块（id 用组 id）')
       if (/固定/.test(l1.aLabel || '')) ok(`名字也对：${l1.aLabel}`)
@@ -1185,12 +1190,12 @@ console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方�
       bad('固定一坨之后连接没了 —— 固定块在 buildLinks 里失效了（owner 被清掉那个 bug）')
     }
     /* 复用同一个索引再来一次（应用里就是复用），结果必须一样 */
-    eq(JSON.stringify(buildLinks(fixed, idx)), JSON.stringify(buildLinks(fixed, idx)), '复用索引连算两次结果一致')
+    eq(JSON.stringify(reader.read(fixed, idx)), JSON.stringify(reader.read(fixed, idx)), '复用索引连算两次结果一致')
 
     /* 把**相隔很远的两坨固定成一块**：线两头落在同一个节点里 → 不该成连接。
        （这条 bug 的表现是"凭空造出一条连接"：索引被清之后两头各算成一块自动块。） */
     const one = mkB([{ id: 'gAll', ids: ['0_0', '0_1', '0_2', '600_0', '600_1', '600_2'] }])
-    eq(buildLinks(one, createInkIndex(one.strokes, one.groups)).length, 0, '两坨固定成一块之后：线两头是同一个节点 → 不算连接')
+    eq(reader.read(one, createInkIndex(one.strokes, one.groups)).length, 0, '两坨固定成一块之后：线两头是同一个节点 → 不算连接')
   }
 
   /* 存盘：只在真有固定块时才写这个字段；成员被擦掉的那些不留尸体 */
@@ -1242,13 +1247,13 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
   }
   const mid = { x: 260, y: 30 } // 那条线的弧长中点
 
-  eq(buildLinks(mk()).length, 1, '先确认这条线是连接')
-  eq(buildLinks(mk())[0].cond, null, '线中点旁边什么都没有 → 没有条件')
+  eq(reader.read(mk()).length, 1, '先确认这条线是连接')
+  eq(reader.read(mk())[0].cond, null, '线中点旁边什么都没有 → 没有条件')
 
   /* ① 中点旁边写几个字 → 它们就是条件 */
   {
     const b = mk(condStrokes(mid.x - 12, mid.y - 34, 'c'))
-    const l = buildLinks(b)[0]
+    const l = reader.read(b)[0]
     if (l.cond && l.cond.kind === 'ink' && l.cond.ids.length === 3) {
       ok(`线中点旁边那 3 笔成了条件：${l.cond.label}`)
     } else {
@@ -1260,7 +1265,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
   /* ② 同样的字摆在**端点**旁边（不在中点）→ 不算条件 */
   {
     const b = mk(condStrokes(370, 44, 'c')) // 离中点 110px 以上，但离 B 那端很近
-    const l = buildLinks(b)[0]
+    const l = reader.read(b)[0]
     eq(l.cond, null, '字摆在端点旁边（不是中点）→ 不算条件')
   }
 
@@ -1268,7 +1273,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
   {
     const C = { ...newCard('note', 0, 0, { w: 90, h: 40 }), x: 215, y: -60, id: 'kc', text: '仅当…' }
     const b = mk([], [A, B, C])
-    const l = buildLinks(b)[0]
+    const l = reader.read(b)[0]
     eq(l.cond && l.cond.kind, 'card', '线中点旁边那张卡才是条件')
     eq(l.cond && l.cond.id, 'kc', '条件指向那张卡')
   }
@@ -1276,7 +1281,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
   /* ④ 一撮 2px 的小墨点不算条件（和墨迹块同一条"最小个头"闸） */
   {
     const b = mk([['p', toFlat([{ x: mid.x, y: mid.y - 30 }, { x: mid.x + 1.5, y: mid.y - 30 }])]])
-    eq(buildLinks(b)[0].cond, null, '一个 2px 的点不算条件')
+    eq(reader.read(b)[0].cond, null, '一个 2px 的点不算条件')
   }
 
   /* ⑤ 推导链：A —推导→ B —推导→ C，中间那步缺条件 */
@@ -1289,7 +1294,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
       { ...newStroke('pen', toFlat([{ x: 460, y: 30 }, { x: 860, y: 30 }])), id: 'l2', link: 'derive' },
       ...condStrokes(250, -4, 'c').map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
     ]
-    const links = buildLinks(b)
+    const links = reader.read(b)
     eq(links.length, 2, '两条推导都成立')
     const chains = deriveChains(links)
     eq(chains.length, 1, '读成 1 条链')
@@ -1300,7 +1305,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
 
     /* 因果那条不算推导链（链只认"推导"）：把 A→B 标成因果，链就该从 B 开始 */
     const b2 = { ...b, strokes: b.strokes.map((s) => (s.id === 'l1' ? { ...s, link: 'cause' } : s)) }
-    const ch2 = deriveChains(buildLinks(b2))
+    const ch2 = deriveChains(reader.read(b2))
     eq(ch2.map((c) => c.steps.map((s) => s.from + '→' + s.to).join(',')), ['kb→kc'], '标成「因果」的那条不进推导链（链从 B 开始）')
   }
 
@@ -1320,7 +1325,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
       { ...newStroke('pen', dense(40, 25, 440, 425)), id: 'l1' }, // 左上 → 右下（卡↔卡）
       { ...newStroke('pen', dense(40, 425, 440, 25)), id: 'l2' }, // 左下 → 右上（交叉）
     ]
-    const ls = buildLinks(b)
+    const ls = reader.read(b)
     eq(ls.length, 2, '两条交叉的卡片连线都成立')
     const cross = ls.filter((l) => l.cond && l.cond.kind === 'ink' && l.cond.ids.includes('l2'))
     const cross2 = ls.filter((l) => l.cond && l.cond.kind === 'ink' && l.cond.ids.includes('l1'))
@@ -1339,7 +1344,7 @@ console.log('\n[6i] 条件从位置送（线中点旁边那几个字）+ 推导�
       { ...newCard('note', 0, 0, { w: 80, h: 50 }), x: 20, y: 180, id: 'k2' },
       { ...newCard('note', 0, 0, { w: 80, h: 40 }), x: 100, y: 150, id: 'k3' },
     ]
-    const l = buildLinks(b)[0]
+    const l = reader.read(b)[0]
     if (l && l.cond && l.cond.id === 'k3') ok('两张端点卡都比它近，中点旁边 40px 那张条件卡照样读出来')
     else bad(`条件卡被漏掉了：cond=${JSON.stringify(l && l.cond)}`)
   }
@@ -1456,6 +1461,61 @@ console.log('\n[6j] 回归闸：缓存不许串味 · 写得出去就必须读�
     if (serializeBoardDocument(parseBoardDocument(t, 'x')) === t) ok('固定之后：存→读→再存仍然字节一致')
     else bad('固定之后往返不一致')
   }
+}
+
+// ═════════════════════ 6k. 连接读法：跨 interface 的断言 ═════════════════════
+console.log('\n[6k] 连接读法（`createLinkReader`）：调用方只认这一个入口')
+{
+  /* 这一节是 2026-09-16 把索引/缓存收进 module 之后**才写得出**的断言。
+     从前调用方要自己 `createInkIndex(strokes, groups)` 再传给 `buildLinks`，
+     于是"缓存该不该失效"变成了调用方的知识 —— 自检只能绕过 `buildLinks` 去问 `inkNodeAt`，
+     而"固定块被清缓存而整个失效"那条严重 bug 正是从这儿漏的。
+     现在这些都能从**同一道 seam** 上问：复用 reader 的结果 == 新开一个 reader 的结果。 */
+  const blob = (cx) => [0, 1, 2].map((i) => [`${cx}_${i}`, toFlat([{ x: cx + i * 9, y: 0 }, { x: cx + i * 9 + 6, y: 7 }])])
+  const b = makeBoard()
+  b.cards = [{ ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 0, y: 0, id: 'ka' }]
+  b.strokes = [
+    ...blob(0).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
+    ...blob(600).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
+    { ...newStroke('pen', toFlat([{ x: 12, y: 3 }, { x: 612, y: 3 }])), id: 'ln' },
+  ]
+  const reused = createLinkReader()
+  const fresh = () => createLinkReader()
+
+  eq(reused.read(b).length, 1, 'reader 读出一条连接')
+  eq(JSON.stringify(reused.read(b)), JSON.stringify(reused.read(b)), '同一个板连读两次结果一致（幂等）')
+
+  /* ① 拖一张卡（board 换了、strokes/groups 引用没换）→ 复用 reader 必须和新 reader 一样 */
+  const moved = { ...b, cards: b.cards.map((c) => ({ ...c, x: c.x + 37, y: c.y - 21 })) }
+  eq(
+    JSON.stringify(reused.read(moved)),
+    JSON.stringify(fresh().read(moved)),
+    '拖卡片之后：复用 reader 的结果 = 新 reader 的结果（缓存不会吐旧结果）'
+  )
+
+  /* ② 板上多一笔（strokes 换新引用）→ 同上 */
+  const added = {
+    ...b,
+    strokes: [...b.strokes, { ...newStroke('pen', toFlat([{ x: 300, y: 300 }, { x: 380, y: 320 }])), id: 'extra' }],
+  }
+  eq(
+    JSON.stringify(reused.read(added)),
+    JSON.stringify(fresh().read(added)),
+    '板上多一笔之后：复用 reader 的结果 = 新 reader 的结果'
+  )
+
+  /* ③ 固定块改了（groups 换新引用）→ 固定块必须重新生效（就是那条严重 bug 的形状）。
+     用 `moved` 那块板：卡片已经移开，线的起点落在**墨迹块**里，所以固定它之后那一头
+     应该变成「固定的块」。（在没移开的板上，起点在卡片里 —— 卡片优先，读出来是 ka，
+     那是**对**的，第一版断言在这里写错了。） */
+  const fixed = { ...moved, groups: [{ id: 'gX', ids: ['0_0', '0_1', '0_2'] }] }
+  const withFixed = reused.read(fixed)
+  eq(JSON.stringify(withFixed), JSON.stringify(fresh().read(fixed)), '改了固定块之后：复用 reader = 新 reader')
+  eq(withFixed[0] && withFixed[0].a, 'grp:gX', '而且那一头确实是「固定的块」（没有因为复用缓存而失效）')
+
+  /* ④ 两个 reader 互不干扰 */
+  const other = createLinkReader()
+  eq(other.read(b).length, reused.read(b).length, '另一个 reader 自己算自己的')
 }
 
 // ═════════════════════ 7. 装进视口 ═════════════════════
