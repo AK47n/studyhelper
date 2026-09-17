@@ -20,19 +20,22 @@
  *     ids, count, empty, strokes, box,
  *     link,     // 框里**正好一条**连接线时是那条连接（改词那排的入口），否则 null
  *     noLink,   // 框住的笔里有没有"你说过不算连接"的（有就给一条回头路）
- *     group,    // 框住的这些笔**正好就是**某一块固定块吗（是 → 浮层给「拆开这块」）
+ *     frame,    // 框住的这些笔**正好就是**某个板框吗（是 → 浮层给「拆开这块」）
  *   }
  *   applyStrokeLink(board, links, strokeId, kind, { reverse }) → board' | null
  *     kind = 词表里的词 → 写/清那个字段；kind = LINK_NONE → 写在整条链上；
  *     词不认识 → **null**（什么都没改，调用方也别弹提示）。
  *   clearNoLinkMarks(board, ids) → board'   按**整条链**把 `link:'none'` 清掉（回头路）
- *   removeStrokes(board, ids) → board'      删掉这些笔（一步撤销交给调用方）
- *   freezeSelection(board, ids) → { board, movedFrom }   固定成一块；movedFrom 是被挪过的别的块
- *   dissolveGroup(board, groupId) → board'  拆开一块
- * 这些函数都是**纯的**：不动原对象、只返回新的 board（约定见 board.js 顶部）。
+ *   removeStrokes(board, ids) → board'      删掉这些笔（顺手把板框里的死成员摘掉）
+ *   freezeFrameSelection(board, ids, cards) → { board, movedFrom }   留下板框；movedFrom 是被挪过的别的框
+ *   这些函数都是**纯的**：不动原对象、只返回新的 board（约定见 board.js 顶部）。
+ *   「拆开一个板框」在 frames.js 的 `dissolveFrame`（它只认 board + frameId）。
  */
 
-import { freezeGroup } from './board.js'
+/* 板框那一族（留下 / 拆开 / 改标题 / 整体挪）搬去了 frames.js（2026-09-17）：
+   从前的 `groups`（"固定成一块"）在这里，现在它长成了板框 —— 成员多了卡片、多了标题，
+   所以规矩跟着那个概念一起走，这个 module 只管"**框住**这一撮笔意味着什么"。 */
+import { freezeFrame, pruneFrames } from './frames.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
 import { strokesBBox } from './geometry.js'
 import { autoLinkKind, chainOfStroke } from './links.js'
@@ -68,13 +71,15 @@ export function readSelection(board, ids, links = []) {
      （不然那句话是单向门：点完只能 Ctrl+Z，重开之后就没路可走了）。 */
   const noLink = strokes.some((s) => s.link === LINK_NONE)
 
-  /* 框住的这些笔**正好就是**某一块固定块吗？判据是"集合完全相等"：
-     少一笔都不算 —— 不然框一大片会把某块顺手拆了。 */
-  let group = null
-  for (const g of board.groups || []) {
-    if (g.ids.length !== set.size) continue
-    if (g.ids.every((id) => set.has(id))) {
-      group = g
+  /* 框住的这些笔**正好就是**某个板框的笔吗？判据是"集合完全相等"：
+     少一笔都不算 —— 不然框一大片会把某个框顺手拆了。
+     （框里可以还有卡片成员：卡片框不进来，所以只比笔迹这一半。） */
+  let frame = null
+  for (const f of board.frames || []) {
+    const ids = f.ids || []
+    if (ids.length !== set.size) continue
+    if (ids.every((id) => set.has(id))) {
+      frame = f
       break
     }
   }
@@ -87,7 +92,7 @@ export function readSelection(board, ids, links = []) {
     box: set.size ? strokesBBox(strokes) : null,
     link,
     noLink,
-    group,
+    frame,
   }
 }
 
@@ -149,29 +154,28 @@ export function clearNoLinkMarks(board, ids) {
   }
 }
 
-/** 删掉这些笔（撤销栈由调用方管：这是"一步"操作）。 */
+/** 删掉这些笔（撤销栈由调用方管：这是"一步"操作）。
+ *  顺手把板框里的**死成员**摘掉（框围着空气的样子很怪），空掉的框自己消失。 */
 export function removeStrokes(board, ids) {
   const set = asSet(ids)
   if (!set.size) return board
-  return { ...board, strokes: board.strokes.filter((s) => !set.has(s.id)) }
+  return pruneFrames({ ...board, strokes: board.strokes.filter((s) => !set.has(s.id)) })
 }
 
-/* 固定成一块（写进 `groups`）。`freezeGroup` 会把这些笔从**别的块**里拿走
- * （一笔只能属于一个组）—— 不这么干，界面就能造出"内存里重叠、文件里只认一笔"的状态，
- * 下次打开分组悄悄变（模糊测试逮到过）。
- * `movedFrom` 是原来装着这些笔的那些块 —— 界面拿它决定提示语怎么说（"其中几笔原来在别处"）。 */
-export function freezeSelection(board, ids) {
+/* 「▣ 留下板框」（写进 `frames`，见 frames.js 的 freezeFrame）。
+ * 这些成员会从**别的框**里被拿走（一个成员只能属于一个框）—— 不这么干，界面就能造出
+ * "内存里重叠、文件里只认一个框"的状态，下次打开归属悄悄变（旧 groups 的模糊测试逮到过）。
+ * `movedFrom` 是原来装着这些东西的那些框 —— 界面拿它决定提示语怎么说（"其中几笔原来在别处"）。 */
+export function freezeFrameSelection(board, ids, cards = []) {
   const list = [...asSet(ids)]
-  if (!list.length) return { board, movedFrom: [] }
-  const set = new Set(list)
-  const movedFrom = (board.groups || []).filter((g) => g.ids.some((id) => set.has(id)))
-  return { board: { ...board, groups: freezeGroup(board.groups, list) }, movedFrom }
-}
-
-/** 拆开一块（把这条组整个去掉）。 */
-export function dissolveGroup(board, groupId) {
-  if (!groupId) return board
-  return { ...board, groups: (board.groups || []).filter((g) => g.id !== groupId) }
+  const cardList = [...asSet(cards)]
+  if (!list.length && !cardList.length) return { board, movedFrom: [] }
+  const S = new Set(list)
+  const C = new Set(cardList)
+  const movedFrom = (board.frames || []).filter(
+    (f) => (f.ids || []).some((id) => S.has(id)) || (f.cards || []).some((id) => C.has(id))
+  )
+  return { board: freezeFrame(board, { ids: list, cards: cardList }), movedFrom }
 }
 
 /* ── 条件那一族的三个"说法"（值见 link-kinds.js 的 parseCond）──────────────

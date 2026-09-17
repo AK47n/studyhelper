@@ -10,11 +10,17 @@ import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H,
   CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, TEXT_CARD_MAX_W,
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, cardHeightFromContent, cardWidthFromContent, clampCardScale,
-  freezeGroup, fontCss, isBoardDocument, isBoardName, newBoard, newCard,
-  newStroke, nextCardScale, parseBoardDocument, serializeBoardDocument, textCardRect,
+  fontCss, isBoardDocument, isBoardName, newBoard, newCard, linkId, newFrameId,
+  newStroke, nextCardScale, normalizeFrames, normalizeLinks, parseBoardDocument, serializeBoardDocument, textCardRect,
 } from '../src/lib/board.js'
-/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
-import { NEAR_GAP, READABLE_FIT_S, buildRelations, descendantsOf, fitView, pointSegDist, relationCurve, simplifyPoints, strokeBounds, strokeHitsCircle, toFlat, toPoints } from '../src/lib/geometry.js'
+/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
+   板框的几何（成员包围盒 + 内边距、框选命中）2026-09-17 也进了那儿。 */
+import { NEAR_GAP, READABLE_FIT_S, buildRelations, descendantsOf, fitView, frameBounds, membersInBox, pointSegDist, relationCurve, simplifyPoints, strokeBounds, strokeHitsCircle, strokesBBox, toFlat, toPoints } from '../src/lib/geometry.js'
+/* 板框 / 连接这两个概念**动作**（留下 / 加进来 / 改标题 / 拆开 / 连上 / 删掉）在 frames.js。 */
+import {
+  addToFrame, declareLink, dissolveFrame, frameById, frameMembers, frameOf, freezeFrame, linkOf,
+  pruneFrames, removeLink, setFrameTitle, setLinkKind, takeOutOfFrame, translateFrame,
+} from '../src/lib/frames.js'
 /* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
 import {
   TIP_MAX_ANGLE, createLinkReader, classifyLinkShape, chainOfStroke, deriveChains, findTip,
@@ -28,7 +34,7 @@ import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
 /* 选中这一族（框住的笔意味着什么 + 改词/反向/否决/回头路/固定/拆开）搬去了 selection.js
    （2026-09-16）：纯函数、有断言（见 [6m]）。 */
 import {
-  applyStrokeLink, clearCond, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes, specCond, vetoCond,
+  applyStrokeLink, clearCond, clearNoLinkMarks, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
 } from '../src/lib/selection.js'
 /* 板文件这一步（data/ 的读写 + 打开哪一个）搬去了 files.js（2026-09-16 C4）：
    "打开哪一个"是一个纯决定，于是那些入口情形在这儿断言得到（见 [6n]）。 */
@@ -1141,105 +1147,204 @@ console.log('\n[6g] 「不算连接」：自动读错了要有一条一键改回
   else bad('没标过的板里出现了 link 字段')
 }
 // ═════════════════════ 6h. 固定成一块 / 拆开 ═════════════════════
-console.log('\n[6h] 框选固化（`groups`）：自动聚错了，得有地方纠正它')
+console.log('\n[6h] 板框（`frames`）：你亲手留下的一个整体')
 {
-  /* 自动聚类会把挨得近的两坨并成一块。后果虽然轻（"多连了一个"），
-     但你没地方纠正它就很难受 —— 这个功能就是那个地方：
-     框住一块 → 固定成一块；两块各自固定 = 把它们拆开。 */
+  /* 从前的"固定成一块"（`groups`）**长出了脸**：成员可以是笔迹**和卡片**、有标题、
+     框线按成员包围盒现算。所以这一段同时钉三件事：
+       · 板框必须真的在 **buildLinks** 里生效（2026-09-16 审查挑出来的严重 bug：
+         固定块登记在 `owner` 上，而 `owner` 在 dropKey 变化时被清光）；
+       · 老文件里的 `groups` 必须**就地升成板框**（不然用户打开旧板，"我固定过的那块"没了）；
+       · 存盘的规矩一个字都不能松：真有框才写、死成员不留尸体、空框自己消失。 */
   const blob = (cx, cy) => [0, 1, 2].map((i) => toFlat([{ x: cx + i * 9, y: cy }, { x: cx + i * 9 + 6, y: cy + 7 }]))
-  const mk = (groups) => {
+  const mk = (frames) => {
     const b = makeBoard()
     b.strokes = [
       ...blob(0, 0).map((f, i) => ({ ...newStroke('pen', f), id: 'a' + i })),
       ...blob(30, 0).map((f, i) => ({ ...newStroke('pen', f), id: 'b' + i })),
     ]
-    b.groups = groups
+    b.frames = frames
     return b
   }
   /* 两坨只差 6px（< INK_BLOCK_GAP）→ 自动聚成一块 */
   eq(inkBlocks(mk([]).strokes).length, 1, '两坨挨得近 → 自动聚成 1 块')
 
-  const fixed = [
-    { id: 'g1', ids: ['a0', 'a1', 'a2'] },
-    { id: 'g2', ids: ['b0', 'b1', 'b2'] },
+  const two = [
+    { id: 'g1', ids: ['a0', 'a1', 'a2'], cards: [] },
+    { id: 'g2', title: '第二块', ids: ['b0', 'b1', 'b2'], cards: [] },
   ]
-  const b2 = mk(fixed)
-  const blocks = inkBlocks(b2.strokes, { groups: b2.groups })
-  eq(blocks.length, 2, '两块各自固定 → 2 块（这就是"拆开"）')
-  eq(blocks.map((x) => x.id).sort(), ['grp:g1', 'grp:g2'], '固定块的 id 用组 id（稳定、跨重开一样）')
+  const b2 = mk(two)
+  const blocks = inkBlocks(b2.strokes, { frames: b2.frames })
+  eq(blocks.length, 2, '两块各自留下 → 2 块（这就是"拆开"）')
+  eq(blocks.map((x) => x.id).sort(), ['frm:g1', 'frm:g2'], '板框的节点 id 用框 id（稳定、跨重开一样）')
   eq(blocks.filter((x) => x.fixed).length, 2, '两块都标着 fixed')
-  if (/固定/.test(blocks[0].label)) ok(`面板上有名字：${blocks[0].label}`)
-  else bad(`固定块的 label 不对：${blocks[0].label}`)
-  /* 固定之后端点认到的是**那一块**（不是自动并出来的大块） */
-  const idx = createInkIndex(b2.strokes, b2.groups)
-  eq(inkNodeAt(idx, { x: 3, y: 3 }).id, 'grp:g1', '落在第一坨上 → 拿到的是固定的那一块')
-  eq(inkNodeAt(idx, { x: 33, y: 3 }).id, 'grp:g2', '落在第二坨上 → 另一块')
+  eq(blocks.find((x) => x.id === 'frm:g2').label, '第二块', '有标题的板框：面板上就用你的话')
+  eq(blocks.find((x) => x.id === 'frm:g1').label, '板框（3 笔）', '没标题的板框：说清楚它是一块板框')
+  /* 留下板框之后端点认到的是**那一块**（不是自动并出来的大块） */
+  const idx = createInkIndex(b2.strokes, b2.frames)
+  eq(inkNodeAt(idx, { x: 3, y: 3 }).id, 'frm:g1', '落在第一坨上 → 拿到的是留下的那个框')
+  eq(inkNodeAt(idx, { x: 33, y: 3 }).id, 'frm:g2', '落在第二坨上 → 另一个框')
 
-  /* ① 固定块必须在 **buildLinks** 里生效（不能只直接问 inkNodeAt）——
+  /* ① 板框必须在 **buildLinks** 里生效（不能只直接问 inkNodeAt）——
      2026-09-16 审查挑出来的严重 bug：固定块登记在 `owner` 上，而 `owner` 在 dropKey
      变化时被清掉（dropKey 初始是 undefined，第一次 buildLinks 就清光），
-     于是"固定反而丢连接、把相隔很远的两坨固定成一块还会凭空造出连接"。
+     于是"留下框反而丢连接、把相隔很远的两坨框成一块还会凭空造出连接"。
      自检当时只直接问了 inkNodeAt，所以两条都漏过了。 */
   {
     const blobs = (cx) => [0, 1, 2].map((i) => [`${cx}_${i}`, toFlat([{ x: cx + i * 9, y: 0 }, { x: cx + i * 9 + 6, y: 7 }])])
-    const mkB = (groups) => {
+    const mkB = (frames) => {
       const b = makeBoard()
       b.strokes = [
         ...blobs(0).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
         ...blobs(600).map(([id, flat]) => ({ ...newStroke('pen', flat), id })),
         { ...newStroke('pen', toFlat([{ x: 12, y: 3 }, { x: 612, y: 3 }])), id: 'ln' },
       ]
-      b.groups = groups
+      b.frames = frames
       return b
     }
     /* 干净板：两头都是自动聚出来的块 */
     const l0 = reader.read(mkB([]))[0]
-    eq([l0 && l0.aKind, l0 && l0.bKind], ['ink', 'ink'], '不固定时：两头都是自动聚出来的墨迹块')
+    eq([l0 && l0.aKind, l0 && l0.bKind], ['ink', 'ink'], '不留框时：两头都是自动聚出来的墨迹块')
 
-    /* 固定第一坨 → **buildLinks 必须还给出这条连接**，而且那一头是「固定的块」 */
-    const fixed = mkB([{ id: 'gA', ids: ['0_0', '0_1', '0_2'] }])
-    const idx = createInkIndex(fixed.strokes, fixed.groups)
-    const l1 = reader.read(fixed, idx)[0] // ← 走应用真实路径（复用记忆化的索引）
+    /* 留下第一坨 → **buildLinks 必须还给出这条连接**，而且那一头是你的板框 */
+    const fixedB = mkB([{ id: 'gA', title: '左边这一节', ids: ['0_0', '0_1', '0_2'], cards: [] }])
+    const idx2 = createInkIndex(fixedB.strokes, fixedB.frames)
+    const l1 = reader.read(fixedB, idx2)[0] // ← 走应用真实路径（复用记忆化的索引）
     if (l1) {
-      eq(l1.a, 'grp:gA', '固定之后：那一头是固定的块（id 用组 id）')
-      if (/固定/.test(l1.aLabel || '')) ok(`名字也对：${l1.aLabel}`)
-      else bad(`固定块的名字不对：${l1.aLabel}`)
+      eq(l1.a, 'frm:gA', '留下框之后：那一头是板框（id 用框 id）')
+      eq(l1.aLabel, '左边这一节', '名字就是你的标题（面板上直接读得懂）')
       eq(l1.bKind, 'ink', '另一头还是自动聚的块')
     } else {
-      bad('固定一坨之后连接没了 —— 固定块在 buildLinks 里失效了（owner 被清掉那个 bug）')
+      bad('留下框之后连接没了 —— 板框在 buildLinks 里失效了（owner 被清掉那个 bug）')
     }
     /* 复用同一个索引再来一次（应用里就是复用），结果必须一样 */
-    eq(JSON.stringify(reader.read(fixed, idx)), JSON.stringify(reader.read(fixed, idx)), '复用索引连算两次结果一致')
+    eq(JSON.stringify(reader.read(fixedB, idx2)), JSON.stringify(reader.read(fixedB, idx2)), '复用索引连算两次结果一致')
 
-    /* 把**相隔很远的两坨固定成一块**：线两头落在同一个节点里 → 不该成连接。
+    /* 把**相隔很远的两坨框成一块**：线两头落在同一个节点里 → 不该成连接。
        （这条 bug 的表现是"凭空造出一条连接"：索引被清之后两头各算成一块自动块。） */
-    const one = mkB([{ id: 'gAll', ids: ['0_0', '0_1', '0_2', '600_0', '600_1', '600_2'] }])
-    eq(reader.read(one, createInkIndex(one.strokes, one.groups)).length, 0, '两坨固定成一块之后：线两头是同一个节点 → 不算连接')
+    const one = mkB([{ id: 'gAll', ids: ['0_0', '0_1', '0_2', '600_0', '600_1', '600_2'], cards: [] }])
+    eq(reader.read(one, createInkIndex(one.strokes, one.frames)).length, 0, '两坨框成一块之后：线两头是同一个节点 → 不算连接')
   }
 
-  /* 存盘：只在真有固定块时才写这个字段；成员被擦掉的那些不留尸体 */
+  /* ② 存盘：真有框才写这个字段；死成员不留尸体；空框自己消失 */
   const text = serializeBoardDocument(b2)
   const back = parseBoardDocument(text, 'x')
-  eq(back.groups.length, 2, '固定块存进文件了')
-  eq(back.groups[0].ids, ['a0', 'a1', 'a2'], '成员原样')
-  const noGroups = serializeBoardDocument(mk([]))
-  if (!/groups/.test(noGroups)) ok('没固定过的板一个 groups 字段都不写（不造假 diff）')
-  else bad('没固定过的板里出现了 groups')
-  const halfDead = serializeBoardDocument({ ...b2, strokes: b2.strokes.filter((s) => s.id !== 'a1') })
-  const hd = JSON.parse(halfDead)
-  eq(hd.groups[0].ids, ['a0', 'a2'], '擦掉一笔之后，组里那个死 id 不再写出去')
+  eq(back.frames.length, 2, '板框存进文件了')
+  eq(back.frames[0].ids, ['a0', 'a1', 'a2'], '成员原样')
+  eq(back.frames[1].title, '第二块', '标题也存进去了')
+  if (!/frames/.test(serializeBoardDocument(mk([])))) ok('没框过的板一个 frames 字段都不写（不造假 diff）')
+  else bad('没框过的板里出现了 frames')
+  if (!('title' in JSON.parse(serializeBoardDocument(mk([{ id: 'g1', ids: ['a0', 'a1', 'a2'], cards: [] }]))).frames[0])) {
+    ok('没起过名字的框不写 title（同上：零字节）')
+  } else bad('空标题的框写出了 title')
+  const halfDead = JSON.parse(serializeBoardDocument({ ...b2, strokes: b2.strokes.filter((s) => s.id !== 'a1') }))
+  eq(halfDead.frames[0].ids, ['a0', 'a2'], '擦掉一笔之后，框里那个死 id 不再写出去')
   const allDead = parseBoardDocument(
     serializeBoardDocument({ ...b2, strokes: b2.strokes.filter((s) => !s.id.startsWith('a')) }),
     'x'
   )
-  eq(allDead.groups.map((g) => g.id), ['g2'], '一块的成员被擦光 → 那个组自己消失（不留空壳）')
+  eq(allDead.frames.map((f) => f.id), ['g2'], '一个框的成员被擦光 → 那个框自己消失（不留空壳）')
 
-  /* 同一笔不许进两个组（重复的 id 一律丢掉） */
+  /* 同一个成员不许进两个框（重复的一律丢掉，先写的赢） */
   const dup = parseBoardDocument(
-    serializeBoardDocument({ ...b2, groups: [...fixed, { id: 'g3', ids: ['a0', 'a1', 'a2'] }] }),
+    serializeBoardDocument({ ...b2, frames: [...two, { id: 'g3', ids: ['a0', 'a1', 'a2'], cards: [] }] }),
     'x'
   )
-  eq(dup.groups.map((g) => g.id), ['g1', 'g2'], '同一笔不能同时属于两个组（后来那个丢掉）')
+  eq(dup.frames.map((f) => f.id), ['g1', 'g2'], '同一笔不能同时属于两个框（后来那个丢掉）')
+
+  /* ③ 卡片也能是成员（"让板框内的东西形成一个整体"）—— 卡片和笔迹各管一摊，互不挤占 */
+  {
+    const b = makeBoard()
+    b.strokes = [...blob(0, 0).map((f, i) => ({ ...newStroke('pen', f), id: 'a' + i }))]
+    const c = { ...newCard('note', 100, 100), id: 'n1' }
+    b.cards = [c]
+    const wrapped = parseBoardDocument(
+      serializeBoardDocument({ ...b, frames: [{ id: 'f1', title: '这一节', ids: ['a0'], cards: ['n1'] }] }),
+      'x'
+    )
+    eq([wrapped.frames[0].ids, wrapped.frames[0].cards], [['a0'], ['n1']], '卡片和笔迹都能当成员，存读往返一致')
+    /* 卡片被删掉 → 那个成员不留尸体；笔迹还在，框还在 */
+    const gone = parseBoardDocument(serializeBoardDocument({ ...wrapped, cards: [] }), 'x')
+    eq([gone.frames.length, gone.frames[0].cards], [1, []], '卡片删了：框还在（笔迹还在），死卡片 id 不再写')
+    /* 两样都没了 → 框消失 */
+    eq(parseBoardDocument(serializeBoardDocument({ ...wrapped, cards: [], strokes: [] }), 'x').frames.length, 0, '笔迹和卡片都没了 → 框自己消失')
+  }
+
+  /* ④ 老文件里的 `groups`（"固定成一块"）**就地升成板框** —— 那个功能不是被删掉，是长出了脸 */
+  {
+    const legacy = JSON.stringify({
+      title: '老板',
+      strokes: mk([]).strokes,
+      cards: [],
+      groups: [{ id: 'gold', ids: ['a0', 'a1', 'a2'] }],
+    })
+    const up = parseBoardDocument(legacy, 'x')
+    eq([up.frames.length, up.frames[0].id, up.frames[0].ids], [1, 'gold', ['a0', 'a1', 'a2']], '老 groups → 板框（id 和成员都不动）')
+    const reread = parseBoardDocument(serializeBoardDocument(up), 'x')
+    eq([reread.frames.length, reread.frames[0].ids], [1, ['a0', 'a1', 'a2']], '升完存回去还是那一块（往返一致）')
+    if (!/groups/.test(serializeBoardDocument(up))) ok('升完之后文件里不再有 groups（一份真相）')
+    else bad('升完之后还有 groups 字段')
+    /* 新的 frames 优先：两个字段同时在（手改过的文件）时不看旧的 */
+    const both = parseBoardDocument(JSON.stringify({ strokes: mk([]).strokes, frames: [{ id: 'gnew', ids: ['b0'] }], groups: [{ id: 'gold', ids: ['a0'] }] }), 'x')
+    eq(both.frames.map((f) => f.id), ['gnew'], 'frames 和 groups 同时在 → 只认 frames')
+  }
+
+  /* ⑤ frames.js 的那些**动作**（界面调的就是它们）*/
+  {
+    const b = mk([{ id: 'g1', ids: ['a0', 'a1'], cards: [] }])
+    /* 留下一个新框：原来装着这些笔的框**让位**（一个成员只属于一个框），被拿空的框消失 */
+    const moved = freezeFrame(b, { ids: ['a1', 'a2'], cards: [] })
+    eq(moved.frames.map((f) => f.ids), [['a0'], ['a1', 'a2']], '新框把这些笔从旧框里拿走（旧的还剩一笔就留着）')
+    const empty = freezeFrame(b, { ids: ['a0', 'a1'], cards: [] })
+    eq(empty.frames.length, 1, '旧框被拿空 → 直接消失（不留空壳）')
+    eq(empty.frames[0].ids, ['a0', 'a1'], '新框拿到了成员')
+    eq(freezeFrame(b, { ids: [], cards: [] }), b, '什么都没圈 → 原样返回（不动板）')
+
+    /* 加进来 / 拿出去 / 拆开 / 改标题 */
+    const f1 = b.frames[0].id
+    eq(addToFrame(b, f1, { ids: ['b0'], cards: [] }).frames[0].ids, ['a0', 'a1', 'b0'], '明说"加进来" → 并进去')
+    eq(takeOutOfFrame(b, { ids: ['a0'], cards: [] }).frames[0].ids, ['a1'], '拿出去 → 框里少一笔')
+    eq(takeOutOfFrame(b, { ids: ['a0', 'a1'], cards: [] }).frames.length, 0, '拿空了 → 框消失')
+    eq(setFrameTitle(b, f1, '  这一节  ').frames[0].title, '这一节', '改标题（顺手去掉首尾空白）')
+    eq('title' in setFrameTitle(b, f1, '   ').frames[0], false, '标题清空 → 字段也去掉（零字节那条规矩）')
+    eq(dissolveFrame(b, f1).frames.length, 0, '拆开 → 框没了（成员照旧留在板上）')
+    eq(dissolveFrame(b, '不存在').frames.length, 1, '拆一个不存在的框 → 原样返回')
+
+    /* 整体挪：挪的是**成员**（框线是成员包围盒的函数，跟着走） */
+    const card = { ...newCard('note', 200, 200), id: 'n1' }
+    const b3 = { ...b, cards: [card], frames: [{ id: 'f9', title: 'x', ids: ['a0'], cards: ['n1'] }] }
+    const before = frameBounds(b3, b3.frames[0])
+    const movedB = translateFrame(b3, 'f9', 40, 25)
+    const after = frameBounds(movedB, movedB.frames[0])
+    eq([after.x - before.x, after.y - before.y], [40, 25], '整体挪一下：框线跟着成员走（挪的就是成员）')
+    eq([movedB.cards[0].x - card.x, movedB.cards[0].y - card.y], [40, 25], '框里的卡片也一起挪')
+    eq(movedB.strokes.find((s) => s.id === 'a1').points[0], b3.strokes.find((s) => s.id === 'a1').points[0], '不在这个框里的笔一笔都不动')
+    eq(translateFrame(b3, 'f9', 0, 0), b3, '没位移 → 原样返回')
+
+    /* 成员被删掉之后：内存里那一道清理 */
+    eq(frameOf(b3, 'a0').id, 'f9', 'frameOf：一笔属于哪个框')
+    eq(frameOf(b3, 'n1').id, 'f9', 'frameOf：卡片也问同一个入口')
+    eq(frameOf(b3, 'b1'), null, '不在任何框里 → null')
+    eq(pruneFrames({ ...b3, strokes: b3.strokes.filter((s) => s.id !== 'a0') }).frames[0].ids, [], '拿走框里唯一的笔：卡片还在 → 框还在（成员只剩卡片）')
+    eq(pruneFrames({ ...b3, strokes: b3.strokes.filter((s) => s.id !== 'a0'), cards: [] }).frames.length, 0, '成员都没了 → 内存里那个框也没了')
+    eq(frameMembers(b3, b3.frames[0]).strokes.map((s) => s.id), ['a0'], 'frameMembers：框里的成员对象')
+  }
+
+  /* ⑥ 框线的几何：成员包围盒 + 一圈内边距；成员里有卡片也算进去 */
+  {
+    const b = mk([{ id: 'g1', ids: ['a0', 'a1', 'a2'], cards: [] }])
+    const box = frameBounds(b, b.frames[0])
+    /* 比的是**成员**的墨迹外框，不是全板的（板上还有另一坨 b0..b2 不属于这个框）。
+       外框按 `strokeBounds` 算 —— 它把线宽/2 撑出去（2.5 的笔 = 1.25），
+       框线要抱住**墨**，不是抱住点的中心线（粗荧光笔的边才不会露在框外）。 */
+    const inner = strokesBBox(b.strokes.filter((s) => b.frames[0].ids.includes(s.id)))
+    const pad = 14 + 2.5 / 2
+    near(box.x, inner.x0 - pad, 0.01, '框线 = 成员墨迹外框 + 14 内边距（左边）')
+    near(box.y, inner.y0 - pad, 0.01, '同上（上边）')
+    near(box.w, inner.x1 - inner.x0 + pad * 2, 0.01, '宽度也对得上')
+    const withCard = { ...b, cards: [{ ...newCard('note', 400, 400), id: 'n9' }], frames: [{ id: 'g1', ids: [], cards: ['n9'] }] }
+    eq(frameBounds(withCard, withCard.frames[0]).w >= 80, true, '只有卡片成员也能算出框线（卡片也是内容）')
+    eq(frameBounds(b, { id: 'gX', ids: [], cards: [] }), null, '空框算不出框线 → null（不该画一个围空气的框）')
+  }
 }
 
 // ═════════════════════ 6i. 条件从位置送 + 推导链 ═════════════════════
@@ -1461,24 +1566,24 @@ console.log('\n[6j] 回归闸：缓存不许串味 · 写得出去就必须读�
     else bad('存→读→再存不一致（文件里留下了读不回来的东西）')
   }
 
-  /* ── ③ 一笔只能进一个组（界面的"⧉ 固定成一块"调的就是 freezeGroup）── */
+  /* ── ③ 一个成员只能进一个框（界面的「▣ 留下板框」调的就是 frames.js 的 freezeFrame）── */
   {
     const before = [
-      { id: 'g1', ids: ['a', 'b'] },
-      { id: 'g2', ids: ['c', 'd'] },
+      { id: 'g1', ids: ['a', 'b'], cards: [] },
+      { id: 'g2', ids: ['c', 'd'], cards: [] },
     ]
-    const after = freezeGroup(before, ['b', 'c'])
-    eq(after.map((g) => g.ids), [['a'], ['d'], ['b', 'c']], '新固定的一块赢：别处只剩没被拿走的')
+    const after = freezeFrame({ ...makeBoard(), frames: before }, { ids: ['b', 'c'] }).frames
+    eq(after.map((g) => g.ids), [['a'], ['d'], ['b', 'c']], '新留下的框赢：别处只剩没被拿走的')
     const flat = after.flatMap((g) => g.ids)
-    eq(new Set(flat).size, flat.length, '没有一笔同时属于两块')
-    eq(freezeGroup([{ id: 'g9', ids: ['x', 'y'] }], ['x', 'y']).length, 1, '整块重新固定 → 原来那个组消失（不留空壳）')
+    eq(new Set(flat).size, flat.length, '没有一笔同时属于两个框')
+    eq(freezeFrame({ ...makeBoard(), frames: [{ id: 'g9', ids: ['x', 'y'], cards: [] }] }, { ids: ['x', 'y'] }).frames.length, 1, '整块重新留下 → 原来那个框消失（不留空壳）')
     /* 内存里守住了，文件才守得住：这一串操作之后往返仍然字节一致 */
     const b = makeBoard()
     b.strokes = ['x', 'y'].map((id) => ({ ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 20, y: 0 }])), id }))
-    b.groups = freezeGroup([{ id: 'g9', ids: ['x', 'y'] }], ['x', 'y'])
+    b.frames = freezeFrame({ ...b, frames: [{ id: 'g9', ids: ['x', 'y'], cards: [] }] }, { ids: ['x', 'y'] }).frames
     const t = serializeBoardDocument(b)
-    if (serializeBoardDocument(parseBoardDocument(t, 'x')) === t) ok('固定之后：存→读→再存仍然字节一致')
-    else bad('固定之后往返不一致')
+    if (serializeBoardDocument(parseBoardDocument(t, 'x')) === t) ok('留下板框之后：存→读→再存仍然字节一致')
+    else bad('留下板框之后往返不一致')
   }
 }
 
@@ -1523,14 +1628,14 @@ console.log('\n[6k] 连接读法（`createLinkReader`）：调用方只认这一
     '板上多一笔之后：复用 reader 的结果 = 新 reader 的结果'
   )
 
-  /* ③ 固定块改了（groups 换新引用）→ 固定块必须重新生效（就是那条严重 bug 的形状）。
-     用 `moved` 那块板：卡片已经移开，线的起点落在**墨迹块**里，所以固定它之后那一头
-     应该变成「固定的块」。（在没移开的板上，起点在卡片里 —— 卡片优先，读出来是 ka，
+  /* ③ 板框改了（frames 换新引用）→ 板框必须重新生效（就是那条严重 bug 的形状）。
+     用 `moved` 那块板：卡片已经移开，线的起点落在**墨迹块**里，所以框住它之后那一头
+     应该变成你的板框。（在没移开的板上，起点在卡片里 —— 卡片优先，读出来是 ka，
      那是**对**的，第一版断言在这里写错了。） */
-  const fixed = { ...moved, groups: [{ id: 'gX', ids: ['0_0', '0_1', '0_2'] }] }
-  const withFixed = reused.read(fixed)
-  eq(JSON.stringify(withFixed), JSON.stringify(fresh().read(fixed)), '改了固定块之后：复用 reader = 新 reader')
-  eq(withFixed[0] && withFixed[0].a, 'grp:gX', '而且那一头确实是「固定的块」（没有因为复用缓存而失效）')
+  const fixedB = { ...moved, frames: [{ id: 'gX', ids: ['0_0', '0_1', '0_2'], cards: [] }] }
+  const withFixed = reused.read(fixedB)
+  eq(JSON.stringify(withFixed), JSON.stringify(fresh().read(fixedB)), '改了板框之后：复用 reader = 新 reader')
+  eq(withFixed[0] && withFixed[0].a, 'frm:gX', '而且那一头确实是你的板框（没有因为复用缓存而失效）')
 
   /* ④ 两个 reader 互不干扰 */
   const other = createLinkReader()
@@ -1710,7 +1815,7 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
   {
     const b = mkConnected()
     const r = readSelection(b, null, reader.read(b))
-    eq([r.count, r.empty, r.strokes.length, r.box, r.link, r.noLink, r.group], [0, true, 0, null, null, false, null], '没框东西 → 全空（empty=true）')
+    eq([r.count, r.empty, r.strokes.length, r.box, r.link, r.noLink, r.frame], [0, true, 0, null, null, false, null], '没框东西 → 全空（empty=true）')
   }
 
   /* ② 框住一笔普通墨迹：有 strokes 和 box，但"不是一条线、不是一块、没有否决" */
@@ -1718,7 +1823,7 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     const b = makeBoard()
     b.strokes = [{ ...newStroke('pen', toFlat([{ x: 10, y: 10 }, { x: 40, y: 30 }])), id: 's1' }]
     const r = readSelection(b, new Set(['s1']), [])
-    eq([r.count, r.strokes.length, r.link, r.noLink, r.group], [1, 1, null, false, null], '普通一笔：有一条 box、其余都是空')
+    eq([r.count, r.strokes.length, r.link, r.noLink, r.frame], [1, 1, null, false, null], '普通一笔：有一条 box、其余都是空')
     eq(r.box, { x0: 10, y0: 10, x1: 40, y1: 30 }, 'box 就是这一笔的包围盒（世界坐标、不撑线宽）')
   }
 
@@ -1750,14 +1855,14 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     eq(readSelection(b, new Set(['no', 'lk']), []).noLink, true, '一框多笔里有一笔是 → 也给（不然点不到）')
   }
 
-  /* ⑤ 「框住的**正好是一整块**」才算那一块：少一笔都不算（不然框一大片会顺手拆了某块） */
+  /* ⑤ 「框住的**正好是某个框的笔**」才算那个框：少一笔都不算（不然框一大片会顺手拆了某个框） */
   {
     const b = makeBoard()
     b.strokes = ['a', 'b', 'c'].map((id, i) => ({ ...newStroke('pen', toFlat([{ x: i * 10, y: 0 }, { x: i * 10 + 5, y: 5 }])), id }))
-    b.groups = [{ id: 'g1', ids: ['a', 'b'] }]
-    eq(readSelection(b, new Set(['a', 'b']), []).group && readSelection(b, new Set(['a', 'b']), []).group.id, 'g1', '正好框住一块 → 拿到那一块（浮层给「拆开这块」）')
-    eq(readSelection(b, new Set(['a']), []).group, null, '只框住一块里的一笔 → 不算（少一笔都不算）')
-    eq(readSelection(b, new Set(['a', 'b', 'c']), []).group, null, '多框了一笔 → 也不算（不顺手拆）')
+    b.frames = [{ id: 'g1', title: '这一节', ids: ['a', 'b'], cards: [] }]
+    eq(readSelection(b, new Set(['a', 'b']), []).frame && readSelection(b, new Set(['a', 'b']), []).frame.id, 'g1', '正好框住一个框的笔 → 拿到那个框（浮层给「拆开这块」）')
+    eq(readSelection(b, new Set(['a']), []).frame, null, '只框住框里的一笔 → 不算（少一笔都不算）')
+    eq(readSelection(b, new Set(['a', 'b', 'c']), []).frame, null, '多框了一笔 → 也不算（不顺手拆）')
   }
 
   /* ⑥ 改词：选的和形状自动读出来的一样 → **不写字段**（一条没动过的连接是零字节） */
@@ -1826,7 +1931,7 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     eq(applyStrokeLink(b, reader.read(b), '不存在的一笔', 'cause').strokes.length, b.strokes.length, '笔不存在也不会炸（照常返回一张板）')
   }
 
-  /* ⑪ 删 / 固定 / 拆开：三步都有"只动该动的"这条底线 */
+  /* ⑪ 删 / 留下板框 / 拆开：三步都有"只动该动的"这条底线 */
   {
     const b = makeBoard()
     b.cards = [{ ...newCard('note', 0, 0, { w: 100, h: 60 }), id: 'kc' }]
@@ -1836,19 +1941,19 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     eq(del.cards, b.cards, '卡片一个没动（同一个数组引用）')
     eq(removeStrokes(b, new Set()), b, '没框东西 → 原样返回（不造新对象，免得白记一步撤销）')
 
-    /* 先固定 {s1,s2}，再把 {s2,s3} 固定成一块：s2 只能属于一个组，
-       所以它要从第一块里被拿走，而且 movedFrom 要说得出"原来在哪"（提示语照实说）。 */
-    const first = freezeSelection(b, new Set(['s1', 's2']))
-    eq(first.board.groups.length, 1, '第一次固定：多了一块')
-    eq(first.movedFrom.length, 0, '第一次固定：没有"从别的块挪过来"这回事')
-    const second = freezeSelection(first.board, new Set(['s2', 's3']))
-    eq(second.movedFrom.length, 1, '第二次固定和第一块重叠 → movedFrom 报出那一块（提示语要照实说）')
-    const gs = second.board.groups
-    eq(gs.filter((g) => g.ids.includes('s2')).length, 1, '★ 一笔只能属于一个组（s2 只在一个块里）')
-    eq(gs.map((g) => [...g.ids].sort()).sort().join('|'), ['s1', 's2,s3'].sort().join('|'), '第一块里只剩 s1，新块是 s2+s3')
-    const dissolved = dissolveGroup(second.board, gs[0].id)
-    eq(dissolved.groups.length, 1, '拆开一块 → 只剩另一块')
-    eq(dissolveGroup(b, null), b, '没有块可拆 → 原样返回')
+    /* 先留下 {s1,s2}，再把 {s2,s3} 留成一个框：s2 只能属于一个框，
+       所以它要从第一个框里被拿走，而且 movedFrom 要说得出"原来在哪"（提示语照实说）。 */
+    const first = freezeFrameSelection(b, new Set(['s1', 's2']))
+    eq(first.board.frames.length, 1, '第一次留下：多了一个框')
+    eq(first.movedFrom.length, 0, '第一次留下：没有"从别的框挪过来"这回事')
+    const second = freezeFrameSelection(first.board, new Set(['s2', 's3']))
+    eq(second.movedFrom.length, 1, '第二个框和第一个重叠 → movedFrom 报出那个框（提示语要照实说）')
+    const gs = second.board.frames
+    eq(gs.filter((g) => g.ids.includes('s2')).length, 1, '★ 一笔只能属于一个框（s2 只在一个框里）')
+    eq(gs.map((g) => [...g.ids].sort()).sort().join('|'), ['s1', 's2,s3'].sort().join('|'), '第一个框里只剩 s1，新框是 s2+s3')
+    const dissolved = dissolveFrame(second.board, gs[0].id)
+    eq(dissolved.frames.length, 1, '拆开一个框 → 只剩另一个')
+    eq(dissolveFrame(b, null).frames.length, 0, '没有框可拆 → 原样返回')
   }
 }
 
@@ -2212,6 +2317,134 @@ console.log('\n[6p] 「条件就是它」（`cond: card:/ink:`）：位置读不
     eq(parseCond('yes'), null, '认不出的值 parseCond 给 null（读的时候当没说过）')
     if (!/"cond"/.test(serializeBoardDocument(dirty2))) ok('认不出的值也不会被写回文件')
     else bad('认不出的值被写回去了')
+  }
+}
+
+// ═════════════════════ 6q. 宣告的连接 ═════════════════════
+console.log('\n[6q] 宣告的连接（`links`）：两端 + 一个词，屏幕上那条线是应用画的')
+{
+  /* 见 ADR-0001：连接不再从笔迹形状/位置里猜，而是你**宣告**出来的。
+     这一节钉三件事：
+       · 存法（有序端点对、死端点不留尸体、自己连自己不算、同一个对只留一条）；
+       · 读法（两族合一：画出来的 + 宣告的，形状一样、`declared` 区分）；
+       · 几何（两端贴在**框/卡的边**上，框一动线跟着动 —— 这就是"连接两个板块"）。 */
+  const mkCards = () => {
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 200, h: 100 }), x: 0, y: 0, id: 'ka' },
+      { ...newCard('note', 0, 0, { w: 200, h: 100 }), x: 600, y: 0, id: 'kb' },
+    ]
+    return b
+  }
+
+  /* ① 存法 */
+  {
+    const b = declareLink(mkCards(), 'ka', 'kb', 'cause')
+    eq(b.links.length, 1, '连上两端 → 多了一条记录')
+    eq(b.links[0], { from: 'ka', to: 'kb', kind: 'cause' }, '记录就是两端 + 一个词（没有 id、没有坐标）')
+    eq(linkId('ka', 'kb'), 'ka|kb', '身份 = 有序端点对')
+    eq(declareLink(b, 'ka', 'kb', 'derive'), b, '同一个有序对再连一次 → 原样返回（先有的那条赢）')
+    eq(declareLink(b, 'ka', 'ka').links.length, 1, '自己连自己不算')
+    eq(declareLink(b, 'ka', '没有这个').links.length, 1, '端点不存在 → 不算')
+    const rev = declareLink(b, 'kb', 'ka', 'cause')
+    eq(rev.links.length, 2, '反过来是**另一条**关系（「因果」有方向）')
+    eq(setLinkKind(b, 'ka', 'kb', 'equiv').links[0].kind, 'equiv', '换个词（点线上那颗词调的就是它）')
+    eq(setLinkKind(b, 'ka', 'kb', '不认识的词').links[0].kind, 'cause', '认不出的词 → 原样返回（不猜）')
+    eq(removeLink(b, 'ka', 'kb').links.length, 0, '删掉这条连接')
+    eq(removeLink(b, 'ka', '没有的').links, b.links, '删一条不存在的 → 原样返回')
+    eq(linkOf(b, 'ka', 'kb').kind, 'cause', 'linkOf：问某两端之间那条')
+
+    /* 存盘：只在真有时才写；死端点不留尸体；往返一致 */
+    const text = serializeBoardDocument(b)
+    eq(JSON.parse(text).links, [{ from: 'ka', to: 'kb', kind: 'cause' }], '文件里就是这两端 + 这个词')
+    eq(parseBoardDocument(text, 'x').links, b.links, '存→读一致')
+    if (!/links/.test(serializeBoardDocument(mkCards()))) ok('没连过的板一个 links 字段都不写（不造假 diff）')
+    else bad('没连过的板里出现了 links')
+    const deadEnd = serializeBoardDocument({ ...b, cards: b.cards.filter((c) => c.id !== 'kb') })
+    if (!/"links"/.test(deadEnd)) ok('端点没了 → 那条记录不再写出去（不留尸体）')
+    else bad('端点没了还写着 links')
+    /* 手改文件写坏的值：认不出的词退回箭头工具的本意（因果），重复的丢掉 */
+    const dirty = parseBoardDocument(
+      JSON.stringify({ ...JSON.parse(text), links: [{ from: 'ka', to: 'kb', kind: '因果' }, { from: 'ka', to: 'kb', kind: 'equiv' }] }),
+      'x'
+    )
+    eq(dirty.links, [{ from: 'ka', to: 'kb', kind: 'cause' }], '认不出的词退回默认；同一个对只留一条')
+  }
+
+  /* ①b 板框也能当端点（"两个板块之间连一笔"）*/
+  {
+    const b = mkCards()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 200, y: 300 }, { x: 240, y: 306 }])), id: 'p1' },
+      { ...newStroke('pen', toFlat([{ x: 250, y: 300 }, { x: 290, y: 306 }])), id: 'p2' },
+    ]
+    b.frames = [{ id: 'f1', title: '第一节', ids: ['p1', 'p2'], cards: ['ka'] }]
+    const linked = declareLink(b, 'f1', 'kb', 'cause')
+    eq(linked.links.length, 1, '一个板框可以连一张卡')
+    eq(parseBoardDocument(serializeBoardDocument(linked), 'x').links[0].from, 'f1', '框当端点也存得住')
+    /* 框散了 → 那条记录跟着作废（不留一条指向空气的箭头） */
+    const gone = serializeBoardDocument({ ...linked, frames: [] })
+    if (!/"links"/.test(gone)) ok('板框散了 → 挂在它身上的连接一起消失')
+    else bad('板框散了那条连接还在')
+  }
+
+  /* ② 读法：两族合一（画出来的 + 宣告的），形状一样、`declared` 区分 */
+  {
+    const b = mkCards()
+    const declared = reader.read(declareLink(b, 'ka', 'kb', 'cause'))
+    eq(declared.length, 1, 'reader 读得出宣告的连接')
+    const d = declared[0]
+    eq([d.declared, d.strokeId, d.ids.length, d.manual, d.headInk], [true, null, 0, true, false], '它没有那一笔：declared=true、manual=true、尖由应用合成')
+    eq([d.a, d.b, d.aKind, d.bKind], ['ka', 'kb', 'card', 'card'], '两端和它们的种类')
+    eq([d.kind, d.dir, d.shape], ['cause', true, 'arrow'], '词从记录里来（不是读形状读出来的）')
+    eq(d.id, 'ka|kb', '身份就是有序端点对（面板/React key 都用它）')
+    /* 两族同时存在：一条画的 + 一条宣告的。
+       画的那条必须**真的从一张卡里进到另一张卡里**（两头都在卡里 = 铁定是连接，不看形状）。 */
+    const both = { ...b, strokes: [{ ...newStroke('pen', toFlat([{ x: 20, y: 50 }, { x: 780, y: 50 }])), id: 'ln' }] }
+    const all = reader.read(declareLink(both, 'ka', 'kb', 'derive'))
+    eq(all.length, 2, '画出来的那条 + 宣告的那条，两条都在')
+    eq(all.filter((l) => l.declared).length, 1, '其中只有一条是宣告的')
+    eq(all.filter((l) => !l.declared && l.strokeId === 'ln').length, 1, '另一条仍然是那一笔画出来的')
+  }
+
+  /* ③ 几何：两端贴在框/卡的**边**上（不是中心），而且框一动线跟着动 */
+  {
+    const b = declareLink(mkCards(), 'ka', 'kb', 'cause')
+    const l = reader.read(b)[0]
+    near(l.from.x, 200, 0.01, '起点贴在左边那张卡的右边上（x=200，不是中心 100）')
+    near(l.from.y, 50, 0.01, '起点在竖直方向的中间')
+    near(l.to.x, 594, 0.01, '尖停在右边那张卡的左边再让开 6px（600-6）')
+    /* 把右边那张卡挪远 → 线自己跟着变长（这就是"箭头跟着板块走"） */
+    const moved = { ...b, cards: b.cards.map((c) => (c.id === 'kb' ? { ...c, x: 900 } : c)) }
+    const l2 = reader.read(moved)[0]
+    near(l2.to.x, 894, 0.01, '卡一挪，尖跟着跑到新位置（连接是"两个板块之间"，不是一条死路径）')
+    /* 那条线带一点点弧度（LINK_BOW 5%）：控制点在中点 + 法线方向让开 5% × 两端距离 */
+    near(l.ctrl.y, 50 + (594 - 200) * 0.05, 0.01, '控制点让开 5%（"像画出来的一笔"，但仍是两点之间那条线）')
+    near(l.mid.y, 50 + (594 - 200) * 0.05 * 0.5, 0.01, '词放在**曲线的**中点上（Q(0.5)），不是两端的中点')
+    /* 尖的方向 = 末端切线（控制点 → 端点），不是两端连线 */
+    const straight = (Math.atan2(l.to.y - l.from.y, l.to.x - l.from.x) * 180) / Math.PI
+    near(Math.abs((l.angle * 180) / Math.PI - straight), 5.71, 0.05, '带弧度时尖比两端连线偏 5.7°（切线，不是连线）')
+    /* 两端互换（反向宣告）→ 尖换一头 */
+    const rev = reader.read(declareLink(mkCards(), 'kb', 'ka', 'cause'))[0]
+    eq(Math.abs((rev.angle * 180) / Math.PI) > 90, true, '反过来宣告 → 尖在另一头（朝左）')
+    eq(rev.a === 'kb' && rev.b === 'ka', true, '记录的方向也反过来了')
+    /* 端点没了（内存里的中间态）→ 这一帧不画，绝不画一条指向空气的箭头 */
+    eq(reader.read({ ...b, cards: b.cards.filter((c) => c.id !== 'kb') }).filter((x) => x.declared).length, 0, '端点没了 → 不画那条连接')
+  }
+
+  /* ④ 框选命中（"留下板框"圈到哪些东西）：笔迹碰着就算、卡片要中心落在框里 */
+  {
+    const b = mkCards()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 300, y: 300 }, { x: 320, y: 320 }])), id: 'in' },
+      { ...newStroke('pen', toFlat([{ x: 900, y: 900 }, { x: 920, y: 920 }])), id: 'out' },
+    ]
+    const got = membersInBox(b, { x0: 250, y0: 250, x1: 400, y1: 400 })
+    eq(got.ids, ['in'], '圈里的笔迹被圈到、圈外的不算')
+    eq(got.cards, [], '卡片只是碰着一条边不算（中心得落在框里）')
+    const got2 = membersInBox(b, { x0: -50, y0: -50, x1: 500, y1: 200 })
+    eq(got2.cards, ['ka'], '卡片中心在框里 → 算')
+    eq(membersInBox(b, null), { ids: [], cards: [] }, '没框 → 什么都圈不到（不是 undefined）')
   }
 }
 

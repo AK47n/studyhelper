@@ -183,6 +183,52 @@ export function strokeHitsCircle(stroke, cx, cy, radius, extra = 0) {
   return false
 }
 
+/* ═══════════ 板框的几何 ═══════════
+ *
+ * 板框（`frames`，见 board.js 的 normalizeFrames 与 ADR-0001）只存**成员 id**，
+ * 框线是**算出来的**：成员的包围盒 + 一圈内边距。所以内容一挪，框自己跟着走。
+ * ★ 这就是"为什么框不存矩形"的落地处：只有一份真相（内容），框是它的函数。
+ * 内边距给 14 世界像素：比笔宽和卡片边框都宽一点，框线才能"抱着"内容而不是压在上面
+ * （卡片自己的边框 1px、字号 15px，14 看起来是"一圈留白"而不是"贴边"）。 */
+export const FRAME_PAD = 14
+
+/* 一个板框的框线矩形（世界坐标 {x,y,w,h}）；成员一个都不在了 → null（框就不该画）。 */
+export function frameBounds(board, frame, pad = FRAME_PAD) {
+  const S = new Set((frame && frame.ids) || [])
+  const C = new Set((frame && frame.cards) || [])
+  const sb = boundsOfAll(((board && board.strokes) || []).filter((s) => S.has(s.id)), strokeBounds)
+  const cb = boundsOfAll(((board && board.cards) || []).filter((c) => C.has(c.id)), cardBounds)
+  const inner = sb && cb ? unionRect(sb, cb) : sb || cb
+  if (!inner) return null
+  return { x: inner.x - pad, y: inner.y - pad, w: inner.w + pad * 2, h: inner.h + pad * 2 }
+}
+
+/* 一笔有没有"碰到"这个矩形（世界坐标，{x0,y0,x1,y1} 的圈选框）。
+ * 判定用碰着就算 —— 只要有任意一个点落在框里，这一笔就算被圈住了。
+ * 比"整笔必须完全落在里面"符合直觉得多：手写时很少有人能一笔不越界地圈住东西，
+ * 按"完全包含"来判，用户会觉得"我明明框住了它却没选上"。
+ * （它原来住在 Board.jsx 底部；2026-09-17 搬进来，因为"留下板框"要用**同一个**判据。） */
+export function strokeHitsRect(stroke, r) {
+  for (const p of toPoints(stroke && stroke.points)) {
+    if (p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1) return true
+  }
+  return false
+}
+
+/* 框里圈到了哪些东西：笔迹（碰着就算，同 strokeHitsRect）+ 卡片（**中心**落在框里才算）。
+ * ★ 卡片为什么不按"碰着就算"：一张便签常常很大，碰着一条边就把它整个拉进一个框，
+ *   而"我圈住的是这一节"这句话就变味了；中心在框里，才是"我圈的是这张卡"。
+ *   （和"留下板框"那句话对齐：框住的东西从那一刻起属于它 —— 归属要你圈得明白。） */
+export function membersInBox(board, box) {
+  if (!box) return { ids: [], cards: [] }
+  const r = { x: box.x0, y: box.y0, w: Math.max(0, box.x1 - box.x0), h: Math.max(0, box.y1 - box.y0) }
+  const ids = ((board && board.strokes) || []).filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
+  const cards = ((board && board.cards) || [])
+    .filter((c) => pointInRect(rectCenter(cardBounds(c)), r))
+    .map((c) => c.id)
+  return { ids, cards }
+}
+
 /* 点抽稀：道格拉斯—普克。
    为什么必须在保存前跑：Surface 的笔 + getCoalescedEvents 一秒钟能给 240 个点，
    一笔签名就是几十个点。不抽稀的话，一节课的文件几兆，打开要等、Git 每次全量 diff。

@@ -16,15 +16,16 @@
  */
 
 /* 关系的词表（LINK_KINDS / LINK_NONE / isLinkKind…）搬去了 link-kinds.js；
-   连接那一族的实现搬去了 links.js；点 / 几何 / 关系搬去了 geometry.js。
+   连接那一族的实现搬去了 links.js；点 / 几何 / 关系搬去了 geometry.js；
+   「板框 / 连接」这些**动作**在 frames.js。
    board.js 只剩**数据模型**：一张板长什么样、怎么读写、卡片多大。
    这里只用得到 geometry 的一件：**toFlat**（所有入口都把点收敛成扁平数组）。
    （视图映射在 view.js —— 那个现在由 geometry.js 的 fitView 用，这边用不着了：
      读盘时的缩放归一是本地那个 clampScale。） */
-import { COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
+import { ARROW_LINK, COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
 import { toFlat } from './geometry.js'
 
-export const BOARD_VERSION = 3
+export const BOARD_VERSION = 4
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
 export const CARD_KINDS = ['formula', 'note']
 /* 新卡片的默认框。
@@ -202,6 +203,10 @@ export function newId(prefix = 'x') {
   return `${prefix}${Date.now().toString(36)}${idSeq.toString(36)}`
 }
 
+/* 板框的 id 前缀（`fr`）—— 只在这里定义一处：读盘补一个、新建一个，都得是同一个形状。
+   卡片是 `f…`（formula）/ `n…`（note）、笔迹是 `s…`，所以 `fr` 一眼能认出来是框。 */
+export const newFrameId = () => newId('fr')
+
 // ─────────────────────────── 新建 / 解析 / 序列化 ───────────────────────────
 
 export function newBoard(title = '新白板') {
@@ -218,8 +223,13 @@ export function newBoard(title = '新白板') {
     viewPinned: false,
     strokes: [],
     cards: [],
-    // 「圈起来的范围」：暂时不做，先留字段，免得以后加字段要改版本号
-    groups: [],
+    /* 板框（你框选之后亲手留下的一块，见 normalizeFrames）：成员是笔迹 + 卡片。
+       以前这里叫 `groups`（"固定成一块"）—— 那是个没长脸的版本（不可见、不能装卡片），
+       现在升成板框；老文件的 `groups` 在解析时就地升上来。 */
+    frames: [],
+    /* 连接（你宣告的那条关系，见 ADR-0001 与 normalizeLinks）：两端 + 一个词。
+       形状/位置猜出来的连接**不存**，所以这个字段里只有你亲口说过的话。 */
+    links: [],
   }
 }
 
@@ -255,19 +265,86 @@ export function newStroke(tool, points, brush = {}) {
   }
 }
 
-/* 把一组笔**固定成一块**：返回新的 `groups`（界面只负责调它）。
- * 一笔只能属于一个组（见 normalizeGroups），所以这里先把这些笔从别的组里**拿走** ——
- * 新选的这块更具体，它赢；被拿空的组直接消失（不留空壳）。
- * 为什么要放进 lib：不这么干的话，界面能造出"内存里两笔重叠、文件里只认一笔"的状态，
- * 于是**存→读→再存不一致**（下次打开分组悄悄变了）—— 模糊测试逮到过。 */
-export function freezeGroup(groups, ids) {
-  const set = new Set(ids)
+/* ═══════════ 板框：你亲手留下的一块（`frames`） ═══════════
+ *
+ * 框选之后按「▣ 留下板框」，圈住的东西从**那一刻**起属于它（笔迹和卡片都算）。
+ * 存的是**成员 id**，不是矩形 —— 框线按成员的包围盒现算（`geometry.js` 的 `frameBounds`），
+ * 所以内容一挪，框自己跟着走；成员全没了，框自己消失。
+ * ★ 为什么是成员、不是矩形：框必须是**内容的函数**。再存一份平行的 x/y/w/h 的话，
+ *   内容一动框就飘，"形成一个整体"当场变假（ADR-0001 里被否掉的候选 5）。
+ * ★ 为什么框不叫"卡片"：卡片的宽高是**按它的内容量出来的**（card-fit.js），
+ *   框的尺寸是**成员包围盒**的函数 —— 两套尺寸语义混进一个名字里会互相推（候选 6）。
+ *
+ * 三条规矩（和从前那个 `groups` 一模一样，只是换了名字、长了外延）：
+ *   ① 一个成员**最多属于一个框**（重复的、指向已经擦掉的 id 一律丢掉）；
+ *   ② 成员全被擦光的框自己消失，不留空壳；
+ *   ③ 只在真有板框时才写这个字段 —— 没框过的板一个字节都不多。
+ * 老文件里的 `groups`（"固定成一块"）在解析时**就地升成板框**（没有标题、没有卡片成员），
+ * 于是那个功能不是被删掉，而是长出了脸。
+ *
+ * 「留下板框 / 拆开 / 改标题 / 整体拖动」这些**动作**在 frames.js；
+ * 这里只管**长什么样、怎么读写**（和 normalizeGroups 当年待在同一层）。 */
+export function normalizeFrames(raw, { strokeIds, cardIds } = {}) {
+  const liveS = strokeIds instanceof Set ? strokeIds : new Set()
+  const liveC = cardIds instanceof Set ? cardIds : new Set()
   const out = []
-  for (const g of groups || []) {
-    const keep = (g.ids || []).filter((id) => !set.has(id))
-    if (keep.length) out.push({ ...g, ids: keep })
+  const usedS = new Set()
+  const usedC = new Set()
+  for (const f of Array.isArray(raw) ? raw : []) {
+    if (!f || typeof f !== 'object') continue
+    const ids = (Array.isArray(f.ids) ? f.ids : []).filter((id) => typeof id === 'string' && liveS.has(id) && !usedS.has(id))
+    const cards = (Array.isArray(f.cards) ? f.cards : []).filter((id) => typeof id === 'string' && liveC.has(id) && !usedC.has(id))
+    if (!ids.length && !cards.length) continue
+    for (const id of ids) usedS.add(id)
+    for (const id of cards) usedC.add(id)
+    out.push({
+      id: typeof f.id === 'string' && f.id ? f.id : newFrameId(),
+      /* 标题是给你自己看的（"这一节是什么"）。空标题**不写这个字段** ——
+         没起过名字的框和没框过的板一样，不该多出字节。 */
+      ...(typeof f.title === 'string' && f.title.trim() ? { title: f.title.trim() } : {}),
+      ids,
+      cards,
+    })
   }
-  out.push({ id: newId('g'), ids: [...set] })
+  return out
+}
+
+/* ═══════════ 连接：你宣告的那条关系（`links`） ═══════════
+ *
+ * 一条记录 = 两端 + 一个词（见 link-kinds.js 的 `LINK_KINDS`）。两端是**卡片或板框**的 id。
+ * ★ `from` / `to` 是**有序**的：「因果」有方向，A→B 和 B→A 是两条不同的关系。
+ * ★ 不存 id：一条记录的身份就是它的有序端点对（`linkId`），文件里少一个会撞、要维护的字段。
+ * ★ 不存几何：屏幕上那条箭头是**合成**的（两端贴着框/卡的边，中间一条规整的线 + 一个尖）——
+ *   框一动箭头跟着动，这才是"连接两个板块"。存一条手画的路径反而会把箭头钉死在原地。
+ * ★ 条件记在**这条记录**上（宣告的连接没有"那一笔"可挂）：词表和笔迹上那个 `cond` 同一套。
+ *
+ * 三条规矩：
+ *   ① 两端都得**还在板上**（卡删了、框散了 → 这条记录消失，不留尸体）；
+ *   ② 自己连自己不算；同一个有序端点对只留一条（先写的赢）；
+ *   ③ 认不出的词退回箭头工具的本意（`ARROW_LINK` = 「因果」），不猜成别的。 */
+export const linkId = (from, to) => `${from}|${to}`
+
+export function normalizeLinks(raw, { cardIds, frameIds } = {}) {
+  const liveCards = cardIds instanceof Set ? cardIds : new Set()
+  const liveFrames = frameIds instanceof Set ? frameIds : new Set()
+  const live = (id) => liveCards.has(id) || liveFrames.has(id)
+  const out = []
+  const seen = new Set()
+  for (const l of Array.isArray(raw) ? raw : []) {
+    if (!l || typeof l !== 'object') continue
+    const from = typeof l.from === 'string' ? l.from : ''
+    const to = typeof l.to === 'string' ? l.to : ''
+    if (!live(from) || !live(to) || from === to) continue
+    const key = linkId(from, to)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({
+      from,
+      to,
+      kind: isLinkKind(l.kind) ? l.kind : ARROW_LINK,
+      ...(parseCond(l.cond) ? { cond: l.cond } : {}),
+    })
+  }
   return out
 }
 
@@ -280,33 +357,6 @@ export function freezeGroup(groups, ids) {
  *   但别的入口、手改过的文件、以后的新代码都可能产生，所以出关也拦一道。） */
 export function isStrokePointsOK(flat) {
   return toFlat(flat).length >= 6 // 两个点 × (x, y, p)
-}
-
-/* ═══════════ 显式分组：「这一坨就是我说的那一块」 ═══════════
- *
- * 自动聚类（见下面"墨迹块"那一节）会把挨得近的两坨并成一块 —— 后果虽然轻
- * （"多连了一个"，绝不改你的字），但**你没地方纠正它**。这里就是那个地方：
- * 框住一块 → 固定成一块（写进 `groups`）。固定之后：
- *   ① 它**永远是独立的一块**（旁边那坨再近也不并）；
- *   ② 两块各自固定 = 把它们**拆开**（自动聚类再也不会把它们并起来）；
- *   ③ 块 id 变成 `grp:<组 id>` —— 稳定、跨重开还是同一个。
- * 存盘**只在真有固定块时才写**这个字段：没固定过的板一个字节都不多。
- *
- * 规矩：一笔**最多属于一个给组**（重复的、指向已经擦掉的笔的 id 一律丢掉；
- * 成员全被擦光的组自己消失，不留空壳——不然文件里会攒一堆尸体）。 */
-export function normalizeGroups(raw, strokeIds) {
-  const out = []
-  const used = new Set()
-  for (const g of Array.isArray(raw) ? raw : []) {
-    if (!g || typeof g !== 'object') continue
-    const ids = (Array.isArray(g.ids) ? g.ids : []).filter(
-      (id) => typeof id === 'string' && strokeIds.has(id) && !used.has(id)
-    )
-    if (!ids.length) continue
-    for (const id of ids) used.add(id)
-    out.push({ id: typeof g.id === 'string' && g.id ? g.id : newId('g'), ids })
-  }
-  return out
 }
 
 export function isBoardName(name) {
@@ -344,20 +394,39 @@ export function parseBoardDocument(text, fallbackTitle = '新白板') {
   b.viewPinned = raw.viewPinned === true
   b.strokes = (Array.isArray(raw.strokes) ? raw.strokes : []).map(normalizeStroke).filter(Boolean)
   b.cards = (Array.isArray(raw.cards) ? raw.cards : []).map(normalizeCard).filter(Boolean)
-  /* 显式分组（"这一坨就是我说的那一块"）：成员被擦掉的、重复的一律丢掉。
-     必须**在 strokes 之后**做 —— 要看得出哪些 id 还活着。 */
-  b.groups = normalizeGroups(raw.groups, new Set(b.strokes.map((s) => s.id)))
+  /* 板框（"这一坨就是我说的那一块"）：成员被擦掉的、重复的一律丢掉。
+     必须**在 strokes / cards 之后**做 —— 要看得出哪些 id 还活着。
+     ★ 老文件里的 `groups`（"固定成一块"）就地升成板框 —— 那个功能不是被删掉，是长出了脸
+       （没标题、没卡片成员）。升完只认 `frames`：一块地方只留一份真相。 */
+  b.frames = normalizeFrames(Array.isArray(raw.frames) ? raw.frames : raw.groups, {
+    strokeIds: new Set(b.strokes.map((s) => s.id)),
+    cardIds: new Set(b.cards.map((c) => c.id)),
+  })
+  /* 连接（见 ADR-0001）：两端必须**都还在板上** —— 卡删了、框散了，这条记录就作废。 */
+  b.links = normalizeLinks(raw.links, {
+    cardIds: new Set(b.cards.map((c) => c.id)),
+    frameIds: new Set(b.frames.map((f) => f.id)),
+  })
   /* 「条件就是这个」（`cond: 'card:x'` / `'ink:y'`）指的东西可能已经没了
-     （卡删了、那笔擦了）—— 那句话作废，不留尸体（和 groups 同一条规矩）。 */
+     （卡删了、那笔擦了）—— 那句话作废，不留尸体（和板框同一条规矩）。
+     笔迹上、连接记录上各有一处，用的是同一套判据。 */
   {
     const liveCards = new Set(b.cards.map((c) => c.id))
     const liveStrokes = new Set(b.strokes.map((s) => s.id))
+    const aliveCond = (v) => {
+      const spec = parseCond(v)
+      if (!spec || spec.kind === 'none') return !!spec
+      return spec.kind === 'card' ? liveCards.has(spec.id) : liveStrokes.has(spec.id)
+    }
     b.strokes = b.strokes.map((s) => {
-      const spec = parseCond(s.cond)
-      if (!spec || spec.kind === 'none') return s
-      const alive = spec.kind === 'card' ? liveCards.has(spec.id) : liveStrokes.has(spec.id)
-      if (alive) return s
+      if (!s.cond || aliveCond(s.cond)) return s
       const next = { ...s }
+      delete next.cond
+      return next
+    })
+    b.links = b.links.map((l) => {
+      if (!l.cond || aliveCond(l.cond)) return l
+      const next = { ...l }
       delete next.cond
       return next
     })
@@ -468,10 +537,10 @@ function normalizeCard(c) {
    于是 Git 每次都报一次假 diff，而你会慢慢学会忽略 diff —— 那比不备份更糟。
    宁可一个点多两个字节，也不要每天一条假改动。 */
 export function serializeBoardDocument(board) {
-  /* ★ 先算出"这次真的会写进文件的笔"：后面 groups 的"哪一笔还活着"必须看**这一批**，
+  /* ★ 先算出"这次真的会写进文件的笔"：后面板框的"哪一笔还活着"必须看**这一批**，
      不是内存里那一批 —— 两批不一样时（内存里有一笔写不出去的垃圾笔迹），
-     groups 会引用一个文件里根本没有的 id，读回来时又被 normalizeGroups 丢掉，
-     于是"存→读→再存"不再一致（模糊测试逮到的就是这一条）。 */
+     板框会引用一个文件里根本没有的 id，读回来时又被 normalizeFrames 丢掉，
+     于是"存→读→再存"不再一致（模糊测试在旧的 groups 上逮到的就是这一条）。 */
   const kept = (board.strokes || [])
     /* ★ 出关也要过"这一笔能不能进文件"那道闸（`isStrokePointsOK`）——
        写得出去、读不回来的东西一个都不留。判据和 normalizeStroke 是同一份。 */
@@ -480,7 +549,7 @@ export function serializeBoardDocument(board) {
   const strokeIds = new Set(kept.map((it) => it.s.id))
   const liveCards = new Set((board.cards || []).map((c) => c.id))
   /* 条件那一族（`'none'` / `'card:<id>'` / `'ink:<id>'`）：只有形状认得出、
-     而且指的东西**还在这一批要写出去的东西里**才写 —— 死 id 不留尸体（和 groups 同一条规矩）。 */
+     而且指的东西**还在这一批要写出去的东西里**才写 —— 死 id 不留尸体（和板框同一条规矩）。 */
   const condToWrite = (v) => {
     const spec = parseCond(v)
     if (!spec) return null
@@ -502,7 +571,7 @@ export function serializeBoardDocument(board) {
          `'none'`（"这条不算连接"）同样只在你说过时才写。 */
       ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
       /* 条件那一族同理，只在你说过时才写；**指的东西还在**才写（死 id 不留尸体 ——
-         和 groups 一样。判据必须按"这一批真会写出去的卡/笔"算，和上面那段同一个道理）。 */
+         和板框一样。判据必须按"这一批真会写出去的卡/笔"算，和上面那段同一个道理）。 */
       ...(condToWrite(s.cond) ? { cond: condToWrite(s.cond) } : {}),
       // ★ 必须过 toFlat，不能直接 Array.from 遍历。
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
@@ -546,26 +615,57 @@ export function serializeBoardDocument(board) {
          （"不固定"是绝大多数卡片的状态，写 `locked: false` 出去就是纯噪音。） */
       ...(c.locked === true ? { locked: true } : {}),
     })),
-    /* 显式分组（你框住一块说"它就是一块"，见 normalizeGroups）：
-       **只在你固定过的时候才写** —— 老文件、没固定过的板一个字节都不多。
-       写之前把"已经不在板上的笔"滤掉（这个会话里刚擦掉的那些）：文件里不留尸体。
-       为了让老文件的 diff 最小，它排在最后（新字段追加在尾部）。 */
+    /* 板框（见 normalizeFrames）：**只在真有框时才写** —— 老文件、没框过的板一个字节都不多。
+       写之前把"已经不在板上的成员"滤掉（这个会话里刚擦掉的那些）：文件里不留尸体。
+       判据必须按"这一批真会写出去的笔"算（`kept`），不是内存里那一批 —— 两边不一样时
+       框会引用一个文件里根本没有的 id，读回来又被丢掉，"存→读→再存"就不一致了
+       （模糊测试当年在 groups 上逮到的就是这一条）。
+       为了让老文件的 diff 最小，它们排在最后（新字段追加在尾部）。 */
     ...(() => {
-      const live = new Set(strokes.map((s) => s.id))
-      const taken = new Set()
-      const gs = []
-      for (const g of board.groups || []) {
-        /* ★ 顺手去重：一笔只能属于一个组（先写的那个赢）——
-           和读盘时的 normalizeGroups 同一套规矩。界面已经不会造出重叠了
-           （`freezeGroup` 会先把它从别的组里拿走），但"内存里的状态"和
-           "文件里的状态"必须是同一个 —— 不然出现重叠时，文件在读回来之后
-           会悄悄变一个样（审查挑出来的那条）。 */
-        const ids = (g.ids || []).filter((id) => live.has(id) && !taken.has(id))
-        if (!ids.length) continue
-        for (const id of ids) taken.add(id)
-        gs.push({ id: g.id, ids })
+      const liveS = new Set(strokes.map((s) => s.id))
+      const liveC = new Set((board.cards || []).map((c) => c.id))
+      const takenS = new Set()
+      const takenC = new Set()
+      const fs = []
+      for (const f of board.frames || []) {
+        /* ★ 顺手去重：一个成员只能属于一个框（先写的那个赢）—— 和读盘时的
+           normalizeFrames 同一套规矩。frames.js 的动作已经不会造出重叠了，
+           但"内存里的状态"和"文件里的状态"必须是同一个，不然读回来会悄悄变一个样。 */
+        const ids = (f.ids || []).filter((id) => liveS.has(id) && !takenS.has(id))
+        const cards = (f.cards || []).filter((id) => liveC.has(id) && !takenC.has(id))
+        if (!ids.length && !cards.length) continue
+        for (const id of ids) takenS.add(id)
+        for (const id of cards) takenC.add(id)
+        fs.push({
+          id: f.id,
+          ...(f.title ? { title: f.title } : {}),
+          ids,
+          ...(cards.length ? { cards } : {}),
+        })
       }
-      return gs.length ? { groups: gs } : {}
+      return fs.length ? { frames: fs } : {}
+    })(),
+    /* 连接（见 ADR-0001 与 normalizeLinks）：只有你宣告过才有这个字段；
+       两端**都还在这一批要写出去的东西里**才写 —— 死 id 不留尸体（和板框同一条规矩）。 */
+    ...(() => {
+      const liveCards = new Set((board.cards || []).map((c) => c.id))
+      const liveFrames = new Set((board.frames || []).map((f) => f.id))
+      const live = (id) => liveCards.has(id) || liveFrames.has(id)
+      const seen = new Set()
+      const ls = []
+      for (const l of board.links || []) {
+        if (!l || !live(l.from) || !live(l.to) || l.from === l.to) continue
+        const key = linkId(l.from, l.to)
+        if (seen.has(key)) continue
+        seen.add(key)
+        ls.push({
+          from: l.from,
+          to: l.to,
+          kind: isLinkKind(l.kind) ? l.kind : ARROW_LINK,
+          ...(condToWrite(l.cond) ? { cond: condToWrite(l.cond) } : {}),
+        })
+      }
+      return ls.length ? { links: ls } : {}
     })(),
   }
   return JSON.stringify(out, null, 1) + '\n'

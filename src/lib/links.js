@@ -15,7 +15,8 @@
  *     `findTip` 那一族纯函数 / 各阈值常量）—— 只给这个 module 自己的测试用。调用方别走。
  */
 
-import { cardBounds, pointInRect, toFlat, toPoints } from './geometry.js'
+import { cardBounds, frameBounds, pointInRect, rectCenter, toFlat, toPoints } from './geometry.js'
+import { linkId } from './board.js'
 import {
   ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isLinkKind, isNoLink, linkKind, parseCond,
 } from './link-kinds.js'
@@ -75,6 +76,20 @@ function arcLen(pts) {
   let s = 0
   for (let i = 1; i < pts.length; i++) s += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y)
   return s
+}
+
+/* 从矩形中心朝 `towards` 射出去，打在矩形边上的那一点（宣告的连接就贴在这儿）。
+   为什么要打在边上、不连中心：线要**看得出是"从这张卡到那张卡"**；
+   连中心的话那条线和卡片自己的边框重叠着穿过卡片，屏幕上脏得很（尤其卡片不透明时）。 */
+function edgePoint(box, towards) {
+  const c = rectCenter(box)
+  const dx = towards.x - c.x
+  const dy = towards.y - c.y
+  if (!dx && !dy) return c
+  const hw = box.w / 2
+  const hh = box.h / 2
+  const t = Math.min(hw / (Math.abs(dx) || 1e-9), hh / (Math.abs(dy) || 1e-9))
+  return { x: c.x + dx * t, y: c.y + dy * t }
 }
 
 /* 点列里有没有"尖"（两只臂张开得够小），返回张开角最小的那一个。
@@ -453,6 +468,17 @@ export const INK_NODE_PAD = 12       // 端点离块的墨这么近，算"落在
 export const INK_LINK_MIN_LEN = 48   // 比这短的笔不当连接
 export const INK_LINK_MID_GAP = 18   // 中段离别的墨要这么远（降到 12 会误判，实测：见 README 第 22 条）
 export const INK_NODE_MIN_SIZE = 18  // 一块墨的"最小个头"（包围盒对角线）：比这小的不算"一个东西"
+
+/* 宣告的连接那条合成线，两端离框/卡的边留多宽（世界像素）。
+   世界像素而不是屏幕像素：它和框一样是板上的东西，缩放时该跟着一起放大
+   （屏幕上看着"箭头离框总是那么一点"，放大之后才发现贴上了，那就是两套单位混了）。 */
+export const LINK_GAP = 6
+
+/* 那条线的弧度（横向偏移 = 两端距离 × 这个系数）。
+   0.05 ≈ 5%：看得出是"画出来的一笔"，但仍然是"两点之间那条线"。
+   为什么不留成纯直线：两张卡之间的箭头一多，纯直线挤在一起像电路板；
+   一点点弧度让每一条都认得出来（关系面板里那些曲线也是同一路数，见 relationCurve）。 */
+export const LINK_BOW = 0.05
 /* 「条件是位置送的」：线**中点**这么近的地方写着的字（或那张卡）就是这条关系的条件。
    64 世界像素大约是"贴着线写两三个字"的距离 —— 他本来就要写"仅当…"，
    不用再告诉应用这是谁的条件。见 linkCondition。 */
@@ -476,7 +502,7 @@ function inkKey(cx, cy) {
 /* ⚠ **internal seam**：只给这个 module 自己的测试用（`check-board` 里缓存那几条）。
    调用方请走 `createLinkReader().read(board)` —— 把索引直接递给 `buildLinks` 的那条路
    已经收掉了，它就是"内部纪律变成调用方知识"的入口。 */
-export function createInkIndex(strokes, groups = []) {
+export function createInkIndex(strokes, frames = []) {
   const grid = new Map()
   const list = []
   for (const s of strokes || []) {
@@ -502,28 +528,30 @@ export function createInkIndex(strokes, groups = []) {
        （实测：目标变成"箭头自己的两撇 + 一个小点"）。 */
     caches: new Map(),
     byId: new Map(list.map((it, i) => [it.id, i])),
-    /* 你**固定过**的那些块（见 normalizeGroups）：它们的成员从自动聚类里剔出去。
+    /* 你**留过板框**的那些块（见 frames.js）：它们的成员从自动聚类里剔出去。
        ★ 单独放一个 Map，**绝不能挂在 `owner` 上**：`owner` 是"候选线"那套缓存，
          `dropKey` 一变就会被清掉（而 `dropKey` 一开始是 undefined，
-         所以第一次 buildLinks 就会把它清光）—— 挂在那上面等于固定块从来没生效过：
-         本来连得上的连接会消失、把相隔很远的两坨固定成一块还会**凭空造出一条连接**。
+         所以第一次 buildLinks 就会把它清光）—— 挂在那上面等于板框从来没生效过：
+         本来连得上的连接会消失、把相隔很远的两坨框成一块还会**凭空造出一条连接**。
          （这条是 2026-09-16 让独立审查挑出来的；自检当时只直接问了 inkNodeAt，
            没走 buildLinks，所以漏过了 —— 补的断言必须走 buildLinks。） */
     fixed: new Map(),
     groupIdx: new Set(),
   }
-  for (const g of Array.isArray(groups) ? groups : []) {
+  for (const f of Array.isArray(frames) ? frames : []) {
     const ids = []
-    for (const id of (g && g.ids) || []) {
+    for (const id of (f && f.ids) || []) {
       const i = index.byId.get(id)
       if (i !== undefined) ids.push(i)
     }
     if (!ids.length) continue
     const node = {
       kind: 'ink',
-      id: 'grp:' + (g.id || ids.map((i) => index.list[i].id).sort()[0]),
+      id: 'frm:' + (f.id || ids.map((i) => index.list[i].id).sort()[0]),
       ids: ids.map((i) => index.list[i].id),
-      label: `固定的块（${ids.length} 笔）`,
+      /* 有标题就用你的话（"这一节是什么"），没有就说清楚它是一块板框。
+         这一行是面板上"连着谁"那一栏显示的字 —— 你自己起的名字比"固定的块（7 笔）"有用得多。 */
+      label: f.title ? String(f.title) : `板框（${ids.length} 笔）`,
       box: inkBounds(index, ids),
       fixed: true,
     }
@@ -659,9 +687,9 @@ export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exc
   const store = storeFor(index, exclude, cacheKey)
   const seeds = [...inkNear(index, p.x, p.y, pad, exclude)]
   if (!seeds.length) return null
-  /* ★ **亲手固定过的块**（`groups`）永远优先，而且不看 store：
+  /* ★ **你留过板框的那些块**（`frames`）永远优先，而且不看 store：
      它们在 `index.fixed` 里 —— 和排除集无关、`owner` 被清也不受影响
-     （"你说它是东西它就是"）。不先查这一下，固定块在 buildLinks 里就完全失效了。 */
+     （"你说它是东西它就是"）。不先查这一下，板框在 buildLinks 里就完全失效了。 */
   for (const i of seeds) {
     const f = index.fixed.get(i)
     if (f) return f
@@ -675,7 +703,7 @@ export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exc
      实测：他手写公式里有个 **2px 的小点**，旁边一条 121px 的竖笔 + 一个 V 形短笔
      于是被读成"从公式卡指向那个点的箭头" —— 一个 2px 的点没有可指的对象。
      这里返回 null = 这一头不算落在块上（那一笔就不是连接）。
-     ⚠ 你**亲手固定过**的块不走这条 —— 它在上面那个 owner 循环里就返回了
+     ⚠ 你**亲手留过板框**的块不走这条 —— 它在上面那个 owner 循环里就返回了
      （"你说它是东西它就是"）。 */
   if (Math.hypot(box.w, box.h) < INK_NODE_MIN_SIZE) return null
   const node = {
@@ -693,11 +721,11 @@ export function inkNodeAt(index, p, pad = INK_NODE_PAD, gap = INK_BLOCK_GAP, exc
   return node
 }
 
-/* 板上所有的墨迹块：你**固定过的**先出（`groups`），然后是自动聚出来的。
-   给自检和"框选固化"的界面用；不进 buildLinks 的热路径。 */
+/* 板上所有的墨迹块：你**留过板框的**先出（`frames`），然后是自动聚出来的。
+   给自检和"那一块是什么"的界面用；不进 buildLinks 的热路径。 */
 /* ⚠ **internal seam**（同上）：给自检看"板上有哪几块"的。 */
-export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, groups = [] } = {}) {
-  const index = createInkIndex(strokes, groups)
+export function inkBlocks(strokes, { gap = INK_BLOCK_GAP, frames = [] } = {}) {
+  const index = createInkIndex(strokes, frames)
   const out = []
   const fixed = new Set()
   for (const node of index.fixed.values()) {
@@ -911,18 +939,20 @@ function inkLinkShapeOK(pts, index, exclude) {
 export function createLinkReader() {
   let ink = null
   let lastStrokes = null
-  let lastGroups = null
+  let lastFrames = null
   return {
     read(board) {
       const strokes = (board && board.strokes) || []
-      const groups = (board && board.groups) || []
+      const frames = (board && board.frames) || []
       /* 引用没变 = 内容没变（板子的每次改动都会换数组）→ 索引和它那一堆缓存继续用。 */
-      if (!ink || strokes !== lastStrokes || groups !== lastGroups) {
+      if (!ink || strokes !== lastStrokes || frames !== lastFrames) {
         lastStrokes = strokes
-        lastGroups = groups
-        ink = createInkIndex(strokes, groups)
+        lastFrames = frames
+        ink = createInkIndex(strokes, frames)
       }
-      return buildLinks(board, ink)
+      /* 两族合一：你**画出来**的（位置现算，`buildLinks`）+ 你**宣告**的（`board.links`）。
+         面板、那排词、箭头渲染都只认这一种对象 —— 区别在 `declared`。 */
+      return [...buildLinks(board, ink), ...readDeclaredLinks(board, ink)]
     },
   }
 }
@@ -1183,27 +1213,8 @@ function buildLinks(board, inkInput) {
     }
     return null
   }
-  /* 你亲手指的那个条件：**卡片**直接用 id（面板自己会去 board.cards 里取名字）；
-     **某一笔**要先问索引"它属于哪一撮字"（块是现算的）；索引给不出来（太小、
-     或者那笔已经没了）就退回"这一笔自己" —— 你说过的话要算数，不能因为
-     算法觉得它太小就丢掉。at 用它自己的第一个点（浮层/连线都用不上，诊断用）。 */
-  const specCondition = (spec, mid) => {
-    if (!spec) return null
-    if (spec.kind === 'card') {
-      const known = boxes.some((b) => b.id === spec.id)
-      return known ? { kind: 'card', id: spec.id, ids: [], label: '', at: mid } : null
-    }
-    if (spec.kind === 'ink') {
-      const st = byId.get(spec.id)
-      if (!st) return null
-      const p = toPoints(st.points)[0]
-      if (!p) return null
-      const node = inkNodeAt(ink, p, INK_NODE_PAD, INK_BLOCK_GAP, null, 'mc:' + spec.id)
-      if (node) return { kind: 'ink', id: node.id, ids: node.ids.slice(), label: node.label, at: p }
-      return { kind: 'ink', id: spec.id, ids: [spec.id], label: '墨迹块（1 笔）', at: p }
-    }
-    return null
-  }
+  /* 你亲手指的那个条件：解析成面板/连线上要的形状 —— 实现是 module 级的
+     `resolveCondSpec`（宣告的连接也用它，两份实现迟早分叉）。 */
   for (const l of out) {
     /* ★ 你说过的话优先于位置：
        · `'none'`（这个条件不算）→ **别再读**（cond 留 null）；
@@ -1215,7 +1226,7 @@ function buildLinks(board, inkInput) {
     let manual = null
     if (spec && spec.kind === 'none') manual = { kind: 'none' }
     else if (spec) {
-      const resolved = specCondition(spec, l.midInk)
+      const resolved = resolveCondSpec({ spec, ink, cards: boxes, byId, mid: l.midInk, cacheKey: 'mc:' + spec.id })
       if (resolved) manual = { kind: 'spec', cond: resolved, spec }
     }
     l.condManual = !!manual
@@ -1233,6 +1244,139 @@ function buildLinks(board, inkInput) {
           { kind: l.bKind, id: l.b },
           'c:' + l.ids.join('+')
         )
+  }
+  return out
+}
+
+/* ── 「你亲手指的那个条件」的解析（笔迹版和宣告版共用这一份）──────────────
+ * 卡片直接用 id（面板自己会去 board.cards 里取名字）；某一笔要先问索引
+ * "它属于哪一撮字"（块是现算的）；索引给不出来（太小、或者那笔已经没了）就退回
+ * "这一笔自己" —— **你说过的话要算数**，不能因为算法觉得它太小就丢掉。
+ * `at` 只给诊断用（浮层和连线都用不上它）。
+ * ⚠ 从前这一份写在 `buildLinks` 第二趟里（闭包拿得到 ink/boxes/byId）。
+ *   宣告的连接（下面 `readDeclaredLinks`）也要它 —— 两处各写一份迟早分叉，所以提出来。 */
+function resolveCondSpec({ spec, ink, cards, byId, mid, cacheKey }) {
+  if (!spec) return null
+  if (spec.kind === 'card') {
+    const known = (cards || []).some((c) => c.id === spec.id)
+    return known ? { kind: 'card', id: spec.id, ids: [], label: '', at: mid } : null
+  }
+  if (spec.kind === 'ink') {
+    const st = byId.get(spec.id)
+    if (!st) return null
+    const p = toPoints(st.points)[0]
+    if (!p) return null
+    const node = ink ? inkNodeAt(ink, p, INK_NODE_PAD, INK_BLOCK_GAP, null, cacheKey || 'mc:' + spec.id) : null
+    if (node) return { kind: 'ink', id: node.id, ids: node.ids.slice(), label: node.label, at: p }
+    return { kind: 'ink', id: spec.id, ids: [spec.id], label: '墨迹块（1 笔）', at: p }
+  }
+  return null
+}
+
+/* ═══════════ 宣告的连接（`board.links`，见 ADR-0001）═══════════
+ *
+ * 这些连接**没有那一笔**：你划一笔只是"指了哪两样东西"，屏幕上那条线是**应用画的**。
+ * 所以几何全部现算：两端取**节点框的边**（不是中心）→ 一条规整的线 + 一个尖；
+ * 框一动、卡一挪，线自己跟着走 —— 这正是"连接两个板块"该有的样子
+ * （存一条手画的路径反而会把箭头钉死在原地，见 ADR-0001 的后果一节）。
+ *
+ * ★ 输出故意和"画出来的连接"**同一种形状**（面板、那排词、箭头渲染只认一种对象），
+ *   区别只在两个字段：`declared: true`、`strokeId: null`（删它 = 删那条记录，不是擦一笔）。
+ * ⚠ 条件（`rec.cond`）这里只认**你说过的**那两种说法（不算 / 就是它）。
+ *   "写在中点旁边那几个字"那条位置读法要排除所有连接的笔，那是 `buildLinks` 第二趟的事，
+ *   等箭头工具落地时再和它合流（第二刀）。
+ */
+export function readDeclaredLinks(board, ink) {
+  const cards = (board && board.cards) || []
+  const frames = (board && board.frames) || []
+  const byId = new Map(((board && board.strokes) || []).map((s) => [s.id, s]))
+  const cardById = new Map(cards.map((c) => [c.id, c]))
+  const frameById = new Map(frames.map((f) => [f.id, f]))
+  const nodeFor = (id) => {
+    const c = cardById.get(id)
+    if (c) return { kind: 'card', id, label: '', box: cardBounds(c) }
+    const f = frameById.get(id)
+    if (!f) return null
+    const box = frameBounds(board, f)
+    /* 成员全没了的框（内存里的中间态）：这一头暂时没有对象 → 这条连接这一帧不画，
+       等 pruneFrames / 存盘把它收掉。绝不画一条"指向空气"的箭头。 */
+    if (!box) return null
+    return { kind: 'frame', id, label: f.title ? String(f.title) : '板框', box }
+  }
+  const out = []
+  for (const rec of (board && board.links) || []) {
+    const na = nodeFor(rec.from)
+    const nb = nodeFor(rec.to)
+    if (!na || !nb) continue
+    const p0 = rectCenter(na.box)
+    const p1 = rectCenter(nb.box)
+    const from = edgePoint(na.box, p1)
+    const rawTo = edgePoint(nb.box, p0)
+    const u0 = unit(from, rawTo)
+    /* 尖停在框边上再让开一点点（LINK_GAP）：贴死看着像"插进卡片里"。 */
+    const to = u0 ? { x: rawTo.x - u0.x * LINK_GAP, y: rawTo.y - u0.y * LINK_GAP } : rawTo
+    const u = unit(from, to)
+    /* 那条线的控制点（二次曲线）：中点 + 法线方向让开 LINK_BOW —— 见常量上的说明。
+       尖的方向取**末端切线**（二次曲线的末端切线 = 控制点 → 端点），
+       不然弧度一大，"尖"和线就对不上了（小弧度看不出来，但那是错的）。 */
+    const dx = to.x - from.x
+    const dy = to.y - from.y
+    const ctrl = { x: (from.x + to.x) / 2 - dy * LINK_BOW, y: (from.y + to.y) / 2 + dx * LINK_BOW }
+    const tangent = unit(ctrl, to) || u
+    const kind = isLinkKind(rec.kind) ? rec.kind : ARROW_LINK
+    const meta = linkKind(kind)
+    /* 词放在**曲线的中点**上（t=0.5：Q(0.5) = ¼P₀ + ½C + ¼P₁），不是两端的中点 ——
+       带着弧度时那两个点差得开，词会浮在线的旁边。 */
+    const mid = {
+      x: from.x * 0.25 + ctrl.x * 0.5 + to.x * 0.25,
+      y: from.y * 0.25 + ctrl.y * 0.5 + to.y * 0.25,
+    }
+    const spec = parseCond(rec.cond)
+    let cond = null
+    let condSpec = null
+    let condManual = false
+    if (spec && spec.kind === 'none') condManual = true
+    else if (spec) {
+      const resolved = resolveCondSpec({ spec, ink, cards, byId, mid, cacheKey: 'dc:' + linkId(rec.from, rec.to) })
+      if (resolved) {
+        condManual = true
+        condSpec = spec
+        cond = resolved
+      }
+    }
+    out.push({
+      id: linkId(rec.from, rec.to),
+      declared: true,
+      strokeId: null,
+      ids: [],
+      a: rec.from,
+      b: rec.to,
+      aKind: na.kind,
+      bKind: nb.kind,
+      aLabel: na.label,
+      bLabel: nb.label,
+      shape: 'arrow',
+      kind,
+      auto: kind,
+      manual: true,
+      dir: meta.dir,
+      color: meta.color,
+      name: meta.name,
+      /* 尖是**应用画**的（你自己没画过）—— 所以这条永远是 false，
+         屏幕上的箭头由 BoardCanvas 的 .bd-linkline 那一层合成（见 ADR-0001）。 */
+      headInk: false,
+      headIds: [],
+      tip: meta.dir ? { x: to.x, y: to.y } : null,
+      angle: tangent ? Math.atan2(tangent.y, tangent.x) : 0,
+      mid,
+      midInk: mid,
+      from,
+      to,
+      ctrl,
+      cond,
+      condManual,
+      condSpec,
+    })
   }
   return out
 }

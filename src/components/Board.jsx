@@ -13,8 +13,9 @@ import {
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
-/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
-import { buildRelations, descendantsOf, fitView, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
+/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
+   板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
+import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'
@@ -23,10 +24,13 @@ import {
   createLinkReader, deriveChains,
 } from '../lib/links.js'
 /* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
-   改词 / 反向 / 「不算连接」/ 回头路 / 固定 / 拆开 的规矩都在那儿，纯函数、有断言。 */
+   改词 / 反向 / 「不算连接」/ 回头路 / 留下板框 的规矩都在那儿，纯函数、有断言。 */
 import {
-  applyStrokeLink, clearCond, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes, specCond, vetoCond,
+  applyStrokeLink, clearCond, clearNoLinkMarks, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
 } from '../lib/selection.js'
+/* 板框 / 连接这两个概念的**动作**（留下 / 加进来 / 改标题 / 拆开 / 整体挪 / 删掉连接）
+   在 frames.js —— 和 selection.js 一个路子：纯函数、有断言。见 ADR-0001。 */
+import { dissolveFrame, setFrameTitle, translateFrame } from '../lib/frames.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_KINDS, LINK_NONE, condCard, condInk, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
@@ -191,6 +195,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
   /* 「∈ 条件」武装着的那条连接（null = 没武装）。一次性：点完目标就收（见 armCond）。 */
   const [condArm, setCondArm] = useState(null)
+  /* 板框：正在改标题的那个（双击框上的名字）、选中的那个。
+     和卡片的 selectedId / editingId 是同一个路子，只是对象是"框"（见 ADR-0001）。 */
+  const [frameEditId, setFrameEditId] = useState(null)
+  const [selectedFrameId, setSelectedFrameId] = useState(null)
 
   const wrapRef = useRef(null)
   const sceneRef = useRef(null)
@@ -206,6 +214,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const saveTimer = useRef(null)
   const dirtyRef = useRef(false)
   const dragStartRef = useRef(null)
+  /* 框选刚结束的那个框（世界坐标）。"留下板框"要用它找卡片成员 ——
+     选中笔迹的包围盒不一样：你顺手圈进来、却没在上面写字的卡片会被漏掉（见 keepFrame）。 */
+  const lastLassoRef = useRef(null)
+  /* 板框整体拖动的起点：{ id, before }（before = 按下那一刻的板，松手时进撤销栈）。 */
+  const frameDragRef = useRef(null)
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -624,6 +637,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
            选中这个东西只在"你正在动它"的时候才该亮着。 */
       if (inkSel) setInkSel(null)
       if (selectedId) setSelectedId(null)
+      /* 板框的选中也一样：按在空白处取消。在框里写字不该把它取消 ——
+         所以这一下只有在**没落在任何框的把手/内容上**时才走到（事件先被它们接走）。 */
+      if (selectedFrameId) setSelectedFrameId(null)
 
       /* 会"擦"的两种情况：
          ① 工具条上选着橡皮；
@@ -647,7 +663,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm, selectedFrameId]
   )
   const onPointerMove = useCallback(
     (e) => {
@@ -779,6 +795,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const box = lassoRef.current.box
         lassoRef.current = null
         setLasso(null)
+        /* 记下这个框：「留下板框」要拿它找卡片成员（见 keepFrame 的说明）。 */
+        lastLassoRef.current = box
         let ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
         /* ★ 点一下那条线 = 选中它（"点线即选中"，2026-09-16 加）。
            以前改一个词得先**框住**那条线 —— 一条线本来就是一个点得中的东西，
@@ -930,9 +948,28 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           flash('不收条件了', 'ok')
           return
         }
+        /* 正在给板框改名 → Esc 先收编辑（别顺手把选中的东西也一起取消，
+           那会让你觉得"我按一下 Esc，框也没了"）。 */
+        if (frameEditId) {
+          setFrameEditId(null)
+          return
+        }
         setSelectedId(null)
         setEditingId(null)
         setInkSel(null)
+        setSelectedFrameId(null)
+        return
+      }
+      /* 选中一个板框时，Delete 把那几样东西从框里**拿出来**（框还在、内容一个字不动）——
+         它和"删内容"是两件事：想删内容得先框住内容本身。 */
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedFrameId && !inkSel && !selectedId) {
+        e.preventDefault()
+        const f = (boardRef.current.frames || []).find((x) => x.id === selectedFrameId)
+        if (f) {
+          commit((cur) => dissolveFrame(cur, f.id))
+          setSelectedFrameId(null)
+          flash('拆开了 —— 里面的东西照旧留在板上', 'ok')
+        }
         return
       }
       if (e.key === 'p' || e.key === 'P') return setTool('pen')
@@ -978,7 +1015,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke, condArm])
+  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke, condArm, frameEditId, selectedFrameId])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -1136,31 +1173,70 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     return true
   }
 
-  /* ── 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）──
-   * 自动聚类会把挨得近的两坨并成一块。后果虽然轻（"多连了一个"，绝不改你的字），
-   * 但**你得有地方纠正它** —— 这里就是：框住一块 → 固定成一块（写进 `groups`）。
-   * 两块各自固定 = 把它们**拆开**（自动聚类再也不会把它们并起来）。
-   * 只在你说过时才写这个字段：没固定过的板一个字节都不多。 */
-  function freezeInkGroup() {
-    if (!inkSel || !inkSel.size) return
-    /* `freezeSelection` 会把这几笔从**别的块**里拿走（一笔只能属于一个组），
-       并告诉你原来装着它们的那些块 —— 提示语要照实说"其中几笔原来在别处"。 */
-    const { board: next, movedFrom } = freezeSelection(boardRef.current, inkSel)
+  /* ── 板框：留下 / 拆开 / 改标题 / 整体挪（见 ADR-0001、lib/frames.js）──────────
+   * 从前这里叫"固定成一块"（`groups`）：**不可见**、只能装笔迹。现在它是**板框** ——
+   * 有框线、有标题、成员可以是笔迹和卡片，还能整体拖动。
+   * ★ 归属只在**你按「留下板框」的那一刻**判定：以后再往框里画一笔，它不会自己变成成员
+   *   （那又变回"位置猜"，而这次的整个教训就是别猜）。想加就明说（frames.js 的 addToFrame）。
+   * ★ 卡片成员靠**最后一次框选的矩形**找（卡片中心落在框里才算）——
+   *   不能用"选中笔迹的包围盒"：你顺手圈进来的那张卡会被漏掉，
+   *   而"板框里的东西形成一个整体"正是你要的那句话。 */
+  function keepFrame() {
+    const b = boardRef.current
+    const ids = inkSel ? [...inkSel] : []
+    if (!ids.length) {
+      flash('先框住要归到一块的笔迹（笔杆侧键拖一圈，或者工具条上的「⬚ 框选」）', 'warn')
+      return
+    }
+    const box = lastLassoRef.current || sel.box
+    const cards = membersInBox(b, box).cards
+    const { board: next, movedFrom } = freezeFrameSelection(b, ids, cards)
     commit(next)
+    setInkSel(null)
     flash(
       movedFrom.length
-        ? `固定成一块了（${inkSel.size} 笔）—— 其中几笔原来在别的块里，已经挪过来了`
-        : `固定成一块了（${inkSel.size} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`,
+        ? `留下板框了（${ids.length} 笔 + ${cards.length} 张卡）—— 其中几样原来在别的框里，已经挪过来了`
+        : `留下板框了（${ids.length} 笔 + ${cards.length} 张卡）—— 拖框上那个名字能整体挪，双击能起名`,
       'ok'
     )
   }
 
-  function dissolveInkGroup() {
-    if (!sel.group) return
-    const gid = sel.group.id
-    commit((cur) => dissolveGroup(cur, gid))
+  function dissolveFrameNow() {
+    if (!sel.frame) return
+    const id = sel.frame.id
+    commit((cur) => dissolveFrame(cur, id))
     setInkSel(null)
-    flash('拆开了 —— 这一块又回到"按邻近自动聚"', 'ok')
+    setSelectedFrameId((cur) => (cur === id ? null : cur))
+    flash('拆开了 —— 里面的东西照旧留在板上', 'ok')
+  }
+
+  function renameFrame(frameId, title) {
+    commit((cur) => setFrameTitle(cur, frameId, title))
+  }
+
+  /* 整体挪：挪的是**成员**（框线是成员的函数，跟着走）。
+     一次拖动 = 一步撤销 —— 中途那些帧走 commit(…, false) 不记历史，
+     松手时把"按下那一刻的板"补进撤销栈（和卡片 / 墨迹拖动同一条规矩）。 */
+  function frameDragStart(frameId) {
+    frameDragRef.current = { id: frameId, before: boardRef.current }
+    setSelectedFrameId(frameId)
+  }
+
+  function frameDrag(frameId, dxScreen, dyScreen) {
+    const k = boardRef.current.view.s || 1
+    commit((cur) => translateFrame(cur, frameId, dxScreen / k, dyScreen / k), false)
+  }
+
+  function frameDragEnd(frameId) {
+    const st = frameDragRef.current
+    frameDragRef.current = null
+    if (!st || st.id !== frameId) return
+    /* 拖了等于没拖（两个数组还是同一个引用）→ 别往撤销栈里塞一步空操作。 */
+    if (st.before.frames === boardRef.current.frames && st.before.strokes === boardRef.current.strokes) return
+    undoRef.current.push(st.before)
+    if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
+    redoRef.current = []
+    setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
   }
 
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
@@ -1307,13 +1383,37 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     window.addEventListener('pointercancel', onUp, true)
   }
 
+  /* 板框要画成什么样：`{frame, box}` 一对一对地算出来（box = 成员包围盒 + 内边距）。
+     算在这里、不写进数据 —— 框是**成员的函数**（见 frames.js 的文件头）。
+     `box` 为空（成员都没了）的框不画：屏幕上绝不出现一个"围着空气的框"，
+     它会在下一次 commit 的 pruneFrames / 存盘时被收掉。 */
+  const framesToDraw = useMemo(() => {
+    const out = []
+    for (const f of board.frames || []) {
+      const box = frameBounds(board, f)
+      if (box) out.push({ frame: f, box })
+    }
+    return out
+  }, [board])
+
   /* stageProps 里那些东西要一起传给画布：卡片层作为 children（同一个世界原点）。 */
   const stageProps = {
     sceneRef, liveRef, view: board.view, size,
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, hoverEdge, eraserAt,
     links, selLink: sel.link, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
-    inkNoLink: sel.noLink, onClearNoLink: clearNoLink, inkGroup: sel.group, onFreezeInk: freezeInkGroup, onDissolveInk: dissolveInkGroup,
+    inkNoLink: sel.noLink, onClearNoLink: clearNoLink, inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
+    /* 板框那一族（见 frames.js）：渲染要的是"框 + 框线矩形"，交互只有把手那三件事。 */
+    frames: framesToDraw,
+    frameEditId,
+    selectedFrameId,
+    onFrameSelect: setSelectedFrameId,
+    onFrameDragStart: frameDragStart,
+    onFrameDrag: frameDrag,
+    onFrameDragEnd: frameDragEnd,
+    onFrameTitle: renameFrame,
+    onFrameEdit: setFrameEditId,
+    onFrameEditClose: () => setFrameEditId(null),
     onLinkHover: (inside) => {
       linkLeftRef.current = inside
     },
@@ -1341,7 +1441,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
                （笔迹那边是 onPointerDown 拦的，见上面 ⓪）。 */
             onSelect={() => {
               if (condArm) pickCond(condArm, { cardId: c.id })
-              else setSelectedId(c.id)
+              else {
+                setSelectedId(c.id)
+                /* 选中一张卡 = 板框不再是"当前这个"（两套选中不并存，免得 Delete 说不清删谁）。 */
+                setSelectedFrameId(null)
+              }
             }}
             onStartDrag={() => {
               const c0 = boardRef.current.cards.find((x) => x.id === c.id)
@@ -1418,6 +1522,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          入口就在它旁边。`condArmId` 是正武装着的那条，用来把按钮点亮。 */
       onArmCond={armCond}
       condArmId={condArm ? condArm.strokeId : null}
+      /* 板框那一行（见 ADR-0001）：点一下 = 选中它 + 视野居到它身上。 */
+      onFrameSelect={setSelectedFrameId}
+      onFocusFrame={(id) => {
+        const f = (boardRef.current.frames || []).find((x) => x.id === id)
+        const el = wrapRef.current
+        if (!f || !el) return
+        const box = frameBounds(boardRef.current, f)
+        if (!box) return
+        setView(centerOn(boardRef.current.view, { x: box.x + box.w / 2, y: box.y + box.h / 2 }, el.clientWidth, el.clientHeight))
+      }}
       onFocus={(id) => {
         const el = wrapRef.current
         if (!el) return
@@ -1961,7 +2075,7 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
 
 // ────────────────────────────── 关系面板 ──────────────────────────────
 
-function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack, onArmCond, condArmId }) {
+function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack, onArmCond, condArmId, onFrameSelect, onFocusFrame }) {
   const byId = new Map(board.cards.map((c) => [c.id, c]))
   const label = (c) => {
     if (!c) return '(没了)'
@@ -1975,13 +2089,18 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
     return (c.text || '(空便签)').slice(0, 24).replace(/\s+/g, ' ')
   }
   const roots = board.cards.filter((c) => !relations.parentOf.has(c.id))
-  /* 连接的两端可能不是卡片，而是**墨迹块**（没成卡的字迹、手画的图，见 lib/board.js）。
-     那种端点的名字在链接对象上（aLabel/bLabel），不能去卡片表里找 —— 找不到就是"(没了)"。 */
-  const endName = (l, k) => (l[k + 'Kind'] === 'ink' ? l[k + 'Label'] || '墨迹块' : label(byId.get(l[k])))
-  /* 链里的人名：端点可能是卡片，也可能是墨迹块（名字在链接对象上）。 */
+  /* 两族连接（见 ADR-0001）：**你连的**（宣告的，`declared`）和**你画过的**（画出来的那一条线）。
+     分开列而不是混在一起：前者删它 = 删一条记录，后者删它 = 擦掉那一笔 ——
+     两句话不是一回事，混着说用户会以为"删了线关系还在"。 */
+  const declared = links.filter((l) => l.declared)
+  const drawn = links.filter((l) => !l.declared)
+  /* 连接的两端可能是卡片、**墨迹块**（没成卡的字迹、手画的图）或者**板框**。
+     后两种的名字都挂在链接对象上（aLabel/bLabel），不能去卡片表里找 —— 找不到就是"(没了)"。 */
+  const endName = (l, k) => (l[k + 'Kind'] === 'card' ? label(byId.get(l[k])) : l[k + 'Label'] || (l[k + 'Kind'] === 'frame' ? '板框' : '墨迹块'))
+  /* 链里的人名：端点可能是卡片，也可能是墨迹块 / 板框（名字在链接对象上）。 */
   const nameOf = (id, link) => {
-    if (link && id === link.a && link.aKind === 'ink') return link.aLabel || '墨迹块'
-    if (link && id === link.b && link.bKind === 'ink') return link.bLabel || '墨迹块'
+    if (link && id === link.a && link.aKind !== 'card') return link.aLabel || (link.aKind === 'frame' ? '板框' : '墨迹块')
+    if (link && id === link.b && link.bKind !== 'card') return link.bLabel || (link.bKind === 'frame' ? '板框' : '墨迹块')
     return label(byId.get(id))
   }
   const condName = (cond) => (cond.kind === 'ink' ? cond.label || '墨迹块' : label(byId.get(cond.id)))
@@ -2004,26 +2123,83 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
         ))}
       </div>
 
+      {/* ★ 板框：你亲手留下的那些整体（见 ADR-0001）。
+          面板里也给一节的理由：板框常常把**离得很远**的东西收在一起，
+          屏幕上不一定同时看得见，而"这一节跟哪几节连着"正是要对着看的东西。
+          点一行 = 选中它（屏幕上那个框亮起来）+ 视野居中到它身上。 */}
+      {(board.frames || []).length > 0 && (
+        <div className="bd-frames-list">
+          <div className="bd-rel-sub">板框（{board.frames.length} 个）</div>
+          {board.frames.map((f) => {
+            const mine = links.filter((l) => l.a === f.id || l.b === f.id)
+            const nCard = (f.cards || []).length
+            return (
+              <button
+                key={f.id}
+                className="bd-frame-row"
+                data-frame-row={f.id}
+                onClick={() => {
+                  onFrameSelect && onFrameSelect(f.id)
+                  onFocusFrame && onFocusFrame(f.id)
+                }}
+                title="点一下：选中这个框（能整体拖、能起名）；在板上拖框上的名字也行"
+              >
+                <span className="bd-frame-name">▣ {f.title || '未命名'}</span>
+                <span className="dim small">
+                  {(f.ids || []).length} 笔{nCard ? ` · ${nCard} 卡` : ''}
+                </span>
+                {mine.length > 0 && <span className="bd-frame-links">{mine.length} 条连接</span>}
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       {/* ★ 你亲手画出来的那些连接 —— 和上面的"按位置读出来的"分开列。
           为什么要单独一节：连线的两张卡常常离得很远（位置推断根本不会把它俩凑一对），
           而"我画过线"恰恰是最确定的一句话，它不该因为离得远就从面板上消失。 */}
       {links.length > 0 && (
         <div className="bd-links-list">
-          <div className="bd-rel-sub">你画过的（{links.length} 条）</div>
-          {links.map((l) => (
-            <button
-              key={l.strokeId}
-              className={'bd-link-row' + (l.dir ? ' dir' : '')}
-              onClick={() => onFocus(l.a)}
-              title={l.manual ? '你标过的：' + l.name : '按笔迹形状读出来的：' + l.name}
-            >
-              <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
-                {l.name}
-                {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
-              </span>
-              <span className="bd-er">{endName(l, 'a')}</span>
-              <span className="dim">{l.dir ? '→' : '—'}</span>
-              <span className="bd-er">{endName(l, 'b')}</span>
+          {/* 你**连**的（宣告的）：那一笔没有留在板上，屏幕上那条箭头是应用画的。 */}
+          {declared.length > 0 && (
+            <>
+              <div className="bd-rel-sub">你连的（{declared.length} 条）</div>
+              {declared.map((l) => (
+                <button
+                  key={l.id}
+                  className={'bd-link-row' + (l.dir ? ' dir' : '')}
+                  data-link-declared={l.id}
+                  onClick={() => onFocus(l.a)}
+                  title={'你连的：' + l.name + '（点线上那颗词能改词 / 删掉这条连接）'}
+                >
+                  <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
+                    {l.name}
+                    {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
+                  </span>
+                  <span className="bd-er">{endName(l, 'a')}</span>
+                  <span className="dim">{l.dir ? '→' : '—'}</span>
+                  <span className="bd-er">{endName(l, 'b')}</span>
+                </button>
+              ))}
+            </>
+          )}
+          {drawn.length > 0 && (
+            <>
+              <div className="bd-rel-sub">你画过的（{drawn.length} 条）</div>
+              {drawn.map((l) => (
+                <button
+                  key={l.strokeId}
+                  className={'bd-link-row' + (l.dir ? ' dir' : '')}
+                  onClick={() => onFocus(l.a)}
+                  title={l.manual ? '你标过的：' + l.name : '按笔迹形状读出来的：' + l.name}
+                >
+                  <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
+                    {l.name}
+                    {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
+                  </span>
+                  <span className="bd-er">{endName(l, 'a')}</span>
+                  <span className="dim">{l.dir ? '→' : '—'}</span>
+                  <span className="bd-er">{endName(l, 'b')}</span>
               {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。
                   ★ 位置两头都不灵的时候有说法：
                      · 读错了 → 那颗 ✕ 是「这个条件不算」（`cond:'none'`）；
@@ -2079,9 +2255,11 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
               )}
             </button>
           ))}
+            </>
+          )}
           <div className="dim small pad">
-            形状读出来的（直线=相关、带箭头=因果）**不写进文件**；
-            你点过词的那几条才会记住。
+            画出来的那条线：形状读出来的（直线=相关、带箭头=因果）**不写进文件**，
+            你点过词的那几条才会记住；你**连**的那些（上面一节）都写在文件里。
           </div>
         </div>
       )}

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { relationCurve } from '../lib/geometry.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_KINDS, LINK_NONE } from '../lib/link-kinds.js'
@@ -27,9 +27,12 @@ const INK_PAD = 6
 export default function BoardCanvas({
   sceneRef, liveRef, view, size, strokes, relations, cardById, cardsForInk,
   hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
-  lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk, inkGroup = null, onFreezeInk, onDissolveInk,
+  lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk, inkFrame = null, onKeepFrame, onDissolveFrame,
   links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
   inkNoLink = false, onClearNoLink,
+  /* 板框（见 ADR-0001）：`frames` 是 [{frame, box}]（box 是按成员现算的框线，世界坐标）。 */
+  frames = [], frameEditId = null, selectedFrameId = null,
+  onFrameSelect, onFrameDragStart, onFrameDrag, onFrameDragEnd, onFrameEdit, onFrameTitle, onFrameEditClose,
   children,
 }) {
   const dpr = typeof window === 'undefined' ? 1 : Math.min(2.5, window.devicePixelRatio || 1)
@@ -137,7 +140,35 @@ export default function BoardCanvas({
              （直接投给卡片，**绕过命中测试**），所以"卡片点得到"这条一直是假的绿灯。
              现在那条自检改成用真鼠标点了 —— 见 scripts/check-board-browser.js 第 [5] 节。
              记法：**沾指针的东西，只有真鼠标事件能证明它点得到。** */}
-      <div className="bd-world">{children}</div>
+      <div className="bd-world">
+        {/* ── 板框：你亲手留下的一个整体（见 ADR-0001、frames.js）──
+            ★ 它在卡片**下面**：框是"这一块区域的记号"，不该盖住里面的内容。
+              实现靠的是 DOM 顺序（同一层里先画的在下面）—— 不靠 z-index 数值，
+              免得和"卡片要压过 .bd-hit(5)"那条规矩打架（见 .bd-world 那段说明）。
+            ★ 只有顶上那颗标题小按钮收指针事件：那是这个框唯一的把手
+              （拖动 = 挪整个框、双击 = 改名）。框线本身不吃事件 ——
+              不然你在框里写字、框卡片的时候会一直被它挡着。 */}
+        <div className="bd-framelayer">
+          {frames.map((it) => (
+            <Frame
+              key={it.frame.id}
+              frame={it.frame}
+              box={it.box}
+              view={view}
+              editing={it.frame.id === frameEditId}
+              selected={it.frame.id === selectedFrameId}
+              onSelect={() => onFrameSelect?.(it.frame.id)}
+              onStartDrag={() => onFrameDragStart?.(it.frame.id)}
+              onDrag={(dx, dy) => onFrameDrag?.(it.frame.id, dx, dy)}
+              onDragEnd={() => onFrameDragEnd?.(it.frame.id)}
+              onEdit={() => onFrameEdit?.(it.frame.id)}
+              onTitle={(t) => onFrameTitle?.(it.frame.id, t)}
+              onCloseEdit={() => onFrameEditClose?.()}
+            />
+          ))}
+        </div>
+        {children}
+      </div>
 
       {/* 正在画、还没提交的那一笔 */}
       <canvas
@@ -237,22 +268,21 @@ export default function BoardCanvas({
             >
               ✕ 删除
             </button>
-            {/* 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）。
-                自动聚类会把挨得近的两坨并成一块 —— 后果虽然轻（"多连了一个"），
-                但你得有地方纠正它：框住一块 → 固定成一块（写进 groups）。
-                固定之后它永远是独立的一块；两块各自固定 = 把它们**拆开**。 */}
-            {inkGroup ? (
+            {/* ★ 框住的**正好是一个板框里的笔**时，按钮变成「拆开这个框」。
+                一个成员只能属于一个框（见 frames.js），所以"两块各自留下 = 把它们拆开"
+                这条老规矩原样成立 —— 只是现在它有脸了。 */}
+            {inkFrame ? (
               <button
                 className="bd-inkgroup"
                 data-ink-group="off"
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation()
-                  onDissolveInk?.()
+                  onDissolveFrame?.()
                 }}
-                title="拆开：把这一块恢复成「按邻近自动聚」（它就不再是固定的一块了）"
+                title="拆开这个框：里面的东西照旧留在板上（这个框不再是一个整体）"
               >
-                ⧉ 拆开这块
+                ▣ 拆开这个框
               </button>
             ) : (
               <button
@@ -261,11 +291,11 @@ export default function BoardCanvas({
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation()
-                  onFreezeInk?.()
+                  onKeepFrame?.()
                 }}
-                title="固定成一块：圈住的这些笔以后永远是独立的一块（旁边那坨再近也不并起来）"
+                title="留下板框：圈住的这些东西从这一刻起是一个整体（可以整体拖动、起个名字）"
               >
-                ⧉ 固定成一块
+                ▣ 留下板框
               </button>
             )}
             {/* ★ 框住的**正好是一条连接线**时，多给一排词。
@@ -378,6 +408,28 @@ export default function BoardCanvas({
        *   不然画一笔穿过线的时候会被它挡一下。 */}
       <div className="bd-linklayer">
         <svg className="bd-linksvg" width={size.w} height={size.h} viewBox={`0 0 ${size.w} ${size.h}`}>
+          {/* ★ 宣告的连接：**那条线是应用画的**（见 ADR-0001）。
+              你划的那一笔只是"指了哪两样东西"，屏幕上这条规整的线 + 那个尖才是关系的样子 ——
+              两端贴在框/卡的边上、位置每次现算，所以框一动它就跟着走。
+              （画出来的连接不走这儿：那条线本来就是你的墨迹，不该再被描一遍。） */}
+          {links
+            .filter((l) => l.declared)
+            .map((l) => {
+              const a = worldToScreen(l.from, view)
+              const b = worldToScreen(l.to, view)
+              const c = worldToScreen(l.ctrl || { x: (l.from.x + l.to.x) / 2, y: (l.from.y + l.to.y) / 2 }, view)
+              return (
+                <path
+                  key={'ln' + l.id}
+                  data-link-line={l.id}
+                  d={`M ${a.x} ${a.y} Q ${c.x} ${c.y} ${b.x} ${b.y}`}
+                  fill="none"
+                  stroke={l.color}
+                  strokeWidth="2.4"
+                  strokeLinecap="round"
+                />
+              )
+            })}
           {links
             .filter((l) => l.dir && !l.headInk)
             .map((l) => {
@@ -387,8 +439,10 @@ export default function BoardCanvas({
               const a2 = l.angle + Math.PI + 0.5
               return (
                 <path
-                  key={'ah' + l.strokeId}
-                  data-link-arrow={l.strokeId}
+                  key={'ah' + (l.id || l.strokeId)}
+                  /* 宣告的连接没有 `strokeId`（null）—— React 会把 null 的属性整个删掉，
+                     于是这个尖在 DOM 里就没法被选中（自检和"哪一个尖"都要它）。 */
+                  data-link-arrow={l.declared ? l.id : l.strokeId}
                   d={`M ${ax + r * Math.cos(a1)} ${ay + r * Math.sin(a1)} L ${ax} ${ay} L ${ax + r * Math.cos(a2)} ${ay + r * Math.sin(a2)}`}
                   fill="none"
                   stroke={l.color}
@@ -409,10 +463,12 @@ export default function BoardCanvas({
             const my = at.y + Math.cos(l.angle) * 16
             return (
               <button
-                key={'pill' + l.strokeId}
+                key={'pill' + (l.id || l.strokeId)}
                 className="bd-linkpill"
                 data-link-kind={l.kind}
-                data-link-stroke={l.strokeId}
+                data-link-stroke={l.strokeId || undefined}
+                /* 宣告的连接那颗词：自检和"删掉这条连接"都靠它认出来（`strokeId` 是 null）。 */
+                data-link-pill={l.declared ? l.id : undefined}
                 style={{ left: mx, top: my, color: l.color, borderColor: l.color }}
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
@@ -495,6 +551,121 @@ function LinkChips({ at, onPick, onReverse, onHover }) {
         不算连接
       </button>
       <span className="bd-linkchips-x">不点也行</span>
+    </div>
+  )
+}
+
+/* ── 一个板框（见 ADR-0001、frames.js）──
+ *
+ * 框线是**算出来的**：成员的包围盒 + 一圈内边距（geometry.js 的 `frameBounds`），
+ * 所以内容一挪、框自己跟着走。这就是"框必须是内容的函数"那句设计的落地 ——
+ * 也因此它**没有缩放手柄**（尺寸不是第二份真相）。
+ *
+ * ★ 把手只有顶上那颗标题小按钮，三件事都从它入手：
+ *     · 点一下 → 选中这个框（面板里那一行跟着亮）
+ *     · 拖它   → 整个框（连同里面的笔迹和卡片）一起挪（frames.js 的 translateFrame）
+ *     · 双击它 → 就地改标题（"这一节是什么"）
+ *   框线本身**不吃指针事件**（.bd-framelayer 的 pointer-events: none + 这里只给按钮 auto）：
+ *   不然你在框里写字、框卡片的时候会一直撞在框线上。
+ *   为什么不把标题放在框**里面**：框里是内容的地盘（你随时会往里写东西），
+ *   标题压在内容上就永远在挡路；挂在框线上方一点点，两边都清楚。 */
+function Frame({ frame, box, view, editing, selected, onSelect, onStartDrag, onDrag, onDragEnd, onEdit, onTitle, onCloseEdit }) {
+  const dragRef = useRef(null)
+  const inRef = useRef(null)
+  const [draft, setDraft] = useState('')
+  const at = worldToScreen({ x: box.x, y: box.y }, view)
+
+  useEffect(() => {
+    if (!editing) return
+    setDraft(frame.title || '')
+    const raf = requestAnimationFrame(() => {
+      const el = inRef.current
+      if (!el) return
+      el.focus()
+      el.setSelectionRange(el.value.length, el.value.length)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [editing, frame.title])
+
+  function commit() {
+    if (onTitle) onTitle(draft.trim())
+    if (onCloseEdit) onCloseEdit()
+  }
+
+  const title = (frame.title || '').trim()
+  return (
+    <div
+      className={'bd-frame' + (selected ? ' on' : '')}
+      /* dataset 是给自检看的：框线是算出来的，"这个框围着谁、多大"只有真 DOM 能证明。 */
+      data-frame-id={frame.id}
+      data-frame-title={title}
+      style={{
+        left: at.x,
+        top: at.y,
+        width: Math.max(1, box.w * view.s),
+        height: Math.max(1, box.h * view.s),
+      }}
+    >
+      {editing ? (
+        <input
+          ref={inRef}
+          className="bd-frame-in"
+          value={draft}
+          spellCheck={false}
+          placeholder="这一节是什么"
+          onPointerDown={(e) => e.stopPropagation()}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            /* 卡片那边一样的规矩：别让打字触发板上的快捷键（P/E/S… 会切工具）。 */
+            e.stopPropagation()
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              commit()
+            } else if (e.key === 'Escape') {
+              e.preventDefault()
+              if (onCloseEdit) onCloseEdit()
+            }
+          }}
+        />
+      ) : (
+        <button
+          className={'bd-frame-t' + (title ? '' : ' dim')}
+          data-frame-handle={frame.id}
+          title="拖动 = 整个框一起挪 · 双击 = 起个名字（这一节是什么）"
+          onPointerDown={(e) => {
+            e.stopPropagation()
+            if (onSelect) onSelect()
+            if (onStartDrag) onStartDrag()
+            dragRef.current = { x: e.clientX, y: e.clientY, moved: false }
+            e.currentTarget.setPointerCapture?.(e.pointerId)
+          }}
+          onPointerMove={(e) => {
+            const d = dragRef.current
+            if (!d) return
+            /* 只报**屏幕位移**，换算成世界坐标由 Board 按当前缩放做 ——
+               在这个闭包里读 view.s 会读到"按下那一刻"的缩放（卡片拖动踩过这条）。 */
+            const dx = e.clientX - d.x
+            const dy = e.clientY - d.y
+            if (Math.abs(dx) < 0.4 && Math.abs(dy) < 0.4) return
+            d.x = e.clientX
+            d.y = e.clientY
+            d.moved = true
+            if (onDrag) onDrag(dx, dy)
+          }}
+          onPointerUp={() => {
+            if (dragRef.current && onDragEnd) onDragEnd()
+            dragRef.current = null
+          }}
+          onDoubleClick={(e) => {
+            e.stopPropagation()
+            if (onEdit) onEdit()
+          }}
+        >
+          <span className="bd-frame-ico">▣</span>
+          {title || '未命名'}
+        </button>
+      )}
     </div>
   )
 }

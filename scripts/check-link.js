@@ -552,26 +552,39 @@ console.log('\n[9] 「不算连接」：自动读错了能一键改回来（点�
   else bad(`文件里还留着 link: "none"：${JSON.stringify(links9b)}`)
 }
 
-/* ═════════════════ 10. 框选固化：固定成一块 / 拆开 ═════════════════ */
-console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里记下来 → 能拆开')
+/* ═════════════════ 10. 板框：留下 / 起名 / 整体挪 / 拆开 ═════════════════ */
+console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 → 整体挪 → 拆开')
 {
-  /* 自动聚类会把挨得近的并成一块。这一步验的是"纠正它的那个口子"：
-     框住一块 → ⧉ 固定成一块 → 写进 groups；再点 ⧉ 拆开 → 那个字段消失。 */
+  /* 见 ADR-0001：板框是"你亲手留下的一个整体"（从前的"固定成一块"长出了脸）。
+     这一段走的是**真鼠标**的完整一条路，包括三件只有真 DOM 才验得了的事：
+       · 顶栏那颗名字**点得到**（elementFromPoint）——浮出来的把手被盖住是踩过的坑；
+       · 双击它就地改名、回车落盘；
+       · 拖它 = **成员整体挪**（框线是成员的函数，跟着走）。 */
+  const docBefore = await read()
+  const pointsOf = (doc, ids) =>
+    JSON.stringify(
+      (doc.strokes || [])
+        .filter((s) => ids.includes(s.id))
+        .map((s) => [s.id, s.points.slice(0, 6)])
+    )
+  const allPoints = (doc) => JSON.stringify((doc.strokes || []).map((s) => [s.id, s.points.slice(0, 6)]))
+
   await pickTool('框选')
   await s.sleep(200)
-  const st7 = await readBoard()
-  const f3 = { x: st7.a.x - 70, y: st7.a.y - 60 }
-  const t3 = { x: st7.a.x + st7.a.w + 70, y: st7.a.y + st7.a.h + 60 }
-  await s.mouse(f3.x, f3.y, { steps: 8, dx: t3.x - f3.x, dy: t3.y - f3.y })
-  const sel = await readBoard()
-  if (sel.inkBox && sel.inkActs) ok('框住了东西（虚线框和那排动作都在）')
-  else bad(`框选没选上东西（inkBox=${sel.inkBox} inkActs=${sel.inkActs}）—— 后面两条没意义`)
-  const hasFreeze = await s.eval(`!!document.querySelector('[data-ink-group="on"]')`)
-  if (hasFreeze) ok('浮层上有「⧉ 固定成一块」')
-  else bad('浮层上没有「固定成一块」那个按钮')
+  const st10 = await readBoard()
+  const f10 = { x: st10.a.x - 70, y: st10.a.y - 60 }
+  const t10 = { x: st10.a.x + st10.a.w + 70, y: st10.a.y + st10.a.h + 60 }
+  await s.mouse(f10.x, f10.y, { steps: 8, dx: t10.x - f10.x, dy: t10.y - f10.y })
+  const sel10 = await readBoard()
+  if (sel10.inkBox && sel10.inkActs) ok('框住了东西（虚线框和那排动作都在）')
+  else bad(`框选没选上东西（inkBox=${sel10.inkBox} inkActs=${sel10.inkActs}）—— 后面几条没意义`)
+
+  const hasKeep = await s.eval(`!!document.querySelector('[data-ink-group="on"]')`)
+  if (hasKeep) ok('浮层上有「▣ 留下板框」')
+  else bad('浮层上没有「留下板框」那个按钮')
   /* ★ 不能只看"在不在 DOM 里"：浮出来的按钮被别的层盖住、或者跑到画布外面，
      在这套界面里都是踩过的坑（README 第 13 条）。命中测试说了算。 */
-  const freezeHit = await s.eval(`(() => {
+  const keepHit = await s.eval(`(() => {
     const b = document.querySelector('[data-ink-group="on"]')
     if (!b) return 'no-btn'
     const r = b.getBoundingClientRect()
@@ -579,40 +592,102 @@ console.log('\n[10] 框选固化（`groups`）：固定成一块 → 文件里�
     if (!el) return '(无)'
     return el === b || b.contains(el) ? 'self' : (el.className && typeof el.className === 'string' ? el.className : el.tagName)
   })()`)
-  if (freezeHit === 'self') ok('那颗按钮**真的点得到**（中心命中的是它自己）')
-  else bad(`「固定成一块」中心命中的是「${freezeHit}」—— 用户点不到`)
+  if (keepHit === 'self') ok('那颗按钮**真的点得到**（中心命中的是它自己）')
+  else bad(`「留下板框」中心命中的是「${keepHit}」—— 用户点不到`)
 
-  const clicked = await s.eval(`(() => {
-    const b = document.querySelector('[data-ink-group="on"]')
-    if (!b) return 'no-btn'
-    b.click()
-    return 'ok'
-  })()`)
-  if (clicked === 'ok') ok('点了「固定成一块」')
-  else bad(`点不到那个按钮（${clicked}）`)
+  await s.eval(`(() => { const b = document.querySelector('[data-ink-group="on"]'); if (b) b.click() })()`)
   await sleep(1200)
-  const doc = await read()
-  if (Array.isArray(doc.groups) && doc.groups.length === 1 && doc.groups[0].ids.length >= 2) {
-    ok(`文件里写下了 1 块（${doc.groups[0].ids.length} 笔）`)
-  } else {
-    bad(`文件里的 groups 不对：${JSON.stringify(doc.groups)}`)
-  }
-  const flip = await s.eval(`!!document.querySelector('[data-ink-group="off"]')`)
-  if (flip) ok('按钮换成了「⧉ 拆开这块」（说明它认得出这是固定块）')
-  else bad('固定之后按钮没换成「拆开」')
+  const doc1 = await read()
+  const fr = Array.isArray(doc1.frames) ? doc1.frames[0] : null
+  if (fr && fr.ids.length >= 2) ok(`文件里写下了 1 个板框（${fr.ids.length} 笔）`)
+  else bad(`文件里的 frames 不对：${JSON.stringify(doc1.frames)}`)
+  const memberIds = fr ? fr.ids : []
+  const ptsBefore = pointsOf(docBefore, memberIds)
 
-  const undone = await s.eval(`(() => {
-    const b = document.querySelector('[data-ink-group="off"]')
-    if (!b) return 'no-btn'
-    b.click()
-    return 'ok'
+  /* 屏幕上出现框 + 那颗名字（它是唯一的把手） */
+  const chip = await s.eval(`(() => {
+    const t = document.querySelector('.bd-frame-t')
+    if (!t) return null
+    const r = t.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: t.textContent.trim(), dim: t.classList.contains('dim') }
   })()`)
-  if (undone === 'ok') ok('点了「拆开这块」')
-  else bad(`点不到「拆开」（${undone}）`)
+  if (chip) ok(`屏幕上出现板框的名字：${JSON.stringify(chip.text)}（还没起名时是灰的）`)
+  else bad('屏幕上没有出现板框的名字（.bd-frame-t）')
+  /* 框线要真的围着成员：量一下框的屏幕矩形，成员笔迹都在里面 */
+  const around = await s.eval(`(() => {
+    const f = document.querySelector('.bd-frame')
+    if (!f) return null
+    const r = f.getBoundingClientRect()
+    return { w: Math.round(r.width), h: Math.round(r.height) }
+  })()`)
+  if (around && around.w > 40 && around.h > 20) ok(`框线画出来了（${around.w}×${around.h} 屏幕像素）`)
+  else bad(`框线看着不对：${JSON.stringify(around)}`)
+
+  /* 双击把手 → 就地改名 → 回车落盘 */
+  await s.doubleClick(chip.x, chip.y)
+  const editing = await s.eval(`!!document.querySelector('.bd-frame-in')`)
+  if (editing) ok('双击那颗名字 → 就地出现输入框')
+  else bad('双击板框的名字没有出现输入框')
+  await s.eval(`(() => {
+    const el = document.querySelector('.bd-frame-in')
+    if (!el) return false
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+    setter.call(el, '这一节')
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+    return true
+  })()`)
+  await s.key('Enter', 'Enter', 13)
   await sleep(1200)
   const doc2 = await read()
-  if (!doc2.groups || doc2.groups.length === 0) ok('拆开之后文件里那个字段也没了（不留空壳）')
-  else bad(`拆开之后 groups 还在：${JSON.stringify(doc2.groups)}`)
+  if (doc2.frames && doc2.frames[0] && doc2.frames[0].title === '这一节') ok('标题写进文件了（`title: "这一节"`）')
+  else bad(`文件里的标题不对：${JSON.stringify(doc2.frames && doc2.frames[0])}`)
+  const chip2 = await s.eval(`(() => {
+    const t = document.querySelector('.bd-frame-t')
+    if (!t) return null
+    const r = t.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: t.textContent.trim() }
+  })()`)
+  if (chip2 && chip2.text.includes('这一节')) ok('屏幕上的名字跟着变了')
+  else bad(`屏幕上的名字没变：${JSON.stringify(chip2)}`)
+
+  /* 拖它 → **成员整体挪**（框线是成员的函数，自己跟着走） */
+  await s.mouse(chip2.x, chip2.y, { steps: 8, dx: 60, dy: 40 })
+  await sleep(1200)
+  const doc3 = await read()
+  const ptsAfter = pointsOf(doc3, memberIds)
+  if (memberIds.length && ptsAfter !== ptsBefore) ok('拖那颗名字：框里的笔迹整体挪了')
+  else bad('拖了板框，成员一个都没动')
+  const others = (doc3.strokes || []).filter((s) => !memberIds.includes(s.id))
+  const othersBefore = (docBefore.strokes || []).filter((s) => !memberIds.includes(s.id))
+  if (JSON.stringify(others.map((s) => s.id)) === JSON.stringify(othersBefore.map((s) => s.id)) && allPoints(doc3).length > 0) {
+    ok('框外面的笔一笔都没动（只挪这个框里的东西）')
+  } else {
+    bad('拖板框把框外面的东西也动了（或者笔少了）')
+  }
+  /* 一次拖动 = 一步撤销 */
+  await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
+  await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
+  await sleep(900)
+  const doc4 = await read()
+  if (pointsOf(doc4, memberIds) === ptsBefore) ok('Ctrl+Z 一步就把整次拖动退回去了（一次拖动 = 一步撤销）')
+  else bad('Ctrl+Z 之后位置没回到拖动前')
+
+  /* 点那颗名字选中 → Delete 拆开（内容一个字都不动） */
+  await s.mouse(chip2.x, chip2.y, { steps: 0 })
+  await s.sleep(200)
+  const selected = await s.eval(`!!document.querySelector('.bd-frame.on')`)
+  if (selected) ok('点一下那颗名字 → 这个框被选中了')
+  else bad('点了板框的名字，它没被选中')
+  await s.key('Delete', 'Delete', 46)
+  await sleep(1200)
+  const doc5 = await read()
+  if (!doc5.frames || doc5.frames.length === 0) ok('Delete 拆开了这个框（frames 字段消失）')
+  else bad(`拆开之后 frames 还在：${JSON.stringify(doc5.frames)}`)
+  if (allPoints(doc5) === allPoints(doc4)) ok('拆开只解散了框，内容一个字都没动')
+  else bad('拆开的时候内容被改了（不该）')
+  const noChip = await s.eval(`!document.querySelector('.bd-frame-t')`)
+  if (noChip) ok('屏幕上那个框也没了')
+  else bad('拆开之后屏幕上还挂着板框')
 }
 
 /* ═════════════════ 11. 条件从位置送 + 推导链 ═════════════════ */
@@ -951,8 +1026,80 @@ console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按
   await s.key('Escape', 'Escape', 27)
 }
 
-/* ═════════════════ 14. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[14] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 14. 宣告的连接：屏幕上那条箭头是应用画的 ═════════════════ */
+console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是应用合成的、跟着框走')
+{
+  /* 见 ADR-0001。这一节验的是**渲染那一半**（箭头工具是第二刀的事）：
+     往夹具里写一条记录（两端 = 一个板框 + 一张卡）、重开，屏幕上必须出现：
+       · 一条合成的线（`.bd-linkline`，圆角、带一点点弧度）；
+       · 一个尖（自己画的那个尖不存在，所以这次是应用画的）；
+       · 线上那颗词；
+       · 面板里"你连的"和"板框（1 个）"两节。
+     ★ 用"写进文件再重开"这条路，是因为第一刀还没有造它的界面入口 ——
+       而这一段钉的正是"文件里写了，屏幕上就该有"。
+     夹具是我们自己的（board-zz-linkcheck.md），改它不碰用户的数据。 */
+  const doc = JSON.parse(fs.readFileSync(board.path, 'utf8'))
+  const two = (doc.strokes || []).slice(0, 2).map((s) => s.id)
+  doc.frames = [{ id: 'fr1', title: '第一节', ids: two }]
+  doc.links = [{ from: 'fr1', to: 'lk-b', kind: 'cause' }]
+  fs.writeFileSync(board.path, JSON.stringify(doc, null, 1) + '\n', 'utf8')
+  await open()
+  await s.sleep(400)
+
+  const rendered = await s.eval(`(() => {
+    const line = document.querySelector('[data-link-line]')
+    /* ★ 尖要**按 id 找那一条**：板上还有别的（画出来的）连接也会画尖，
+       不加这个限定的话，"有尖"这条断言可能被别人的尖喂饱（假绿）。 */
+    const arrow = document.querySelector('[data-link-arrow="fr1|lk-b"]')
+    const pill = document.querySelector('.bd-linkpill[data-link-pill]')
+    const frame = document.querySelector('.bd-frame')
+    const row = document.querySelector('[data-link-declared]')
+    const frameRow = document.querySelector('[data-frame-row]')
+    const d = line ? line.getAttribute('d') : null
+    return {
+      hasLine: !!line,
+      curved: !!(d && d.includes('Q')),
+      hasArrow: !!arrow,
+      pill: pill ? pill.textContent.trim() : null,
+      frameTitle: frame ? frame.getAttribute('data-frame-title') : null,
+      declaredRow: row ? row.textContent.replace(/\\s+/g, ' ').trim() : null,
+      frameRow: frameRow ? frameRow.textContent.replace(/\\s+/g, ' ').trim() : null,
+    }
+  })()`)
+  if (rendered.hasLine) ok('屏幕上画出了那条合成的线（.bd-linkline）')
+  else bad('屏幕上没有那条线 —— 宣告的连接没画出来')
+  if (rendered.curved) ok('线是一点点弧（不是硬邦邦的直线段）')
+  else bad(`线的路径看着不对：${rendered.curved}`)
+  if (rendered.hasArrow) ok('尖是**应用画的**（你没有画过那一笔）')
+  else bad('没有画出箭头尖')
+  if (rendered.pill === '因果 →') ok('线上那颗词写着「因果 →」')
+  else bad(`线上那颗词是 ${JSON.stringify(rendered.pill)}`)
+  if (rendered.frameTitle === '第一节') ok('板框按成员算出了框线，名字用你起的标题')
+  else bad(`板框没画出来 / 名字不对：${JSON.stringify(rendered.frameTitle)}`)
+  if (rendered.declaredRow && rendered.declaredRow.includes('因果') && rendered.declaredRow.includes('第一节')) {
+    ok(`面板「你连的」那一行读得懂：${rendered.declaredRow}`)
+  } else {
+    bad(`面板里「你连的」那一行不对：${JSON.stringify(rendered.declaredRow)}`)
+  }
+  if (rendered.frameRow && rendered.frameRow.includes('第一节')) ok(`面板「板框」那一行：${rendered.frameRow}`)
+  else bad(`面板里没有板框那一行：${JSON.stringify(rendered.frameRow)}`)
+
+  /* 把那张卡挪走 → 线自己跟着走（"箭头跟着板块动"这条只有真渲染才看得出来） */
+  const before = await s.eval(`document.querySelector('[data-link-line]').getAttribute('d')`)
+  const cardBox = await s.eval(`(() => {
+    const el = document.querySelector('.bd-card[data-card-id="lk-b"]')
+    const r = el.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + 8) }
+  })()`)
+  await s.mouse(cardBox.x, cardBox.y, { steps: 8, dx: 0, dy: -70 })
+  await s.sleep(400)
+  const after = await s.eval(`document.querySelector('[data-link-line]').getAttribute('d')`)
+  if (before !== after) ok('把那张卡挪一下：那条线跟着变了（连接挂在两端上，不是一条死路径）')
+  else bad('挪了卡片，那条线一动不动 —— 它被钉死在画出来的那一刻了')
+}
+
+/* ═════════════════ 15. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[15] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })

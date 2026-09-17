@@ -1129,6 +1129,65 @@ kbd {
 .bd-inkgroup { background: #3a4457; }
 .bd-inkgroup:hover { background: #4a566d; }
 
+/* ---------- 板框（你亲手留下的一个整体，见 ADR-0001）----------
+   框线是**算出来的**（成员包围盒 + 内边距），所以它的宽高由 JS 算好写进 style，
+   这里只管长相：一圈圆角虚线（"这是一块范围"，不是一张卡片的边框）。
+
+   ★ 整层 pointer-events: none —— 只有顶上那颗名字收事件（那是唯一的把手）。
+     不这样的话，你在框里写字、框卡片时会一直撞在框线上。
+   ★ 它在 .bd-world 里、卡片**前面**（DOM 顺序靠前就画在下面）：
+     框是区域的记号，不该盖住里面的内容。 */
+.bd-framelayer {
+  position: absolute; left: 0; top: 0; width: 0; height: 0;
+  pointer-events: none;
+}
+.bd-frame {
+  position: absolute;
+  border: 1.5px dashed rgba(90, 106, 138, 0.55);
+  border-radius: calc(10px * var(--s));
+  background: rgba(120, 138, 176, 0.045);
+}
+.bd-frame.on { border-color: rgba(47, 111, 208, 0.75); background: rgba(47, 111, 208, 0.07); }
+
+/* 框的名字：挂在框线**上方**（translateY(-100%)），不占框里的地方 ——
+   框里是你随时要写东西的地盘，标题压在上面就永远在挡路。 */
+.bd-frame-t {
+  position: absolute; left: -2px; bottom: 100%; margin-bottom: calc(3px * var(--s));
+  pointer-events: auto; cursor: grab;
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(255, 255, 255, 0.94); color: #4a566d;
+  border: 1px solid rgba(90, 106, 138, 0.45); border-radius: 999px;
+  padding: 0 calc(7px * var(--s));
+  font-size: calc(11.5px * var(--s)); line-height: 1.7; white-space: nowrap;
+  font-weight: 500; font-family: inherit;
+}
+.bd-frame-t:hover { border-color: rgba(47, 111, 208, 0.7); color: #2f6fd0; }
+.bd-frame-t:active { cursor: grabbing; }
+.bd-frame-t.dim { color: var(--dim); font-weight: 400; }
+.bd-frame-ico { opacity: 0.75; }
+.bd-frame-in {
+  position: absolute; left: -2px; bottom: 100%; margin-bottom: calc(3px * var(--s));
+  width: max(160px, 100%);
+  background: #fff; color: var(--fg);
+  border: 1px solid rgba(47, 111, 208, 0.7); border-radius: 999px;
+  padding: 0 calc(8px * var(--s));
+  font-size: calc(11.5px * var(--s)); line-height: 1.7; font-family: inherit;
+  outline: none; pointer-events: auto;
+}
+
+/* 面板里的「板框（N 个）」那一节：一行一个框（名字 + 成员数 + 连着几条）。
+   形状和「你画过的那一条」那一族对齐（都是面板里可点的一行）。 */
+.bd-frames-list { margin-top: 8px; }
+.bd-frame-row {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  background: none; border: 0; border-left: 3px solid rgba(90, 106, 138, 0.45);
+  color: var(--fg); font: inherit; font-size: var(--fs-ui);
+  padding: 3px 6px; cursor: pointer; border-radius: 4px;
+}
+.bd-frame-row:hover { background: rgba(90, 106, 138, 0.1); }
+.bd-frame-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-frame-links { color: var(--dim); font-size: calc(var(--fs-ui) * 0.9); }
+
 /* ---------- 画出来的连接（关系）----------
    用户 2026-09-16：「更便捷的显示出两者之间的主次、因果、并列」
    「我没时间去逐步花很多时间操作这个表示关系的步骤」。
