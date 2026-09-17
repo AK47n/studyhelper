@@ -43,6 +43,9 @@ import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, screenLenT
    "算不算动过"四个判据（架构 review 候选 3）。现在只说 begin / during / end。 */
 import { createHistory } from '../lib/history.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
+/* "那颗词摆哪"（浮层锚点别跑出画布、别压到底部工具条）是一条**屏幕像素的政策**，
+   单独一个文件 —— 和上面那条映射是两件事（2026-09-17 架构 review 候选 1 的尾巴）。 */
+import { chipPlacement } from '../lib/chip-placement.js'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
  *
@@ -1362,20 +1365,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      用户就点不到了（缩放柄、美化按钮都栽过这一条，见 README 第 13 条）。 */
   function linkPickAt(midWorld) {
     const el = wrapRef.current
-    const v = boardRef.current.view
     if (!el) return { x: 0, y: 0 }
-    /* 世界点 → 屏幕点：走 view.js 那一处（从前这里是手推的 `midWorld.x * v.s + v.tx`
-       —— 同一道映射，但绕过了唯一的那个 module，见 README 第 26 条/第 39 条）。 */
-    const p = worldToScreen(midWorld, v)
-    const x = p.x
-    const y = p.y
-    /* ⚠ 下面那三个边距是**屏幕**像素：它们管的是"那颗词别跑到屏幕外 / 别压到底部工具条底下"
-       （工具条 z-index 20，见 README 第 13 条）。夹取政策还没收进 module（架构 review 候选 1
-       的尾巴：`chipPlacement`），但它和上面那条映射是两件事，别再混在一行里手推。 */
-    return {
-      x: Math.min(Math.max(x, 130), Math.max(130, el.clientWidth - 130)),
-      y: Math.min(Math.max(y, 96), Math.max(96, el.clientHeight - 60)),
-    }
+    /* 两件事，各自一个家：
+       · 世界点 → 屏幕点走 `view.js`（从前这里手推 `midWorld.x * v.s + v.tx`，见第 26/39 条）；
+       · "别跑到屏幕外 / 别压到底部工具条底下"走 `chip-placement.js` 的 `chipPlacement`
+         （那三个边距是**屏幕**像素、跟着界面走 —— 架构 review 候选 1 的尾巴，2026-09-17 收）。 */
+    return chipPlacement(worldToScreen(midWorld, boardRef.current.view), { w: el.clientWidth, h: el.clientHeight })
   }
 
   /* 刚画完一笔：如果它正好连上了两个东西，就把那排词浮出来。

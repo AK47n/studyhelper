@@ -50,6 +50,9 @@ import { MOVE_EPS, createHistory, sameWithin } from '../src/lib/history.js'
 import { readFileSync } from 'node:fs'
 import { ARROW_SNAP, CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from '../src/lib/nodes.js'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
+/* "那颗词摆哪"（浮层锚点夹进可用区域）是一条屏幕像素的政策，单开一个文件
+   （2026-09-17 收的候选 1 尾巴 `chipPlacement`）—— 见 [3]⑨。 */
+import { CHIP_MARGIN_BOTTOM, CHIP_MARGIN_TOP, CHIP_MARGIN_X, chipPlacement } from '../src/lib/chip-placement.js'
 
 /* 连接那一层只从这个入口进（module 自己的 internal seam 另说）——见 board.js 的注释。 */
 const reader = createLinkReader()
@@ -367,6 +370,37 @@ console.log('\n[3] 几何：距离 / 命中 / 视图变换')
         1e-9,
         '卡片屏幕宽：一处乘出来的和"手写三个因子"完全一致（口径搬家不许改数）'
       )
+    }
+
+    /* ⑨ "那颗词摆哪"这条**屏幕政策**（2026-09-17 收的候选 1 尾巴 `chipPlacement`）：
+          别跑出画布、别压到底部工具条底下（工具条 z-index 20，见 README 第 13 条）。
+          ★ 搬家不许改数：下面拿从前写在 `Board.jsx` 里的那两行内联公式当"旧实现"，
+          18 种情形逐一比 —— 收进 module 不是"顺手改改行为"。 */
+    {
+      const oldWay = (x, y, w, h) => ({
+        x: Math.min(Math.max(x, 130), Math.max(130, w - 130)),
+        y: Math.min(Math.max(y, 96), Math.max(96, h - 60)),
+      })
+      const area = { w: 1440, h: 700 }
+      eq(chipPlacement({ x: 700, y: 300 }, area), { x: 700, y: 300 }, '摆在中间就是原样（不该乱动）')
+      eq(chipPlacement({ x: 10, y: 10 }, area), { x: CHIP_MARGIN_X, y: CHIP_MARGIN_TOP }, '左上角出去 → 夹到下界（词不会跑出画布）')
+      eq(chipPlacement({ x: 1430, y: 690 }, area), { x: 1440 - CHIP_MARGIN_X, y: 700 - CHIP_MARGIN_BOTTOM }, '右下角出去 → 夹到上界（不压底部工具条）')
+      let same = true
+      for (const [x, y] of [[-50, -50], [0, 0], [700, 350], [2000, 2000], [130, 96], [131, 97]]) {
+        for (const a of [{ w: 1440, h: 700 }, { w: 200, h: 120 }, { w: 90, h: 40 }]) {
+          const got = chipPlacement({ x, y }, a)
+          const want = oldWay(x, y, a.w, a.h)
+          if (got.x !== want.x || got.y !== want.y) same = false
+        }
+      }
+      if (same) ok('★ 搬家不许改数：18 种情形和从前那两行内联公式**逐字一致**')
+      else bad('chipPlacement 和从前那两行算出来的不一样（搬一次就改行为 = 白搬）')
+      eq(
+        chipPlacement({ x: 0, y: 0 }, { w: 90, h: 40 }, { marginX: 10, marginTop: 5, marginBottom: 5 }),
+        { x: 10, y: 5 },
+        '三个边距可以覆盖（界面大小变了只改这一处）'
+      )
+      eq(chipPlacement({ x: 0, y: 0 }, { w: 200, h: 120 }), { x: CHIP_MARGIN_X, y: CHIP_MARGIN_TOP }, '容器装不下两边边距 → 退回下界（不是负数，从前就是这样）')
     }
   }
 }
