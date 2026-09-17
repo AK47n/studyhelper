@@ -13,7 +13,8 @@
  *   "2 个包含 + 1 个挨着 + 1 个孤岛"。我第一版就是凭感觉摆的位置，
  *   注释写着"演示挨着"，实际算出来是"重叠" —— 注释在骗自己。
  */
-import { newBoard, newCard, newStroke, toFlat } from './lib/board.js'
+import { newBoard, newCard, newStroke } from './lib/board.js'
+import { toFlat } from './lib/geometry.js'
 
 const INK = '#1b1d22'
 const BLUE = '#1c7ed6'

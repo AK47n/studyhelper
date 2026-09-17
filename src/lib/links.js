@@ -15,7 +15,7 @@
  *     `findTip` 那一族纯函数 / 各阈值常量）—— 只给这个 module 自己的测试用。调用方别走。
  */
 
-import { cardBounds, pointInRect, toFlat, toPoints } from './board.js'
+import { cardBounds, pointInRect, toFlat, toPoints } from './geometry.js'
 import {
   ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isLinkKind, isNoLink, linkKind,
 } from './link-kinds.js'
@@ -1204,3 +1204,8 @@ export function chainOfStroke(board, strokeId) {
    ② 万一哪天想手改或想让别的 AI 读，"一个开头是 { 的 .md" 比二进制好救；
    ③ 文件名前缀 board- 让列表一眼能分开白板和笔记。
    解析失败的兜底是"给一张空板"，不是抛错——打不开比丢内容更糟。 */
+
+/* `inkedEdges(board)` 删掉了（2026-09-16）。它只是 `buildLinks` 的一行**薄壳**
+ * （老接口，只要 a/b/strokeId），而 deletion test 的答案很清楚：删掉它，复杂度并没有
+ * 散到调用方去 —— 关系面板要的那份"哪两张卡之间有笔迹"直接从 `links` 派生就行
+ * （Board.jsx 早就是这么干的）。留着它只会多一个能绕过 `createLinkReader()` 的入口。 */

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import { cleanLatex, describePayload, ocrSaveConfig, ocrStatus, ocrTest, recognizeHandwriting } from '../lib/ocr.js'
-import { toFlat, toPoints } from '../lib/board.js'
+import { toFlat, toPoints } from '../lib/geometry.js'
 import { canRender, Tex } from './Tex.jsx'
 
 /* 手写公式的写字板。

@@ -8,13 +8,13 @@
  */
 import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H,
-  CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP,
-  READABLE_FIT_S, TEXT_CARD_MAX_W, TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, buildRelations,
-  cardHeightFromContent, cardWidthFromContent, clampCardScale, descendantsOf, freezeGroup, fitView,
-  fontCss, isBoardDocument, isBoardName, newBoard, newCard, newStroke, nextCardScale,
-  parseBoardDocument, pointSegDist, relationCurve, serializeBoardDocument, simplifyPoints, strokeBounds,
-  strokeHitsCircle, textCardRect, toFlat, toPoints,
+  CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, TEXT_CARD_MAX_W,
+  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, cardHeightFromContent, cardWidthFromContent, clampCardScale,
+  freezeGroup, fontCss, isBoardDocument, isBoardName, newBoard, newCard,
+  newStroke, nextCardScale, parseBoardDocument, serializeBoardDocument, textCardRect,
 } from '../src/lib/board.js'
+/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
+import { NEAR_GAP, READABLE_FIT_S, buildRelations, descendantsOf, fitView, pointSegDist, relationCurve, simplifyPoints, strokeBounds, strokeHitsCircle, toFlat, toPoints } from '../src/lib/geometry.js'
 /* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
 import {
   TIP_MAX_ANGLE, createLinkReader, classifyLinkShape, chainOfStroke, deriveChains, findTip,

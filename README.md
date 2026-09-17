@@ -1141,6 +1141,27 @@ Body:   multipart/form-data，字段名固定 file（PNG/JPEG）
     ★ 顺手把"验它要复制整个仓库"这件事也解决了：`.cache/defmode-verify`（把 `src`/`scripts`/
     `dist`/`server.js` 复制过去、`data/` 想留什么留什么），两个场景各跑一遍。
 
+31. **board.js 末尾那 300 行数学：「改一行包围盒要翻过 500 行数据模型」。**
+    2026-09-16 架构 review 的第七刀（C5，最后一条候选）。board.js 原来是"数据模型 + 几何 +
+    关系推理 + 存取"四件事挤在一个文件里：想改一行包围盒，得翻过 500 行数据模型和卡片排布；
+    反过来想看清"一张卡有哪些字段"，又会被末尾 300 行数学挡住。
+    做法：把末尾那三节（**点的读写 / 几何 / 关系**）原样搬进 `src/lib/geometry.js`
+    （347 行、20 个导出：`toPoints` / `toFlat` / 各种包围盒与命中 / `simplifyPoints` /
+    `buildRelations` / `descendantsOf` / `relationCurve` / `fitView` …），board.js 838 → 508 行。
+    ★ **依赖是单向的**：数据模型只用得上 `toFlat`（所有入口把点收敛成扁平数组），
+      几何那边一个东西都不从数据模型拿 —— 关系那两个阈值 `NEAR_GAP` / `CONTAIN_RATIO`
+      也跟着搬过去了：留在 board.js 里就会变成**环**（board.js → geometry.js → board.js）。
+      搬完 board.js 连 `view.js` 都不需要了（`fitView` 走了，读盘时的缩放归一是它自己那个
+      `clampScale`）。
+    ⚠ **搬完必须全仓扫一遍"谁 import 了一个对方已经不再导出的名字"**：`node --check`
+      查不出来（它只管语法），只有真 import 一次才炸。这次扫出**两处漏网** ——
+      `src/seed-board.js`（拿 `toFlat`）和 `scripts/check-link.js`（拿 `toPoints`）：
+      我是按"用到了才改"的清单改的 import，而这两个文件在清单外。
+      扫描脚本 `.cache/check-moved-imports.mjs`（105 个文件、312 个 import 的名字）最后是
+      **0 处悬空**；`check:board` 452 项 + 全量真浏览器自检当对手，一下就照出搬错的地方。
+    自检：几何那些函数**本来就都有断言**（[1]/[1b]/[2]/[3]/[4]/[7] 几节几乎全是它们），
+    所以这一刀不需要新断言 —— 搬家本身由那 452 项兜着。
+
 ---
 
 ## 荧光笔为什么是"一条路径一次描"
@@ -1585,7 +1606,12 @@ studyhelper/
       parse.js         笔记界面：树、字段、引用、连线
       snippets.js      笔记界面：公式条的符号表和 LaTeX 模板
       useFormulaEditing.js  笔记界面：插入 / Tab 跳空位 / [[ 补全
-      board.js         白板：数据模型 + 几何 + 关系推理 + 存取（不碰 DOM，可纯 node 测）
+      board.js         白板：**数据模型**（一张板长什么样、怎么读写、卡片多大）。
+                       点 / 几何 / 关系搬去了 geometry.js —— 这个文件 838 → 508 行
+      geometry.js      点、几何、以及「关系怎么算出来」—— 白板这一侧的**纯数学**：
+                       扁平点的读写（toPoints/toFlat）、包围盒与命中、抽稀、
+                       就近归属/包含/孤岛（buildRelations/descendantsOf/relationCurve）、
+                       装进屏幕（fitView）。**只被它依赖，不依赖数据模型**（单向）
                        还有文字卡的**字体预设**和**落点算法**（卡片落在你圈的那块左上角）
                        （2026-09-16 起"连接"那一族搬去了 links.js —— 这个文件 2100 → 860 行）
       link-kinds.js    关系的**词表**：5 个词 +「不算连接」（LINK_NONE）。单独一个文件是为了

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react'
-import { relationCurve } from '../lib/board.js'
+import { relationCurve } from '../lib/geometry.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_KINDS, LINK_NONE } from '../lib/link-kinds.js'
 import { applyViewTo, viewTransformAttr, worldRectToScreen, worldToScreen } from '../lib/view.js'

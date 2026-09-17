@@ -12,12 +12,9 @@ import {
    教训：删一个 import 之前，先确认这个标识符在同一文件里没人用；
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
-import {
-  CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH,
-  fontCss, nextCardScale, buildRelations, descendantsOf,
-  fitView, newCard, newStroke, parseBoardDocument, serializeBoardDocument,
-  simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
-} from '../lib/board.js'
+import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
+/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
+import { buildRelations, descendantsOf, fitView, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'

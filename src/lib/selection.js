@@ -32,7 +32,9 @@
  * 这些函数都是**纯的**：不动原对象、只返回新的 board（约定见 board.js 顶部）。
  */
 
-import { freezeGroup, strokesBBox } from './board.js'
+import { freezeGroup } from './board.js'
+/* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
+import { strokesBBox } from './geometry.js'
 import { autoLinkKind, chainOfStroke } from './links.js'
 import { LINK_NONE, isLinkKind } from './link-kinds.js'
 

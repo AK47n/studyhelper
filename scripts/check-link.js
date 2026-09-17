@@ -30,7 +30,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { withBoard } from './lib/board-check.js'
-import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument, toPoints } from '../src/lib/board.js'
+import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument } from '../src/lib/board.js'
+import { toPoints } from '../src/lib/geometry.js'
 
 /* ── 夹具板：两张文字卡、**一笔都没有**，而且是**上下摆**不是左右摆 ──
  * ★ 左右摆踩过：屏幕右边 ~330px 是关系面板（.bd-cpanel，覆盖在画布上面），

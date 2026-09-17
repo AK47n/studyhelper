@@ -8,7 +8,7 @@
  *
  * ⚠ 这个文件**不许 import React、不许碰 DOM**（只用传进来的 ctx）。
  */
-import { toPoints } from './board.js'
+import { toPoints } from './geometry.js'
 
 export const MIN_STEP = 0.7 // 世界坐标像素：小于这个距离的重复点不记（防手抖刷点）
 

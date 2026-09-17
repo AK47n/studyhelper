@@ -15,7 +15,7 @@
  *   这两种情况的下一步完全不同：一个去设置里填密钥，一个是网络/额度问题。
  *   混成一句"识别失败"的话，用户会去改错的东西。
  */
-import { strokeBounds, toPoints } from './board.js'
+import { strokeBounds, toPoints } from './geometry.js'
 import { drawStroke } from './ink.js'
 
 /* 发送前把笔迹放大到这个高度。为什么不用原始大小：
