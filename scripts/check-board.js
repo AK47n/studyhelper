@@ -22,6 +22,9 @@ import {
 } from '../src/lib/links.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_NONE } from '../src/lib/link-kinds.js'
+/* 卡片「按内容量尺寸」那一套规矩搬去了 card-fit.js（2026-09-16）：DOM 读数是注入的，
+   所以"提交完不能立刻再量"这类坑在这儿断言得到（见 [6l]）。 */
+import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
@@ -1524,6 +1527,153 @@ console.log('\n[6k] 连接读法（`createLinkReader`）：调用方只认这一
   /* ④ 两个 reader 互不干扰 */
   const other = createLinkReader()
   eq(other.read(b).length, reused.read(b).length, '另一个 reader 自己算自己的')
+}
+
+// ═════════════════════ 6l. 卡片量尺寸 ═════════════════════
+/* 这一节钉的是 README 第 15/16/17 条那三个坑 —— 从前它们锁在 Board.jsx 的闭包里，
+ * 自检够不着，只能靠真浏览器手工验（对手盘长期留在被 gitignore 的 .cache/refit-test.mjs）。
+ * 现在 DOM 读数 / 提交 / 帧调度都是**注入的适配器**，策略本身是纯的，于是：
+ *   · 这里（纯逻辑）：三个坑本身 —— stale 那一趟 / 两条轴都稳 / 编辑态不量 / 门槛 / 排队规矩；
+ *   · `npm run check:refit`（真浏览器）：接线对不对 —— 真的挂 DOM、真的提交、真的落盘。
+ * 两边都绿，"框贴合内容"这件事才算整体没坏。 */
+console.log('\n[6l] 卡片量尺寸（`createCardFitter`）：DOM 读数是注入的，策略是纯的')
+{
+  const mkCard = (over = {}) => ({ id: 'c1', kind: 'formula', x: 100, y: 100, w: 220, h: 90, scale: 1, ...over })
+  const mkSnap = (cur, over = {}) => ({
+    state: 'ok', card: cur, s: 1, domW: cur.w, bodyH: cur.h, padX: 0, padY: 0,
+    naturalW: cur.w, spillPx: 0, texClientW: 0, ...over,
+  })
+  /* 假的调度器：帧回调收在数组里，由这里决定什么时候跑。
+     `quiet()` 把已排上的帧丢掉，`pass()` 直接跑**一趟**（`run` 是 module 的公开入口）——
+     这样"跑了几趟、每趟看到什么"是确定的，而 frames 数组只用来断言"排了几帧"。
+     （kick 会再压一层 wrapper，所以别拿"shift 一次"当"跑一趟"。） */
+  const mkFitter = (deps = {}) => {
+    const frames = []
+    const patches = []
+    const fitter = createCardFitter({
+      commit: (id, p) => patches.push({ id, ...p }),
+      frame: (fn) => frames.push(fn),
+      later: (fn) => frames.push(fn),
+      report: () => {},
+      ...deps,
+    })
+    return { fitter, frames, patches, quiet: () => { frames.length = 0 }, pass: () => fitter.run() }
+  }
+
+  /* ① 三种"量不得"的状态：卡片没挂上 / 已经从板里没了 / 正在编辑 */
+  eq(fitPass(null).state, 'missing', '还没挂上 → missing（下一帧再来）')
+  eq(fitPass({ state: 'gone' }).state, 'gone', '卡片已经从板里没了 → gone（出队，别再找）')
+  eq(fitPass({ state: 'wait' }).state, 'wait', '正在编辑 → wait（量到的是编辑器，不是内容）')
+
+  /* ② 坑（第 17 条前半）：**量之前 DOM 的宽度必须已经等于数据里的宽度** */
+  {
+    const card = mkCard()
+    const r = fitPass(mkSnap(card, { domW: card.w - 3 }), { fitWidth: true })
+    eq(r.state, 'stale', 'DOM 宽度还没跟上数据宽度 → stale（下一帧再来）')
+    eq(r.patch, undefined, 'stale 那一趟**不许**提交（提交了就是把上一次渲染的世界钉进文件）')
+    near(r.wantW, 220, 0.01, '顺便说清"应该多宽"（诊断用：wantW 220）')
+    eq(fitPass(mkSnap(card), { fitWidth: true }).state, 'done', '宽度对得上、内容也一样 → done（不用改）')
+  }
+
+  /* ③ 坑（第 17 条后半）：**提交完不能立刻再量** —— 同一帧第二趟读到的是旧 DOM。
+     DOM 固定成"永远报 220 宽"（模拟还没重渲染），而数据里已经是 299：
+     只要它敢提交第二次，高度就会被按旧的窄宽度钉死（实测 94.4，正确值 66）。 */
+  {
+    let cur = mkCard({ w: 220, h: 90 })
+    const { fitter, patches, quiet, pass } = mkFitter({
+      sample: () => mkSnap(cur, { domW: 220, bodyH: 94, naturalW: 299 }),
+      commit: (id, p) => {
+        patches.push({ id, ...p })
+        cur = { ...cur, ...p }
+      },
+    })
+    fitter.queue('c1', { fitWidth: true })
+    quiet()
+    pass()
+    pass()
+    pass()
+    eq(patches.length, 1, '连量三趟只提交了一次（第一趟之后 DOM 没跟上 → 第二、三趟都 stale）')
+    near(patches[0].w, 299, 0.5, '第一趟按内容的自然宽提交 299')
+    near(patches[0].h, 94, 0.5, '高度也提交了（94 —— 这一趟的宽度是对的，所以 94 才是对的值）')
+    eq(fitter.size, 1, 'stale 那一趟**不把卡从队里摘掉**（下一帧还要再来）')
+  }
+
+  /* ④ 坑（第 17 条）：稳定性要**两条轴都稳**才算数。
+     宽度一直不变、高度还在收敛 —— 只比宽度的话第二趟就误判成"稳定"收工了。 */
+  {
+    let bodyH = 94
+    const { fitter, quiet, pass } = mkFitter({
+      sample: () => mkSnap(mkCard({ w: 299, h: 60 }), { bodyH, naturalW: 299 }),
+    })
+    fitter.queue('c1', { fitWidth: true })
+    quiet()
+    pass() // 第 1 趟：h 94
+    bodyH = 90
+    pass() // 第 2 趟：宽度没变、高度变了
+    eq(fitter.size, 1, '宽度不变、高度还在收敛 → 不许判"稳定"（只比宽度会在这里收工）')
+    bodyH = 80
+    pass() // 第 3 趟：还在收敛
+    eq(fitter.size, 1, '还在收敛 → 继续量')
+    pass() // 第 4 趟：两条轴都没变
+    eq(fitter.size, 0, '两条轴都稳了才收工')
+  }
+
+  /* ⑤ 门槛：1.5（自动重量）不写盘，0.6（一次性拟合）写 —— 这条治的是"每天一条假 diff" */
+  {
+    const s = mkSnap(mkCard({ w: 100, h: 50 }), { bodyH: 50.8, naturalW: 100.8 })
+    eq(fitPass(s, { fitWidth: true, tol: FIT_TOL_AUTO }).state, 'done', '自动重量：差 0.8 世界像素 → 不写盘（KaTeX 字体换入前后就差这么点）')
+    const once = fitPass(s, { fitWidth: true })
+    eq(once.state, 'commit', '一次性拟合：同一个差值 → 写（刚插进来那张要贴紧）')
+    eq(once.patch && once.patch.h, 50.8, '要写的就是量到的那个数')
+  }
+
+  /* ⑥ 内边距 + 边框必须算进去（border-box：写 width 就是连这一圈一起写） */
+  {
+    const r = fitPass(mkSnap(mkCard({ w: 260, h: 40 }), { bodyH: 63, padY: 10, naturalW: 76, padX: 18 }), { fitWidth: true })
+    near(r.patch.w, 94, 0.05, '内容 76px + 左右内边距边框 18px → 卡宽 94（不加就当场裁内容）')
+    near(r.patch.h, 73, 0.05, '内容 63px + 上下内边距边框 10px → 卡高 73')
+  }
+
+  /* ⑦ keepCenterX：写字板那条路要以中心缩宽度（不然卡片会往左跳） */
+  {
+    const c = mkCard({ x: 100, w: 220, h: 90 })
+    near(fitPass(mkSnap(c, { naturalW: 100 }), { fitWidth: true, keepCenterX: true }).patch.x, 160, 0.01, 'keepCenterX：x 补一半（100 → 160）')
+    eq(fitPass(mkSnap(c, { naturalW: 100 }), { fitWidth: true }).patch.x, undefined, '默认按左上角收：不动 x（圈选那条路钉在笔迹左上角）')
+  }
+
+  /* ⑧ 排队规矩：只排有内容的公式卡；**排队自己就开跑**；同一次里多次排队只跑一趟 */
+  {
+    const { fitter, frames } = mkFitter({ sample: () => mkSnap(mkCard()) })
+    fitter.queueFormulaRefits({
+      cards: [
+        { id: 'f1', kind: 'formula', tex: 'a=b', w: 100, h: 40 },
+        { id: 'f2', kind: 'formula', src: '', tex: '', w: 100, h: 40 },
+        { id: 'n1', kind: 'note', text: '一段话', w: 200, h: 60 },
+      ],
+    })
+    eq(fitter.size, 1, '只排有内容的公式卡（空白卡和便签都不排）')
+    eq(frames.length, 1, '排完队**自己就开跑**（"排了队不叫它"= 什么都没发生，第一版就是那样）')
+    fitter.queue('f9', { fitWidth: true })
+    eq(frames.length, 1, '同一次里的第二次排队不会又排一帧（同一帧连跑两趟正是坑 ③ 的现场）')
+  }
+
+  /* ⑨ 兜底：一直不稳也有个头；卡片没了立刻出队（不然 rAF 空转） */
+  {
+    let n = 0
+    const { fitter, pass } = mkFitter({
+      maxTries: 3,
+      sample: () => mkSnap(mkCard({ w: 299, h: 50 }), { bodyH: 50 + n++, naturalW: 299 }),
+    })
+    fitter.queue('c1', { fitWidth: true })
+    for (let i = 0; i < 5 && fitter.size; i++) pass()
+    eq(fitter.size, 0, '一直量不稳也有头：最多 maxTries 趟就放它走（不会永远下一帧再来）')
+    const gone = mkFitter({ sample: () => ({ state: 'gone' }) })
+    gone.fitter.queue('c1', {})
+    gone.quiet()
+    gone.pass()
+    eq(gone.fitter.size, 0, '卡片已经从板里没了 → 立刻出队')
+    eq(gone.frames.length, 0, '也不会再排下一帧（空转的 rAF 就是这么来的）')
+  }
 }
 
 // ═════════════════════ 7. 装进视口 ═════════════════════

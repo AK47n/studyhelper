@@ -20,6 +20,7 @@
     "check:browser": "node scripts/cdp-open.js 9222 && timeout /t 5 >nul && node scripts\\cdp-align.js && node scripts\\cdp-caretfit.js",
     "check:board": "node scripts/check-board.js",
     "check:harness": "node scripts/check-harness.js",
+    "check:refit": "node scripts/check-refit.js",
     "check:default": "node scripts/check-default-mode.js",
     "check:board-browser": "node scripts/check-board-browser.js",
     "check:paper": "node scripts/check-paper.js",

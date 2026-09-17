@@ -14,10 +14,13 @@ import {
 import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH,
-  cardHeightFromContent, cardWidthFromContent, fontCss, nextCardScale, buildRelations, descendantsOf,
+  fontCss, nextCardScale, buildRelations, descendantsOf,
   freezeGroup, fitView, newCard, newStroke, parseBoardDocument, serializeBoardDocument,
   simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../lib/board.js'
+/* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
+   card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
+import { createCardFitter } from '../lib/card-fit.js'
 /* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
 import {
   autoLinkKind, createLinkReader, deriveChains, chainOfStroke,
@@ -209,7 +212,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const saveTimer = useRef(null)
   const dirtyRef = useRef(false)
   const dragStartRef = useRef(null)
-  const pendingFitRef = useRef(new Map())
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -230,6 +232,81 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
     setDirty(true)
   }, [])
+
+  /* ── 卡片「按内容量尺寸」的接线 ────────────────────────────────────────────
+     策略（量什么 / 什么时候量得准 / 什么时候算稳定 / 门槛多少）搬去了
+     `src/lib/card-fit.js` —— 那三条踩过的坑（DOM 还没跟上上一次提交、两条轴都要稳、
+     编辑态量不得）现在在 check-board.js 的 [6l] 里断言得到，不再只能靠真浏览器手工验。
+     这里只做三件接线的事：
+       · sample：把这张卡**同一瞬间**的 DOM 读数采出来（这个 module 唯一的 DOM 依赖）；
+       · commit：把算好的 patch 写回板里（走下面这个 commit，不进撤销栈）；
+       · report：把"这一趟量到了什么"写在 data-fit 上 —— 卡片为什么是这个尺寸，
+         用眼睛看不出来，只能靠它（自检也读它）。
+     `commit` 是 useCallback([])（身份稳定），所以这个 fitter 一个组件实例只建一次，
+     排队状态也就跟着实例走。 */
+  const fitter = useMemo(
+    () =>
+      createCardFitter({
+        sample: (id, opts) => sampleCardForFit(id, opts),
+        commit: (id, patch) =>
+          commit((c) => ({ ...c, cards: c.cards.map((x) => (x.id === id ? { ...x, ...patch } : x)) }), false),
+        frame: (fn) => requestAnimationFrame(fn),
+        later: (fn, ms) => setTimeout(fn, ms),
+        report: (card, info) => {
+          const wrap = wrapRef.current
+          const el = wrap ? wrap.querySelector('[data-card-id="' + card.id + '"]') : null
+          if (el) el.dataset.fit = JSON.stringify(info)
+        },
+      }),
+    [commit]
+  )
+
+  /* 把"这张卡现在长什么样"采下来交给 card-fit.js。
+     采的都是**屏幕像素**，而且必须来自**同一瞬间**的布局：卡片的宽度和内容的高度
+     要是来自不同的渲染帧，算出来的尺寸就是错的（那正是第 17 条那个坑）。 */
+  function sampleCardForFit(id, opts = {}) {
+    const cur = boardRef.current.cards.find((c) => c.id === id)
+    if (!cur) return { state: 'gone' } // 卡片已经从板里没了
+    const wrap = wrapRef.current
+    const cardEl = wrap ? wrap.querySelector('[data-card-id="' + id + '"]') : null
+    if (!cardEl) return { state: 'missing' } // 还没挂上，下一帧再来
+    if (cardEl.classList.contains('editing')) return { state: 'wait' } // 编辑态量不得
+    const el = cardEl.querySelector('.bd-card-body')
+    if (!el) return { state: 'missing' }
+
+    /* 内边距 + 边框（屏幕像素）：这个仓库全局是 `box-sizing: border-box`，
+       卡片上写的 width/min-height **都把这一圈算在里面**，所以算尺寸时必须加上它 ——
+       不加就正好少一整圈，宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 c²）。 */
+    const cs = getComputedStyle(cardEl)
+    const padX =
+      parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
+    const padY =
+      parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth)
+
+    const snap = {
+      state: 'ok',
+      card: cur,
+      s: boardRef.current.view.s,
+      domW: cardEl.getBoundingClientRect().width,
+      bodyH: el.getBoundingClientRect().height,
+      padX,
+      padY,
+    }
+    if (opts.fitWidth) {
+      /* 自然宽度：临时把宽度放开成 `max-content` 读一次（折行内容量不出自然宽），
+         读完立刻还原 —— 同一帧里读回，屏幕上看不出来。 */
+      const prev = el.style.width
+      el.style.width = 'max-content'
+      snap.naturalW = el.getBoundingClientRect().width
+      el.style.width = prev
+      /* 还要把"已经溢出的那部分"算进去：字体没就绪时 max-content 可能偏小，
+         而溢出量（scrollWidth − clientWidth）任何情况下都准。两个取大的那个当需求。 */
+      const tex = el.querySelector('.bd-tex')
+      snap.spillPx = tex ? Math.max(0, tex.scrollWidth - tex.clientWidth) : 0
+      snap.texClientW = tex ? tex.clientWidth : 0
+    }
+    return snap
+  }
 
   const undo = useCallback(() => {
     const prev = undoRef.current.pop()
@@ -293,11 +370,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        规矩只有一条：**两条轴都按真实内容量，收到贴着内容为止**（原来还多一条
        "至少要盖住你圈的那块笔迹"，2026-09-16 用户明确说不要了：
        「不用盖住，就让框贴合公式和字就行」）。
-       量稳了就不再写盘：fitCardSize 要"连续两趟量出同一个数"才收手，重开板这一趟
-       还额外带 1.5 世界像素的余量（见下面 opts.tol 那段）—— 所以不会每次打开都造一条假 diff。
+       量稳了就不再写盘：连**两趟量出同一个数**（两条轴都要稳）才收手，重开板这一趟
+       还额外带 1.5 世界像素的余量（`FIT_TOL_AUTO`）—— 所以不会每次打开都造一条假 diff。
+       那一整套规矩和三个坑的来历都在 src/lib/card-fit.js 的文件头。
        ⚠ 空白卡（"双击写公式"/"双击写字"那个占位）不量 —— 还没有内容可量。 */
-    pendingFitRef.current.clear()
-    queueFormulaRefits(b)
+    fitter.clear()
+    fitter.queueFormulaRefits(b)
+    /* 排队那一步自己会下一帧开跑；再补一趟"字体就绪"（字体换上去会让宽度变一次）。 */
+    scheduleFits()
     // 视野没被你亲手定过 → 每次打开都重新适配一遍。
     // 这么做的原因见 lib/board.js 里 viewPinned 的说明：tx/ty 是相对容器的坐标，
     // 容器一变旧坐标就是错的，与其迁移不如"没定过就重算"。
@@ -345,9 +425,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      **只有笔迹或卡片真的变了才排队**，而且按 REFIT_IDLE_MS 防抖，
      一整串连续操作只量最后一趟。
 
-     ⚠ 正在编辑的那张会挂起来等（fitCardSize 里的 'wait'）。 */
+     ⚠ 正在编辑的那张会挂起来等（card-fit.js 的 'wait'）。 */
   useEffect(() => {
-    const t = setTimeout(() => queueFormulaRefits(boardRef.current), REFIT_IDLE_MS)
+    const t = setTimeout(() => {
+      fitter.queueFormulaRefits(boardRef.current)
+      scheduleFits() // 补"字体就绪"那一趟（排队自己已经会下一帧开跑）
+    }, REFIT_IDLE_MS)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board.strokes, board.cards])
@@ -940,9 +1023,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     /* ★ 写字板这条路上来的公式卡**也要量一次尺寸**：完全贴着式子。
        不量的话它就是默认的 260 宽：一行 `E = mc²` 只有 60 宽，居中之后左右全是空的
        （用户 2026-09-16 报的"识别公式留白依旧很多"，多半就是这张）。
-       keepCenterX：卡片是以视野中心放上去的，收宽度要**从中间缩**，不然会往左跳。 */
-    pendingFitRef.current.set(c.id, { fitWidth: true, keepCenterX: true })
-    scheduleFits()
+       keepCenterX：卡片是以视野中心放上去的，收宽度要**从中间缩**，不然会往左跳。
+       （排队自己就会下一帧开跑；这一次进编辑态量不着，退出编辑时那一趟才量得上。） */
+    fitter.queue(c.id, { fitWidth: true, keepCenterX: true })
   }
 
   /* 换纸。**当场存**，不像板的内容那样等停笔 0.7 秒 ——
@@ -1146,209 +1229,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setInkMode(mode)
   }
 
-  /* ★ 卡片尺寸**按真实内容量一次**。
-   *
-   * 为什么必须有这一步：`textCardRect` 只能按字数估，估出来的尺寸不是多了就是少了；
-   * 而公式卡连估都估不了（分式、根号差别很大）。多出来的部分就是用户报的"留白太多"——
-   * 一行字的卡下面空一大截（高度），一行短公式左右全是空的（宽度）。
-   *
-   * 两条轴都量，而且都是"贴合内容"这**一条**规矩（2026-09-16 用户定下来的：
-   * 「不用盖住，就让框贴合公式和字就行」）：
-   *   · **高度**量的是内容（`.bd-card-body`）——卡片的 min-height 就是 h，
-   *     量卡片自己等于量自己，永远量不出"其实只有一行字"。
-   *   · **宽度**量的是内容的**自然宽度**：临时把宽度放开成 `max-content` 读一次
-   *     （折行内容量不出自然宽）。公式是一行不折行的，它自己多宽就是多宽；
-   *     文字卡的自然宽 = 最长那一行（识别结果保住了你写的换行），
-   *     超过 `TEXT_CARD_MAX_W` 才折行。
-   *   （上一版还多一条"至少要盖住你圈的那块笔迹"，那套 2026-09-16 拆掉了 ——
-   *     它会让卡片永远比内容大一块，看起来就是"框不贴合"。）
-   *
-   * ★ **编辑态不能量。** 那时候卡片里装的是编辑器（输入框 + KaTeX 预览 + 一排符号按钮），
-   *   量出来是编辑器的尺寸 —— 实测把 h 写成了 204，是真正内容的好几倍。
-   *   所以编辑态就把它挂在 pendingFitRef 里，等退出编辑（回车/取消/点别处）再量。
-   *
-   * opts.keepCenterX：从**中间**收宽度（写字板那条路是"以视野中心"放上去的，
-   * 不收中间的话卡片会往左跳）。默认按左上角收（圈选那条路钉在笔迹左上角）。
-   * 返回 'done' / 'missing' / 'wait'，见 runPendingFits。
-   */
-  function fitCardSize(cardId, opts = {}, attempt = 0) {
-    const wrap = wrapRef.current
-    const cur = boardRef.current.cards.find((c) => c.id === cardId)
-    if (!wrap || !cur) return 'done' // 卡片已经没了，当量过了
-    const cardEl = wrap.querySelector('[data-card-id="' + cardId + '"]')
-    const el = cardEl ? cardEl.querySelector('.bd-card-body') : null
-    if (!el) return 'missing' // 还没挂上，让调用方下一帧再来
-    if (cardEl.classList.contains('editing')) return 'wait' // 编辑态量不得，挂着
-
-    const s = boardRef.current.view.s
-    const scale = cur.scale || 1
-    /* 内边距 + 边框（屏幕像素）：这个仓库全局是 `box-sizing: border-box`，
-       卡片上写的 width/min-height **都把这一圈算在里面**，所以算尺寸时必须加上它 ——
-       不加就正好少一整圈，宽度那条线上直接表现为内容被裁掉。 */
-    const cs = getComputedStyle(cardEl)
-    const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
-    const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth)
-
-    /* ★★ 先确认 DOM 上这张卡的宽度**已经是数据里的宽度**，再动尺子。
-       为什么：宽度那一条改完要等 React 重渲染，而"量尺寸"可能在同一帧里被叫第二次
-       （scheduleFits 有几处调用点）—— 那时候量到的是**上一次渲染的世界**：
-       宽度还是旧的，文字就还是折成旧行数，高度会被算错并钉死（实测：钉在 94.4，
-       而正确值是 66，且不会再自己好）。所以对不上就返回 'stale'，下一帧再来。
-       高度不一样没关系 —— 写的是 min-height，布局尺寸只由宽度决定。 */
-    const wantW = cur.w * s * scale
-    if (Math.abs(cardEl.getBoundingClientRect().width - wantW) > 1) return 'stale'
-
-    const nextH = cardHeightFromContent(el.getBoundingClientRect().height, { s, scale, padPx: padY })
-    opts.measuredH = nextH // 高度需求，留给外面判断"这一趟稳定了没有"
-    opts.measured = nextH
-
-    let nextW = cur.w
-    if (opts.fitWidth) {
-      const prev = el.style.width
-      el.style.width = 'max-content'
-      const natural = el.getBoundingClientRect().width
-      el.style.width = prev
-      /* 还要把"已经溢出的那部分"算进去：字体没就绪时 max-content 可能偏小，
-         而溢出量（scrollWidth − clientWidth）任何情况下都准。两个取大的那个当需求。 */
-      const tex = el.querySelector('.bd-tex')
-      const spilled = tex ? Math.max(0, tex.scrollWidth - tex.clientWidth) : 0
-      const needPx = Math.max(natural, spilled ? (tex ? tex.clientWidth : 0) + spilled : 0)
-      opts.measured = needPx // 宽度需求（那才是会被裁的那一轴）
-      nextW = cardWidthFromContent(needPx, { s, scale, padPx: padX })
-    }
-
-    /* "差这么点就不写盘"的门槛。默认 0.6（一次性的拟合，量多准写多准）。
-       ★ 自动重量那一趟（开板 / 板子安静下来）传 1.5，理由不是精度，
-         而是**别每次打开都改一遍文件**：差 1~2 个世界像素肉眼看不出，
-         而内容是文字度量，KaTeX 的字体换进来前后能量出 1px 上下的差别。
-         实测（2026-09-16）：同一张卡冷启动开一次 h=34.1、热一点开一次 34.9，
-         每次打开都写一次盘 —— 那正是 README 反复念叨的"每天一条假 diff、
-         然后你学会忽略 diff"的开端。留 1.5 的余量，两种度量都落进"不用改"里。 */
-    const tol = opts.tol || 0.6
-    /* 把"这一趟量到了什么"写在 DOM 上 —— 和画布那几个 dataset.strokes/pts/flat 一个道理：
-       "卡片为什么是这个尺寸"用眼睛看是看不出来的，而这类问题只有这里能查
-       （量到的宽度、第几趟、算出来的宽高）。自检会读它。
-       ★ 写在"要不要提交"的判断**之前**：不然"量了但觉得不用改"的那一趟不留痕迹，
-         而这正是最需要看的一种状态（"它到底量到几？"）。
-       实测就是靠它查明白的：文字卡那一趟 need=281.3、h=94.4、tries=0 —— 一眼看出
-       高度是**按换行前的窄宽度**算的，而"两趟才收敛"这件事没发生。 */
-    if (cardEl) {
-      cardEl.dataset.fit = JSON.stringify({
-        need: Math.round((opts.measured || 0) * 10) / 10,
-        tries: opts.tries || 0,
-        w: nextW,
-        h: nextH,
-      })
-    }
-    if (Math.abs(nextH - cur.h) < tol && Math.abs(nextW - cur.w) < tol) return 'done'
-    commit(
-      (c) => ({
-        ...c,
-        cards: c.cards.map((x) =>
-          x.id === cardId
-            ? {
-                ...x,
-                w: nextW,
-                h: nextH,
-                /* keepCenterX：写字板那条路是"以中心"把卡片放在视野里的 ——
-                   宽度一收，要让它**从中间缩**，不然卡片会突然往左跳一截。
-                   「框选」那条路是钉在笔迹左上角的，收宽度时左上角不能动。 */
-                x: opts.keepCenterX ? x.x + (cur.w - nextW) / 2 : x.x,
-              }
-            : x
-        ),
-      }),
-      false
-    )
-    return 'done'
-  }
-
-  /* KaTeX 用的是自带字体（dist/assets 里的 woff2）。公式卡的**宽度要在字体就绪之后量**：
-     字体没上时量到的是兜底字体的宽度（实测 58 vs 真正的 76，差 30%），
-     而宽度写的是 `width`（硬约束）—— 卡片会把 `E = mc²` 的 `c²` 当场裁掉。
-     ⚠ 试过两道"等字体"的闸，都不可靠：
-       · `document.fonts.ready` —— 那张卡渲染**触发**的字体加载，可能在它 resolve 之后才开始；
-       · `document.fonts.check('1em KaTeX_Main')` —— 对"还没注册/没加载"的自定义家族，
-         它会当成系统字体返回 true（规范如此），所以闸门形同虚设。
-     所以改成**不猜**：多量几趟（每 150ms 一趟，最多 12 趟），
-     连续两趟量出同一个数才算准 —— 字体换上去会让宽度变一次，那一次必然被抓住。 */
-
-  /* 认出来还没量过尺寸的卡（cardId → 量的选项 + 量到第几趟了）。
-     摘掉的条件：连续两趟量出的需求一样**而且两条轴都一样**（稳定了），
-     或者量满 12 趟，或者这张卡没了。
-
-     ★★ "同一帧里连量两趟"必须挡住，否则会量到一个**还没更新完的 DOM**：
-       实测（2026-09-16，文字卡）：scheduleFits 被几处同时叫，两个 rAF 在同一帧里
-       先后跑 —— 第一趟提交了新的宽度（w 220 → 299），第二趟在**同一毫秒**又量了一次
-       （dom 还是 220 宽），于是它看到的还是"折成三行"的内容，把高度钉在 94.4；
-       而宽度那一趟已经相等了 → 判成"稳定" → 收工。屏幕上就是"卡片比字高出一行"，
-       而且**永远不会自己好**（除非重开文件）。所以：量之前先看 DOM 的宽度对不对得上
-       （'stale' → 下一帧再来），并且稳定性要**两条轴都稳**才算数。
-       记法：**提交完不能立刻再量 —— 你量的是上一次渲染的世界。** */
-  const FIT_MAX_TRIES = 12
-  function runPendingFits() {
-    let retryFrame = false
-    let tryLater = false
-    for (const [id, opts] of [...pendingFitRef.current]) {
-      const state = fitCardSize(id, opts)
-      if (state === 'missing' || state === 'stale') {
-        retryFrame = true // 还没挂上 / DOM 还没跟上上一次提交 —— 下一帧再来
-        continue
-      }
-      if (state === 'wait') continue // 编辑态，等 editingId 一变再来
-
-      const stableH = opts.lastNeedH != null && opts.measuredH != null && Math.abs(opts.measuredH - opts.lastNeedH) < 1
-      const stableW = opts.lastNeed != null && opts.measured != null && Math.abs(opts.measured - opts.lastNeed) < 1
-      opts.lastNeed = opts.measured
-      opts.lastNeedH = opts.measuredH
-      opts.tries = (opts.tries || 0) + 1
-      if ((stableH && stableW) || opts.tries >= FIT_MAX_TRIES) {
-        pendingFitRef.current.delete(id)
-        continue
-      }
-      pendingFitRef.current.set(id, opts)
-      tryLater = true
-    }
-    if (retryFrame) requestAnimationFrame(() => runPendingFits())
-    if (tryLater) setTimeout(() => runPendingFits(), 150)
-  }
-
-  /* 排上量尺寸的头几趟：下一帧、以及字体就绪时（editingId 变化时也会来一趟，见那个 effect）。 */
+  /* 排上量尺寸的头几趟：**字体就绪**那一趟非有不可 —— KaTeX 用的是自带 woff2，
+     字体换上去会让宽度变一次，而宽度写的是硬约束（写小了当场裁内容，实测裁掉 `E = mc²` 的 c²）。
+     试过两道"等字体"的闸都不可靠（document.fonts.ready 可能在那张卡触发加载之前就 resolve；
+     document.fonts.check('1em KaTeX_Main') 对没注册的自定义家族按规范返回 true）。
+     所以不猜：**多量几趟**（每 150ms 一趟 = `FIT_LATER_MS`，最多 12 趟 = `FIT_MAX_TRIES`），
+     连续两趟量出同一个数才算准 —— 字体换上去那一次必然被抓住（见 card-fit.js）。
+     排队（fitter.queue / queueFormulaRefits）自己已经会下一帧开跑，这里只补这一趟。 */
   function scheduleFits() {
-    requestAnimationFrame(() => runPendingFits())
+    fitter.kick()
     const fonts = typeof document !== 'undefined' ? document.fonts : null
     if (fonts && fonts.ready && typeof fonts.ready.then === 'function') {
-      fonts.ready.then(() => requestAnimationFrame(() => runPendingFits()))
+      fonts.ready.then(() => fitter.kick())
     }
-  }
-
-  /* 把这张板上所有**有内容的公式卡**排进"重新量一次"的队里。
-     两个调用点共用这一份规矩：换文件/重载那一趟（先 clear 再排）、
-     以及板子安静下来之后那一趟（见上面那个 effect）。写成一处的理由很实在 ——
-     这两处一旦各写一份，"量什么、门槛多少"就会慢慢不一样。
-
-     ⚠ **只管公式卡，便签/文字卡不在这里自动收。**
-       刚认出来的文字卡照样贴合内容（那一刻由 insertFromInk 排一次量尺寸，
-       公式卡和文字卡一视同仁）；但"每次开板/板子一静就自动收"这件事只给公式卡做，
-       因为便签卡在这个应用里有个**容器**身份：关系面板那条「公式卡整个落在便签里
-       → 包含（这公式属于这一节）」就是靠"便签比自己的字大一圈"成立的 ——
-       实测（2026-09-16）把便签也一起自动收之后，样板板的 3 条连线当场变成 0 条，
-       关系推理整块塌掉。你要更紧凑的便签，拖右下角那个柄就把它收小。
-     ⚠ 已经排在队里的不覆盖：刚插进来的那张可能带着自己的选项
-       （比如 keepCenterX，写字板那条路要从中间收宽度），覆盖掉就会往左跳。
-     ⚠ 空白卡（"双击写公式"/"双击写字"那个占位）不排 —— 还没有内容可量。
-     ⚠ `scheduleFits()` 由这里自己叫 —— 排了队不开跑，就等于什么都没发生，
-       而且屏幕上完全看不出来（第一版就是这样：卡片纹丝不动，
-       量尺寸那几趟一趟都没跑）。 */
-  function queueFormulaRefits(b) {
-    if (!b) return
-    for (const c of b.cards || []) {
-      if (c.kind !== 'formula') continue
-      if (!String(c.tex || c.src || '').trim()) continue
-      if (pendingFitRef.current.has(c.id)) continue
-      pendingFitRef.current.set(c.id, { fitWidth: true, tol: 1.5 })
-    }
-    scheduleFits()
   }
 
   /* 识别结果落成一张卡（文字卡或公式卡）。
@@ -1388,9 +1281,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        两条轴都收，公式卡和文字卡一样（"就让框贴合公式和字"）。
        勾不勾"擦掉原笔迹"只影响**那几笔还在不在**，不再影响卡片多大。
        ★ 插完是进编辑态的，所以这一次量不着（编辑器不是内容）——
-         挂进 pendingFitRef，等退出编辑时由 runPendingFits 量。 */
-    pendingFitRef.current.set(card.id, { fitWidth: true })
-    scheduleFits()
+         排进队里，等退出编辑时那一趟（editingId 一变就 scheduleFits）量。 */
+    fitter.queue(card.id, { fitWidth: true })
     flash(
       (isFormula ? '公式卡放上去了' : '放上去了') +
         (erase ? '，原来那几笔已擦掉（Ctrl+Z 能退回）' : '，原来那几笔还留在板上（卡片不盖它）')
