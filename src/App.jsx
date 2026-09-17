@@ -9,23 +9,12 @@ import { parseDoc, renderTitle, cleanName } from './lib/parse.js'
 import { normalizeMarkers, useFormulaEditing } from './lib/useFormulaEditing.js'
 import { SEED_NAME, SEED_TEXT } from './seed.js'
 import { buildSeedBoard } from './seed-board.js'
+/* 板文件这一步（data/ 的读写 + **打开哪一个**）收进了 src/lib/files.js：
+   URL 只有那一处、首次加载那串分支是一个**纯决定**（planStartup），
+   于是每种入口情形都能在 check-board [6n] 里断言，不用真浏览器。 */
+import { SEED_BOARD_NAME, boardFileName, createFileApi, planStartup } from './lib/files.js'
 
-const api = {
-  list: () => fetch('/api/list').then((r) => r.json()),
-  get: (name) => fetch('/api/file/' + encodeURIComponent(name)).then((r) => r.json()),
-  put: (name, text) =>
-    fetch('/api/file/' + encodeURIComponent(name), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    }).then((r) => r.json()),
-  create: (name, text) =>
-    fetch('/api/new', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, text }),
-    }).then((r) => r.json()),
-}
+const api = createFileApi()
 
 /* 白板的新建得先问一下"这一课叫什么" —— 板子里有标题，
    文件名只是给人看的（Git、列表）。两步都做，看着才不别扭。 */
@@ -33,7 +22,7 @@ async function createBoard({ prompt, flash, refresh }) {
   const raw = prompt('这一课叫什么？（写"大物 · 电磁学"就行）', '')
   if (!raw || !raw.trim()) return null
   const title = raw.trim().replace(/\.md$/i, '')
-  const r = await api.create('board-' + title + '.md', serializeBoardDocument(newBoard(title)))
+  const r = await api.create(boardFileName(title), serializeBoardDocument(newBoard(title)))
   if (r.error) {
     flash(r.error, 'err')
     return null
@@ -42,7 +31,7 @@ async function createBoard({ prompt, flash, refresh }) {
   return r.name
 }
 
-/* 一张白板都没有的时候，直接开一张**空**的，别退回笔记界面。
+/* 补一张**空**板（一张板都没有的时候，别退回笔记界面）。
    ── 为什么不能退：白板是这个工具的入口（左栏第一个按钮、README 第一段），
       列表里没有板就不给板 = 把入口锁上了。用户真正的遭遇：
       data/ 里板被删干净、只剩笔记，打开就进笔记界面；
@@ -50,16 +39,9 @@ async function createBoard({ prompt, flash, refresh }) {
    ── 为什么是空白板而不是样板板：样板是"第一次装这个工具"的见面礼，
       只在 data/ 完全为空时给（见 createSeedBoard 的调用处）；
       用户已经把板删干净了，说明他要自己从头来，再塞一张示例进去是添乱。
-   ── 为什么名字要在这里先探一遍：服务端 /api/new 撞名直接回 409，
-      不探就是静默失败（结果还是进笔记界面，症状和没修一样）。 */
-async function ensureBoard({ files, refresh, flash }) {
-  const taken = new Set((files || []).map((f) => f.name))
-  let name = ''
-  for (let i = 1; i <= 99 && !name; i += 1) {
-    const cand = i === 1 ? 'board-新白板.md' : `board-新白板 ${i}.md`
-    if (!taken.has(cand)) name = cand
-  }
-  if (!name) return null
+   ── 名字由 files.js 的 nextBoardName 探好（撞名往后排）——
+      服务端 /api/new 撞名直接回 409，不探就是静默失败（结果还是进笔记界面）。 */
+async function makeBoard(name, { refresh, flash }) {
   const r = await api.create(name, serializeBoardDocument(newBoard('新白板')))
   if (r.error) {
     flash(r.error, 'err')
@@ -69,10 +51,10 @@ async function ensureBoard({ files, refresh, flash }) {
   return r.name
 }
 
-/* 第一次打开"一张白板都没有"的时候，先放一张样板进去。
+/* 第一次打开"data/ 一个文件都没有"的时候，先放一张样板进去。
    理由是"关系靠位置"这件事必须看见一次才懂 —— 空板配一句说明，人是不会照做的。 */
 async function createSeedBoard({ refresh, flash }) {
-  const r = await api.create('board-示例 · 大物电磁学.md', serializeBoardDocument(buildSeedBoard()))
+  const r = await api.create(SEED_BOARD_NAME, serializeBoardDocument(buildSeedBoard()))
   if (r.error) {
     flash(r.error, 'err')
     return null
@@ -228,6 +210,12 @@ export default function App() {
   }, [])
 
   // ---- 首次加载 ----
+  /* 打开哪一个？这一整串判断是 src/lib/files.js 的 `planStartup`（**纯函数、有断言**）：
+   * 空目录先放样板、`?file=` 指名只认那一个、否则列表里第一张板、一张板都没有就补一张空的。
+   * 这里只负责照它说的做（建文件 / 打开 / 说一句话）。
+   * ⚠ `?file=<名字>` 是**自检用的入口**：自检直接从 URL 打开自己造的夹具板，
+   *   于是用户那张板根本不会被读到（从前"进界面之后点左栏那一行"，
+   *   而应用在挂界面**之前**就已经把用户的板读进来、冷字体缓存下还会写回去一次）。 */
   useEffect(() => {
     let alive = true
     ;(async () => {
@@ -238,44 +226,34 @@ export default function App() {
         flash('连不上本地服务，检查跑 studyhelper 的那个黑窗口', 'err')
         return
       }
-      if (list.files.length === 0) {
+      const want = new URLSearchParams(window.location.search).get('file')
+      let plan = planStartup({ files: list.files, want })
+      if (plan.step === 'seed') {
         // 全新的用户：先给一张白板样板 + 一份笔记样板。
-        // 白板在前，因为它才是入口（见下方"打开哪一个"的说明）。
+        // 白板在前，因为它才是入口（见 planStartup 里"打开哪一个"的说明）。
         await createSeedBoard({ refresh: async () => {}, flash })
         await api.create(SEED_NAME, SEED_TEXT)
         list = await api.list()
+        if (!alive) return
+        plan = planStartup({ files: (list && list.files) || [], want })
       }
-      setFiles(list.files || [])
-      if (list.files && list.files.length) {
-        /* ?file=<名字> —— **自检用的入口**：直接从 URL 打开指定的那一张板。
-           ★ 为什么不走下面那条"列表里第一个"：自检要打开的是它自己造的夹具板，
-             而列表第一个常常是用户自己那张（中文名在 zh 排序里排在 board-zz-* 前面），
-             于是应用会先把用户的板读进来、冷字体缓存下还会重量卡片尺寸再写回去一次 ——
-             每次自检都动一下用户的数据（README 自检那一节记着这条）。
-             从这里进，用户那张板根本不会被读到。
-           ★ 找不到就**什么都不打开**（只给一句话）：自检要躲的正是"退回列表里第一个"，
-             退回等于把上面这条又踩一遍。这个参数不是给用户的功能，不用兜底到好看。
-           ★ 名字只跟 /api/list 里的名字比，绝不当路径用（服务端另有 SAFE_NAME 那道闸）。 */
-        const want = new URLSearchParams(window.location.search).get('file')
-        if (want) {
-          const hit = list.files.find((f) => f.name === want)
-          if (hit) await open(hit.name, { force: true })
-          else flash('?file= 说的那个文件不在列表里：' + want, 'err')
-        } else {
-          // 打开哪一个？优先白板 —— 这是"打开就能画"的默认入口。
-          // 排序在服务端钉死了（见 server.js 的 /api/list），所以这里的结果是稳定的。
-          const firstBoard = list.files.find((f) => isBoardName(f.name))
-          if (firstBoard) {
-            await open(firstBoard.name)
-          } else {
-            /* 一张板都没有（笔记还在、板被删干净了）。
-               ★ 这里以前是直接打开第一个笔记 —— 用户看到的就是"怎么打开是笔记界面"。
-               现在：补一张空板再进去；真的建不出来（名字探完了 / 写盘失败）才退回笔记。 */
-            const made = await ensureBoard({ files: list.files, refresh: refreshList, flash })
-            await open(made || list.files[0].name, { force: true })
-            if (made) flash('没有白板，先给你开了一张空的：' + made)
-          }
-        }
+      setFiles((list && list.files) || [])
+      if (plan.step === 'open') {
+        await open(plan.name, { force: plan.force })
+      } else if (plan.step === 'none') {
+        // `?file=` 指了个不存在的：什么都不打开（绝不退回"列表里第一个"）
+        if (want) flash('?file= 说的那个文件不在列表里：' + want, 'err')
+      } else if (plan.step === 'create-board') {
+        /* 一张板都没有（笔记还在、板被删干净了）。
+           ★ 这里以前是直接打开第一个笔记 —— 用户看到的就是"怎么打开是笔记界面"。
+           现在：补一张空板再进去；真的建不出来（写盘失败）才退回列表里第一个。 */
+        const made = await makeBoard(plan.name, { refresh: refreshList, flash })
+        /* 建不出来（写盘失败）就退回列表里第一个 —— 至少不是白屏。
+           ⚠ 退回的是**列表里第一个**，不是刚探出来的那个名字：那个文件根本没建出来，
+             拿它去 open 只会得到一句"文件不存在"。 */
+        const fallback = (list && list.files && list.files[0] && list.files[0].name) || plan.name
+        await open(made || fallback, { force: true })
+        if (made) flash('没有白板，先给你开了一张空的：' + made)
       }
       setBusy(false)
     })()

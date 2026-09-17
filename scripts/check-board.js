@@ -11,7 +11,7 @@ import {
   CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, NEAR_GAP,
   READABLE_FIT_S, TEXT_CARD_MAX_W, TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, buildRelations,
   cardHeightFromContent, cardWidthFromContent, clampCardScale, descendantsOf, freezeGroup, fitView,
-  fontCss, isBoardDocument, newBoard, newCard, newStroke, nextCardScale,
+  fontCss, isBoardDocument, isBoardName, newBoard, newCard, newStroke, nextCardScale,
   parseBoardDocument, pointSegDist, relationCurve, serializeBoardDocument, simplifyPoints, strokeBounds,
   strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../src/lib/board.js'
@@ -30,6 +30,9 @@ import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
 import {
   applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
 } from '../src/lib/selection.js'
+/* 板文件这一步（data/ 的读写 + 打开哪一个）搬去了 files.js（2026-09-16 C4）：
+   "打开哪一个"是一个纯决定，于是那些入口情形在这儿断言得到（见 [6n]）。 */
+import { SEED_BOARD_NAME, boardFileName, createFileApi, nextBoardName, planStartup } from '../src/lib/files.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
@@ -1846,6 +1849,99 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     const dissolved = dissolveGroup(second.board, gs[0].id)
     eq(dissolved.groups.length, 1, '拆开一块 → 只剩另一块')
     eq(dissolveGroup(b, null), b, '没有块可拆 → 原样返回')
+  }
+}
+
+// ═════════════════════ 6n. 板文件这一步 ═════════════════════
+/* 这一节钉的是**应用的入口行为**：data/ 里那些文件怎么读写、以及"打开哪一个"。
+ * 从前那串判断住在 App.jsx 的首次加载里（四层分支），只有真浏览器跑得出来 ——
+ * "一张板都没有时必须进白板"那条自检（check:default）要的前提本机永远不成立
+ * （有用户的板），2026-09-16 验它得把整个仓库复制到临时目录、把 data/ 留空。
+ * 现在它是一个**纯决定** `planStartup({ files, want })`，每种情形在这儿都能摆出来。
+ * 端到端对手仍然是 `npm run check:default`（它跑真应用 + 真服务）。 */
+console.log('\n[6n] 板文件这一步（`files.js`）：data/ 怎么读写 + 打开哪一个')
+{
+  const F = (name, extra = {}) => ({ name, title: name.replace(/\.md$/i, ''), nodes: 0, mtime: 0, size: 0, ...extra })
+  const NOTE = F('大物 · 电磁学.md')
+  const BOARD = F('board-新白板.md')
+
+  /* ① 一个文件都没有 → 先放样板（板 + 笔记），调用方重新问一次 */
+  {
+    const p = planStartup({ files: [] })
+    eq(p.step, 'seed', 'data/ 一个文件都没有 → 先放样板（不是白屏、也不是笔记界面）')
+    eq(planStartup({ files: [], want: 'board-x.md' }).step, 'seed', '连 ?file= 也拦不住"先放样板"（这时列表还是空的）')
+    if (isBoardName(SEED_BOARD_NAME)) ok(`样板板的名字是一张板：${SEED_BOARD_NAME}`)
+    else bad(`样板板的名字不像板：${SEED_BOARD_NAME}`)
+  }
+
+  /* ② 有板 → 打开列表里第一张板（排序由服务端钉死），不 force（要走"没保存"那道闸） */
+  {
+    const p = planStartup({ files: [NOTE, BOARD, F('board-电磁学.md')] })
+    eq([p.step, p.name, p.force], ['open', 'board-新白板.md', false], '有板 → 打开列表里第一张板')
+    eq(p.name, planStartup({ files: [NOTE, BOARD] }).name, '选择只看列表顺序，不挑名字（服务端钉死了排序）')
+  }
+
+  /* ③ `?file=` 只认那一个：在列表里就打开（force），不在就**什么都不打开** */
+  {
+    const files = [NOTE, BOARD]
+    const hit = planStartup({ files, want: BOARD.name })
+    eq([hit.step, hit.name, hit.force], ['open', 'board-新白板.md', true], '?file= 指到的那张 → 打开它')
+    const miss = planStartup({ files, want: 'board-zz-nope.md' })
+    eq([miss.step, miss.want], ['none', 'board-zz-nope.md'], '?file= 指了个不存在的 → 什么都不打开（绝不退回列表第一个）')
+    eq(planStartup({ files, want: NOTE.name }).name, NOTE.name, '?file= 也可以指名一个笔记（不限于板）')
+  }
+
+  /* ④ 一张板都没有（笔记还在）→ 补一张空的，名字先探好（撞名往后排） */
+  {
+    const p = planStartup({ files: [NOTE, F('zz · 模板（复制这个来写新的一课）.md')] })
+    eq([p.step, p.name], ['create-board', 'board-新白板.md'], '只剩笔记 → 补一张空板（不是退回笔记界面）')
+    eq(nextBoardName(['board-新白板.md']), 'board-新白板 2.md', '撞名往后排：新白板 2')
+    eq(nextBoardName(['board-新白板.md', 'board-新白板 2.md']), 'board-新白板 3.md', '再撞就 3')
+    const many = Array.from({ length: 99 }, (_, i) => (i === 0 ? 'board-新白板.md' : `board-新白板 ${i + 1}.md`))
+    eq(nextBoardName(many), null, '探到 99 就放弃（返回 null，调用方自己决定怎么办）')
+    /* ★ 这一条顺便说明 planStartup 里那个"名字探不出来"的兜底其实**到不了**：
+       候选名全都长得像板，所以"99 个都被占"就意味着列表里**有板** —— 走的是"打开第一张板"。
+       （兜底留在那儿是为了前缀万一变了不返回坏名字，不是一条正常路径。） */
+    const allTaken = many.map((n) => F(n))
+    eq(planStartup({ files: [NOTE, ...allTaken] }).step, 'open', '99 个候选名全被占 → 说明列表里有板，走"打开第一张板"')
+    eq(planStartup({ files: [NOTE, ...allTaken] }).name, 'board-新白板.md', '开的就是列表里第一张板（不是退回笔记）')
+  }
+
+  /* ⑤ 新板的文件名：标题 → `board-<标题>.md`（去 .md、去两头空白） */
+  {
+    eq(boardFileName('大物 · 电磁学'), 'board-大物 · 电磁学.md', '标题 → board-<标题>.md')
+    eq(boardFileName('大物.md'), 'board-大物.md', '标题里带的 .md 不要重复加')
+    eq(boardFileName('  复变函数  '), 'board-复变函数.md', '两头空白去掉')
+    if (isBoardName(boardFileName('x'))) ok('造出来的名字应用认得出是板（isBoardName）')
+    else bad('造出来的名字不是板名：' + boardFileName('x'))
+  }
+
+  /* ⑥ data/ 怎么读写：URL 只有这一处，而且文件名**必须编码**
+     （中文 / `·` / 空格 / 括号在板文件名里很常见，漏了 encodeURIComponent 就是 404，
+     症状是"这张板打不开"，看着像文件坏了）。 */
+  {
+    const calls = []
+    const fake = (url, init) => {
+      calls.push({ url, init })
+      return Promise.resolve({ json: () => Promise.resolve({ ok: true }) })
+    }
+    const api = createFileApi({ fetch: fake })
+    const NAME = 'board-复变函数 （1）.md'
+    await api.list()
+    eq(calls[0].url, '/api/list', 'list → /api/list')
+    await api.get(NAME)
+    eq(calls[1].url, '/api/file/' + encodeURIComponent(NAME), 'get → /api/file/<文件名>，而且**编码过**')
+    if (/[\u4e00-\u9fa5]/.test(calls[1].url)) bad('URL 里直接出现了中文 —— 没编码，中文名一取就 404')
+    else ok('URL 里没有裸中文（编码过了：' + calls[1].url.slice(0, 28) + '…）')
+    await api.put(NAME, 'hello')
+    eq([calls[2].init.method, calls[2].init.headers['Content-Type']], ['PUT', 'application/json'], 'put → PUT + JSON')
+    eq(JSON.parse(calls[2].init.body), { text: 'hello' }, 'put 的 body 是 { text }')
+    await api.create('board-a.md', '# a')
+    eq([calls[3].url, calls[3].init.method], ['/api/new', 'POST'], 'create → POST /api/new')
+    eq(JSON.parse(calls[3].init.body), { name: 'board-a.md', text: '# a' }, 'create 的 body 是 { name, text }')
+    /* 服务端的错误要**原样透传**（调用方靠 r.error 决定弹什么） */
+    const errApi = createFileApi({ fetch: () => Promise.resolve({ json: () => Promise.resolve({ error: '非法文件名' }) }) })
+    eq((await errApi.create('x', 'y')).error, '非法文件名', '服务端回的错误原样透传（不吞、不改写）')
   }
 }
 
