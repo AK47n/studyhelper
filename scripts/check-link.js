@@ -1086,8 +1086,115 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
   else bad('挪了卡片，那条线一动不动 —— 它被钉死在画出来的那一刻了')
 }
 
-/* ═════════════════ 15. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[15] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 15. 一次手势 = 一步撤销（真鼠标走四条路） ═════════════════ */
+console.log('\n[15] 一次手势 = 一步撤销：拖卡片 / 缩放卡片 / 挪笔迹 / 空点不吃掉重做')
+{
+  /* 见 `src/lib/history.js` 与 README 第 41 条。这四条手势从前各自记一次账、
+     "算不算动过"四个判据，而上面 [10] 只覆盖了"拖板框"。
+     这一节把另外三条补齐，外加一条**只有账本保证得了**的：空点（按下去没动就抬手）
+     不占一步 —— 否则它会顺手把重做清掉（"随便点一下就没法重做"）。
+     ⚠ 读文件之前一律等"盘上真的变成那个样子"（`untilFile`，别睡毫秒数）——
+       判据就是下面要断言的那件事本身。 */
+  const cardAt = (d, id) => (d.cards || []).find((c) => c.id === id)
+  const r3 = (n) => Math.round(n * 1000) / 1000
+  const xyEq = (c, xy) => !!c && Math.abs(c.x - xy[0]) <= 0.5 && Math.abs(c.y - xy[1]) <= 0.5
+  const ctrlZ = async (shift) => {
+    const modifiers = shift ? 10 : 2 // 2 = Ctrl，8 = Shift
+    await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers })
+    await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers })
+  }
+  const allPointsOf = (doc) => JSON.stringify((doc.strokes || []).map((x) => [x.id, x.points.slice(0, 8)]))
+  const xyOf = (d) => {
+    const c = cardAt(d, 'lk-a')
+    return c ? [r3(c.x), r3(c.y)] : null
+  }
+
+  const w0 = await untilSaved()
+  if (!w0.ok) bad(`等了 ${w0.waited}ms，应用一直没说「已存」—— 下面读到的是旧文件`)
+  const d0 = await read()
+  const c0 = cardAt(d0, 'lk-a')
+  if (!c0) {
+    bad('盘上找不到 lk-a —— [15] 这一节整段没意义')
+  } else {
+    const xy0 = [r3(c0.x), r3(c0.y)]
+    const sc0 = r3(c0.scale || 1)
+
+    /* ① 拖一张卡：一次拖动 = 一步撤销 */
+    const boxA = await readBoard()
+    await s.mouse(boxA.a.cx, boxA.a.cy, { steps: 8, dx: -40, dy: -30 })
+    const w1 = await untilFile((d) => !xyEq(cardAt(d, 'lk-a'), xy0), { what: '卡片挪了' })
+    if (w1.ok) ok(`拖一张卡：盘上的位置变了（${JSON.stringify(xy0)} → ${JSON.stringify(xyOf(w1.value))}）`)
+    else bad(`拖了卡片，盘上的位置一直没变（还是 ${JSON.stringify(xy0)}）`)
+
+    await ctrlZ()
+    const w2 = await untilFile((d) => xyEq(cardAt(d, 'lk-a'), xy0), { what: '一步撤销回到拖动前' })
+    if (w2.ok) ok('★ Ctrl+Z **一步**就回到拖动前（一次拖动 = 一步撤销）')
+    else bad(`Ctrl+Z 之后盘上没回到拖动前：${JSON.stringify(xyOf(await read()))}`)
+
+    /* ② 空点不吃掉重做：这一刻重做栈里正有一步（刚才那一拖） */
+    await s.mouse(boxA.a.cx, boxA.a.cy, { steps: 0 })
+    await s.sleep(300)
+    await ctrlZ(true)
+    const w3 = await untilFile((d) => !xyEq(cardAt(d, 'lk-a'), xy0), { what: '重做把那一步放回来了' })
+    if (w3.ok) ok('★ 空点不占一步：紧接着 Ctrl+Shift+Z 还能重做（差一点就成了"随便点一下就没法重做"）')
+    else bad('空点把重做吃掉了 —— 撤销栈里多了一步空操作（`end()` 的判据没生效）')
+    await ctrlZ()
+    const w4 = await untilFile((d) => xyEq(cardAt(d, 'lk-a'), xy0), { what: '再撤一步回到拖动前' })
+    if (!w4.ok) bad('第二次 Ctrl+Z 没回到拖动前 —— 下面两条的起点就不是 xy0 了')
+
+    /* ③ 缩放卡片（拖右下角那个柄）：一次缩放 = 一步撤销 */
+    const handle = await s.eval(`(() => {
+      const h = document.querySelector('.bd-card[data-card-id="lk-a"] .bd-card-resize')
+      if (!h) return null
+      const r = h.getBoundingClientRect()
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+    })()`)
+    if (!handle) bad('找不到缩放柄（.bd-card-resize）—— 缩放那一条没验')
+    else {
+      await s.mouse(handle.x, handle.y, { steps: 8, dx: 60, dy: 0 })
+      const w5 = await untilFile((d) => r3((cardAt(d, 'lk-a') || {}).scale || 1) > sc0, { what: '卡片放大了' })
+      if (w5.ok) ok(`拖右下角那个柄：卡片放大了（scale ${sc0} → ${r3(cardAt(w5.value, 'lk-a').scale || 1)}）`)
+      else bad(`拖了缩放柄，盘上的 scale 一直没变（还是 ${sc0}）`)
+      await ctrlZ()
+      const w6 = await untilFile((d) => Math.abs(r3((cardAt(d, 'lk-a') || {}).scale || 1) - sc0) < 1e-6, { what: '一步撤销回到缩放前' })
+      if (w6.ok) ok(`★ Ctrl+Z 一步就回到缩放前（scale 又是 ${sc0}）`)
+      else bad(`Ctrl+Z 之后 scale 没回到 ${sc0}：${JSON.stringify(cardAt(await read(), 'lk-a'))}`)
+    }
+
+    /* ④ 挪笔迹：先画一笔 → 框住它 → **切回笔**（框选工具下按在框里是"重新框选"）
+       → 在框里拖 = 整组挪。一次拖动 = 一步撤销。 */
+    const ptsBefore = allPointsOf(await read())
+    await pickTool('笔')
+    await s.sleep(150)
+    const stage = await s.eval(`(() => {
+      const r = document.querySelector('.bd-stagewrap').getBoundingClientRect()
+      return { x: Math.round(r.x + r.width * 0.14), y: Math.round(r.y + r.height * 0.16) }
+    })()`)
+    await s.penStroke(stage, { x: stage.x + 70, y: stage.y + 36 })
+    const w7 = await untilFile((d) => allPointsOf(d) !== ptsBefore, { what: '盘上多了一笔' })
+    if (!w7.ok) bad('画了一笔，盘上没多出来 —— 挪笔迹那一条没验')
+    await pickTool('框选')
+    await s.sleep(150)
+    await s.mouse(stage.x - 40, stage.y - 40, { steps: 8, dx: 160, dy: 120 })
+    const sel = await readBoard()
+    if (sel.inkBox && sel.inkActs) ok('框住了一组笔迹（虚线框 + 那排动作都在）')
+    else bad(`框选没选上（inkBox=${sel.inkBox} inkActs=${sel.inkActs}）—— 挪笔迹那一条没验`)
+    const ptsSel = allPointsOf(await read())
+    await pickTool('笔')
+    await s.sleep(150)
+    await s.mouse(stage.x + 40, stage.y + 20, { steps: 8, dx: 50, dy: 35 })
+    const w8 = await untilFile((d) => allPointsOf(d) !== ptsSel, { what: '选中的笔迹挪了' })
+    if (w8.ok) ok('在选中框里拖：盘上那几笔的点变了')
+    else bad('拖了选中的笔迹，盘上的点一个都没动（是不是没落在选中框里？）')
+    await ctrlZ()
+    const w9 = await untilFile((d) => allPointsOf(d) === ptsSel, { what: '一步撤销回到挪动前' })
+    if (w9.ok) ok('★ Ctrl+Z 一步就回到挪笔迹之前（一次拖动 = 一步撤销）')
+    else bad('Ctrl+Z 之后笔迹没回到挪动前 —— 这一族还有别处在手记撤销账')
+  }
+}
+
+/* ═════════════════ 16. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[16] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })

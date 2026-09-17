@@ -38,6 +38,9 @@ import { ARROW_LINK, LINK_DELETE, LINK_KINDS, condCard, condInk, linkKind } from
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
    滚动/捏合/平移/居中全走这里。 */
 import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, screenLenToWorld, screenToWorld, worldLenToScreen, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
+/* 撤销账本（一次手势 = 一步撤销）在 history.js —— 四条手势从前各自手记一次账、
+   "算不算动过"四个判据（架构 review 候选 3）。现在只说 begin / during / end。 */
+import { createHistory } from '../lib/history.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
@@ -77,7 +80,8 @@ const REFIT_IDLE_MS = 400
      （世界半径）。**注释和名字都撒谎**，正是 ADR-0002 那类"单位的账没人管"的温床。
    世界半径一律用 `screenLenToWorld(ERASER_R_SCREEN, view.s)` 现算。 */
 const ERASER_R_SCREEN = 14
-const UNDO_MAX = 60
+/* UNDO_MAX / "一次手势算几步"整套账本搬去了 src/lib/history.js（2026-09-17 候选 3）——
+   这个文件里不再留一份（曾经"另一条路忘了裁到 UNDO_MAX"是没有任何东西会响的）。 */
 /* HL_COLOR / HL_WIDTH 从 lib/board.js 来（那边是"存储层归一化"用的同一对常量）。
    这个文件里**不再各留一份** —— 曾经两处各写了一份 #ffd43b / 16，
    改一处忘一处就是"荧光笔颜色改不动"或者"宽度对不上"的经典来源。 */
@@ -210,8 +214,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const sceneRef = useRef(null)
   const liveRef = useRef(null)
   const boardRef = useRef(board)
-  const undoRef = useRef([])
-  const redoRef = useRef([])
   const pointersRef = useRef(new Map())
   const drawRef = useRef(null)
   const panRef = useRef(null)
@@ -232,22 +234,34 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   boardRef.current = board
   dirtyRef.current = dirty
 
+  /* ── 撤销账本 ──────────────────────────────────────────────────────────
+     "一次手势 = 一步撤销"这套规矩整个在 `src/lib/history.js`（架构 review 候选 3）：
+     裁到 UNDO_MAX / 清掉重做 / 报数从前在四条手势里各抄了一遍，而"这算不算动过"
+     四个判据各写各的（还有一个手写的 `moved` 标记）。这里只接三样它拿不到的东西：
+     板怎么读、怎么写、数数往哪儿报。 */
+  const ledger = useMemo(
+    () =>
+      createHistory({
+        get: () => boardRef.current,
+        write: (next) => {
+          boardRef.current = next
+          setBoard(next)
+          setDirty(true)
+        },
+        onCount: setHist,
+      }),
+    []
+  )
+
   /* 唯一改板的入口。history=true 表示这一步值得撤销（画一笔、加卡片、删卡片）；
    false 表示是连续手势的中间状态（拖动、连续擦除），不该塞满撤销栈。 */
-  const commit = useCallback((next, history = true) => {
-    const prev = boardRef.current
-    const value = typeof next === 'function' ? next(prev) : next
-    if (value === prev) return
-    boardRef.current = value
-    if (history) {
-      undoRef.current.push(prev)
-      if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
-      redoRef.current = []
-    }
-    setBoard(value)
-    setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
-    setDirty(true)
-  }, [])
+  const commit = useCallback(
+    (next, history = true) => {
+      if (history) ledger.step(next)
+      else ledger.apply(next)
+    },
+    [ledger]
+  )
 
   /* ── 卡片「按内容量尺寸」的接线 ────────────────────────────────────────────
      策略（量什么 / 什么时候量得准 / 什么时候算稳定 / 门槛多少）搬去了
@@ -329,25 +343,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     return snap
   }
 
-  const undo = useCallback(() => {
-    const prev = undoRef.current.pop()
-    if (!prev) return
-    redoRef.current.push(boardRef.current)
-    boardRef.current = prev
-    setBoard(prev)
-    setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
-    setDirty(true)
-  }, [])
+  /* 撤销 / 重做：账本的事（空栈时它自己返回 false，不抛、不改板）。 */
+  const undo = useCallback(() => ledger.undo(), [ledger])
 
-  const redo = useCallback(() => {
-    const next = redoRef.current.pop()
-    if (!next) return
-    undoRef.current.push(boardRef.current)
-    boardRef.current = next
-    setBoard(next)
-    setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
-    setDirty(true)
-  }, [])
+  const redo = useCallback(() => ledger.redo(), [ledger])
 
   /* 改视野。注意 pin 参数：
      - pin=true  你亲手平移/缩放了 → 记下来，下次打开照用（"我看到哪了"是你的意图）
@@ -367,7 +366,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* ── 换文件 / 点「重载」：整块重来。白板是"一节课一页"，不混着开 ──
      ⚠ 依赖里**不能**放 initialText。
        它是 App 塞进来的"最新内容"，每自动保存一次就会变一次字符串。
-       一旦按它重跑，这个 effect 就会在每次保存之后把 undoRef 清空 ——
+       一旦按它重跑，这个 effect 就会在每次保存之后把撤销账本清空 ——
        表现是"拖完东西按 Ctrl+Z 没反应、撤销按钮永远是灰的"，
        而且从代码上完全看不出毛病（这一条排查了一整轮才揪出来，
        中间还错怪了 pointerup 那几行）。
@@ -380,9 +379,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setSelectedId(null)
     setEditingId(null)
     setDirty(false)
-    undoRef.current = []
-    redoRef.current = []
-    setHist({ undo: 0, redo: 0 })
+    /* 换了一份板 → 账本归零（从前是三行手写的：两个 ref 清空 + setHist）。 */
+    ledger.reset()
     /* ★ 重开一张板时，把卡片过时的尺寸重新量一次（用户 2026-09-16：
        「公式板子周围留白太大」—— 一半是 KaTeX 的 1em 边距，另一半是 w/h 过时）。
        为什么非要在"每次打开"跑一趟：w/h 是**存进文件**的测量值，而它可能是在
@@ -411,7 +409,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
     })
     return () => cancelAnimationFrame(raf)
-  }, [file, reloadToken, commit])
+  }, [file, reloadToken, commit, ledger])
 
   // ── 量可用区域 ──
   useEffect(() => {
@@ -675,7 +673,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         // 把"选中那几条按下时的原样"存下来，拖动时拿它算偏移（不累加，见 onPointerMove）
         const origin = new Map()
         for (const s of boardRef.current.strokes) if (inkSel.has(s.id)) origin.set(s.id, s)
-        inkMoveRef.current = { from: wp, origin, moved: false }
+        /* 一次拖动 = 一步撤销：起点交给账本记（`moved` 那个手写标记没了 ——
+           "动没动过"由 `end()` 按 `sameWithin` 判一次，见 history.js）。 */
+        inkMoveRef.current = { from: wp, origin, g: ledger.begin() }
         return
       }
 
@@ -713,7 +713,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm, selectedFrameId]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm, selectedFrameId, ledger]
   )
   const onPointerMove = useCallback(
     (e) => {
@@ -754,14 +754,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const mv = inkMoveRef.current
         const dx = wp.x - mv.from.x
         const dy = wp.y - mv.from.y
-        if (dx || dy) mv.moved = true // 给松手时用：点一下没拖的话，不该往撤销栈里塞东西
-        commit(
-          (cur) => ({
-            ...cur,
-            strokes: cur.strokes.map((s) => (mv.origin.has(s.id) ? shiftStroke(mv.origin.get(s.id), dx, dy) : s)),
-          }),
-          false
-        )
+        /* 中途每一帧只改板、不记账（"这一下算不算一步"收尾时由账本判一次）。 */
+        mv.g.during((cur) => ({
+          ...cur,
+          strokes: cur.strokes.map((s) => (mv.origin.has(s.id) ? shiftStroke(mv.origin.get(s.id), dx, dy) : s)),
+        }))
         return
       }
 
@@ -839,7 +836,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         if (added) paintLive(liveRef, d.stroke, boardRef.current.view)
       }
     },
-    [tool, localPoint, setView, eraseAt, trackPointerKind, commit]
+    [tool, localPoint, setView, eraseAt, trackPointerKind, commit, ledger]
   )
 
   const onPointerUp = useCallback(
@@ -894,19 +891,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
-      /* 拖完松手：把整次拖动记成一步撤销（中途那些帧都不记）。 */
+      /* 拖完松手：整次拖动记成一步撤销（中途那些帧都不记）。 */
       if (inkMoveRef.current) {
         const mv = inkMoveRef.current
         inkMoveRef.current = null
-        const now = boardRef.current.strokes
-        /* 用拖动过程中打的 moved 标记，不去逐条比对坐标 ——
-           比对那版看着更"严谨"，实际不可靠。 */
-        if (mv.moved) {
-          undoRef.current.push({ ...boardRef.current, strokes: now.map((s) => mv.origin.get(s.id) || s) })
-          if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
-          redoRef.current = []
-          setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
-        }
+        mv.g.end()
         return
       }
 
@@ -1343,29 +1332,27 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }
 
   /* 整体挪：挪的是**成员**（框线是成员的函数，跟着走）。
-     一次拖动 = 一步撤销 —— 中途那些帧走 commit(…, false) 不记历史，
-     松手时把"按下那一刻的板"补进撤销栈（和卡片 / 墨迹拖动同一条规矩）。 */
+     一次拖动 = 一步撤销 —— 中途那些帧走账本的 `during`（不记账），
+     松手时 `end()` 把"按下那一刻的板"补进撤销栈，判据是"和起点是不是同一个样"
+     （从前这里是"两个数组还是不是同一个引用"，四个手势里唯一有 Ctrl+Z 断言的一条）。 */
   function frameDragStart(frameId) {
-    frameDragRef.current = { id: frameId, before: boardRef.current }
+    frameDragRef.current = { id: frameId, g: ledger.begin() }
     setSelectedFrameId(frameId)
   }
 
   function frameDrag(frameId, dxScreen, dyScreen) {
+    const st = frameDragRef.current
+    if (!st || st.id !== frameId) return
     const k = boardRef.current.view.s || 1
     /* 屏幕位移 → 世界位移：走 view.js 那一处（别自己除 s）。 */
-    commit((cur) => translateFrame(cur, frameId, screenLenToWorld(dxScreen, k), screenLenToWorld(dyScreen, k)), false)
+    st.g.during((cur) => translateFrame(cur, frameId, screenLenToWorld(dxScreen, k), screenLenToWorld(dyScreen, k)))
   }
 
   function frameDragEnd(frameId) {
     const st = frameDragRef.current
     frameDragRef.current = null
     if (!st || st.id !== frameId) return
-    /* 拖了等于没拖（两个数组还是同一个引用）→ 别往撤销栈里塞一步空操作。 */
-    if (st.before.frames === boardRef.current.frames && st.before.strokes === boardRef.current.strokes) return
-    undoRef.current.push(st.before)
-    if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
-    redoRef.current = []
-    setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
+    st.g.end()
   }
 
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
@@ -1498,30 +1485,24 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   function startResize(cardId, rectW, startX) {
     const c0 = boardRef.current.cards.find((x) => x.id === cardId)
     if (!c0) return
-    const st = { id: cardId, rectW: rectW || c0.w, startX, scale: c0.scale || 1, w: c0.w, moved: false }
+    const st = { id: cardId, rectW: rectW || c0.w, startX, scale: c0.scale || 1, w: c0.w }
+    /* 一次缩放 = 一步撤销：起点交给账本（`moved` 那个手写标记没了）。 */
+    const g = ledger.begin()
 
     const onMove = (e) => {
       const dx = e.clientX - st.startX
+      /* 这道门留在原地：它管的是"这一下别污染手势"（1.5 屏幕像素的起手噪声），
+         不是"算不算一步" —— 后者由账本的 `end()` 判（见 history.js）。 */
       if (Math.abs(dx) < 1.5) return
-      st.moved = true
       const k = (st.rectW + dx) / st.rectW
       const next = nextCardScale({ w: st.w, scale: st.scale }, k)
-      commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === st.id ? { ...x, scale: next } : x)) }), false)
+      g.during((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === st.id ? { ...x, scale: next } : x)) }))
     }
     const onUp = () => {
       window.removeEventListener('pointermove', onMove, true)
       window.removeEventListener('pointerup', onUp, true)
       window.removeEventListener('pointercancel', onUp, true)
-      if (!st.moved) return
-      // 一次缩放 = 一步撤销（和拖动同一个做法：把"按下那一刻"补进栈）
-      const before = {
-        ...boardRef.current,
-        cards: boardRef.current.cards.map((x) => (x.id === st.id ? { ...x, scale: st.scale } : x)),
-      }
-      undoRef.current.push(before)
-      if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
-      redoRef.current = []
-      setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
+      g.end()
     }
     window.addEventListener('pointermove', onMove, true)
     window.addEventListener('pointerup', onUp, true)
@@ -1594,7 +1575,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             }}
             onStartDrag={() => {
               const c0 = boardRef.current.cards.find((x) => x.id === c.id)
-              dragStartRef.current = c0 ? { id: c.id, x: c0.x, y: c0.y } : null
+              /* 一次拖动 = 一步撤销：起点交给账本（"点了一下没拖"由 `end()` 判）。 */
+              dragStartRef.current = c0 ? { id: c.id, x: c0.x, y: c0.y, g: ledger.begin() } : null
             }}
             onStartEdit={() => {
               setSelectedId(c.id)
@@ -1602,33 +1584,25 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             }}
             onCommit={(patch) => commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, ...patch } : x)) }))}
             onCloseEdit={() => setEditingId(null)}
-            onDrag={(dxScreen, dyScreen) =>
-              commit(
-                (cur) => {
-                  // 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）——走 view.js 那一处
-                  const k = cur.view.s
-                  const dx = screenLenToWorld(dxScreen, k)
-                  const dy = screenLenToWorld(dyScreen, k)
-                  return { ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
-                },
-                false
-              )
-            }
+            onDrag={(dxScreen, dyScreen) => {
+              /* 中途每一帧只改板、不记账 —— 这一次拖动的那一步由 onDragEnd 的 `end()` 记。 */
+              const g = dragStartRef.current && dragStartRef.current.g
+              if (!g) return
+              g.during((cur) => {
+                // 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）——走 view.js 那一处
+                const k = cur.view.s
+                const dx = screenLenToWorld(dxScreen, k)
+                const dy = screenLenToWorld(dyScreen, k)
+                return { ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
+              })
+            }}
             onDragEnd={() => {
               const st = dragStartRef.current
               dragStartRef.current = null
               if (!st) return
-              const now = boardRef.current.cards.find((x) => x.id === st.id)
-              if (!now || (Math.abs(now.x - st.x) < 0.5 && Math.abs(now.y - st.y) < 0.5)) return
-              // 一次拖动 = 一次撤销：把"拖动前的位置"补进栈（中途那些步不记）
-              const before = {
-                ...boardRef.current,
-                cards: boardRef.current.cards.map((x) => (x.id === st.id ? { ...x, x: st.x, y: st.y } : x)),
-              }
-              undoRef.current.push(before)
-              if (undoRef.current.length > UNDO_MAX) undoRef.current.shift()
-              redoRef.current = []
-              setHist({ undo: undoRef.current.length, redo: redoRef.current.length })
+              /* "点了一下没拖"由账本判（收尾那版板和起点是不是同一个样，数字按 0.5
+                 世界像素的余量比）—— 从前这里是 `|dx| < 0.5 && |dy| < 0.5`。 */
+              st.g.end()
             }}
             /* ── 放大缩小（拖右下角那个柄）──
                ★ 手势的移动/松手**挂在 window 上**，不靠 setPointerCapture、也不靠
@@ -1636,8 +1610,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
                  ① 手柄只有 18px，鼠标拖两下就出去了，靠元素自己的 onPointerMove
                     会当场收不到事件（自检里实测：拖了 120px，倍率纹丝不动）；
                  ② 卡片本身会 stopPropagation，窗口级 + 捕获阶段最省事。
-               这个手势和"拖动"是同一种东西：中途 commit(..., false) 不进撤销栈，
-               松手时把"按下那一刻的倍率"补成**一步**撤销。 */
+               这个手势和"拖动"是同一种东西：中途只改板不进撤销栈，
+               松手时由账本补成**一步**撤销（见上面的 startResize）。 */
             onStartResize={(rectW, startX) => startResize(c.id, rectW, startX)}
             onToggleLock={() => toggleLock(c.id)}
             onDelete={() => {

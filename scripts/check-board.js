@@ -44,6 +44,9 @@ import {
 import { SEED_BOARD_NAME, boardFileName, createFileApi, nextBoardName, planStartup } from '../src/lib/files.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, scaledRectToScreen, screenLenToWorld, screenToWorld, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
+/* 撤销账本（一次手势 = 一步撤销）搬去了 history.js（2026-09-17 架构 review 候选 3）：
+   四条手势从前各自记一次账、判据四个 —— 这里用假 adapter 断言整族（见 [6s]）。 */
+import { MOVE_EPS, createHistory, sameWithin } from '../src/lib/history.js'
 import { readFileSync } from 'node:fs'
 import { ARROW_SNAP, CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from '../src/lib/nodes.js'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
@@ -2347,6 +2350,138 @@ console.log('\n[6r] 端点（`nodes.js`）：谁算端点、这一点落在谁�
     const parsed = parseBoardDocument(serializeBoardDocument(withDead), 'x')
     eq(parsed.links.length, 1, '写盘：死 id 那条不留尸体（只剩活着的那一对）')
     eq(parsed.links[0].from + '→' + parsed.links[0].to, 'ka→kb', '活下来的正是两端都活着的那条')
+  }
+}
+
+// ═════════════════════ 6s. 撤销账本 ═════════════════════
+console.log('\n[6s] 撤销账本（`history.js`）：一次手势 = 一步，判据只有"和起点同一个样"')
+{
+  /* 为什么单开一节（2026-09-17 架构 review 候选 3）：同一段账（裁到 UNDO_MAX / 清重做 /
+     报数）从前在**四条手势**里各抄了一遍，而"这算不算动过"四个判据各写各的；
+     四条里只有"拖板框"有 Ctrl+Z 断言 —— 另外三条忘了清重做、或者忘了裁，
+     屏幕上没有任何东西会响。这个 module 不认识 React、也不认识"板"是什么，
+     所以拿一对假 adapter 就能把整族钉住（真鼠标那半边在 check-link 的 [15]）。 */
+  function fake(init, opts = {}) {
+    const box = { cur: init, counts: [] }
+    const led = createHistory({
+      get: () => box.cur,
+      write: (next) => {
+        box.cur = next
+      },
+      onCount: (c) => box.counts.push(c),
+      ...opts,
+    })
+    return { box, led }
+  }
+
+  /* ① "没动"的判据：数字按 eps（世界像素）比，别的精确比 */
+  if (sameWithin({ a: 1 }, { a: 1.4 }, MOVE_EPS)) ok(`差 0.4（≤ MOVE_EPS=${MOVE_EPS} 世界像素）算没动`)
+  else bad('eps 之内应该算"没动"')
+  if (!sameWithin({ a: 1 }, { a: 1.6 }, MOVE_EPS)) ok('差 0.6 就是动了')
+  else bad('eps 之外必须算"动了"')
+  if (!sameWithin({ a: [1, 2] }, { a: [1, 2, 3] })) ok('数组变长了就是动了')
+  else bad('数组长度不一样必须算"动了"')
+  if (!sameWithin({ a: 'x' }, { a: 'y' })) ok('字符串 / 布尔精确比')
+  else bad('字符串不该按"差不多"算')
+  if (!sameWithin({ a: true }, { a: 1 })) ok('true 和 1 不是同一个样（不按 JS 的真值比）')
+  else bad('类型不同必须算"动了"')
+  if (sameWithin({ a: 1, b: undefined }, { a: 1 })) ok('`{ b: undefined }` 和"没有 b"是同一个样（板是 spread 出来的）')
+  else bad('undefined 的键和缺键该算同一个样')
+  if (!sameWithin({ a: 1 }, { a: 1, b: 2 })) ok('多出一个有值的键就是动了')
+  else bad('多一个键必须算"动了"')
+
+  /* ② 一步到位的改动（画一笔 / 删一张卡） */
+  {
+    const { box, led } = fake({ v: 1 })
+    eq(led.step({ v: 2 }), true, 'step：改了板')
+    eq(box.cur.v, 2, 'step：写进去了')
+    eq(led.counts(), { undo: 1, redo: 0 }, 'step：记一步')
+    eq(led.step((cur) => cur), false, 'step：返回同一个引用 → 什么都不做')
+    eq(led.counts(), { undo: 1, redo: 0 }, '  （"什么都没发生"不占一步撤销）')
+  }
+
+  /* ③ 一次手势 = 一步（中途多少帧都只算一步） */
+  {
+    const { box, led } = fake({ v: 1 })
+    const g = led.begin()
+    g.during({ v: 1.2 })
+    g.during({ v: 9 })
+    eq(g.end(), true, '手势收尾：真的动了 → 记一步')
+    eq(led.counts(), { undo: 1, redo: 0 }, '★ 中途两帧 + 收尾一次 → **只记一步**')
+    led.undo()
+    eq(box.cur.v, 1, '撤销回到"按下那一刻"那一版板')
+    eq(led.counts(), { undo: 0, redo: 1 }, '撤销之后重做栈里有一步')
+    led.redo()
+    eq(box.cur.v, 9, '重做回到松手那一版')
+    eq(led.counts(), { undo: 1, redo: 0 }, '重做之后又回到撤销栈里')
+  }
+
+  /* ④ 判"没动"的三种现场（从前是三个判据 / 一个手写标记） */
+  {
+    const { led } = fake({ cards: [{ id: 'a', x: 0, y: 0 }] })
+    const g = led.begin()
+    /* 点一下：拖动那条路照样会提交一版**新对象**，数字一个没变 */
+    g.during((cur) => ({ ...cur, cards: cur.cards.map((c) => ({ ...c })) }))
+    eq(g.end(), false, '点一下没拖（板重建了一版、数字一个没变）→ 不记一步')
+    eq(led.counts().undo, 0, '  （撤销栈里没有空操作 —— 这就是从前那个 `moved` 标记在管的事）')
+  }
+  {
+    const { led } = fake({ cards: [{ id: 'a', x: 0, y: 0 }] })
+    const g = led.begin()
+    g.during({ cards: [{ id: 'a', x: 0.3, y: -0.2 }] })
+    eq(g.end(), false, `手抖 0.3 世界像素（≤ ${MOVE_EPS}）不算动过`)
+    eq(led.counts().undo, 0, '  （从前的卡片拖动就是按 0.5 判的，现在只有这一处判）')
+  }
+  {
+    const { led } = fake({ cards: [{ id: 'a', x: 0, y: 0 }] })
+    const g = led.begin()
+    g.during({ cards: [{ id: 'a', x: 50, y: 0 }] })
+    g.during({ cards: [{ id: 'a', x: 0, y: 0 }] })
+    eq(g.end(), false, '拖出去又拖回原点 → 不记（按了 Ctrl+Z 也什么都看不出来）')
+  }
+  {
+    const { led } = fake({ v: 1 })
+    const g = led.begin()
+    g.during((cur) => cur)
+    eq(g.end(), false, '一次手势里"每帧都返回同一个引用"→ 不记')
+    eq(g.end(), false, '★ end 只算一次（连着调两次不会记两步）')
+    eq(led.counts().undo, 0, '  （撤销栈还是空的）')
+  }
+
+  /* ⑤ 账本自己那两条纪律：裁到 max、新的一步清掉重做 */
+  {
+    const { box, led } = fake({ v: 0 }, { max: 3 })
+    for (let i = 1; i <= 5; i++) led.step({ v: i })
+    eq(led.counts().undo, 3, '账本裁到 max=3（最老的两步被丢掉）')
+    led.undo()
+    led.undo()
+    led.undo()
+    eq(box.cur.v, 2, '裁掉之后撤到底 = 第 3 步之前那一版（不是最初的 1）')
+    eq(led.undo(), false, '空栈时再撤销：返回 false（不抛、不改板 —— 按钮靠 counts() 置灰）')
+    eq(box.cur.v, 2, '  （板没被动过）')
+    eq(led.redo(), true, '空撤销栈也不影响重做（还能往前）')
+  }
+  {
+    const { led } = fake({ v: 0 })
+    led.step({ v: 1 })
+    led.step({ v: 2 })
+    led.undo()
+    eq(led.counts(), { undo: 1, redo: 1 }, '撤销一步 → 有一步可以重做')
+    led.step({ v: 9 })
+    eq(led.counts(), { undo: 2, redo: 0 }, '★ 新的一步把重做清掉（从前这条没有任何断言，忘了清也没人响）')
+  }
+
+  /* ⑥ 只改板、不记账（连续手势的中途 / 量尺寸那一趟）与换文件归零 */
+  {
+    const { box, led } = fake({ v: 0 })
+    eq(led.apply({ v: 5 }), true, 'apply：只改板')
+    eq(box.cur.v, 5, '  （写进去了）')
+    eq(led.counts(), { undo: 0, redo: 0 }, 'apply：不记账')
+    eq(led.apply((cur) => cur), false, 'apply：同一个引用 → 返回"没改"')
+    led.step({ v: 6 })
+    led.reset()
+    eq(led.counts(), { undo: 0, redo: 0 }, 'reset：换了一份板 → 账本归零（两个栈都清）')
+    eq(led.undo(), false, '归零之后没有东西可撤')
   }
 }
 
