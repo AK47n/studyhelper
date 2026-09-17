@@ -1086,8 +1086,84 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
   else bad('挪了卡片，那条线一动不动 —— 它被钉死在画出来的那一刻了')
 }
 
-/* ═════════════════ 15. 一次手势 = 一步撤销（真鼠标走四条路） ═════════════════ */
-console.log('\n[15] 一次手势 = 一步撤销：拖卡片 / 缩放卡片 / 挪笔迹 / 空点不吃掉重做')
+/* ═════════════════ 15. 宣告的连接上的条件（架构 review 候选 4） ═════════════════ */
+console.log('\n[15] 你连的那条也能说条件：∈ 指一个 → 写进那条**记录** → 重开还在 → ↺ 清掉')
+{
+  /* 从前的三个写入口只看 `link.strokeId`，而宣告的连接那个字段**恒为 null** ——
+     面板上"你连的"那一节连一颗按钮都没有：你点了也没反应，而且**一句提示都没有**。
+     现在写入口按 `link.declared` 自己决定住哪（住笔上还是住记录上，见 selection.js），
+     两节共用同一份按钮。
+     ★ 这一节还钉住一条**真 bug**：读法里那个 `cards` 从前**根本没有定义**
+       （这条路走不到，所以一直没炸）—— 第一次真的指一下就 `ReferenceError`、白板白屏。 */
+  const declaredRow = () =>
+    s.eval(`(() => {
+      const row = document.querySelector('[data-link-declared]')
+      if (!row) return null
+      const at = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } }
+      const arm = row.querySelector('[data-arm-cond]')
+      const back = row.querySelector('[data-cond-btn="back"]')
+      const cond = row.querySelector('.bd-cond')
+      return { id: row.dataset.linkDeclared, arm: at(arm), armKey: arm ? arm.dataset.armCond : null, back: at(back), cond: cond ? cond.textContent.trim() : null }
+    })()`)
+
+  const row0 = await declaredRow()
+  if (!row0) {
+    bad('面板里找不到"你连的"那一行 —— 这一节整段没意义')
+  } else {
+    if (row0.arm) ok(`"你连的"那一行有「∈ 条件」（data-arm-cond=${row0.armKey}，从前这里是空的）`)
+    else bad('"你连的"那一行没有 ∈ —— 候选 4 那半件事没接上')
+    /* 命中测试：那一行本身是个 <button>，∈ 是它里面的 span —— 必须点得到它自己 */
+    const hit = await hitAt(row0.arm.x, row0.arm.y)
+    if (hit.includes('bd-cond-no')) ok(`那颗 ∈ 中心命中的就是它自己（${hit}）`)
+    else bad(`∈ 中心命中的是「${hit}」—— 点不到`)
+
+    const errsBefore = s.exceptions.length
+    await s.mouse(row0.arm.x, row0.arm.y, { steps: 0 })
+    await s.sleep(200)
+    const armed = await s.eval(`document.querySelector('.bd').classList.contains('condarm')`)
+    if (armed) ok('按它 → 武装上了（整块板换成十字光标）')
+    else bad('按了 ∈ 没武装')
+
+    /* 点一张卡 = "这张卡就是它的条件"（卡片自己收指针事件，所以走 Card 的 onSelect） */
+    const st15 = await readBoard()
+    await s.mouse(st15.a.cx, st15.a.cy, { steps: 0 })
+    const wLinkCond = await untilFile((d) => ((d.links || [])[0] || {}).cond, { what: '记录上写下了 cond' })
+    if (wLinkCond.ok) ok(`点一张卡 → 写进那条**记录**：${JSON.stringify(wLinkCond.value.links[0])}`)
+    else bad(`文件里的 links 记录上一直没有 cond：${JSON.stringify((await read()).links)}`)
+    const afterSpec = await read()
+    const strokeConds = (afterSpec.strokes || []).filter((x) => x.cond).length
+    if (strokeConds === 0) ok('★ 一笔都没被碰（宣告的连接没有笔可挂 —— 从前正是挂不上）')
+    else bad(`有 ${strokeConds} 笔被写上了 cond —— 那句话应该住在记录上`)
+    if (s.exceptions.length === errsBefore) ok('这一路没有 JS 报错（从前这里 `cards is not defined` —— 一写就白屏）')
+    else bad(`这一路抛了 ${s.exceptions.length - errsBefore} 条异常：` + s.exceptions.slice(errsBefore, errsBefore + 2).join(' ｜ '))
+
+    const row1 = await declaredRow()
+    if (row1 && row1.cond && /你指的/.test(row1.cond)) ok(`面板那一行跟上了：「${row1.cond}」`)
+    else bad(`面板那一行没跟上：${JSON.stringify(row1 && row1.cond)}`)
+    if (row1 && !row1.arm) ok('有条件时 ∈ 收起来了（一行最多两颗按钮，和"你画过的"那一节同一条规矩）')
+    else bad('有条件了 ∈ 还挂在那儿 —— 一行上挤了三颗')
+
+    /* 重开一次：这件事存在**记录**里，不是只活在屏幕上 */
+    await open()
+    const row2 = await declaredRow()
+    if (row2 && row2.cond && /你指的/.test(row2.cond) && row2.back) ok('重开之后那句话还在（而且 ↺ 在手边）')
+    else bad(`重开之后丢了：${JSON.stringify(row2)}`)
+
+    /* ↺ = 回头路：清掉记录上的那个字段 */
+    if (row2 && row2.back) {
+      await s.mouse(row2.back.x, row2.back.y, { steps: 0 })
+      const wClear = await untilFile((d) => !(d.links || []).some((r) => r.cond), { what: '记录上那个 cond 清掉了' })
+      if (wClear.ok) ok('↺ 清掉了记录上的条件（回到"这条连接没有条件"）')
+      else bad(`点了 ↺，文件里的 cond 还在：${JSON.stringify((await read()).links)}`)
+      const row3 = await declaredRow()
+      if (row3 && row3.arm && !row3.cond) ok('那一行回到 ∈（可以再指一个）')
+      else bad(`↺ 之后那一行不对：${JSON.stringify(row3)}`)
+    }
+  }
+}
+
+/* ═════════════════ 16. 一次手势 = 一步撤销（真鼠标走四条路） ═════════════════ */
+console.log('\n[16] 一次手势 = 一步撤销：拖卡片 / 缩放卡片 / 挪笔迹 / 空点不吃掉重做')
 {
   /* 见 `src/lib/history.js` 与 README 第 41 条。这四条手势从前各自记一次账、
      "算不算动过"四个判据，而上面 [10] 只覆盖了"拖板框"。
@@ -1193,8 +1269,8 @@ console.log('\n[15] 一次手势 = 一步撤销：拖卡片 / 缩放卡片 / 挪
   }
 }
 
-/* ═════════════════ 16. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[16] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 17. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[17] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })

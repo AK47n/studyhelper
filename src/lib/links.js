@@ -688,6 +688,12 @@ function resolveCondSpec({ spec, ink, cards, byId, mid, cacheKey }) {
  */
 export function readDeclaredLinks(board, ink) {
   const byId = new Map(((board && board.strokes) || []).map((s) => [s.id, s]))
+  /* ⚠ `cards` 这个局部从前**根本没有**（那行直接引用了一个不存在的名字）——
+     而这条分支只有"你在一条宣告的连接上指过条件"才走得到，而那时候**还没有 writer**
+     （2026-09-17 架构 review 候选 4 才补上）→ 于是它是"一写就崩"的死代码：
+     `ReferenceError: cards is not defined`，整块白板当场白屏。
+     自检里那条"指一个条件 → 写在 links[i].cond 上，再读回来"就是照它的。 */
+  const cards = (board && board.cards) || []
   /* 两端按 id 取节点：判据（卡片 / 板框、框的成员全没了就不画）住在 nodes.js 一处 */
   const nodeFor = (id) => nodeById(board, id)
   const out = []
@@ -767,6 +773,13 @@ export function readDeclaredLinks(board, ink) {
   }
   return out
 }
+
+/* 一条连接在界面上的**身份**（两个用处：条件那条"正武装着哪一条"、以及按钮上的 data 属性）：
+   · 你**画**的那种看**那一笔**（同一对卡片之间可以画两条线，只有笔能分开它们）；
+   · 你**连**的那种看**那条记录**（`links[i]` 的身份 = 两端那一对，见 board.js 的 linkId）。
+   从前界面直接写 `l.strokeId`，而宣告的连接那个字段**恒为 null** ——
+   于是"武装 ∈ 条件"那一颗永远点不亮、`data-arm-cond` 也是空的（架构 review 候选 4）。 */
+export const linkKey = (l) => (l && (l.strokeId || l.id)) || null
 
 /* 白板的文件里其实是 JSON —— 但仍然叫 .md。
    为什么：① 现有服务、备份脚本、Git 流程都按 *.md 走，改后缀就是改了四处；

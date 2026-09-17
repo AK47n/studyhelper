@@ -27,7 +27,7 @@ import {
      墨迹块当端点 + 三道闸）整个删掉了 —— 它在真笔迹上 92:0（ADR-0001），
      所以这里也不再 import 它们（[6d]/[6e]/[6f] 那几节跟着没了）。 */
 import {
-  INK_BLOCK_GAP, LINK_COND_RADIUS, createInkIndex, createLinkReader, deriveChains, inkBlocks, inkNodeAt,
+  INK_BLOCK_GAP, LINK_COND_RADIUS, createInkIndex, createLinkReader, deriveChains, inkBlocks, inkNodeAt, linkKey,
 } from '../src/lib/links.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { COND_NONE, LINK_DELETE, condCard, condInk, parseCond } from '../src/lib/link-kinds.js'
@@ -2130,6 +2130,68 @@ console.log('\n[6p] 「条件就是它」（`cond: card:/ink:`）：位置读不
     const chained = { ...onOther, strokes: onOther.strokes.map((s) => ({ ...s })) }
     const link2 = { strokeId: 'lk', ids: ['lk', 'f1'] }
     eq(clearCond(chained, link2).strokes.find((s) => s.id === 'lk').cond, undefined, '按整条链清（链里那一笔的话也一起清掉）')
+  }
+
+  /* ⑧ ★ 宣告的连接（`links[i]`）：它**没有那一笔**，条件只能住在记录上 ——
+     存储层一直读得出、写得出这个字段，可从前三个写入口只看 `link.strokeId`，
+     那个字段恒为 null → "点一下 ∈ 条件"是个静默 no-op（架构 review 候选 4）。
+     下面这一族钉的就是"两族走同一道缝、各自住在自己家里"。 */
+  const mkDeclared = () => {
+    const b = mk()
+    /* 把那条画出来的线**拿走**，改成一条宣告的记录（你连的） */
+    b.strokes = b.strokes.filter((s) => s.id !== 'lk')
+    b.links = [{ from: 'k1', to: 'k2', kind: 'derive' }]
+    return b
+  }
+  {
+    const b = mkDeclared()
+    const l = reader.read(b)[0]
+    eq([l.declared, l.strokeId, l.cond], [true, null, null], '基线：宣告的连接没有笔、也没有条件（位置读法对它不成立）')
+    eq(linkKey(l), linkId('k1', 'k2'), '★ 它在界面上的身份 = 那条记录（不是恒为 null 的 strokeId）')
+    eq(linkKey(reader.read(mk())[0]), 'lk', '画出来的那种身份 = 那一笔（同一对卡之间两条线才分得开）')
+
+    /* 指一张卡 → 写进**记录**（不是某一笔） */
+    const next = specCond(b, l, condCard('k3'))
+    const rec = next.links.find((r) => r.from === 'k1' && r.to === 'k2')
+    eq(rec.cond, 'card:k3', '★ 指一个条件 → 写在 `links[i].cond` 上（从前没有 writer，点了没反应）')
+    eq(next.strokes.filter((s) => s.cond).length, 0, '一笔都没被碰（宣告的连接没有笔可挂）')
+    const l2 = reader.read(next)[0]
+    eq([l2.cond && l2.cond.id, l2.condSpec, l2.condManual], ['k3', { kind: 'card', id: 'k3' }, true], '读回来：条件 + "（你指的）" + 回头路')
+    /* 链上那一步不再缺条件 */
+    eq(deriveChains(reader.read(next))[0].steps[0].missing, false, '推导链上那一步补齐了（和画出来的那种一个效果）')
+    eq(JSON.stringify(b.links), JSON.stringify([{ from: 'k1', to: 'k2', kind: 'derive' }]), '★ 原 board 没动（纯函数）')
+
+    /* 指一撮字也认 */
+    const inkSpec = specCond(b, l, condInk('f1'))
+    eq(reader.read(inkSpec)[0].cond.kind, 'ink', '指一撮字 → 同样写在记录上（`ink:<笔 id>`）')
+    eq(inkSpec.strokes.filter((s) => s.cond).length, 0, '  （还是没碰任何一笔）')
+
+    /* 只有**那一条**记录被改（记录身份 = 两端那一对） */
+    const twoRecs = { ...b, links: [{ from: 'k1', to: 'k2', kind: 'derive' }, { from: 'k2', to: 'k3', kind: 'cause' }] }
+    const lA = reader.read(twoRecs).find((x) => x.a === 'k1')
+    const one = specCond(twoRecs, lA, condCard('k3'))
+    eq(one.links.map((r) => r.cond).filter(Boolean).length, 1, '两条记录里只有指的那一条被改')
+    eq(one.links[1].cond, undefined, '  （另一条一个字节都没多）')
+
+    /* 否决 / 回头路：同一批函数，落在同一个字段上 */
+    const vetoed = vetoCond(b, l)
+    eq(vetoed.links[0].cond, 'none', '不说算（`vetoCond`）也写在记录上')
+    eq(reader.read(vetoed)[0].condManual, true, '读回来 condManual（面板要给一颗 ↺）')
+    const cleared = clearCond(next, l2)
+    eq(cleared.links[0].cond, undefined, '回头路：清掉记录上的那个字段（回到"这条连接没有条件"）')
+    eq(reader.read(cleared)[0].cond, null, '  （读回来确实没有条件了）')
+    eq(clearCond(b, l), b, '本来就没说过话 → 原样返回（不造新对象）')
+
+    /* 指的东西没了 → 当没说过，而且**不留尸体**（和画出来的那种同一条纪律） */
+    const gone = specCond(b, l, condCard('k9'))
+    eq(reader.read(gone)[0].cond, null, '指的卡不在板上 → 当没说过')
+    eq(reader.read(gone)[0].condManual, false, '  （也不留"你说过"的痕迹）')
+    if (!/"cond"/.test(serializeBoardDocument(gone))) ok('死 id 不进文件（links 记录上也不留尸体）')
+    else bad('文件里的 links 记录上写了一个已经不存在的 id')
+    const round = parseBoardDocument(serializeBoardDocument(next), 'x')
+    const roundRec = round.links.find((r) => r.from === 'k1' && r.to === 'k2')
+    eq(roundRec && roundRec.cond, 'card:k3', '存 → 读 → 再存：记录上的那个条件往返还在')
+    eq(reader.read(round)[0].cond.id, 'k3', '  （读回来还是那张卡）')
   }
 
   /* ⑧ 存盘往返 + 形状不认的值丢掉 */

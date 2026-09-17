@@ -19,9 +19,10 @@ import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simp
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'
-/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
+/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。
+   `linkKey` = 一条连接在界面上的身份（你画的看那一笔、你连的看那条记录）。 */
 import {
-  createLinkReader, deriveChains,
+  createLinkReader, deriveChains, linkKey,
 } from '../lib/links.js'
 /* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
    改词 / 反向 / 「不算连接」/ 回头路 / 留下板框 的规矩都在那儿，纯函数、有断言。 */
@@ -1640,7 +1641,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          "只框住其中一条"很不好框，而"缺条件"这件事本来就显示在那一行上 ——
          入口就在它旁边。`condArmId` 是正武装着的那条，用来把按钮点亮。 */
       onArmCond={armCond}
-      condArmId={condArm ? condArm.strokeId : null}
+      condArmId={condArm ? linkKey(condArm) : null}
       /* 板框那一行（见 ADR-0001）：点一下 = 选中它 + 视野居到它身上。 */
       onFrameSelect={setSelectedFrameId}
       onFocusFrame={(id) => {
@@ -2243,6 +2244,61 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
     return label(byId.get(id))
   }
   const condName = (cond) => (cond.kind === 'ink' ? cond.label || '墨迹块' : label(byId.get(cond.id)))
+  /* 条件那一族的几颗按钮（✕ / ↺ / ∈）—— **你画的和你的连的共用这一份**。
+     从前只有"你画过的"那一行有它们：三个写入口只看 `link.strokeId`，而宣告的连接
+     那个字段恒为 null —— 于是"∈ 条件"在那一节里根本不存在，你连的那条**永远指不了条件**
+     （架构 review 候选 4；现在写入口按 `link.declared` 自己决定住哪，见 selection.js）。
+     ✕ 是"位置读错了"那个口子，只对**画出来**的连接有意义（宣告的那种条件只能是你亲口说的），
+     所以它在那一节里自然不会出现（`condManual` 只在你说过话时为真）。 */
+  const condChips = (l) => (
+    <>
+      {l.cond && (
+        <span
+          className="bd-cond"
+          title={l.condSpec ? '你亲手指的那个条件（点右边的 ↺ 回到按位置读）' : '写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件'}
+        >
+          条件 {condName(l.cond)}
+          {l.condSpec ? '（你指的）' : ''}
+        </span>
+      )}
+      {l.condManual && !l.cond && (
+        <span className="bd-cond-note" title="你说过：这个条件不算（位置读出来的那个作废）；点右边的 ↺ 改回来">
+          条件不算
+        </span>
+      )}
+      {(l.cond || l.condManual) && (
+        <span
+          className={'bd-cond-no' + (l.condManual ? ' back' : '')}
+          role="button"
+          data-cond-btn={l.condManual ? 'back' : 'no'}
+          title={l.condManual ? '改回来：还是按位置读' : '这个条件不是给这条线的（位置读错了）'}
+          onClick={(e) => {
+            e.stopPropagation()
+            if (l.condManual) onCondBack && onCondBack(l)
+            else onNoCond && onNoCond(l)
+          }}
+        >
+          {l.condManual ? '↺' : '✕'}
+        </span>
+      )}
+      {/* 「∈ 条件」：这一行现在**没有条件显示**时给的口子（读不到、或者你刚否掉）——
+          按一下它，再点一下要当条件的那张卡/那撮字。两种连接都有这条口子。 */}
+      {!l.cond && (
+        <span
+          className={'bd-cond-no arm' + (condArmId === linkKey(l) ? ' on' : '')}
+          role="button"
+          data-arm-cond={linkKey(l)}
+          title="指定条件：按一下，再点要当条件的那张卡或那撮字（Esc 取消）"
+          onClick={(e) => {
+            e.stopPropagation()
+            onArmCond && onArmCond(l)
+          }}
+        >
+          ∈
+        </span>
+      )}
+    </>
+  )
   /* 「推导链」（见 lib/board.js 的 deriveChains）：由推导连接串起来的 A→B→C，
      并标出**哪一步缺条件** —— 条件就是写在线中点旁边那几个字，不用你声明。 */
   const chains = deriveChains(links)
@@ -2309,7 +2365,7 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                   className={'bd-link-row' + (l.dir ? ' dir' : '')}
                   data-link-declared={l.id}
                   onClick={() => onFocus(l.a)}
-                  title={'你连的：' + l.name + '（点线上那颗词能改词 / 删掉这条连接）'}
+                  title={'你连的：' + l.name + '（点线上那颗词能改词 / 删掉这条连接 / ∈ 指一个条件）'}
                 >
                   <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
                     {l.name}
@@ -2318,6 +2374,8 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                   <span className="bd-er">{endName(l, 'a')}</span>
                   <span className="dim">{l.dir ? '→' : '—'}</span>
                   <span className="bd-er">{endName(l, 'b')}</span>
+                  {/* 你连的这条也能说条件 —— 只是它没有"位置读法"，所以只有 ∈ / ↺ 两种。 */}
+                  {condChips(l)}
                 </button>
               ))}
             </>
@@ -2345,53 +2403,7 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                      · 读不到（条件写在别处）→ 框住那条线，浮层上按「∈ 条件」再点一下目标
                        （`cond:'card:<id>'` / `'ink:<笔 id>'`）—— 那一行会写「（你指的）」。
                      · 旁边的 ↺ 是这两种说法的**回头路**（回到按位置读）。 */}
-              {l.cond && (
-                <span
-                  className="bd-cond"
-                  title={l.condSpec ? '你亲手指的那个条件（点右边的 ↺ 回到按位置读）' : '写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件'}
-                >
-                  条件 {condName(l.cond)}
-                  {l.condSpec ? '（你指的）' : ''}
-                </span>
-              )}
-              {l.condManual && !l.cond && (
-                <span className="bd-cond-note" title="你说过：这个条件不算（位置读出来的那个作废）；点右边的 ↺ 改回来">
-                  条件不算
-                </span>
-              )}
-              {(l.cond || l.condManual) && (
-                <span
-                  className={'bd-cond-no' + (l.condManual ? ' back' : '')}
-                  role="button"
-                  data-cond-btn={l.condManual ? 'back' : 'no'}
-                  title={l.condManual ? '改回来：还是按位置读' : '这个条件不是给这条线的（位置读错了）'}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    if (l.condManual) onCondBack && onCondBack(l)
-                    else onNoCond && onNoCond(l)
-                  }}
-                >
-                  {l.condManual ? '↺' : '✕'}
-                </span>
-              )}
-              {/* 「∈ 条件」：位置送的条件**读不到**的时候（写在别处、或者你后来把那几笔
-                  挪走了）—— 按一下它，再点一下要当条件的那张卡/那撮字。
-                  只在"这一行现在没有条件显示"时出现：有条件时那一行已经有 ✕（否决）了，
-                  不想让一行上挤三颗按钮；而"缺条件"正是最需要指一个的时候。 */}
-              {!l.cond && (
-                <span
-                  className={'bd-cond-no arm' + (condArmId === l.strokeId ? ' on' : '')}
-                  role="button"
-                  data-arm-cond={l.strokeId}
-                  title="指定条件：按一下，再点要当条件的那张卡或那撮字（Esc 取消）"
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onArmCond && onArmCond(l)
-                  }}
-                >
-                  ∈
-                </span>
-              )}
+              {condChips(l)}
             </button>
           ))}
             </>
