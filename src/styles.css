@@ -1205,6 +1205,12 @@ kbd {
 }
 .bd-cond-no:hover { background: #2b3444; color: #dde3ee; border-color: #3a4457; }
 .bd-cond-no.back { color: #7fb2e5; }
+.bd-cond-no.arm { color: #9aa7bd; font-weight: 600; }
+.bd-cond-no.arm:hover { color: #cfe3fa; }
+.bd-cond-no.arm.on { background: #2b3444; border-color: #7fb2e5; color: #cfe3fa; }
+/* 「∈ 条件」武装着的时候：整块板换成十字光标（"这一下是**指**，不是画"）。
+   不这么做的话，用户会以为自己在画线。 */
+.bd.condarm .bd-stagewrap, .bd.condarm .bd-hit { cursor: crosshair; }
 /* 推导链：A →(条件) B →(缺条件) C */
 .bd-chain-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
 .bd-chain { margin: 6px 0 10px 2px; }

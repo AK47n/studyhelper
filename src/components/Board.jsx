@@ -25,10 +25,10 @@ import {
 /* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
    改词 / 反向 / 「不算连接」/ 回头路 / 固定 / 拆开 的规矩都在那儿，纯函数、有断言。 */
 import {
-  applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
+  applyStrokeLink, clearCond, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes, specCond, vetoCond,
 } from '../lib/selection.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { COND_NONE, LINK_KINDS, LINK_NONE, isCondNone, linkKind } from '../lib/link-kinds.js'
+import { LINK_KINDS, LINK_NONE, condCard, condInk, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
@@ -189,6 +189,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      mode='text' 认文字（文字卡 + 字体）、mode='formula' 认公式（公式卡）。
      和写字板是两条路：那条是"另开一块小板先写再认"（见 InkToCard.jsx 顶部）。 */
   const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
+  /* 「∈ 条件」武装着的那条连接（null = 没武装）。一次性：点完目标就收（见 armCond）。 */
+  const [condArm, setCondArm] = useState(null)
 
   const wrapRef = useRef(null)
   const sceneRef = useRef(null)
@@ -566,6 +568,22 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       const lp = localPoint(e)
       const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
 
+      /* ⓪ 「∈ 条件」武装着 → 这一下不是画、不是选，是**指**：
+         点到哪撮字就把"条件就是它"写在那条连接上（点到卡片那条路走 Card 的 onSelect，
+         因为卡片自己收指针事件 —— 见下面 Card 的 onSelect）。
+         没点到东西就说一句、**保持武装**（指着指着点偏了很正常，不用重新按一次）。
+         ⚠ 这一步必须在"平移/框选/画/擦"之前 —— 武装着的时候不该落墨。 */
+      if (condArm) {
+        const R = 12 / (boardRef.current.view.s || 1) // 12 屏幕像素换算成世界像素
+        const hit = [...boardRef.current.strokes].reverse().find((s) => strokeHitsCircle(s, wp.x, wp.y, R))
+        if (hit) {
+          pickCond(condArm, { strokeId: hit.id })
+        } else {
+          flash('这一点上没东西 —— 点一下那撮字，或者点一张卡（Esc 取消）', 'warn')
+        }
+        return
+      }
+
       // 中键 / 空格 / 手指 → 平移。手写笔永远只画画，这是 Surface 上最要紧的一条。
       if (e.button === 1 || spaceRef.current || e.pointerType === 'touch') {
         panRef.current = { lp, tx: boardRef.current.view.tx, ty: boardRef.current.view.ty }
@@ -629,7 +647,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm]
   )
   const onPointerMove = useCallback(
     (e) => {
@@ -906,6 +924,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
       if (e.key === 'Escape') {
+        /* 武装着「∈ 条件」时，Esc 先收掉它（不然你以为取消了、其实下一下点还是会指过去）。 */
+        if (condArm) {
+          setCondArm(null)
+          flash('不收条件了', 'ok')
+          return
+        }
         setSelectedId(null)
         setEditingId(null)
         setInkSel(null)
@@ -954,7 +978,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke])
+  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke, condArm])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -1072,38 +1096,44 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash('又算回连接了（按形状重新判）', 'ok')
   }
 
-  /* ── 「这个条件不算」 ──────────────────────────────────────────────────────
+  /* ── 「这个条件不算」/「条件就是它」 ────────────────────────────────────────
    * 条件本来是**位置送的**：写在那条线弧长中点旁边的字/卡自动成为它的条件。
-   * 位置会读错（那撮字可能是另一条线的、或者只是随手写的旁注），而这个口子就是
-   * "你说了不算"：写在那一笔上（`cond: 'none'`，见 link-kinds.js 的 COND_NONE），
-   * 读连接的时候**否决权优先**（不再去位置里读）。
-   * ★ 要有回头路（`condBack`）：一句话说出口、重开之后就没路了，那还是单向门 ——
+   * 位置两头都不灵的时候就得有说法：
+   *   · 读错了 → `noCond`（`cond:'none'`，否决权优先，不再往位置里读）；
+   *   · 读不到（条件写在别处）→ `armCond` 武装一下、再点一下目标（卡片或那撮字），
+   *     写 `cond:'card:<id>'` / `'ink:<笔 id>'`。
+   * ★ 两个口子都要有回头路（`condBack`）：一句话说出口、重开之后就没路了，那还是单向门 ——
    *   和「不算连接」的「又算回连接」是同一个道理。
-   * ⚠ 只说"那个不是条件"，不是"这一步不需要条件" —— 否决之后面板照实回到"缺条件"，
-   *   补的办法还是老规矩：在中点旁边把该写的写上。 */
+   * ⚠ 只说"那个不是条件"/"就是它"，不是"这一步不需要条件" —— 否决之后面板照实回到
+   *   "缺条件"，补的办法还是老规矩：在中点旁边把该写的写上（或者指一个）。 */
   function noCond(link) {
     if (!link) return
-    commit((cur) => ({
-      ...cur,
-      strokes: cur.strokes.map((s) => (s.id === link.strokeId ? { ...s, cond: COND_NONE } : s)),
-    }))
+    commit((cur) => vetoCond(cur, link))
     flash('这个条件不算了 —— 那撮字照旧留在板上（想改回来点 ↺）', 'ok')
   }
 
   function condBack(link) {
     if (!link) return
-    /* 清的是**整条链**上的那句话（链里任意一笔挂着都算数，见 links.js）。 */
-    const ids = new Set(link.ids && link.ids.length ? link.ids : [link.strokeId])
-    commit((cur) => ({
-      ...cur,
-      strokes: cur.strokes.map((s) => {
-        if (!ids.has(s.id) || !isCondNone(s.cond)) return s
-        const next = { ...s }
-        delete next.cond
-        return next
-      }),
-    }))
+    commit((cur) => clearCond(cur, link))
     flash('又按位置读了（那条线中点旁边写什么就是什么）', 'ok')
+  }
+
+  /* 武装：「∈ 条件」按下之后，下一下点在哪张卡/哪撮字上，它就成了这条线的条件。
+     一次性（点完就收）—— 不做成常驻模式，免得下次画东西时它还开着。 */
+  function armCond(link) {
+    if (!link) return
+    setCondArm(link)
+    flash('点一下要当条件的那张卡、或者那撮字（Esc 取消）', 'warn')
+  }
+
+  /* 真去说那句"条件就是它"。kind 由"点到了什么"决定（卡片 / 笔迹）。 */
+  function pickCond(link, target) {
+    const value = target && target.cardId ? condCard(target.cardId) : condInk(target && target.strokeId)
+    if (!value) return false
+    commit((cur) => specCond(cur, link, value))
+    setCondArm(null)
+    flash(target.cardId ? '这张卡就是它的条件了（点 ↺ 回到按位置读）' : '这撮字就是它的条件了（点 ↺ 回到按位置读）', 'ok')
+    return true
   }
 
   /* ── 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）──
@@ -1306,7 +1336,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             dimmed={focusIds ? !focusIds.has(c.id) : false}
             editing={c.id === editingId}
             view={board.view}
-            onSelect={() => setSelectedId(c.id)}
+            /* ★ 武装着「∈ 条件」时，点一张卡 = **指着它**（"这张卡就是那条线的条件"），
+               而不是选中它 —— 卡片自己收指针事件，所以这条只能在这儿拦
+               （笔迹那边是 onPointerDown 拦的，见上面 ⓪）。 */
+            onSelect={() => {
+              if (condArm) pickCond(condArm, { cardId: c.id })
+              else setSelectedId(c.id)
+            }}
             onStartDrag={() => {
               const c0 = boardRef.current.cards.find((x) => x.id === c.id)
               dragStartRef.current = c0 ? { id: c.id, x: c0.x, y: c0.y } : null
@@ -1377,6 +1413,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          （见 RelationPanel 的说明：它是纯展示，改板一律回到 Board 这边做）。 */
       onNoCond={noCond}
       onCondBack={condBack}
+      /* 「∈ 条件」的入口放在**这一行**（不是框选浮层）：板上几条线走同一条走廊时
+         "只框住其中一条"很不好框，而"缺条件"这件事本来就显示在那一行上 ——
+         入口就在它旁边。`condArmId` 是正武装着的那条，用来把按钮点亮。 */
+      onArmCond={armCond}
+      condArmId={condArm ? condArm.strokeId : null}
       onFocus={(id) => {
         const el = wrapRef.current
         if (!el) return
@@ -1433,7 +1474,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      写字板那块小板也要跟着换纸，而它是 .bd 的兄弟分支，不是 stagewrap 的孩子。
      挂在根上，一条 `.paper-grid .bd-stagewrap, .paper-grid .wp-padwrap` 就都管得住。 */
   return (
-    <div className={'bd variant-' + variant + ' paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '')}>
+    <div className={'bd variant-' + variant + ' paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '') + (condArm ? ' condarm' : '')}>
       {/* ★ 指针种类在**捕获阶段**就记下来（挂在最外层，卡片上的事件也会先经过这里）。
           为什么不能只在 .bd-hit 上记：笔悬停到**卡片**上时，事件被卡片接走了，
           .bd-hit 上的监听收不到 —— 于是"上一次是笔"要等按下才知道，
@@ -1920,7 +1961,7 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
 
 // ────────────────────────────── 关系面板 ──────────────────────────────
 
-function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack }) {
+function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack, onArmCond, condArmId }) {
   const byId = new Map(board.cards.map((c) => [c.id, c]))
   const label = (c) => {
     if (!c) return '(没了)'
@@ -1984,15 +2025,21 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
               <span className="dim">{l.dir ? '→' : '—'}</span>
               <span className="bd-er">{endName(l, 'b')}</span>
               {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。
-                  ★ 读错了就在这儿说一句：那颗 ✕ 是「这个条件不算」——
-                    位置读出来的那个作废（存进这一笔的 cond:'none'），
-                    旁边的 ↺ 是它的回头路（见 noCond / condBack）。 */}
+                  ★ 位置两头都不灵的时候有说法：
+                     · 读错了 → 那颗 ✕ 是「这个条件不算」（`cond:'none'`）；
+                     · 读不到（条件写在别处）→ 框住那条线，浮层上按「∈ 条件」再点一下目标
+                       （`cond:'card:<id>'` / `'ink:<笔 id>'`）—— 那一行会写「（你指的）」。
+                     · 旁边的 ↺ 是这两种说法的**回头路**（回到按位置读）。 */}
               {l.cond && (
-                <span className="bd-cond" title="写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件">
+                <span
+                  className="bd-cond"
+                  title={l.condSpec ? '你亲手指的那个条件（点右边的 ↺ 回到按位置读）' : '写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件'}
+                >
                   条件 {condName(l.cond)}
+                  {l.condSpec ? '（你指的）' : ''}
                 </span>
               )}
-              {l.condManual && (
+              {l.condManual && !l.cond && (
                 <span className="bd-cond-note" title="你说过：这个条件不算（位置读出来的那个作废）；点右边的 ↺ 改回来">
                   条件不算
                 </span>
@@ -2010,6 +2057,24 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                   }}
                 >
                   {l.condManual ? '↺' : '✕'}
+                </span>
+              )}
+              {/* 「∈ 条件」：位置送的条件**读不到**的时候（写在别处、或者你后来把那几笔
+                  挪走了）—— 按一下它，再点一下要当条件的那张卡/那撮字。
+                  只在"这一行现在没有条件显示"时出现：有条件时那一行已经有 ✕（否决）了，
+                  不想让一行上挤三颗按钮；而"缺条件"正是最需要指一个的时候。 */}
+              {!l.cond && (
+                <span
+                  className={'bd-cond-no arm' + (condArmId === l.strokeId ? ' on' : '')}
+                  role="button"
+                  data-arm-cond={l.strokeId}
+                  title="指定条件：按一下，再点要当条件的那张卡或那撮字（Esc 取消）"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onArmCond && onArmCond(l)
+                  }}
+                >
+                  ∈
                 </span>
               )}
             </button>

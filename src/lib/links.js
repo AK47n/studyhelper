@@ -17,7 +17,7 @@
 
 import { cardBounds, pointInRect, toFlat, toPoints } from './geometry.js'
 import {
-  ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isCondNone, isLinkKind, isNoLink, linkKind,
+  ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isLinkKind, isNoLink, linkKind, parseCond,
 } from './link-kinds.js'
 
 /* ═══════════ 形状判据：这一笔是不是箭头 ═══════════
@@ -1173,18 +1173,57 @@ function buildLinks(board, inkInput) {
       if (i !== undefined) linkStrokeIdx.add(i)
     }
   }
-  for (const l of out) {
-    /* ★ 你手动说过"这个条件不算"的那条：**别再读**（cond 留 null）。
-       和 linkCondition 的关系是"否决权优先"：位置读得再像也不算数。
-       `condManual` 给面板用 —— 它要显示"（你说过不算）"并给一条回头路，
-       不然那句话就是单向门（点完只能 Ctrl+Z，重开之后没路可走）。 */
-    const vetoed = l.ids.some((id) => {
+  /* 链上挂着的那句话（`stroke.cond`）：挂在**任意一笔**上就生效 —— 和手动改词同一个口径。
+     一个字段只能有一个值，所以"否决"和"指定"不可能互相打架。 */
+  const manualCondOf = (l) => {
+    for (const id of l.ids) {
       const s = byId.get(id)
-      return !!s && isCondNone(s.cond)
-    })
-    l.condManual = vetoed
-    l.cond = vetoed
-      ? null
+      const parsed = s ? parseCond(s.cond) : null
+      if (parsed) return parsed
+    }
+    return null
+  }
+  /* 你亲手指的那个条件：**卡片**直接用 id（面板自己会去 board.cards 里取名字）；
+     **某一笔**要先问索引"它属于哪一撮字"（块是现算的）；索引给不出来（太小、
+     或者那笔已经没了）就退回"这一笔自己" —— 你说过的话要算数，不能因为
+     算法觉得它太小就丢掉。at 用它自己的第一个点（浮层/连线都用不上，诊断用）。 */
+  const specCondition = (spec, mid) => {
+    if (!spec) return null
+    if (spec.kind === 'card') {
+      const known = boxes.some((b) => b.id === spec.id)
+      return known ? { kind: 'card', id: spec.id, ids: [], label: '', at: mid } : null
+    }
+    if (spec.kind === 'ink') {
+      const st = byId.get(spec.id)
+      if (!st) return null
+      const p = toPoints(st.points)[0]
+      if (!p) return null
+      const node = inkNodeAt(ink, p, INK_NODE_PAD, INK_BLOCK_GAP, null, 'mc:' + spec.id)
+      if (node) return { kind: 'ink', id: node.id, ids: node.ids.slice(), label: node.label, at: p }
+      return { kind: 'ink', id: spec.id, ids: [spec.id], label: '墨迹块（1 笔）', at: p }
+    }
+    return null
+  }
+  for (const l of out) {
+    /* ★ 你说过的话优先于位置：
+       · `'none'`（这个条件不算）→ **别再读**（cond 留 null）；
+       · `'card:<id>'` / `'ink:<id>'`（就是它）→ 直接用你指的，不看中点旁边有什么。
+       读不出来（指的那张卡/那笔已经没了）→ 当没说过，回到按位置读。
+       `condManual` 给面板用：它要显示"你说过的"并给一条回头路 ——
+       不然那些话就是单向门（点完只能 Ctrl+Z，重开之后没路可走）。 */
+    const spec = manualCondOf(l)
+    let manual = null
+    if (spec && spec.kind === 'none') manual = { kind: 'none' }
+    else if (spec) {
+      const resolved = specCondition(spec, l.midInk)
+      if (resolved) manual = { kind: 'spec', cond: resolved, spec }
+    }
+    l.condManual = !!manual
+    l.condSpec = manual && manual.kind === 'spec' ? manual.spec : null
+    l.cond = manual
+      ? manual.kind === 'spec'
+        ? manual.cond
+        : null
       : linkCondition(
           ink,
           boxes,

@@ -21,7 +21,7 @@
    这里只用得到 geometry 的一件：**toFlat**（所有入口都把点收敛成扁平数组）。
    （视图映射在 view.js —— 那个现在由 geometry.js 的 fitView 用，这边用不着了：
      读盘时的缩放归一是本地那个 clampScale。） */
-import { COND_NONE, LINK_NONE, isCondNone, isLinkKind } from './link-kinds.js'
+import { COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
 import { toFlat } from './geometry.js'
 
 export const BOARD_VERSION = 3
@@ -347,6 +347,21 @@ export function parseBoardDocument(text, fallbackTitle = '新白板') {
   /* 显式分组（"这一坨就是我说的那一块"）：成员被擦掉的、重复的一律丢掉。
      必须**在 strokes 之后**做 —— 要看得出哪些 id 还活着。 */
   b.groups = normalizeGroups(raw.groups, new Set(b.strokes.map((s) => s.id)))
+  /* 「条件就是这个」（`cond: 'card:x'` / `'ink:y'`）指的东西可能已经没了
+     （卡删了、那笔擦了）—— 那句话作废，不留尸体（和 groups 同一条规矩）。 */
+  {
+    const liveCards = new Set(b.cards.map((c) => c.id))
+    const liveStrokes = new Set(b.strokes.map((s) => s.id))
+    b.strokes = b.strokes.map((s) => {
+      const spec = parseCond(s.cond)
+      if (!spec || spec.kind === 'none') return s
+      const alive = spec.kind === 'card' ? liveCards.has(spec.id) : liveStrokes.has(spec.id)
+      if (alive) return s
+      const next = { ...s }
+      delete next.cond
+      return next
+    })
+  }
   return b
 }
 
@@ -385,11 +400,13 @@ function normalizeStroke(s) {
        ★ `'none'`（"这条不算连接"）要原样保留 —— 它是你明确说过的一句话，
          丢了它，下次打开那条假连接就自己回来了。 */
     ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
-    /* 「这个条件不算」（见 link-kinds.js 的 COND_NONE）：条件本来是位置送的
-       （写在线中点旁边那几个字），位置会读错，所以给你一句否决。
-       ★ 和上面那条一模一样的规矩：**只认这个字面值**、**不补默认值** ——
-         没说过这句话的板一个字节都不多。 */
-    ...(isCondNone(s.cond) ? { cond: COND_NONE } : {}),
+    /* 条件那一族（见 link-kinds.js 的 parseCond）：`'none'`（这个条件不算）/
+       `'card:<id>'` / `'ink:<id>'`（条件就是它）。位置送的条件本身**不存盘**
+       （随时能重算），只有你亲口说的那三种值才写。
+       ★ 规矩和上面 link 那条一样：**形状不认的一律丢掉**（手改文件写个 "yes" 不该
+         变成一个说法）、**不补默认值**（没说过这句话的板一个字节都不多）。
+       ★ 指的东西后来没了 → 这个字段在解析的最后一步被清掉（那里看得到所有 id）。 */
+    ...(parseCond(s.cond) ? { cond: s.cond } : {}),
     points: pts,
   }
 }
@@ -455,11 +472,23 @@ export function serializeBoardDocument(board) {
      不是内存里那一批 —— 两批不一样时（内存里有一笔写不出去的垃圾笔迹），
      groups 会引用一个文件里根本没有的 id，读回来时又被 normalizeGroups 丢掉，
      于是"存→读→再存"不再一致（模糊测试逮到的就是这一条）。 */
-  const strokes = (board.strokes || [])
+  const kept = (board.strokes || [])
     /* ★ 出关也要过"这一笔能不能进文件"那道闸（`isStrokePointsOK`）——
        写得出去、读不回来的东西一个都不留。判据和 normalizeStroke 是同一份。 */
     .map((s) => ({ s, flat: toFlat(s.points) }))
     .filter((it) => isStrokePointsOK(it.flat))
+  const strokeIds = new Set(kept.map((it) => it.s.id))
+  const liveCards = new Set((board.cards || []).map((c) => c.id))
+  /* 条件那一族（`'none'` / `'card:<id>'` / `'ink:<id>'`）：只有形状认得出、
+     而且指的东西**还在这一批要写出去的东西里**才写 —— 死 id 不留尸体（和 groups 同一条规矩）。 */
+  const condToWrite = (v) => {
+    const spec = parseCond(v)
+    if (!spec) return null
+    if (spec.kind === 'none') return COND_NONE
+    if (spec.kind === 'card') return liveCards.has(spec.id) ? v : null
+    return strokeIds.has(spec.id) ? v : null
+  }
+  const strokes = kept
     .map(({ s, flat }) => ({
       id: s.id,
       tool: s.tool,
@@ -472,8 +501,9 @@ export function serializeBoardDocument(board) {
          文件里那个"因果"就成了谎话）。老文件里没有这个字段，所以往返仍然字节级一致。
          `'none'`（"这条不算连接"）同样只在你说过时才写。 */
       ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
-      /* 同理：`'none'`（"这个条件不算"）也只在你说过时才写（见 link-kinds.js 的 COND_NONE）。 */
-      ...(isCondNone(s.cond) ? { cond: COND_NONE } : {}),
+      /* 条件那一族同理，只在你说过时才写；**指的东西还在**才写（死 id 不留尸体 ——
+         和 groups 一样。判据必须按"这一批真会写出去的卡/笔"算，和上面那段同一个道理）。 */
+      ...(condToWrite(s.cond) ? { cond: condToWrite(s.cond) } : {}),
       // ★ 必须过 toFlat，不能直接 Array.from 遍历。
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
       //   直接遍历再用 Number(n) 读，每个点都会变成 0 —— 又一次静默毁数据。

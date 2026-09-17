@@ -21,14 +21,14 @@ import {
   inkBlocks, inkNodeAt, createInkIndex, readArrowHead, tipNearEnd,
 } from '../src/lib/links.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { COND_NONE, LINK_NONE } from '../src/lib/link-kinds.js'
+import { COND_NONE, LINK_NONE, condCard, condInk, parseCond } from '../src/lib/link-kinds.js'
 /* 卡片「按内容量尺寸」那一套规矩搬去了 card-fit.js（2026-09-16）：DOM 读数是注入的，
    所以"提交完不能立刻再量"这类坑在这儿断言得到（见 [6l]）。 */
 import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
 /* 选中这一族（框住的笔意味着什么 + 改词/反向/否决/回头路/固定/拆开）搬去了 selection.js
    （2026-09-16）：纯函数、有断言（见 [6m]）。 */
 import {
-  applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
+  applyStrokeLink, clearCond, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes, specCond, vetoCond,
 } from '../src/lib/selection.js'
 /* 板文件这一步（data/ 的读写 + 打开哪一个）搬去了 files.js（2026-09-16 C4）：
    "打开哪一个"是一个纯决定，于是那些入口情形在这儿断言得到（见 [6n]）。 */
@@ -2060,6 +2060,158 @@ console.log('\n[6o] 「这个条件不算」（`COND_NONE`）：位置读错了�
     eq(dirtyBack.strokes.find((s) => s.id === 'lk').cond, undefined, '不认识的值丢掉（手改文件不会把它变成一个说法）')
     if (reader.read(dirtyBack)[0].cond) ok('丢掉之后它回到"按位置读"（屏幕上的表现是对的）')
     else bad('丢掉怪值之后条件没回来')
+  }
+}
+
+// ═════════════════════ 6p. 「条件就是它」 ═════════════════════
+/* 位置送的条件还有**读不到**的时候：条件写在别处、或者你后来把那几笔挪走了
+ * （挪走就不算数了 —— 那正是"位置送"的定义）。这时得能亲手指一个：
+ * `cond: 'card:<卡 id>'` / `'ink:<笔 id>'`。
+ * 这一节钉的就是这条路的规矩：**你说过的话优先于位置**、指的东西没了就当没说过、
+ * 死 id 不进文件（不留尸体）、回头路清得干净。
+ * 端到端对手是 check:link 的 [13]（真浏览器：框住线 → 「∈ 条件」→ 点一下目标）。 */
+console.log('\n[6p] 「条件就是它」（`cond: card:/ink:`）：位置读不到时，你亲手指一个')
+{
+  /* 一张板：两张卡 + 一条直线连接 + **离中点很远**的一撮字（位置读不到它）。 */
+  const mk = () => {
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 0, id: 'k1', text: 'A' },
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 0, id: 'k2', text: 'B' },
+      { ...newCard('note', 0, 0, { w: 120, h: 60 }), x: 0, y: 400, id: 'k3', text: '仅当…（离得远）' },
+    ]
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 300, y: 40 }, { x: 660, y: 40 }])), id: 'lk' },
+      /* 板角上那撮字：离这条线的中点 (360,40) 有 400 世界像素，位置永远读不到 */
+      { ...newStroke('pen', toFlat([{ x: 40, y: 520 }, { x: 120, y: 520 }])), id: 'f1' },
+      { ...newStroke('pen', toFlat([{ x: 40, y: 528 }, { x: 128, y: 528 }])), id: 'f2' },
+      { ...newStroke('pen', toFlat([{ x: 40, y: 536 }, { x: 112, y: 536 }])), id: 'f3' },
+    ]
+    return b
+  }
+
+  /* ① 基线：位置读不到那撮字（离中点太远），所以这一步"缺条件" */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    eq(l.cond, null, '位置读不到（那撮字离中点 400 像素）—— 所以才有"指"这条路')
+    eq(l.condManual, false, '没说过话 → condManual false')
+    /* 把那条线标成"推导"，好让面板读成链（链上那一步会显示缺条件） */
+    b.strokes = b.strokes.map((s) => (s.id === 'lk' ? { ...s, link: 'derive' } : s))
+    const chains = deriveChains(reader.read(b))
+    eq(chains[0].steps[0].missing, true, '推导链上那一步缺条件（下一步指一个给它）')
+  }
+
+  /* ② 指一撮字：就算它离中点十万八千里，也算数 */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    const next = specCond(b, l, condInk('f1'))
+    const l2 = reader.read(next)[0]
+    if (l2.cond && l2.cond.kind === 'ink') ok(`指了板角那撮字 → 它成了条件（${l2.cond.label}）`)
+    else bad(`指了却没成条件：${JSON.stringify(l2.cond)}`)
+    eq(l2.condSpec, { kind: 'ink', id: 'f1' }, 'condSpec 记住了"这是你指的、指的是谁"（面板据此写"（你指的）"）')
+    eq(l2.condManual, true, 'condManual：你说过话（面板要给回头路）')
+    eq(b.strokes.find((s) => s.id === 'lk').cond, undefined, '★ 原 board 没动（纯函数）')
+    /* 链上那一步不再缺条件了 */
+    const withDerive = { ...next, strokes: next.strokes.map((s) => (s.id === 'lk' ? { ...s, link: 'derive' } : s)) }
+    eq(deriveChains(reader.read(withDerive))[0].steps[0].missing, false, '链上那一步补齐了')
+  }
+
+  /* ③ 指一张卡：直接认它（面板自己会去 board.cards 里取名字） */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    const next = specCond(b, l, condCard('k3'))
+    const l2 = reader.read(next)[0]
+    eq([l2.cond && l2.cond.kind, l2.cond && l2.cond.id], ['card', 'k3'], '指一张卡 → 条件就是那张卡')
+    eq(l2.condSpec, { kind: 'card', id: 'k3' }, 'condSpec 记的是卡 id')
+  }
+
+  /* ④ 你说的话**压过**位置：中点旁边本来有字也算你说过的那个 */
+  {
+    const b = mk()
+    /* 在中点旁边塞一撮字（位置本来会读它） */
+    b.strokes.push(
+      { ...newStroke('pen', toFlat([{ x: 352, y: 84 }, { x: 392, y: 84 }])), id: 'm1' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 92 }, { x: 400, y: 92 }])), id: 'm2' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 100 }, { x: 388, y: 100 }])), id: 'm3' }
+    )
+    const l0 = reader.read(b)[0]
+    if (l0.cond && l0.cond.kind === 'ink') ok(`先把位置读到的那个也摆上（${l0.cond.label}）`)
+    else bad('夹具没摆出"位置读得到"的情形')
+    const next = specCond(b, l0, condCard('k3'))
+    eq(reader.read(next)[0].cond.id, 'k3', '★ 你说过的话优先：位置读到的那个让位')
+  }
+
+  /* ⑤ 指的东西没了 → 当没说过（回到按位置读），而且**不进文件**（不留尸体） */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    /* 卡被删了 */
+    const goneCard = specCond(b, l, condCard('k9'))
+    eq(reader.read(goneCard)[0].cond, null, '指的卡不在板上 → 当没说过（回到按位置读）')
+    eq(reader.read(goneCard)[0].condManual, false, '也不留"你说过"的痕迹')
+    if (!/"cond"/.test(serializeBoardDocument(goneCard))) ok('死 id 不进文件（不留尸体）')
+    else bad('文件里写了一个已经不存在的 id')
+    /* 笔被擦了 */
+    const goneInk = specCond(b, l, condInk('zzz'))
+    eq(reader.read(goneInk)[0].cond, null, '指的笔不在板上 → 同样当没说过')
+    /* 而且**存→读→再存**之后，那句话彻底消失（解析时也清死 id） */
+    const round = parseBoardDocument(serializeBoardDocument(goneCard), 'x')
+    eq(round.strokes.find((s) => s.id === 'lk').cond, undefined, '读回来时死 id 已经被清掉')
+  }
+
+  /* ⑥ 否决和指定**互相覆盖**（一个字段只能有一个值 —— 这就是把它们放在一个字段里的原因） */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    const vetoed = vetoCond(b, l)
+    eq(reader.read(vetoed)[0].condManual, true, '先说不算 → condManual')
+    const thenSpec = specCond(vetoed, reader.read(vetoed)[0], condCard('k3'))
+    eq(reader.read(thenSpec)[0].cond.id, 'k3', '再指一个 → 指定赢了（不会"既不算、又是它"）')
+    const thenVeto = vetoCond(thenSpec, reader.read(thenSpec)[0])
+    eq(reader.read(thenVeto)[0].cond, null, '再说不算 → 又回到否决')
+  }
+
+  /* ⑦ 回头路：清掉那个字段 → 回到按位置读（整条链一起清） */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    const next = specCond(b, l, condCard('k3'))
+    const l2 = reader.read(next)[0]
+    const cleared = clearCond(next, l2)
+    eq(reader.read(cleared)[0].cond, null, '清掉之后回到按位置读（那撮字在板角，所以读不到）')
+    eq(reader.read(cleared)[0].condManual, false, '痕迹也没了')
+    eq(clearCond(b, l), b, '本来就没说过话 → 原样返回（不造新对象）')
+    /* 挂在链里**别的**笔上时，也要清得掉（按整条链清） */
+    const onOther = specCond(b, { strokeId: 'lk', ids: ['lk'] }, condCard('k3'))
+    const chained = { ...onOther, strokes: onOther.strokes.map((s) => ({ ...s })) }
+    const link2 = { strokeId: 'lk', ids: ['lk', 'f1'] }
+    eq(clearCond(chained, link2).strokes.find((s) => s.id === 'lk').cond, undefined, '按整条链清（链里那一笔的话也一起清掉）')
+  }
+
+  /* ⑧ 存盘往返 + 形状不认的值丢掉 */
+  {
+    const b = mk()
+    const l = reader.read(b)[0]
+    const next = specCond(b, l, condInk('f1'))
+    const text = serializeBoardDocument(next)
+    if (/"cond":\s*"ink:f1"/.test(text)) ok('落盘写的是 cond: "ink:f1"')
+    else bad('落盘不对：' + (text.match(/"cond":[^,}]*/) || ['(没有 cond)'])[0])
+    const back = parseBoardDocument(text, 'x')
+    eq(back.strokes.find((s) => s.id === 'lk').cond, 'ink:f1', '读得回来')
+    eq(reader.read(back)[0].cond.kind, 'ink', '重开之后仍然是你指的那撮字')
+    /* 手改出来的怪值：丢掉，回到按位置读 */
+    const dirty = mk()
+    dirty.strokes = dirty.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: 'card' } : s))
+    const dirtyBack = parseBoardDocument(serializeBoardDocument(dirty), 'x')
+    eq(dirtyBack.strokes.find((s) => s.id === 'lk').cond, undefined, '"card"（少了 id）不算一个说法 → 丢掉')
+    const dirty2 = mk()
+    dirty2.strokes = dirty2.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: 'yes' } : s))
+    eq(parseCond('yes'), null, '认不出的值 parseCond 给 null（读的时候当没说过）')
+    if (!/"cond"/.test(serializeBoardDocument(dirty2))) ok('认不出的值也不会被写回文件')
+    else bad('认不出的值被写回去了')
   }
 }
 

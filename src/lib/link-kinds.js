@@ -64,24 +64,57 @@ export function isNoLink(stroke) {
   return !!stroke && stroke.link === LINK_NONE
 }
 
-/* 「这个条件不算」—— 2026-09-16 加的第三个手动口子（前两个：改词、不算连接）。
+/* 「这个条件不算」+「条件就是它」—— 2026-09-16 给"位置送的条件"配的两个手动口子
+ * （前两个手动口子是：改词、不算连接）。
  *
  * 条件本来是**位置送的**：写在那条线**弧长中点**旁边的字/卡自动成为它的条件
- * （见 links.js 的 linkCondition）。可位置会读错 —— 中点旁边那撮字可能根本是
- * 另一条线的东西，或者只是你随手写的旁注。在那之前认错了**没有任何说法**：
- * 面板上就一直挂着那个错的条件（README「还没做的」里那条小尾巴就是这个）。
+ * （见 links.js 的 linkCondition）。位置有两头都不灵的时候：
+ *   ① 读错了 —— 中点旁边那撮字可能是另一条线的东西，或者只是随手写的旁注
+ *      → **`'none'`**：这个条件不算（否决权优先，不再往位置里读）；
+ *   ② 读不到 —— 条件写在别处（离中点太远、或者你后来把那几笔挪走了）
+ *      → **`'card:<卡 id>'`** / **`'ink:<笔 id>'`**：条件就是它（你亲手指的）。
  *
- * 存法：`stroke.cond = 'none'`（和 LINK_NONE 一个路子：不是新字段之外的机制，
- * 也不是往词表里加一项 —— 它回答的是"这个条件不成立"，不是"条件是什么"）。
- * 只认这一个字面值；别的值一律当没写（读盘时丢掉）。
+ * 存法：还是 `stroke.cond` 一个字段，值是上面三种形状之一（前缀用冒号分开 ——
+ * 固定块的 id 早就是这个写法：`grp:<组 id>`）。这不只是省一个字段：
+ * **读的时候只要问一个值**，否决和指定就不可能互相打架（一个字段只能有一个值）。
  *
- * ⚠ 否决之后那一步会**回到"缺条件"**，不是"不需要条件"：
- *   你说的是"那撮字不是这条线的条件"，它到底有没有条件还是未知的 ——
- *   面板照实说"缺条件"，再补的办法还是老规矩：在中点旁边把该写的写上。 */
+ * ⚠ 三条规矩（和前两个手动口子一样）：
+ *   · 只在你说过时才写；没说过 → 文件里一个字节都不多；
+ *   · 值只认这个形状，认不出的一律当没写（回到按位置读）；
+ *   · 指的东西**后来没了**（卡删了 / 那笔擦了）→ 这句话作废、回到按位置读，
+ *     而且序列化时**不留尸体**（死 id 不写回文件）。 */
 export const COND_NONE = 'none'
+const COND_CARD = 'card:'
+const COND_INK = 'ink:'
 
 export function isCondNone(v) {
   return v === COND_NONE
+}
+
+/** 指定"条件是那张卡"时该写什么值 */
+export function condCard(cardId) {
+  return cardId ? COND_CARD + cardId : null
+}
+
+/** 指定"条件是那一笔（它所在的那一撮字）"时该写什么值 */
+export function condInk(strokeId) {
+  return strokeId ? COND_INK + strokeId : null
+}
+
+/* 把一个 `stroke.cond` 值解成 { kind, id } —— 认不出返回 null（当没写）。
+   `kind`: 'none' | 'card' | 'ink'。 */
+export function parseCond(v) {
+  if (typeof v !== 'string' || !v) return null
+  if (v === COND_NONE) return { kind: 'none' }
+  if (v.startsWith(COND_CARD)) {
+    const id = v.slice(COND_CARD.length)
+    return id ? { kind: 'card', id } : null
+  }
+  if (v.startsWith(COND_INK)) {
+    const id = v.slice(COND_INK.length)
+    return id ? { kind: 'ink', id } : null
+  }
+  return null
 }
 
 export function linkKind(id) {

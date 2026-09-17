@@ -36,7 +36,7 @@ import { freezeGroup } from './board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
 import { strokesBBox } from './geometry.js'
 import { autoLinkKind, chainOfStroke } from './links.js'
-import { LINK_NONE, isLinkKind } from './link-kinds.js'
+import { COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
 
 /** 把扁平点数组整个倒过来（[x,y,p] 三个一组）。⇄ 反向就是它。 */
 export function reverseFlat(flat) {
@@ -172,4 +172,44 @@ export function freezeSelection(board, ids) {
 export function dissolveGroup(board, groupId) {
   if (!groupId) return board
   return { ...board, groups: (board.groups || []).filter((g) => g.id !== groupId) }
+}
+
+/* ── 条件那一族的三个"说法"（值见 link-kinds.js 的 parseCond）──────────────
+ * 条件本来是位置送的（线弧长中点旁边那几个字/那张卡）。位置会读错、也有读不到的时候，
+ * 所以配了三个手动口子：
+ *   vetoCond  ——「这个条件不算」（`'none'`）
+ *   specCond  ——「条件就是它」（`'card:<卡 id>'` / `'ink:<笔 id>'`，你亲手指的）
+ *   clearCond —— 回到按位置读（把那个字段清掉）—— **这就是上面两个口子的回头路**。
+ * 写在哪一笔上：那条连接自己的那一笔（`link.strokeId`）。
+ * ⚠ 清要按**整条链**清：读的时候链里任意一笔挂着都算数（见 links.js），
+ *   只清一笔的话链里还剩一笔，用户点「改回来」就像没反应（`link:'none'` 踩过这条）。 */
+const linkStrokeIds = (link) => {
+  const ids = link && link.ids && link.ids.length ? link.ids : [link && link.strokeId]
+  return new Set(ids.filter(Boolean))
+}
+
+export function vetoCond(board, link) {
+  const id = link && link.strokeId
+  if (!id) return board
+  return { ...board, strokes: board.strokes.map((s) => (s.id === id ? { ...s, cond: COND_NONE } : s)) }
+}
+
+export function specCond(board, link, value) {
+  const id = link && link.strokeId
+  if (!id || !parseCond(value)) return board
+  return { ...board, strokes: board.strokes.map((s) => (s.id === id ? { ...s, cond: value } : s)) }
+}
+
+export function clearCond(board, link) {
+  const ids = linkStrokeIds(link)
+  if (!ids.size) return board
+  let changed = false
+  const strokes = board.strokes.map((s) => {
+    if (!ids.has(s.id) || !s.cond) return s
+    changed = true
+    const next = { ...s }
+    delete next.cond
+    return next
+  })
+  return changed ? { ...board, strokes } : board
 }

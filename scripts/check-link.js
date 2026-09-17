@@ -781,8 +781,178 @@ console.log('\n[12] 「这个条件不算」：位置读错了，一句话作废
   }
 }
 
-/* ═════════════════ 13. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[13] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 13. 「条件就是它」 ═════════════════ */
+/* 位置送的条件还有**读不到**的时候：条件写在别处（或者你后来把那几笔挪走了 ——
+ * 那正是"位置送"的定义）。这时得能亲手指一个：那一行右边的 **∈** → 再点一下目标
+ * （一撮字 / 一张卡）。存成 `cond: 'ink:<笔 id>'` / `'card:<卡 id>'`。
+ * 入口为什么在**面板那一行**而不是框选浮层：板上几条线走同一条走廊时"只框住其中一条"
+ * 很不好框，而"缺条件"本来就显示在那一行上（见 Board.jsx 的注释）。
+ * ★ 全程真鼠标 + elementFromPoint：那颗 ∈ 是行内 span（那一行本身是 button），
+ *   和「📌 点得到」那类断言同一个道理（README 第 11 条）。 */
+console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按 ∈ 再点一下目标')
+{
+  const rowInfo = async () =>
+    (await readBoard()).condRowInfo.find((r) => /推导/.test(r.kind)) || null
+  const armBtn = () =>
+    s.eval(`(() => {
+      const rows = [...document.querySelectorAll('.bd-link-row')]
+      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
+      const el = row && row.querySelector('[data-arm-cond]')
+      if (!el) return null
+      const r = el.getBoundingClientRect()
+      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height), strokeId: el.dataset.armCond }
+    })()`)
+  const condBtn = (which) =>
+    s.eval(`(() => {
+      const rows = [...document.querySelectorAll('.bd-link-row')]
+      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
+      const el = row && row.querySelector('[data-cond-btn="' + ${JSON.stringify(which)} + '"]')
+      if (!el) return null
+      const r = el.getBoundingClientRect()
+      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) }
+    })()`)
+
+  const start = await readBoard()
+  const row0 = await rowInfo()
+  if (!row0 || !row0.cond) {
+    bad(`这一节要的前提不对（推导那一行现在没有条件显示）：${JSON.stringify(row0)}`)
+  } else {
+    ok(`推导那一行现在挂的是位置读出来的条件（${row0.cond}）`)
+    /* ① 有条件时**不给** ∈（那一行已经有 ✕ 了，别挤三颗按钮） */
+    if (!(await armBtn())) ok('这时候没有 ∈（有条件 → 给的是 ✕；设计如此，一行最多两颗按钮）')
+    else bad('有条件时也摆了一颗 ∈ —— 那一行会挤三颗按钮')
+
+    /* ② 先否决掉位置读错的那个 → 那一行变成"条件不算"，∈ 才出现 */
+    const veto = await condBtn('no')
+    if (!veto) {
+      bad('找不到那颗 ✕')
+    } else {
+      await s.mouse(veto.cx, veto.cy)
+      await s.sleep(450)
+      const row1 = await rowInfo()
+      if (row1 && /不算/.test(row1.note)) ok('否决成功（那一行显示"条件不算"）')
+      else bad(`否决没生效：${JSON.stringify(row1)}`)
+
+      /* ③ 按 ∈ → 武装：整块板换十字光标、按钮亮着、给一句人话 */
+      const btn = await armBtn()
+      if (!btn) {
+        bad('否决之后那一行上还是没有 ∈ —— 那"指一个"这条路就没有入口')
+      } else {
+        const hit = await hitAt(btn.cx, btn.cy)
+        if (String(hit).includes('bd-cond-no')) ok(`∈ 中心命中的就是它自己（${btn.w}×${btn.h}）`)
+        else bad(`∈ 中心命中的是「${hit}」—— 用户点不到`)
+        await s.mouse(btn.cx, btn.cy)
+        await s.sleep(350)
+        const armed = await s.eval(`(() => ({
+          cls: (document.querySelector('.bd') || {}).className || '',
+          on: !!document.querySelector('[data-arm-cond].on'),
+          toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
+        }))()`)
+        if (/condarm/.test(armed.cls)) ok('武装上了（.bd.condarm —— 整块板换成十字光标）')
+        else bad(`没武装：class=${armed.cls}`)
+        if (armed.on) ok('那颗 ∈ 亮着（知道自己正指着谁）')
+        else bad('∈ 没亮')
+        if (/点一下/.test(armed.toast)) ok('给了一句人话：' + armed.toast)
+        else bad('没提示怎么指：' + JSON.stringify(armed.toast))
+
+        /* ④ Esc 先收掉武装（不然你以为取消了、其实下一下点还是会指过去） */
+        await s.key('Escape', 'Escape', 27)
+        await s.sleep(250)
+        if (!(await s.eval("!!document.querySelector('.bd.condarm')"))) ok('Esc 收掉了武装')
+        else bad('Esc 没收掉武装')
+        await s.mouse(btn.cx, btn.cy)
+        await s.sleep(300)
+
+        /* ⑤ 点一下**那撮字**（[11] 写在中点旁边的那两笔）→ 它成了条件。
+              （这一步验的是"指"这条路的接线：指谁都能写进去；指得对不对是用户的事。） */
+        const fixture = await read()
+        const ca = fixture.cards.find((c) => c.id === 'lk-a')
+        const cb = fixture.cards.find((c) => c.id === 'lk-b')
+        const now = await readBoard()
+        const wDist = Math.hypot(ca.x + ca.w / 2 - (cb.x + cb.w / 2), ca.y + ca.h / 2 - (cb.y + cb.h / 2))
+        const sDist = Math.hypot(now.a.cx - now.b.cx, now.a.cy - now.b.cy)
+        const scale = wDist > 0 ? sDist / wDist : 1
+        const mx = Math.round((now.a.cx + now.b.cx) / 2)
+        const my = Math.round((now.a.cy + now.b.cy) / 2)
+        await s.mouse(mx, my - Math.round(34 * scale)) // 那两笔短笔之间（世界 -34 换算到屏幕）
+        await s.sleep(500)
+        const pickedInk = await readBoard()
+        const row2 = await rowInfo()
+        if (row2 && /条件/.test(row2.cond) && /你指的/.test(row2.cond)) ok(`那一行写上了"（你指的）"：${row2.cond}`)
+        else bad(`没写出"你指的"：${JSON.stringify(row2)}`)
+        if (!(await s.eval("!!document.querySelector('.bd.condarm')"))) ok('指完就收（一次性，不会留着影响下一次画）')
+        else bad('指完还武装着 —— 下次落笔会被它吃掉')
+        const doc = await read({ wait: 1200 })
+        const inkCond = (doc.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('ink:'))
+        if (inkCond.length === 1) ok('文件里写的是 ' + inkCond[0])
+        else bad('文件里的 cond 不对：' + JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1])))
+
+        /* ⑥ 重开还在，然后 ↺ 回到按位置读 */
+        await open()
+        const row3 = await rowInfo()
+        if (row3 && /你指的/.test(row3.cond) && row3.btn === 'back') ok('重开之后还是你指的那一个（而且 ↺ 在）')
+        else bad(`重开之后丢了：${JSON.stringify(row3)}`)
+        const back = await condBtn('back')
+        if (!back) {
+          bad('找不到 ↺')
+        } else {
+          await s.mouse(back.cx, back.cy)
+          await s.sleep(450)
+          const row4 = await rowInfo()
+          if (row4 && /条件/.test(row4.cond) && !/你指的/.test(row4.cond)) ok(`↺ 回到按位置读了（${row4.cond}）`)
+          else bad(`点了 ↺ 没回到按位置读：${JSON.stringify(row4)}`)
+          const doc2 = await read({ wait: 1200 })
+          if (!/"cond"/.test(JSON.stringify(doc2))) ok('文件里那个字段也清掉了')
+          else bad('文件里还留着 cond')
+
+          /* ⑦ 另一条路：点一张**卡**当条件（卡片自己收指针事件，所以那是另一段代码） */
+          const veto2 = await condBtn('no')
+          if (!veto2) {
+            bad('第二步找不到那颗 ✕')
+          } else {
+            await s.mouse(veto2.cx, veto2.cy)
+            await s.sleep(400)
+            const btn2 = await armBtn()
+            if (!btn2) {
+              bad('第二次没找到 ∈')
+            } else {
+              await s.mouse(btn2.cx, btn2.cy)
+              await s.sleep(300)
+              const card = await s.eval(`(() => {
+                const el = document.querySelector('.bd-card[data-card-id="lk-a"]')
+                if (!el) return null
+                const r = el.getBoundingClientRect()
+                return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) }
+              })()`)
+              await s.mouse(card.cx, card.cy)
+              await s.sleep(500)
+              const pickedCard = await readBoard()
+              const row5 = pickedCard.condRowInfo.find((r) => /推导/.test(r.kind))
+              if (row5 && /你指的/.test(row5.cond)) ok(`点一张卡也能当条件：${row5.cond}`)
+              else bad(`点卡片那条路没走通：${JSON.stringify(row5)}`)
+              const doc3 = await read({ wait: 1200 })
+              const cardCond = (doc3.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('card:'))
+              if (cardCond.length === 1 && /card:lk-a/.test(cardCond[0])) ok('文件里写的是 ' + cardCond[0])
+              else bad('文件里的 cond 不对：' + JSON.stringify(cardCond))
+              if (pickedCard.count === start.count) ok('"指一个条件"没有多出/少掉连接')
+              else bad(`连接数变了：${start.count} → ${pickedCard.count}`)
+              /* 收尾：把那句话清掉，别影响后面的收尾检查 */
+              const back2 = await condBtn('back')
+              if (back2) {
+                await s.mouse(back2.cx, back2.cy)
+                await s.sleep(400)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  await s.key('Escape', 'Escape', 27)
+}
+
+/* ═════════════════ 14. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[14] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })
