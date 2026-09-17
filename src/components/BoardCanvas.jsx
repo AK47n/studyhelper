@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { relationCurve } from '../lib/geometry.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_DELETE, LINK_KINDS } from '../lib/link-kinds.js'
-import { applyViewTo, viewTransformAttr, worldRectToScreen, worldToScreen } from '../lib/view.js'
+import { applyViewTo, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen } from '../lib/view.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
  *
@@ -183,8 +183,10 @@ export default function BoardCanvas({
           className="bd-eraser"
           style={{
             ...worldToScreen(eraserAt, view),
-            width: 2 * eraserAt.r * view.s,
-            height: 2 * eraserAt.r * view.s,
+            /* 圈的半径是世界坐标（`eraseAt` 那边用 screenLenToWorld 算的），
+               这里乘回屏幕 —— 走 view.js 那一处，别自己乘 s。 */
+            width: worldLenToScreen(2 * eraserAt.r, view.s),
+            height: worldLenToScreen(2 * eraserAt.r, view.s),
           }}
         />
       )}
@@ -591,8 +593,8 @@ function Frame({ frame, box, view, editing, selected, onSelect, onStartDrag, onD
       style={{
         left: at.x,
         top: at.y,
-        width: Math.max(1, box.w * view.s),
-        height: Math.max(1, box.h * view.s),
+        width: Math.max(1, worldLenToScreen(box.w, view.s)),
+        height: Math.max(1, worldLenToScreen(box.h, view.s)),
       }}
     >
       {editing ? (
@@ -670,4 +672,4 @@ function Frame({ frame, box, view, editing, selected, onSelect, onStartDrag, onD
  *   所以这里**不再保留任何副本**：同一个函数只有一个定义处，
  *   要用就来 import。宁可多一行 import，也不要两份实现（改一份忘一份，
  *   或者一份被删一份还在用，都是这种半夜排查的 bug）。 */
-export { drawStroke, MIN_STEP, wFromPressure } from '../lib/ink.js'
+export { drawStroke, MIN_STEP_SCREEN, wFromPressure } from '../lib/ink.js'

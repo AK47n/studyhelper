@@ -289,12 +289,19 @@ export default function App() {
   }
 
   // 白板：它自己决定什么时候存，我们只负责写盘 + 回个时间戳
+  /* ★ 回一个**判决**（{ ok, mtime } / { ok: false, error }）：白板那边靠它决定
+     那个「已存」能不能亮（见 Board.jsx 的 flushSave 与 README 第 38 条）。
+     以前这里什么都不回，于是"发出去了"和"写进去了"在白板看来是同一件事。 */
   async function saveBoardText(t) {
-    if (!current) return
+    if (!current) return { ok: false, error: '还没有打开任何文件' }
     boardTextRef.current = t
     const r = await api.put(current, t)
-    if (r.error) return flash(r.error, 'err')
+    if (r.error) {
+      flash(r.error, 'err')
+      return { ok: false, error: r.error }
+    }
     setDiskMtime(r.mtime || 0)
+    return { ok: true, mtime: r.mtime || 0 }
   }
 
   async function save() {

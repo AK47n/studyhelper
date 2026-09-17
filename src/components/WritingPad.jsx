@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { drawStroke, MIN_STEP } from '../lib/ink.js'
+import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
 import { cleanLatex, describePayload, ocrSaveConfig, ocrStatus, ocrTest, recognizeHandwriting } from '../lib/ocr.js'
 import { toFlat, toPoints } from '../lib/geometry.js'
 import { canRender, Tex } from './Tex.jsx'
@@ -121,7 +121,7 @@ export default function WritingPad({ onInsert, onClose, onOpenSettings, flash })
         const x = ev.clientX - r.left
         const y = ev.clientY - r.top
         const n = d.stroke.points.length
-        if (n >= 3 && Math.hypot(x - d.stroke.points[n - 3], y - d.stroke.points[n - 2]) < MIN_STEP) continue
+        if (n >= 3 && Math.hypot(x - d.stroke.points[n - 3], y - d.stroke.points[n - 2]) < MIN_STEP_SCREEN) continue
         d.stroke.points.push(x, y, ev.pressure > 0 ? ev.pressure : 0.5)
         added = true
       }

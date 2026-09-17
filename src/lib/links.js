@@ -31,8 +31,9 @@
  *     只给这个 module 自己的测试用。调用方别走。
  */
 
-import { cardBounds, frameBounds, pointInRect, rectCenter, toFlat, toPoints } from './geometry.js'
+import { cardBounds, rectCenter, toFlat, toPoints } from './geometry.js'
 import { linkId } from './board.js'
+import { CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById } from './nodes.js'
 import {
   ARROW_LINK, DEFAULT_LINK, LINK_KINDS, isLinkKind, linkKind, parseCond,
 } from './link-kinds.js'
@@ -52,26 +53,13 @@ function arcLen(pts) {
   return s
 }
 
-/* 从矩形中心朝 `towards` 射出去，打在矩形边上的那一点（宣告的连接就贴在这儿）。
-   为什么要打在边上、不连中心：线要**看得出是"从这张卡到那张卡"**；
-   连中心的话那条线和卡片自己的边框重叠着穿过卡片，屏幕上脏得很（尤其卡片不透明时）。 */
-function edgePoint(box, towards) {
-  const c = rectCenter(box)
-  const dx = towards.x - c.x
-  const dy = towards.y - c.y
-  if (!dx && !dy) return c
-  const hw = box.w / 2
-  const hh = box.h / 2
-  const t = Math.min(hw / (Math.abs(dx) || 1e-9), hh / (Math.abs(dy) || 1e-9))
-  return { x: c.x + dx * t, y: c.y + dy * t }
-}
+/* 从矩形中心朝 `towards` 射出去、打在矩形边上的那一点 —— 现在住在 `nodes.js`
+   （`edgePointOf`）：那是"端点"这一层的几何，"线贴在框边上"是所有连接共用的规矩。
+   （原来这里有一份私有实现，links.js 与 readDeclaredLinks 各用一次。） */
 
-/* 点落在哪张卡里（宽容 8px：手画的线常常差一点点才碰到卡片边）。
-   这是"卡↔卡画一条线即成立"那条路上唯一的判据 —— 宽容 8px 是 2026-09-16 量的，
-   第二刀一个字没动它（那条路是这堆机制里唯一没有假阳性的部分，见 ADR-0001）。 */
-function cardAt(boxes, p, pad = 8) {
-  return boxes.find((b) => pointInRect(p, b.r, pad)) || null
-}
+/* 点落在哪张卡里（宽容 `CARD_HIT_PAD`）—— 从前这里是 `cardAt`，现在走 `nodes.js` 的
+   `nodeAt(board, p, { kinds: ['card'], pad })`（见 buildLinks 里那两行）。
+   两处都删掉的原因：同一句"这一点落在谁身上"，五个地方各答一遍 —— 见 README 第 40 条。 */
 
 /* ═══════════ 墨迹块：只为「条件」而留 ═══════════
  *
@@ -98,7 +86,9 @@ export const LINK_GAP = 6
 export const LINK_BOW = 0.05
 
 /* 「条件是位置送的」：线**中点**这么近的地方写着的字（或那张卡）就是这条关系的条件。 */
-export const LINK_COND_RADIUS = 64
+/* 条件搜索半径 —— **就是 `nodes.js` 的 `COND_SEARCH`**（64 世界像素）。
+   保留这个名字是因为外面（README、这条自检）叫惯了它；值只在一处定义。 */
+export const LINK_COND_RADIUS = COND_SEARCH
 
 const INK_CELL = 32 // 空间格子边长（查"附近有没有墨"用）
 /* ⚠ 32 是从 HEAD 那一版原样搬过来的，别顺手改：它不只决定"扫几圈"，
@@ -415,16 +405,16 @@ function linkCondition(ink, boxes, mid, exclude, aNode, bNode, cacheKey = '') {
   if (!mid) return null
   /* 半径内的卡**按距离试**，跳过这条关系两端的卡 ——
      ⚠ 不能只看"最近的那一张"：最近那张要是端点卡，真正的条件卡就被整体漏掉了
-     （实测：端点卡 60px、条件卡 62px，两个都在 64px 内 → 条件读成 null）。 */
+     （实测：端点卡 60px、条件卡 62px，两个都在 64px 内 → 条件读成 null）。
+     ★ 距离公式走 nodes.js 的 `edgeDist`（它 = geometry.rectDist 的零尺寸矩形情形）——
+       这条公式从前在三个文件里各内联一份。半径也只有一个名字：COND_SEARCH。 */
   const skip = new Set([aNode && aNode.id, bNode && bNode.id].filter(Boolean))
   let card = null
   let cd = Infinity
   for (const b of boxes) {
     if (skip.has(b.id)) continue
     const r = b.r
-    const dx = Math.max(r.x - mid.x, 0, mid.x - (r.x + r.w))
-    const dy = Math.max(r.y - mid.y, 0, mid.y - (r.y + r.h))
-    const d = Math.hypot(dx, dy)
+    const d = edgeDist(r, mid)
     if (d <= LINK_COND_RADIUS && d < cd) {
       cd = d
       card = b
@@ -565,8 +555,10 @@ function buildLinks(board, inkInput) {
     if (pts.length < 2) continue
     const first = pts[0]
     const last = pts[pts.length - 1]
-    const ca = cardAt(boxes, first)
-    const cb = cardAt(boxes, last)
+    /* 免费路：两头各落在**一张卡片**里（宽容 CARD_HIT_PAD）——
+       判据住在 nodes.js（"这一点落在谁身上"那一层），这里不再自己写一份 pointInRect。 */
+    const ca = nodeAt(board, first, { kinds: ['card'], pad: CARD_HIT_PAD })
+    const cb = nodeAt(board, last, { kinds: ['card'], pad: CARD_HIT_PAD })
     if (!ca || !cb || ca.id === cb.id) continue
     /* 手动标过的词：你点过那排词就有（`stroke.link`），否则「相关」。 */
     const manualStroke = isLinkKind(s.link) ? s : null
@@ -695,22 +687,9 @@ function resolveCondSpec({ spec, ink, cards, byId, mid, cacheKey }) {
  *   等箭头工具和它合流时再补（记在 README 的"还没做的"里）。
  */
 export function readDeclaredLinks(board, ink) {
-  const cards = (board && board.cards) || []
-  const frames = (board && board.frames) || []
   const byId = new Map(((board && board.strokes) || []).map((s) => [s.id, s]))
-  const cardById = new Map(cards.map((c) => [c.id, c]))
-  const frameById = new Map(frames.map((f) => [f.id, f]))
-  const nodeFor = (id) => {
-    const c = cardById.get(id)
-    if (c) return { kind: 'card', id, label: '', box: cardBounds(c) }
-    const f = frameById.get(id)
-    if (!f) return null
-    const box = frameBounds(board, f)
-    /* 成员全没了的框（内存里的中间态）：这一头暂时没有对象 → 这条连接这一帧不画，
-       等 pruneFrames / 存盘把它收掉。绝不画一条"指向空气"的箭头。 */
-    if (!box) return null
-    return { kind: 'frame', id, label: f.title ? String(f.title) : '板框', box }
-  }
+  /* 两端按 id 取节点：判据（卡片 / 板框、框的成员全没了就不画）住在 nodes.js 一处 */
+  const nodeFor = (id) => nodeById(board, id)
   const out = []
   for (const rec of (board && board.links) || []) {
     const na = nodeFor(rec.from)
@@ -718,8 +697,8 @@ export function readDeclaredLinks(board, ink) {
     if (!na || !nb) continue
     const p0 = rectCenter(na.box)
     const p1 = rectCenter(nb.box)
-    const from = edgePoint(na.box, p1)
-    const rawTo = edgePoint(nb.box, p0)
+    const from = edgePointOf(na.box, p1)
+    const rawTo = edgePointOf(nb.box, p0)
     const u0 = unit(from, rawTo)
     /* 尖停在框边上再让开一点点（LINK_GAP）：贴死看着像"插进卡片里"。 */
     const to = u0 ? { x: rawTo.x - u0.x * LINK_GAP, y: rawTo.y - u0.y * LINK_GAP } : rawTo

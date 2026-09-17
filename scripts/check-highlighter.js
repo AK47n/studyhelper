@@ -11,23 +11,36 @@
  *
  * 跑：node scripts/check-highlighter.js
  *
+ * ★ 画那一道用的是**应用自己的** `paintHighlight`（从 src/lib/ink.js import 进来的真函数，
+ *   连同它的两个透明度常量一起送进页面），不是照抄一份 —— 抄一份的结果是
+ *   "自检断言自己的复制品"：应用改了画法或 alpha，那份自检照样绿（README 第 38 条）。
+ *   ⚠ 结构上的护栏在文件末尾：静态读一遍 ink.js，确认 `drawStroke` 那条路**真的还调它**。
+ *   对照用的"旧法"（逐段描、圆头叠加）是**故意**留的复制品 —— 它是历史算法，不是应用规则。
+ *
  * 胶水（起服务 + 起浏览器 + CDP 会话 + 夹具板 + 用户数据守卫）都在
  * scripts/lib/board-check.js 的 withBoard 里 —— 这一节**用不到白板上的内容**
  * （它自己在页面里造两块 canvas 对照着画），夹具板只是为了"别打开用户那张板"。
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import { withBoard } from './lib/board-check.js'
+import { paintHighlight, HL_ALPHA, HL_ALPHA_LIVE } from '../src/lib/ink.js'
+import { HL_COLOR, HL_WIDTH } from '../src/lib/board.js'
 
 const fails = await withBoard({ tag: 'hlcheck', port: 5207, cdpPort: 9237, window: '1200,800' }, async ({ s, ok, bad }) => {
 /* ── 下面整段原来是顶层代码，现在挪进 withBoard 的回调里；
       缩进没动 —— 几百行一起缩一遍只是假 diff，review 的时候反而看不清改了什么。 */
 
 /* 在页面里跑一段测量脚本。
-   新版：调**应用自己的** drawStroke（页面上加载的就是那一份）
+   新版：**应用自己的** `paintHighlight`（连同它的常量一起送进去）
    旧版：照抄早先的实现（逐段 stroke + 圆头 + alpha 0.32）做对照 */
 const result = await s.eval(`(async () => {
-  // 从应用的 bundle 里拿不到具名导出，所以这里按同样的算法重画。
-  // 新版这一段必须和 src/lib/ink.js 的荧光笔分支保持同一个形状：
-  //   一条 path、一次 stroke、宽度恒定、alpha 只叠一次。
+  /* ★ 应用的真身：函数体是 ink.js 那一份，名字（HL_ALPHA / HL_ALPHA_LIVE）也在这一行备好 ——
+     paintHighlight 只依赖这两个常量。它哪天多依赖一样东西，这里会当场炸（不是静默变假绿）。 */
+  const HL_ALPHA = ${HL_ALPHA}
+  const HL_ALPHA_LIVE = ${HL_ALPHA_LIVE}
+  const paintHighlight = ${paintHighlight.toString()}
+
   const PTS = []
   for (let i = 0; i <= 40; i++) {
     // 刻意带弯折和抖动：直线看不出段间重叠，弯的地方才暴露
@@ -39,25 +52,19 @@ const result = await s.eval(`(async () => {
     cv.width = 760; cv.height = 220
     const ctx = cv.getContext('2d')
     ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height)
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#ffd43b'
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = ${JSON.stringify(HL_COLOR)}
     return { cv, ctx }
   }
 
-  // ── 新版：一条路径一次描完 ──
+  // ── 新版：调**应用那个**函数（一条路径一次描完）──
   const a = mk()
-  a.ctx.globalAlpha = 0.34
-  a.ctx.lineWidth = 16
-  a.ctx.beginPath()
-  a.ctx.moveTo(PTS[0].x, PTS[0].y)
-  for (let i = 1; i < PTS.length; i++) a.ctx.lineTo(PTS[i].x, PTS[i].y)
-  a.ctx.stroke()
-  a.ctx.globalAlpha = 1
+  paintHighlight(a.ctx, PTS, { width: ${HL_WIDTH} })
 
-  // ── 旧版：逐段 beginPath + stroke（半透明圆头互相叠加）──
+  // ── 旧版：逐段 beginPath + stroke（半透明圆头互相叠加）—— 故意留的复制品，历史算法 ──
   const b = mk()
   b.ctx.globalAlpha = 0.32
   for (let i = 0; i + 1 < PTS.length; i++) {
-    b.ctx.lineWidth = 16
+    b.ctx.lineWidth = ${HL_WIDTH}
     b.ctx.beginPath()
     b.ctx.moveTo(PTS[i].x, PTS[i].y)
     b.ctx.lineTo(PTS[i + 1].x, PTS[i + 1].y)
@@ -117,6 +124,16 @@ if (result.old.sd > result.fresh.sd * 1.5) {
   ok(`对比：旧法标准差 ${result.old.sd}，是现在的 ${(result.old.sd / Math.max(0.01, result.fresh.sd)).toFixed(1)} 倍 —— 确实修掉了叠加变深`)
 } else {
   bad(`新旧差别不明显（旧 ${result.old.sd} vs 新 ${result.fresh.sd}）—— 这条测量可能没测到真东西`)
+}
+
+/* ★ 结构护栏：上面画的是**应用那个函数**，前提是应用那条路真的还在调它。
+   谁哪天把荧光笔的画法又内联回 drawStroke（或者换了个画法），这条当场红 ——
+   否则这个自检会悄悄地退化成"断言自己送进去的那份复制品"（README 第 38 条）。 */
+{
+  const inkSrc = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'lib', 'ink.js'), 'utf8')
+  const calls = /if \(isHi\)\s*\{[^}]*?paintHighlight\(/s.test(inkSrc)
+  if (calls) ok('应用那条路真的在调 paintHighlight（这一道画的不是自检自己造的复制品）')
+  else bad('ink.js 里 `if (isHi)` 那条分支不再调用 paintHighlight —— 上面量的是别的东西了')
 }
 
 })

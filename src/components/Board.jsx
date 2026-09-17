@@ -11,11 +11,11 @@ import {
    笔完全点不动，而且**只在按下时才炸**（模块加载时不报错，构建也不报错）。
    教训：删一个 import 之前，先确认这个标识符在同一文件里没人用；
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
-import { drawStroke, MIN_STEP } from '../lib/ink.js'
+import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
 import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
-import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
+import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, strokeHitsRect, toFlat, toPoints } from '../lib/geometry.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'
@@ -37,7 +37,7 @@ import { ARROW_LINK, LINK_DELETE, LINK_KINDS, condCard, condInk, linkKind } from
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
    滚动/捏合/平移/居中全走这里。 */
-import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
+import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, screenLenToWorld, screenToWorld, worldLenToScreen, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
@@ -66,11 +66,17 @@ import { displayTex, snippetFor, toTex } from '../lib/formula.js'
  */
 
 const SAVE_DEBOUNCE_MS = 700
+/* 写盘失败之后隔多久再试（见 flushSave）：宁可重试，也不能让「已存」撒谎。 */
+const SAVE_RETRY_MS = 3000
 /* 笔停下来多久之后，公式卡重新量一次尺寸（见下面那个 effect）。
    取 400ms 的用意：它比"存盘 700ms"短，所以屏幕上先贴合、再落盘；
    又比一次连续擦除/画一笔的节奏长，所以一整串手势只量一趟。 */
 const REFIT_IDLE_MS = 400
-const ERASER_R = 14 // 世界坐标半径，约一个字宽
+/* 橡皮圈的半径：**屏幕像素**（约一个字宽）—— 屏幕上大小恒定，不跟着纸缩放走。
+   ⚠ 名字里带单位：它以前叫 `ERASER_R`、注释写着"世界坐标半径"，而用法一直在 `÷ view.s`
+     （世界半径）。**注释和名字都撒谎**，正是 ADR-0002 那类"单位的账没人管"的温床。
+   世界半径一律用 `screenLenToWorld(ERASER_R_SCREEN, view.s)` 现算。 */
+const ERASER_R_SCREEN = 14
 const UNDO_MAX = 60
 /* HL_COLOR / HL_WIDTH 从 lib/board.js 来（那边是"存储层归一化"用的同一对常量）。
    这个文件里**不再各留一份** —— 曾经两处各写了一份 #ffd43b / 16，
@@ -286,7 +292,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
 
     /* 内边距 + 边框（屏幕像素）：这个仓库全局是 `box-sizing: border-box`，
        卡片上写的 width/min-height **都把这一圈算在里面**，所以算尺寸时必须加上它 ——
-       不加就正好少一整圈，宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 c²）。 */
+       不加就正好少一整圈，宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 c²）。
+       ⚠ 2026-09-17 起卡片那一圈是 `outline`（styles.css 的 .bd-card），
+         outline 不进布局 → 这里读到的 borderWidth 是 **0**，padX 就是纯内边距。
+         还读它是因为这条换算对"圈"必须通用：哪天有人把 border 加回来，
+         一个"屏幕像素"的量混进世界坐标的宽度里就会当场把内容挤窄（那正是"卡片底下
+         一条恒粗黑线"的根子 —— 见 styles.css .bd-card 那段）。 */
     const cs = getComputedStyle(cardEl)
     const padX =
       parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth)
@@ -446,10 +457,37 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }, [board.strokes, board.cards])
 
   // ── 存盘 ──
-  const flushSave = useCallback(() => {
-    if (!dirtyRef.current) return
-    onSave(serializeBoardDocument(boardRef.current))
-    setDirty(false)
+  /* ★ 「已存」= **真的写进去了**，不是"我把它发出去了"（2026-09-17 修的）。
+     原来这里是 `onSave(...)` 之后**立刻** `setDirty(false)` —— 而 onSave 是异步的
+     （PUT /api/save），于是那个指示灯在请求还在飞的时候就亮了。
+     两个后果，都咬过人：
+       · 自检要等"真的落到盘了"这个时刻，界面上**根本没有**（它只能睡一个固定毫秒数 —— 
+         check-link 那条 1/3 概率报红就是这么来的，见 README 第 38 条）；
+       · 写失败时，"已存"已经亮过了（只有一句 toast 会闪）。
+     现在：等 onSave 回话；失败就**保持"正在存…"**并过几秒重试（dirty 不清 → 灯不撒谎）。
+     ★ 只在"盘上那份 == 现在这张板"时才清 dirty：await 期间你又画了一笔的话，
+       那一笔还没写出去 —— 清了它就会永远停在"已存"里。 */
+  const flushSave = useCallback(async () => {
+    if (!dirtyRef.current) return false
+    const text = serializeBoardDocument(boardRef.current)
+    const r = await onSave(text)
+    if (r && r.ok === false) {
+      /* 没落地：保持 dirty，过一会儿再试（不重试的话，页面上会一直"正在存…"，
+         而用户下一次编辑才可能再触发 —— 那期间的东西就悬着）。 */
+      if (saveTimer.current) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(flushSave, SAVE_RETRY_MS)
+      return false
+    }
+    const now = serializeBoardDocument(boardRef.current)
+    if (now === text) {
+      setDirty(false)
+    } else {
+      /* await 期间你又改了：盘上那份已经不是最新的 —— 别清 dirty，也别让它悬着，
+         按防抖再来一趟。 */
+      if (saveTimer.current) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(flushSave, SAVE_DEBOUNCE_MS)
+    }
+    return true
   }, [onSave])
 
   useEffect(() => {
@@ -524,7 +562,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const eraseAt = useCallback(
     (wp, history = true) => {
       commit((cur) => {
-        const keep = cur.strokes.filter((s) => !strokeHitsCircle(s, wp.x, wp.y, ERASER_R / cur.view.s))
+        const keep = cur.strokes.filter((s) => !strokeHitsCircle(s, wp.x, wp.y, screenLenToWorld(ERASER_R_SCREEN, cur.view.s)))
         return keep.length === cur.strokes.length ? cur : { ...cur, strokes: keep }
       }, history)
     },
@@ -765,11 +803,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          只看工具的话，就只有按下那一点会被擦掉，拖过去是不擦的。 */
       if (tool === 'eraser' || (drawRef.current && drawRef.current.kind === 'erase')) {
         /* ⚠ 这里必须把 r 一起塞进去。
-           screenToWorld 只给 {x, y}，而 .bd-eraser 的宽高是 2 * eraserAt.r * view.s ——
+           screenToWorld 只给 {x, y}，而 .bd-eraser 的宽高是 `2 × r × s` ——
            少了 r 就成了 NaN，浏览器直接忽略 → 那个橡皮圈**一直画不出来**（原有的问题）。
-           除以 view.s 是因为 r 走世界坐标、渲染时又乘回去，于是圈在屏幕上恒定大小，
-           和擦除判定用的是同一个半径。 */
-        setEraserAt({ x: wp.x, y: wp.y, r: ERASER_R / boardRef.current.view.s })
+           `r` 走**世界**半径（渲染时再乘回屏幕），于是圈在屏幕上恒定大小，
+           和擦除判定用的是同一个半径 —— 两边都走 screenLenToWorld，别自己除。 */
+        setEraserAt({ x: wp.x, y: wp.y, r: screenLenToWorld(ERASER_R_SCREEN, boardRef.current.view.s) })
         if (drawRef.current && drawRef.current.kind === 'erase') eraseAt(wp, false)
         return
       }
@@ -791,8 +829,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           if (n >= 3) {
             const dx = w2.x - d.stroke.points[n - 3]
             const dy = w2.y - d.stroke.points[n - 2]
-            // 阈值按屏幕算：放大后世界坐标的一步更小，不除 s 会把细节吃掉
-            if (Math.hypot(dx, dy) < MIN_STEP / s) continue
+            /* 阈值按**屏幕**算：`MIN_STEP_SCREEN` 是屏幕像素，落点已经是世界坐标了，
+               所以先换算回世界再比（放大后世界坐标的一步更小，不换算会把细节吃掉）。 */
+            if (Math.hypot(dx, dy) < screenLenToWorld(MIN_STEP_SCREEN, s)) continue
           }
           d.stroke.points.push(w2.x, w2.y, ev.pressure > 0 ? ev.pressure : 0.5)
           added = true
@@ -841,10 +880,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
              原来写的是"4 世界像素"，放大到 6 倍时 4 世界像素 = 24 屏幕像素 ——
              轻轻拖一下就成了"点"，行为跟手上的动作对不上（审查挑出来的）。 */
         const vs = boardRef.current.view.s
-        if (!ids.length && (box.x1 - box.x0) * vs <= 4 && (box.y1 - box.y0) * vs <= 4) {
+        if (!ids.length && worldLenToScreen(box.x1 - box.x0, vs) <= 4 && worldLenToScreen(box.y1 - box.y0, vs) <= 4) {
           const cx = (box.x0 + box.x1) / 2
           const cy = (box.y0 + box.y1) / 2
-          const r = 10 / boardRef.current.view.s
+          const r = screenLenToWorld(10, boardRef.current.view.s)
           const hit = boardRef.current.strokes.find((s) => linkByStroke.has(s.id) && strokeHitsCircle(s, cx, cy, r))
           if (hit) ids = [hit.id]
         }
@@ -1313,7 +1352,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
 
   function frameDrag(frameId, dxScreen, dyScreen) {
     const k = boardRef.current.view.s || 1
-    commit((cur) => translateFrame(cur, frameId, dxScreen / k, dyScreen / k), false)
+    /* 屏幕位移 → 世界位移：走 view.js 那一处（别自己除 s）。 */
+    commit((cur) => translateFrame(cur, frameId, screenLenToWorld(dxScreen, k), screenLenToWorld(dyScreen, k)), false)
   }
 
   function frameDragEnd(frameId) {
@@ -1336,8 +1376,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const el = wrapRef.current
     const v = boardRef.current.view
     if (!el) return { x: 0, y: 0 }
-    const x = midWorld.x * v.s + v.tx
-    const y = midWorld.y * v.s + v.ty
+    /* 世界点 → 屏幕点：走 view.js 那一处（从前这里是手推的 `midWorld.x * v.s + v.tx`
+       —— 同一道映射，但绕过了唯一的那个 module，见 README 第 26 条/第 39 条）。 */
+    const p = worldToScreen(midWorld, v)
+    const x = p.x
+    const y = p.y
+    /* ⚠ 下面那三个边距是**屏幕**像素：它们管的是"那颗词别跑到屏幕外 / 别压到底部工具条底下"
+       （工具条 z-index 20，见 README 第 13 条）。夹取政策还没收进 module（架构 review 候选 1
+       的尾巴：`chipPlacement`），但它和上面那条映射是两件事，别再混在一行里手推。 */
     return {
       x: Math.min(Math.max(x, 130), Math.max(130, el.clientWidth - 130)),
       y: Math.min(Math.max(y, 96), Math.max(96, el.clientHeight - 60)),
@@ -1559,10 +1605,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             onDrag={(dxScreen, dyScreen) =>
               commit(
                 (cur) => {
-                  // 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）
+                  // 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）——走 view.js 那一处
                   const k = cur.view.s
-                  const dx = dxScreen / k
-                  const dy = dyScreen / k
+                  const dx = screenLenToWorld(dxScreen, k)
+                  const dy = screenLenToWorld(dyScreen, k)
                   return { ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
                 },
                 false
@@ -1773,6 +1819,10 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
      一个数管全部：字号、内边距、圆角、宽高都乘它 ——
      只改宽高不把字号跟着变的话，卡片越拉越大、字还是那么小，看着像坏了。 */
   const k = Number(card.scale) > 0 ? Number(card.scale) : 1
+  /* 这张卡在屏幕上唯一的倍率（世界 × s × k）—— 尺寸、字号、内边距、圆角全用它，
+     而且它由 view.js 的 combinedScale 算（别在这里手写 `view.s * k`：那条口径
+     以前手抄在三处，ADR-0002 那根黑线就是从这种手抄里长出来的）。 */
+  const f = combinedScale(view.s, k)
 
   useEffect(() => {
     if (!editing) return
@@ -1923,24 +1973,23 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
          四个数（left/top/width/字号缩放）一起算，缩放才能"整体一致地"变小 ——
          只缩 left/top 不缩字号，卡片会一边跑到正确位置、一边保持原来的大小。 */
       style={{
-        /* 位置 = 世界 → 屏幕（只跟视图缩放走）；
-           宽高/字号 = 再乘"这张卡自己的倍率 k" —— 两件事，别混。
-           ⚠ `worldToScreen` 返回的是 `{x, y}`，不是 `{left, top}` ——
-             直接展开进 style 的话卡片会**没有 left/top**（静默退回 CSS 定位，整版错位）。 */
+        /* 位置 = 世界 → 屏幕（点）；尺寸/字号/内边距 = **带倍率的世界长度**。
+           两条映射都住在 view.js 的同一处：`f` 是这张卡唯一的倍率（世界 × s × k）。
+           从前这里手写 6 遍 `view.s * k`，量尺寸那一趟和缩放柄各再抄一遍 ——
+           而"那圈是屏幕像素、宽是世界像素"这件事就藏在这种手抄里（ADR-0002 的根子）。 */
         left: at.x,
         top: at.y,
-        width: card.w * view.s * k,
-        minHeight: card.h * view.s * k,
-        /* 字号和内边距也按缩放走，卡片才是"整体一致地"变大变小。
+        width: worldLenToScreen(card.w, f),
+        minHeight: worldLenToScreen(card.h, f),
+        /* 字号和内边距也按同一个倍率走，卡片才是"整体一致地"变大变小。
            只缩 left/top/width 而不缩字号，卡片会跑到正确的位置却保持原来的大小。
-           倍率有两种：view.s 是"这张纸的缩放"（大家共享），k 是"这张卡自己的放大缩小"。
            CSS 里只有一个 --bd-card-scale，所以在这里乘好再写出去。 */
-        '--bd-card-scale': view.s * k,
+        '--bd-card-scale': f,
         /* 内边距从 10/12 收到 4/8（用户 2026-09-16：「边缘留白太多了」）。
            为什么不干脆给 0：字贴着边框线看着像画坏了，而且卡片一选中、
            边框一加粗就会压到字上。4px 是"看着贴、但不顶边"的那个数。 */
-        padding: `${4 * view.s * k}px ${8 * view.s * k}px`,
-        borderRadius: Math.max(3, 10 * view.s * k),
+        padding: `${worldLenToScreen(4, f)}px ${worldLenToScreen(8, f)}px`,
+        borderRadius: Math.max(3, worldLenToScreen(10, f)),
       }}
       onPointerDown={(e) => {
         /* ★ 固定住的卡片**什么都不接**：不选中、不拖动。
@@ -2042,7 +2091,7 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
               e.stopPropagation()
               e.preventDefault()
               const host = e.currentTarget.closest('.bd-card')
-              const rectW = host ? host.getBoundingClientRect().width : card.w * view.s * k
+              const rectW = host ? host.getBoundingClientRect().width : worldLenToScreen(card.w, f)
               onStartResize?.(rectW, e.clientX)
             }}
           >
@@ -2603,16 +2652,11 @@ function isPenBarrel(e) {
   return e.pointerType === 'pen' && (e.buttons & 2) !== 0
 }
 
-/* 一笔有没有"碰到"这个矩形（都是世界坐标）。
-   判定用碰着就算 —— 只要有任意一个点落在框里，这一笔就算被圈住了。
-   比"整笔必须完全落在里面"符合直觉得多：手写时很少有人能一笔不越界地圈住东西，
-   按"完全包含"来判，用户会觉得"我明明框住了它却没选上"。 */
-function strokeHitsRect(stroke, r) {
-  for (const p of toPoints(stroke.points)) {
-    if (p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1) return true
-  }
-  return false
-}
+/* ⚠ 这里原来有一份**本地**的 `strokeHitsRect`（和 geometry.js 那份逐字相同）——
+   2026-09-17 架构 review 时删掉了：geometry.js 那份是"留下板框"在用的正本、
+   而且被 check-board.js 断言着；本地这份**没有任何断言**，却是**框选**那条路在跑的。
+   两份实现摆在一起，改一处漏一处就是"框选和板框判得不一样"，而屏幕上很难看出来。
+   现在框选也走 geometry.js 那一个入口（见文件头的 import）。 */
 
 /* 一组笔迹的包围盒搬去了 lib/board.js 的 `strokesBBox`（跟着"选中那一族"一起走的）。 */
 
@@ -2669,7 +2713,8 @@ function paintArrowLive(liveRef, board, from, to, view) {
   const color = linkKind('cause').color
   ctx.save()
   ctx.strokeStyle = color
-  ctx.lineWidth = 2.4 / s
+  /* 线宽/虚线都是**屏幕**像素（这块画布上叠着 applyViewTo 的 s），所以先换算回世界再设。 */
+  ctx.lineWidth = screenLenToWorld(2.4, s)
   ctx.lineCap = 'round'
   ctx.beginPath()
   ctx.moveTo(from.x, from.y)
@@ -2679,8 +2724,8 @@ function paintArrowLive(liveRef, board, from, to, view) {
   for (const p of [from, to]) {
     const n = snapNode(board, p)
     if (!n) continue
-    ctx.setLineDash([6 / s, 4 / s])
-    ctx.lineWidth = 2 / s
+    ctx.setLineDash([screenLenToWorld(6, s), screenLenToWorld(4, s)])
+    ctx.lineWidth = screenLenToWorld(2, s)
     ctx.strokeRect(n.box.x, n.box.y, n.box.w, n.box.h)
   }
   ctx.restore()

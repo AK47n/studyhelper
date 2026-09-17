@@ -27,6 +27,7 @@
     "check:lock": "node scripts/check-lock.js",
     "check:link": "node scripts/check-link.js",
     "check:board-all": "npm run check:board && npm run check:board-browser",
+    "check:browser-all": "npm run check:harness && npm run check:board-browser && npm run check:refit && npm run check:paper && npm run check:lock && npm run check:link && npm run check:highlighter && npm run check:ocr-browser && npm run check:default && npm run check:zoom && npm run check:loaded",
     "check:ocr": "node scripts/check-ocr-server.js",
     "check:ocr-browser": "node scripts/check-ocr-browser.js",
     "check:zoom": "node scripts/check-zoom.js",

@@ -162,7 +162,11 @@ export function textCardRect(box, text) {
    ★ `padPx` 必须加上：这个仓库全局是 `box-sizing: border-box`，
      卡片上写的 `width/height/min-height` **都把内边距和边框算在里面**。
      不加的话，算出来的数会比内容真正需要的小一整圈 ——
-     宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 18px 的 `c²`）。 */
+     宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 18px 的 `c²`）。
+   ⚠ 2026-09-17 起卡片那一圈（styles.css 的 .bd-card）是 `outline`：它**不进布局**，
+     所以调用方读到的 borderWidth 是 0、padPx 就是纯内边距。这条换算不跟着改（它要通用）——
+     但谁把 border 加回来，就得知道"屏幕像素的边框 + 世界像素的宽度"这个组合本身就是错的：
+     那正是「缩小画布时卡片底下一条恒粗黑线」的根子（见 styles.css 的 .bd-card 那段）。 */
 export function cardHeightFromContent(px, { s = 1, scale = 1, padPx = 0 } = {}) {
   const k = (Number(s) || 1) * (Number(scale) || 1)
   const h = ((Number(px) || 0) + (Number(padPx) || 0)) / (k > 0 ? k : 1)
@@ -324,10 +328,35 @@ export function normalizeFrames(raw, { strokeIds, cardIds } = {}) {
  *   ③ 认不出的词退回箭头工具的本意（`ARROW_LINK` = 「因果」），不猜成别的。 */
 export const linkId = (from, to) => `${from}|${to}`
 
+/* ═══════════ 端点（板上能当连接两端的东西）的**存活判据** ═══════════
+ *
+ * 一个 id 还活着 = 卡片里有 或 板框里有。**只在这一处实现**（2026-09-17 架构 review 候选 2）。
+ *
+ * 为什么值得单拎出来：这条纪律写在三个地方 —— 解析时过滤死 id（normalizeLinks）、
+ * 写盘时再过滤一遍（serializeBoardDocument）、宣告时校验（frames.js 的 declareLink）。
+ * 三处各写一遍，漏改一处不是崩溃而是**静默**：内存里画着、文件里没了（或反过来），
+ * 而 ADR-0001 那条"死 id 不留尸体"的纪律会在**那一步**悄悄失效。
+ *
+ * 收成一个"给集合"的形状，是因为解析中途还没有一张完整的 board：
+ *   const live = liveNodeIdFn(cardIdSet, frameIdSet)   →   live(id)
+ * 有 board 的调用方用 liveNodesOf(board) 拿那个集合。
+ */
+export function liveNodeIdFn(cardIds, frameIds) {
+  const cards = cardIds instanceof Set ? cardIds : new Set(cardIds || [])
+  const frames = frameIds instanceof Set ? frameIds : new Set(frameIds || [])
+  return (id) => cards.has(id) || frames.has(id)
+}
+
+/** 这张板上所有端点的 id（卡片 + 板框）。 */
+export function liveNodesOf(board) {
+  const ids = new Set()
+  for (const c of (board && board.cards) || []) ids.add(c.id)
+  for (const f of (board && board.frames) || []) ids.add(f.id)
+  return ids
+}
+
 export function normalizeLinks(raw, { cardIds, frameIds } = {}) {
-  const liveCards = cardIds instanceof Set ? cardIds : new Set()
-  const liveFrames = frameIds instanceof Set ? frameIds : new Set()
-  const live = (id) => liveCards.has(id) || liveFrames.has(id)
+  const live = liveNodeIdFn(cardIds, frameIds)
   const out = []
   const seen = new Set()
   for (const l of Array.isArray(raw) ? raw : []) {
@@ -643,9 +672,8 @@ export function serializeBoardDocument(board) {
     /* 连接（见 ADR-0001 与 normalizeLinks）：只有你宣告过才有这个字段；
        两端**都还在这一批要写出去的东西里**才写 —— 死 id 不留尸体（和板框同一条规矩）。 */
     ...(() => {
-      const liveCards = new Set((board.cards || []).map((c) => c.id))
-      const liveFrames = new Set((board.frames || []).map((f) => f.id))
-      const live = (id) => liveCards.has(id) || liveFrames.has(id)
+      /* 和解析那一趟**同一个**存活判据（liveNodeIdFn）—— 三处各写一遍就是静默失效的入口。 */
+      const live = liveNodeIdFn(new Set((board.cards || []).map((c) => c.id)), new Set((board.frames || []).map((f) => f.id)))
       const seen = new Set()
       const ls = []
       for (const l of board.links || []) {

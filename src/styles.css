@@ -936,7 +936,34 @@ kbd {
 .bd-card {
   position: absolute;
   background: #fff;
-  border: 1.5px solid #ccd2dd;
+  /* ★ 卡片那一圈用 **outline**，不用 border（2026-09-17 根治「缩小画布时卡片底下
+     一条恒粗黑线」）。
+
+     为什么非改不可：卡片的 `w` 是按**世界像素**存进文件的，而 `border: 1.5px` 是
+     **屏幕像素** —— 量尺寸时它被读进 padX 再除以 s（Board.jsx 的 sampleCardForFit +
+     board.js 的 cardWidthFromContent），渲染时它却一点都不跟着缩（字号/内边距/圆角
+     都跟着缩）。于是一往小缩，内容盒就比内容窄 `边框总宽 × (1 − s/s0)`（s0 = 上次
+     量尺寸那一档）。实测（dpr 1、公式卡 `\oint \frac{1}{z-2} dz = 0`、s0 = 1.451）：
+       s = 1.451 缺口 −0.17 ｜ 1.0076 +0.45 ｜ 0.8397 +0.67 ｜ 0.4859 +1.31 ｜ 0.4049 +1.36
+     而 `.bd-tex` 是 `overflow-x: auto`（溢出一点都不放过），全局那条
+     `::-webkit-scrollbar { height: 12px }`（拇指 #262e3d）又不跟缩放走 ——
+     屏幕上就是"卡片底下一条**恒粗**黑线"，还白占 12px 布局高度（s = 0.84 时卡高
+     67.08 → 79.08，"贴合内容"跟着破功）。
+
+     outline **不参与布局**：存进文件的宽度里就只剩"内容 + 内边距"这两样都跟着缩放的
+     东西 → 缺口恒为 0（实测全程 −0.03 … −0.23，永远是"多一点点"而不是"少一点点"），
+     任何缩放下都不溢出。另外两个候选都试过、都不行：
+       · 让边框跟缩放走（`border-width: calc(1.5px * var(--bd-card-scale))`）——
+         Blink 把边框宽度**向下取整到整像素**，缺口只是变小，缩到 s≈0.40 照样冒黑线；
+       · 只让滚动条不占位不画（下面 `.bd-tex` 那两行）—— 治的是症状，几何缺口仍在。
+
+     `outline-offset: -1.5px` 把圈画在**里面**，位置和原来的边框重合（outline 跟着
+     border-radius 走，见 .bd-card.on 那个 3px 蓝光圈 —— 它一直是 box-shadow，没动）。
+     ⚠ 内边距没跟着加 1.5px：圈画在原来的边框位置上，所以字离圈近了 1.5px
+       （看着更"贴合内容"，2026-09-16 那两轮就是嫌留白多）。 */
+  --bd-ring: #ccd2dd;
+  outline: 1.5px solid var(--bd-ring);
+  outline-offset: -1.5px;
   border-radius: var(--bd-radius);
   box-shadow: 0 3px 14px rgba(20, 24, 33, 0.09);
   /* 内边距的实际值写在 Board.jsx 的 style 上（它要跟着视图缩放和卡片倍率走），
@@ -950,20 +977,41 @@ kbd {
      混在一起的话，把界面调到 200% 再缩放画布，字体大小会乘两次。 */
   font-size: calc(15px * var(--s) * var(--bd-card-scale, 1));
   line-height: 1.5;
-  transition: box-shadow 0.12s, border-color 0.12s, opacity 0.12s;
+  transition: box-shadow 0.12s, outline-color 0.12s, opacity 0.12s;
   cursor: grab;
   user-select: none;
 }
 .bd-card:hover { box-shadow: 0 6px 20px rgba(20, 24, 33, 0.16); }
-.bd-card.on { border-color: #2f6fd0; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.18), 0 6px 20px rgba(20, 24, 33, 0.16); }
+.bd-card.on { --bd-ring: #2f6fd0; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.18), 0 6px 20px rgba(20, 24, 33, 0.16); }
 .bd-card.dim { opacity: 0.35; }
 .bd-card.editing { cursor: default; box-shadow: 0 10px 34px rgba(20, 24, 33, 0.22); }
-.bd-card.is-formula { background: #fffdf4; border-color: #e2d9bc; }
-.bd-card.is-note { background: #f6f9ff; border-color: #c9d8ef; }
+/* 圈的颜色分两种卡。顺序和原来的 `border-color` 一模一样 —— 于是"选中的公式卡圈是什么
+   颜色"这件事的行为一个字没变（.is-formula 在后面，压过 .on 的 #2f6fd0；选中时看得见的
+   是外面那圈 3px 蓝光）。 */
+.bd-card.is-formula { background: #fffdf4; --bd-ring: #e2d9bc; }
+.bd-card.is-note { background: #f6f9ff; --bd-ring: #c9d8ef; }
 
 .bd-card-empty { color: #a3aab8; font-size: calc(13px * var(--s) * var(--bd-card-scale, 1)); }
 .bd-note { white-space: pre-wrap; word-break: break-word; }
-.bd-tex { overflow-x: auto; overflow-y: hidden; }
+/* ★ 公式卡**不画横向滚动条**：`overflow-x: auto` 留着（"内容有没有被裁"这条硬判据
+   靠 `scrollWidth > clientWidth` 读，见 card-fit.js 的 spillPx），但那条滚动条不占位、
+   也不画出来。
+
+   这一条现在是**第二道闸**，不是根治：根子在 `.bd-card` 那一圈（边框改成 outline，
+   不进布局，缺口恒为 0，见那边的注释）。留着它的理由有两条：
+     · 几何上"少一点点"这种错**不能靠肉眼发现** —— 而这里只要溢出 0.5px 就会换来一条
+       12px 的滚动条（全局 `::-webkit-scrollbar { height: 12px }`，拇指 #262e3d）
+       外加 12px 的撑高（实测 s=0.84 卡高 67.08 → 79.08）。谁以后又往卡片里塞一个
+       "屏幕像素"的量，屏幕上立刻是"卡片底下一根黑棒"，而自检**看不见**它（见下）。
+     · `overflow: hidden` 不能用来代替它：那会把那几像素**真的裁掉**
+       （`E = mc²` 少个 c² 那个坑就是"裁内容"，README 第 15 条）。
+       `auto` + 不画条 = 该滚还能滚、溢出照样断言得到，只是不给你一条假的提示。
+   ⚠ 一条结构性的提醒：所有真浏览器自检都带着 `--hide-scrollbars`
+     （scripts/lib/browser.js 的 headlessArgs），**滚动条类的毛病它们一律看不见** ——
+     同一份夹具带上那个参数，溢出照样报 1~2px 而横条恒为 0。
+     要断言这一族，只能断言几何（`scrollWidth > clientWidth`），不能断言"看不看得见"。 */
+.bd-tex { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.bd-tex::-webkit-scrollbar { height: 0; width: 0; display: none; }
 /* ★ 公式卡里把 KaTeX display 的上下边距清零（KaTeX 默认 `margin: 1em 0`）。
    为什么：那 1em 是给**正文里的独立公式**留的呼吸空间（上面一段、下面一段），
    而卡片是个 box-sizing: border-box 的小盒子，它自己的内边距（4px）就是留白。

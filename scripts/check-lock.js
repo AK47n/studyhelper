@@ -52,7 +52,7 @@ const fails = await withBoard(
       return serializeBoardDocument(b)
     },
   },
-  async ({ s, ok, bad, board, open, read }) => {
+  async ({ s, ok, bad, board, open, read, untilFile }) => {
 /* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
 const sleep = (ms) => s.sleep(ms)
@@ -279,10 +279,16 @@ console.log('\n[8] 点 📌 解开：手柄回来，拖得动了')
 /* ═════════════════ 9. 文件里怎么写的 ═════════════════ */
 console.log('\n[9] 落盘：只有那张卡带 locked，别的卡不多这个字段')
 {
-  /* 先重新锁上，再看文件（前面第 8 步解开了）。 */
+  /* 先重新锁上，再看文件（前面第 8 步解开了）。
+     ★ 等的是"盘上真的出现 locked: true"这个事实，不是 1200ms 这个数字 ——
+       固定毫秒数是在猜（见 README 第 38 条：那条 1/3 概率报红就是猜出来的）。 */
   const c = await readCard(first)
   await s.mouse(c.pinCx, c.pinCy)
-  const doc = await read({ wait: 1200 }) // 等自动存盘（停笔 700ms）
+  const wLock = await untilFile((d) => (d.cards || []).some((x) => x.id === first && x.locked === true), {
+    what: '盘上那张卡真的写上了 locked: true',
+  })
+  if (!wLock.ok) bad(`等了 ${wLock.waited}ms，盘上一直没出现 locked: true`)
+  const doc = wLock.value || (await read())
   if (!doc) bad('夹具板读不出来（落盘那一步没写成？）')
   if (doc) {
     const withLock = doc.cards.filter((x) => x.locked === true)

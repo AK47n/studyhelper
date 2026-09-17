@@ -43,7 +43,14 @@
  *                   / exceptions（页面里的报错）/ errors()（滤掉 favicon 那种噪音）
  *   ctx.board       { name, title, path }，tag 为 null 时是 null
  *   ctx.open(opts)  导航到夹具并等它挂上；opts.settleMs 覆盖等待时长
- *   ctx.read(opts)  读夹具落盘的 JSON（opts.wait 毫秒，等自动存盘用）；读不出返回 null
+ *   ctx.read()      读夹具落盘的 JSON（纯读，读不出返回 null）
+ *   ctx.until(pred, { timeout, every, what }) → { ok, waited, value }
+ *                   等到谓词为真（**不抛异常**）。时序判据只该用它，别读固定毫秒数 ——
+ *                   为什么，见 ctx 里那段注释与 README 第 38 条
+ *   ctx.untilFile(pred, opts)   until 的常用形状：等到夹具文件长成某个样子（谓词拿到板文档；
+ *                               返回的 value 是**那时候的板文档**，不是谓词的返回值）
+ *   ctx.untilSaved(opts)        until 的另一种常用形状：等到应用说「已存」（写盘落地了）——
+ *                               读文件之前该等的那一下，代替从前的 `read({wait: N})`
  *   ctx.raw()       读夹具的原文（字符串）
  *   ctx.drift()     现在为止 data/ 里**原有**文件有没有被改过（返回被改的名字数组，应当为空）
  *   ctx.after(fn)   注册"浏览器杀掉之后"要跑的收尾（删自己跑出来的文件、还原配置、关假服务）
@@ -439,12 +446,56 @@ export async function withBoard(spec, body) {
             port,
             open,
             raw: () => (fix ? fs.readFileSync(fix.path, 'utf8') : null),
-            read: ({ wait = 0 } = {}) => {
-              if (wait) return sleep(wait).then(() => parseMaybe(fix.path))
-              return parseMaybe(fix.path)
+            /* 读夹具落盘的内容（纯读）。**别再给它加 `wait` 那种"先睡再读"的选项** ——
+               要等就用下面的 untilFile。 */
+            read: () => parseMaybe(fix ? fix.path : null),
+            /* ═══════════ 等到真的发生了 ═══════════
+               真浏览器自检里**唯一**该用的时序判据。
+               为什么要它：读一个固定毫秒数就是猜 —— 应用侧有 700ms 防抖存盘、静置 400ms 才重量
+               尺寸、拟合最多跑 12 趟，机器一忙，同一份提交就有两种结果。
+               check-link 那条 1/3 概率报红就是这么来的（README 第 38 条）：
+               它 `sleep(300)` 之后重新导航，而防抖那一趟**有时**赶在导航前落了盘 ——
+               于是 [9] 有时读到 1 笔、有时读到 2 笔。
+               until 的判据是**事实**（夹具文件里的某个东西 / 页面上量到的某个数），不是时间。
+               返回 { ok, waited, value } —— **不抛异常**：超时要由调用方报成一条 ✗，
+               免得一次超时把后面几十条断言全带走。 */
+            until: async (pred, { timeout = 6000, every = 80, what = '条件' } = {}) => {
+              const t0 = Date.now()
+              let value
+              for (;;) {
+                try {
+                  value = await pred()
+                } catch {
+                  value = undefined
+                }
+                if (value) return { ok: true, waited: Date.now() - t0, value }
+                if (Date.now() - t0 >= timeout) return { ok: false, waited: Date.now() - t0, value }
+                await sleep(Math.min(every, Math.max(0, timeout - (Date.now() - t0))))
+              }
             },
+            /* until 的常用形状：**等到夹具文件长成某个样子**。
+               谓词拿到的是解析好的板文档（解析不出来就当没到）。
+               例：await untilFile((d) => d.strokes.length === 2, { what: '盘上多了一笔' })
+               ★ 返回的 `value` 是**那时候的板文档**，不是谓词的返回值 ——
+                 调用方通常要拿这份文档接着断言（`const doc = w.value || await read()`）。
+                 自己绊过一次：把它当成"谓词返回的那张卡"用了，于是 doc.w 全是 undefined。 */
+            untilFile: (pred, opts = {}) =>
+              ctx.until(() => {
+                const d = parseMaybe(fix ? fix.path : null)
+                return d && pred(d) ? d : undefined
+              }, { what: '夹具文件里的 ' + (opts.what || '条件'), ...opts }),
             /* 现在为止，data/ 里原有文件有没有被改过（应当一直是空的） */
             drift: () => changedSince(before),
+            /* 等到**应用自己说"都写进去了"**（工具条那颗「已存」）。
+               这是"读文件之前该等的那一下"的通用形状 —— 以前到处是 `read({wait: 1200})`：
+               睡多久都是猜，而应用侧明明有一个诚实的时刻（2026-09-17 起它真的诚实了：
+               Board.jsx 的 flushSave 要等写盘回来才清 dirty，见 README 第 38 条）。
+               ⚠ 它是**页面事实**：那条自检得开着白板页（所有真浏览器自检都开着）。 */
+            untilSaved: (opts = {}) =>
+              ctx.until(async () => {
+                const t = await s.eval(`(() => { const el = document.querySelector('.bd-save'); return el ? el.textContent.trim() : '' })()`)
+                return t === '已存' ? t : undefined
+              }, { what: '应用说「已存」（写盘真的落地了）', ...opts }),
             after: (fn) => afterFns.push(fn),
           }
           await body(ctx)

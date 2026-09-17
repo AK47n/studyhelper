@@ -18,8 +18,9 @@
  *   frameBounds），箭头两端按框/卡的边现算（links.js 的 readDeclaredLinks）。
  *   所以"整体挪一下"挪的是**成员**，不是框。
  */
-import { linkId, newFrameId } from './board.js'
-import { cardBounds, frameBounds, pointInRect, toFlat } from './geometry.js'
+import { linkId, liveNodesOf, newFrameId } from './board.js'
+import { toFlat } from './geometry.js'
+import { ARROW_SNAP, nodeAt } from './nodes.js'
 import { ARROW_LINK, isLinkKind } from './link-kinds.js'
 
 /* 一个东西属于哪个框（笔迹和卡片都问这一个入口）。不属于任何框 → null。 */
@@ -176,9 +177,10 @@ export function pruneFrames(board) {
 /* 连上两端（同一个有序对只留一条：先有的那条赢，返回原 board —— 调用方靠这个判"什么都没发生"）。 */
 export function declareLink(board, from, to, kind = ARROW_LINK) {
   if (!from || !to || from === to) return board
-  const known = (id) =>
-    ((board && board.cards) || []).some((c) => c.id === id) || ((board && board.frames) || []).some((f) => f.id === id)
-  if (!known(from) || !known(to)) return board
+  /* 两端都得是**还活着的端点**（卡片 / 板框）—— 判据住在 board.js 的 liveNodesOf 一处
+     （三处各写一遍就是"死 id 不留尸体"静默失效的入口，见 README 第 40 条）。 */
+  const live = liveNodesOf(board)
+  if (!live.has(from) || !live.has(to)) return board
   const links = (board && board.links) || []
   if (links.some((l) => linkId(l.from, l.to) === linkId(from, to))) return board
   return { ...board, links: [...links, { from, to, kind: isLinkKind(kind) ? kind : ARROW_LINK }] }
@@ -190,42 +192,17 @@ export function linkOf(board, from, to) {
 
 /* ── 松手时"这一头落在谁身上"（箭头工具的吸附）─────────────────────────────
  *
- * 和从前那套位置判据的区别，一句话：**只认你亲眼看得见的那些方块** ——
- * 卡片和板框，都是"有边框的东西"。不再去猜"这一撮墨是不是一个东西"
- * （墨迹块那套在真实笔迹上 92:0，见 ADR-0001）。
+ * ★ 判据（进框优先、卡片优先于板框、离边 ≤ 40 世界像素）现在住在 **`nodes.js`** ——
+ *   那是"端点"这一层的读接口，见那个文件的说明与 README 第 40 条。
+ *   这里只留一个薄薄的适配器：签名（board, p, radius）和从前一样，
+ *   调用方（Board.jsx 的箭头工具）一个字都不用改。
  *
- * 判据两条，顺序是有意的：
- *   ① **点在框里** → 直接赢，而且**卡片比板框优先**（卡片更具体：一张卡可以落在板框里，
- *      那时候你指的是那张卡，不是外面那个大框）；
- *   ② 都不在里面 → 离**边**最近的那个（≤ radius 世界像素）才算。
- * 半径给得宽（40px）：手画的箭头**常常停在东西前面一点**（尖得留出画 V 的地方），
- * 而"停在前面"和"没连上"在手感上是两件事。 */
-export const ARROW_SNAP = 40
+ * 和从前那套位置判据的区别，一句话：**只认你亲眼看得见的那些方块** ——
+ * 卡片和板框。不再去猜"这一撮墨是不是一个东西"（墨迹块那套在真实笔迹上 92:0，见 ADR-0001）。 */
+export { ARROW_SNAP } from './nodes.js'
 
 export function snapNode(board, p, radius = ARROW_SNAP) {
-  if (!p) return null
-  const cards = ((board && board.cards) || []).map((c) => ({ kind: 'card', id: c.id, label: '', box: cardBounds(c) }))
-  const frames = ((board && board.frames) || [])
-    .map((f) => ({ kind: 'frame', id: f.id, label: f.title ? String(f.title) : '板框', box: frameBounds(board, f) }))
-    .filter((x) => x.box)
-  for (const list of [cards, frames]) {
-    const inside = list.find((n) => pointInRect(p, n.box))
-    if (inside) return inside
-  }
-  let best = null
-  let bd = radius
-  for (const list of [cards, frames]) {
-    for (const n of list) {
-      const dx = Math.max(n.box.x - p.x, 0, p.x - (n.box.x + n.box.w))
-      const dy = Math.max(n.box.y - p.y, 0, p.y - (n.box.y + n.box.h))
-      const d = Math.hypot(dx, dy)
-      if (d <= bd) {
-        bd = d
-        best = n
-      }
-    }
-  }
-  return best
+  return nodeAt(board, p, { radius })
 }
 
 /* 换个词（点线上那颗词、或者那排词里选一个）。 */

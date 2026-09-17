@@ -111,3 +111,47 @@ export function centerOn(view, worldPt, screenW, screenH) {
     ty: screenH / 2 - worldPt.y * view.s,
   }
 }
+
+/* ═══════════ 长度、以及"每样东西自己的倍率" ═══════════
+ *
+ * 上面那几条收的是**点与矩形**；下面这几条收的是**长度**（半径、最小步长、内边距、
+ * 线宽、指针位移……）和**倍率**。
+ *
+ * ★ 为什么单开这几条（2026-09-17 架构 review 的候选 1，ADR-0002 的邻居）：
+ *   "卡片的屏幕尺寸 = 世界 × s × 卡自己的 k" 这条被**手抄过三处** ——
+ *   卡片渲染（Board.jsx 的 Card）、缩放柄的兜底分支、量尺寸那一趟的 wantW（card-fit.js）。
+ *   而 view.js 只认 s、不认 k，于是"卡片这条路不走 view.js"成了惯例：
+ *   屏幕像素的量（那圈边）顺势混进了世界坐标的宽，长出了 ADR-0002 那根恒粗黑线。
+ *   **一个倍率只有一处乘，口径才算真的一处。**
+ *
+ * ★ 这几条都是纯函数（不改入参、**不 round** —— round 是写进 DOM/CSS 那一步的事，见文件头）。
+ * ★ `factor` 一律是 combinedScale(...) 出来的那个倍率；不跟缩放走的量**不要**进这里。
+ */
+export function combinedScale(s, k) {
+  const a = Number(s) || 1
+  const b = Number(k) || 1
+  return a * b
+}
+
+/* 世界长度 → 屏幕长度。 */
+export function worldLenToScreen(len, factor) {
+  return (Number(len) || 0) * (Number(factor) || 1)
+}
+
+/* 屏幕长度 → 世界长度（反方向：指针位移、橡皮半径、命中容差都该走它）。 */
+export function screenLenToWorld(len, factor) {
+  const f = Number(factor) || 1
+  return (Number(len) || 0) / (f > 0 ? f : 1)
+}
+
+/* 世界矩形 → 屏幕盒，带倍率（卡片那条路用它）。
+   `pad` 与 worldRectToScreen 一样是"每边往外让多少屏幕像素"。 */
+export function scaledRectToScreen(rect, factor, pad = 0) {
+  const f = Number(factor) || 1
+  return {
+    left: (Number(rect && rect.x) || 0) * f - pad,
+    top: (Number(rect && rect.y) || 0) * f - pad,
+    width: (Number(rect && rect.w) || 0) * f + pad * 2,
+    height: (Number(rect && rect.h) || 0) * f + pad * 2,
+  }
+}

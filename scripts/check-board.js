@@ -12,6 +12,7 @@ import {
   TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, cardHeightFromContent, cardWidthFromContent, clampCardScale,
   fontCss, isBoardDocument, isBoardName, newBoard, newCard, linkId, newFrameId,
   newStroke, nextCardScale, normalizeFrames, normalizeLinks, parseBoardDocument, serializeBoardDocument, textCardRect,
+  liveNodeIdFn, liveNodesOf,
 } from '../src/lib/board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距、框选命中）2026-09-17 也进了那儿。 */
@@ -42,8 +43,9 @@ import {
    "打开哪一个"是一个纯决定，于是那些入口情形在这儿断言得到（见 [6n]）。 */
 import { SEED_BOARD_NAME, boardFileName, createFileApi, nextBoardName, planStartup } from '../src/lib/files.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
-import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
+import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, scaledRectToScreen, screenLenToWorld, screenToWorld, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
+import { ARROW_SNAP, CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from '../src/lib/nodes.js'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 
 /* 连接那一层只从这个入口进（module 自己的 internal seam 另说）——见 board.js 的注释。 */
@@ -335,6 +337,34 @@ console.log('\n[3] 几何：距离 / 命中 / 视图变换')
     eq(nums, { s: 3, tx: 20, ty: -8 }, 'applyViewTo 返回实际写进去的三个数')
     eq(calls[0], [3, 0, 0, 3, 20, -8], 'applyViewTo：setTransform(dpr×s, …)（dpr 乘进去了）')
     eq(viewTransformAttr({ s: 1.5, tx: 10, ty: -8.5 }), 'translate(10 -8.5) scale(1.5)', 'SVG 变换和 canvas 变换同源')
+
+    /* ⑧ 长度与"每样东西自己的倍率"（2026-09-17 架构 review 的候选 1）：
+          "卡片的屏幕尺寸 = 世界 × s × k"以前**手抄在三处**（卡片渲染 / 缩放柄兜底 / 量尺寸的 wantW），
+          现在只有一处乘。这里钉住那个倍率本身、两个方向、以及"搬家不许改数"。 */
+    {
+      eq(combinedScale(2, 3), 6, '倍率：s × k（两个都算）')
+      eq(combinedScale(2, 0), 2, '倍率：k=0 当成 1（脏数据不该把卡片乘没）')
+      eq(combinedScale(2, NaN), 2, '倍率：k=NaN 当成 1')
+      eq(combinedScale(NaN, NaN), 1, '倍率：都脏 → 1（一次脏输入不该把卡片乘没）')
+      near(worldLenToScreen(4, 2.5), 10, 1e-9, '世界长度 → 屏幕长度：× 倍率')
+      near(screenLenToWorld(10, 2.5), 4, 1e-9, '屏幕长度 → 世界长度：÷ 倍率（反方向也在一处）')
+      near(screenLenToWorld(worldLenToScreen(37.5, 1.486), 1.486), 37.5, 1e-9, '长度往返：世界 → 屏幕 → 世界 回原值')
+      /* 卡片的屏幕盒：宽高只跟倍率（和 worldRectToScreen 一样，位置那一条才带平移） */
+      const vv = { s: 0.5, tx: 100, ty: 40 }
+      const box2 = scaledRectToScreen({ x: 10, y: 20, w: 40, h: 30 }, combinedScale(vv.s, 2))
+      near(box2.left, 10 * 1, 1e-9, '卡片盒：左 = 世界 x × (s×k)（平移由调用方按点加，别混进长度）')
+      near(box2.width, 40 * 1, 1e-9, '卡片盒：宽 = 世界宽 × (s×k)')
+      /* ★ 这条就是那个 bug 的形状：**量尺寸那一趟**和**渲染**算出来的屏幕宽度必须是同一个数
+         （从前两边各写一遍乘法，ADR-0002 那根黑线就是从"两边各算"里长出来的）。 */
+      const cardNow = { w: 141.7, h: 52.1, scale: 1.486 }
+      const viewNow = { s: 1.451, tx: -1022, ty: 795.5 }
+      near(
+        worldLenToScreen(cardNow.w, combinedScale(viewNow.s, cardNow.scale)),
+        cardNow.w * viewNow.s * cardNow.scale,
+        1e-9,
+        '卡片屏幕宽：一处乘出来的和"手写三个因子"完全一致（口径搬家不许改数）'
+      )
+    }
   }
 }
 
@@ -1011,8 +1041,17 @@ console.log('\n[6h] 板框（`frames`）：你亲手留下的一个整体')
     const node = inkNodeAt(idx2, { x: 3, y: 3 })
     eq(node && node.id, 'frm:gA', '留下框之后：那一撮字是你的板框（id 用框 id）')
     eq(node && node.label, '左边这一节', '名字就是你的标题')
-    /* 复用同一个索引再来一次（应用里就是复用），结果必须一样 */
-    eq(JSON.stringify(reader.read(fixedB, idx2)), JSON.stringify(reader.read(fixedB, idx2)), '复用索引连算两次结果一致')
+    /* 复用索引再来一次（应用里就是复用）：结果必须和"新开一个 reader 从零算"**一模一样**。
+       ⚠ 第一版这条是 `JSON.stringify(reader.read(b, idx2)) === JSON.stringify(reader.read(b, idx2))` ——
+          **同一个表达式比自己，恒真**；而且 `read()` 的第二个参数是**被静默忽略**的旧签名
+          （索引早就收进 reader 内部了）。一条永远不会红的断言比没有更坏：它占着位置看着像验过了。
+          见 README 第 38 条。 */
+    const freshReader = createLinkReader()
+    eq(
+      JSON.stringify(reader.read(fixedB)),
+      JSON.stringify(freshReader.read(fixedB)),
+      '复用索引算出来的连接，和"新开一个 reader 从零算"一模一样（缓存不改变答案）'
+    )
   }
 
   /* ② 存盘：真有框才写这个字段；死成员不留尸体；空框自己消失 */
@@ -2239,6 +2278,75 @@ console.log('\n[6q] 宣告的连接（`links`）：两端 + 一个词，屏幕�
     const got2 = membersInBox(b, { x0: -50, y0: -50, x1: 500, y1: 200 })
     eq(got2.cards, ['ka'], '卡片中心在框里 → 算')
     eq(membersInBox(b, null), { ids: [], cards: [] }, '没框 → 什么都圈不到（不是 undefined）')
+  }
+}
+
+// ═════════════════════ 6r. 端点（nodes.js） ═════════════════════
+console.log('\n[6r] 端点（`nodes.js`）：谁算端点、这一点落在谁身上、三个半径各是什么')
+{
+  /* 为什么单开一节（2026-09-17 架构 review 候选 2）：ADR-0001 把"谁是端点"定成核心一句话，
+     可它被写在**五个地方**、三个半径各写各的。这一节钉的是那个 module 的接口，
+     以及"三处判据必须一致"这条纪律（漏一处是静默失效，不是崩溃）。 */
+  const b = makeBoard()
+  b.cards = [
+    { ...newCard('formula', 0, 0, { w: 100, h: 60 }), x: 0, y: 0, id: 'ka' },
+    { ...newCard('formula', 0, 0, { w: 100, h: 60 }), x: 400, y: 0, id: 'kb' },
+  ]
+  /* 一个包住 ka 的板框（成员就是 ka）—— 用来验"进框时卡片优先于板框" */
+  b.frames = [{ id: 'fa', title: '第一节', ids: [], cards: ['ka'] }]
+
+  const { cards, frames } = nodeList(b)
+  eq(cards.length, 2, '端点数：两张卡')
+  eq(frames.length, 1, '端点数：一个板框')
+  eq(frames[0].label, '第一节', '板框的显示名 = 你起的标题')
+  eq(cards[0].label, '', '卡片的显示名是空的（屏上不写字）')
+  {
+    const b2 = { ...b, frames: [{ id: 'fb', ids: [], cards: [] }] }
+    eq(nodeList(b2).frames.length, 0, '成员全没了的板框**不是**端点（绝不画指向空气的箭头）')
+    eq(nodeById(b2, 'fb'), null, '按 id 取它也是 null')
+  }
+
+  /* 进框：卡片在前 → 卡片赢（它更具体：一张卡可以落在板框里） */
+  eq(nodeAt(b, { x: 50, y: 30 })?.id, 'ka', '这一点落在谁身上：卡片优先于板框（这一点两个框都包着）')
+  eq(nodeAt(b, { x: 50, y: 30 }, { kinds: ['frame'] })?.id, 'fa', '只要板框时，同样这一点就是那个框')
+  eq(nodeAt(b, { x: 900, y: 900 }), null, '哪儿都不在框里、又不给半径 → null')
+  /* 板框的包围盒会把卡包住，量"宽容/半径"的边界得用一张只有卡的板（不然框先接住） */
+  const bare = { ...b, frames: [] }
+  eq(nodeAt(bare, { x: 105, y: 30 }), null, '严格模式：卡框外 5px 还不算（不给 pad/radius）')
+  eq(nodeAt(bare, { x: 105, y: 30 }, { pad: CARD_HIT_PAD })?.id, 'ka', `免费路：CARD_HIT_PAD=${CARD_HIT_PAD} 之内算碰到`)
+  eq(nodeAt(bare, { x: 109, y: 30 }, { pad: CARD_HIT_PAD }), null, '超出这个宽容就不算（边界是硬的）')
+  eq(nodeAt(bare, { x: 105, y: 30 }, { radius: ARROW_SNAP })?.id, 'ka', `吸附半径 ARROW_SNAP=${ARROW_SNAP}：离边 5px 也算吸上`)
+  eq(nodeAt(bare, { x: 139, y: 30 }, { radius: ARROW_SNAP })?.id, 'ka', '离边 39px 还在吸附半径里')
+  eq(nodeAt(bare, { x: 141, y: 30 }, { radius: ARROW_SNAP }), null, '离边 41px 就吸不上了')
+  eq(nodeAt(bare, { x: 163, y: 30 }, { radius: COND_SEARCH })?.id, 'ka', `条件半径 COND_SEARCH=${COND_SEARCH} 比吸附宽（离边 63px 也算）`)
+  eq(nodeAt(b, { x: 105, y: 30 }, { radius: ARROW_SNAP })?.id, 'fa', '板框也算端点：这一点在框的包围盒里 → 框接住')
+
+  /* exclude（条件要跳过这条关系自己的两端）与 kinds */
+  eq(nodeAt(b, { x: 0, y: 0 }, { exclude: ['ka'] })?.id, 'fa', 'exclude 跳过的那一个不算，退到下一个')
+  eq(nodeAt(b, { x: 0, y: 0 }, { kinds: ['card'], exclude: ['ka'] }), null, '只找卡片 + 跳过它 → 没东西')
+  eq(nodeAt(b, { x: 0, y: 0 }, { kinds: ['card'] })?.kind, 'card', 'kinds 只找卡片')
+
+  /* ★ 这条是"一处判据"的硬判据：**点→框**那条公式在 module 里只有一份 */
+  near(edgeDist({ x: 0, y: 0, w: 100, h: 60 }, { x: 110, y: 30 }), 10, 1e-9, '点到框边的距离：框外 10 → 10')
+  eq(edgeDist({ x: 0, y: 0, w: 100, h: 60 }, { x: 50, y: 30 }), 0, '点在框里 → 0')
+  near(edgeDist({ x: 0, y: 0, w: 100, h: 60 }, { x: 103, y: 64 }), 5, 1e-9, '斜着出去也按两条边算（3-4-5）')
+  eq(JSON.stringify(edgePointOf({ x: 0, y: 0, w: 100, h: 60 }, { x: 300, y: 30 })), JSON.stringify({ x: 100, y: 30 }), '边点：正右方打在右边中点')
+  eq(JSON.stringify(edgePointOf({ x: 0, y: 0, w: 100, h: 60 }, { x: 50, y: -300 })), JSON.stringify({ x: 50, y: 0 }), '边点：正上方打在上边中点')
+
+  /* ★★ "三处判据一致"：宣告 / 解析 / 写盘 对同一个死 id 必须说同一句话 */
+  {
+    const live = liveNodeIdFn(new Set(['ka']), new Set(['fa']))
+    if (live('ka') && live('fa') && !live('死掉了')) ok('存活判据：卡片 / 板框都活，别的都不算')
+    else bad('liveNodeIdFn 判错了')
+    const ids = [...liveNodesOf(b)].sort().join(',')
+    eq(ids, 'fa,ka,kb', 'liveNodesOf(board) = 卡片 + 板框（另一处调用的同一个判据）')
+    /* 宣告：端点是死 id → 原样返回（不留半条记录） */
+    eq(declareLink(b, 'ka', '死掉了'), b, '宣告：一头是死 id → 一个字节都不改')
+    /* 解析 / 写盘：同一对 id 必须一起被丢掉（漏一处就是"内存里有、文件里没有"） */
+    const withDead = { ...b, links: [{ from: 'ka', to: '死掉了', kind: 'cause' }, { from: 'ka', to: 'kb', kind: 'cause' }] }
+    const parsed = parseBoardDocument(serializeBoardDocument(withDead), 'x')
+    eq(parsed.links.length, 1, '写盘：死 id 那条不留尸体（只剩活着的那一对）')
+    eq(parsed.links[0].from + '→' + parsed.links[0].to, 'ka→kb', '活下来的正是两端都活着的那条')
   }
 }
 

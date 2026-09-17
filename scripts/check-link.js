@@ -56,7 +56,9 @@ const fails = await withBoard(
       return serializeBoardDocument(b)
     },
   },
-  async ({ s, ok, bad, board, open, read }) => {
+  /* `until / untilFile / untilSaved` 是那道门给的"等到真的发生了"（见 board-check.js）。
+     这一条自检里凡是"读了文件再断言"的地方都用它们 —— 别读固定毫秒数（README 第 38 条）。 */
+  async ({ s, ok, bad, board, open, read, until, untilFile, untilSaved }) => {
 /* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
 const sleep = (ms) => s.sleep(ms)
@@ -443,19 +445,31 @@ console.log('\n[9] 「删掉这条连接」（那排词里 `0` 那颗）：你�
   const hasDelete = await s.eval(`!!document.querySelector('.bd-linkchips .bd-linkchip[data-link-kind="delete"]')`)
   if (hasDelete) ok('那排词里有一颗「删掉这条连接」（data-link-kind="delete"）')
   else bad('那排词里没有「删掉这条连接」那颗')
+  /* ★ 这条不变量要写成**相对的**：删的是**记录**，墨迹得一笔不动 ——
+     所以比的是"删之前几笔 / 删之后几笔"，不是"应该正好 1 笔"。
+     为什么（2026-09-17，README 第 38 条）：[7] 那笔乱画**有时候**会被自动存盘写进文件
+     （防抖 700ms 与后面那次重新导航赛跑），于是绝对数字偶尔是 2 —— 那不是 bug，
+     是这条断言不该依赖前几节留下的状态。 */
+  const inkBefore9 = (((await read()) || {}).strokes || []).length
   await s.key('0', 'Digit0', 48)
-  await sleep(1200)
+  /* ⚠ 谓词必须是**你要断言的那件事本身**：删的是记录，所以等的是"文件里那条记录没了"，
+     顺带等笔数没变。第一版这里只等了笔数 —— 而笔数在**删除之前**就已经成立，
+     于是 until 立刻返回一份旧文件，"文件里还留着 links" 当场报红（自己踩的，记一笔）。 */
+  const wDoc9 = await untilFile((d) => !(d.links || []).length && (d.strokes || []).length === inkBefore9, {
+    what: `那条记录从文件里没了、而 ${inkBefore9} 笔一笔没动`,
+  })
+  if (!wDoc9.ok) bad(`等了 ${wDoc9.waited}ms，文件里那条记录一直没走（或墨迹被动了）`)
   const after = await readBoard()
   if (after.count === 1) ok('删掉之后只剩 1 条（那条记录真的走了）')
   else bad(`删完还剩 ${after.count} 条`)
-  const doc9 = await read()
+  const doc9 = wDoc9.value || (await read())
   if (!doc9.links || doc9.links.length === 0) ok('文件里的 links 字段也没了（不留空壳）')
   else bad(`文件里还留着：${JSON.stringify(doc9.links)}`)
   const gone = await s.eval(`!document.querySelector('[data-link-line]') && !document.querySelector('.bd-linkpill[data-link-pill]')`)
   if (gone) ok('屏幕上那条线和那颗词一起消失了')
   else bad('删完了屏幕上还挂着那条连线')
-  if (doc9.strokes.length === 1) ok('纸上那一笔一个字都没动（删的是记录，不是墨迹）')
-  else bad(`墨迹被动了：${doc9.strokes.length} 笔`)
+  if (doc9.strokes.length === inkBefore9) ok(`纸上那 ${inkBefore9} 笔一个字都没动（删的是记录，不是墨迹）`)
+  else bad(`墨迹被动了：${inkBefore9} → ${doc9.strokes.length} 笔`)
 
   /* ② 你**画**的那条：再画一条 A→B 的线 → 那排词 → 按 0 → 删的是**那一笔** */
   const st9b = await readBoard()
@@ -470,16 +484,27 @@ console.log('\n[9] 「删掉这条连接」（那排词里 `0` 那颗）：你�
   if (drew.chipsOpen) ok('那排词浮出来了')
   else bad('没浮出那排词，后面点不到')
   const inkBefore = drew.ink
+  /* 这份"删之前"的文件快照要**等它落盘**（刚画的那一笔还没出去），
+     否则下面那条"文件里也少了一笔"比的是一份旧文件。 */
+  const wDrew = await untilFile((d) => (d.strokes || []).length === inkBefore, { what: `刚画的那一笔落盘（盘上 ${inkBefore} 笔）` })
+  if (!wDrew.ok) bad(`等了 ${wDrew.waited}ms，刚画的那一笔一直没落盘`)
+  const docBefore9b = wDrew.value || (await read())
   await s.key('0', 'Digit0', 48)
-  await sleep(1200)
+  const wDoc9b = await untilFile((d) => (d.strokes || []).length === inkBefore - 1, {
+    what: `删掉那条连接之后、盘上剩 ${inkBefore - 1} 笔`,
+  })
+  if (!wDoc9b.ok) bad(`等了 ${wDoc9b.waited}ms，盘上的笔数没变成 ${inkBefore - 1}`)
   const del = await readBoard()
   if (del.count === 1) ok('这条不算连接了（回到 1 条）')
   else bad(`删完还剩 ${del.count} 条`)
   if (del.ink === inkBefore - 1) ok(`那一笔也从墨迹层里删掉了（${inkBefore} → ${del.ink}）—— "删掉这条连接"对画出来的那条就是删那一笔`)
   else bad(`墨迹层笔数不对：${inkBefore} → ${del.ink}`)
-  const doc9b = await read()
-  if (doc9b.strokes.length === 1) ok('文件里也只剩那一笔（画出来的那条不留记录、删了就是删了）')
-  else bad(`文件里的笔数不对：${doc9b.strokes.length}`)
+  const doc9b = wDoc9b.value || (await read())
+  if (doc9b.strokes.length === docBefore9b.strokes.length - 1) {
+    ok(`文件里正好少了一笔（${docBefore9b.strokes.length} → ${doc9b.strokes.length}）—— 画出来的那条不留记录、删了就是删了`)
+  } else {
+    bad(`文件里的笔数不对：${docBefore9b.strokes.length} → ${doc9b.strokes.length}（应该正好少一笔）`)
+  }
   /* 一步撤销能把它找回来（和别处一样：删是一条正常的撤销步） */
   await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
   await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
@@ -497,9 +522,13 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
        · 顶栏那颗名字**点得到**（elementFromPoint）——浮出来的把手被盖住是踩过的坑；
        · 双击它就地改名、回车落盘；
        · 拖它 = **成员整体挪**（框线是成员的函数，跟着走）。 */
-  /* ⚠ 这一段要读**文件**（不是屏幕），所以每处读之前都要给它自动存盘的时间：
-     应用的自动存盘是"停手 0.7 秒后写盘"（README「别按 Ctrl+S」那一节）。 */
-  const docBefore = await read({ wait: 900 })
+  /* ⚠ 这一段要读**文件**（不是屏幕），所以每处读之前都要等"真的落盘了"：
+     应用的自动存盘是"停手 0.7 秒后写盘"（README「别按 Ctrl+S」那一节）。
+     ★ 别用固定毫秒数等（原来是 `read({ wait: 900 })`）：那是在猜 —— 应用侧明明有一个
+       诚实的时刻（工具条的「已存」，2026-09-17 起它真的诚实了）。见 README 第 38 条。 */
+  const wBefore = await untilSaved()
+  if (!wBefore.ok) bad(`等了 ${wBefore.waited}ms，应用一直没说「已存」—— 下面读到的是旧文件`)
+  const docBefore = await read()
   const pointsOf = (doc, ids) =>
     JSON.stringify(
       (doc.strokes || [])
@@ -590,8 +619,11 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
 
   /* 拖它 → **成员整体挪**（框线是成员的函数，自己跟着走）。
      ⚠ "拖前的位置"要在**这一刻**重新读一次文件：上面刚改过标题、而自动存盘是停手 0.7 秒后 ——
-     拿 [10] 开头那份快照会比现在的文件少几笔（第一次跑就是栽在这儿：拖前的点里少了一笔）。 */
-  const docPreDrag = await read({ wait: 900 })
+     拿 [10] 开头那份快照会比现在的文件少几笔（第一次跑就是栽在这儿：拖前的点里少了一笔）。
+     ★ 等的是「已存」这个事实，不是 900ms 这个数字。 */
+  const wPreDrag = await untilSaved()
+  if (!wPreDrag.ok) bad(`等了 ${wPreDrag.waited}ms，改名那一下一直没落盘 —— 下面那份"拖前快照"会是旧的`)
+  const docPreDrag = await read()
   const ptsBefore = pointsOf(docPreDrag, memberIds)
   await s.mouse(chip2.x, chip2.y, { steps: 8, dx: 60, dy: 40 })
   await sleep(1200)
@@ -758,8 +790,12 @@ console.log('\n[12] 「这个条件不算」：位置读错了，一句话作废
       }
     }
 
-    /* 落盘：那句话写在那一笔上（cond: "none"），重开还在 */
-    const doc = await read({ wait: 1200 })
+    /* 落盘：那句话写在那一笔上（cond: "none"），重开还在 —— 等的是**文件里真的有了** */
+    const wCond = await untilFile((d) => (d.strokes || []).filter((x) => x.cond === 'none').length === 1, {
+      what: '文件里出现一笔 cond:"none"',
+    })
+    if (!wCond.ok) bad(`等了 ${wCond.waited}ms，文件里一直没有 cond:"none" —— 那句话没落盘`)
+    const doc = wCond.value || (await read())
     const withCond = (doc.strokes || []).filter((x) => x.cond === 'none')
     if (withCond.length === 1) ok('文件里正好一笔写着 cond: "none"')
     else bad(`文件里的 cond 不对：${JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1]))}`)
@@ -791,7 +827,9 @@ console.log('\n[12] 「这个条件不算」：位置读错了，一句话作废
       else bad(`按钮没回到 ✕：${JSON.stringify(row3)}`)
       if (restored.chainMissing <= miss0) ok(`推导链那一步又不缺条件了（${restored.chainMissing}）`)
       else bad(`链上那一步还缺着：${restored.chainMissing}`)
-      const doc2 = await read({ wait: 1200 })
+      const wClear = await untilFile((d) => !JSON.stringify(d).includes('"cond"'), { what: '回头看：文件里那个 cond 字段没了' })
+      if (!wClear.ok) bad(`等了 ${wClear.waited}ms，文件里那个 cond 字段还在（回头路没落盘）`)
+      const doc2 = wClear.value || (await read())
       if (!JSON.stringify(doc2).includes('"cond"')) ok('文件里那个字段也没了（回头路清得干净）')
       else bad('文件里还留着 cond 字段')
     }
@@ -899,7 +937,11 @@ console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按
         else bad(`没写出"你指的"：${JSON.stringify(row2)}`)
         if (!(await s.eval("!!document.querySelector('.bd.condarm')"))) ok('指完就收（一次性，不会留着影响下一次画）')
         else bad('指完还武装着 —— 下次落笔会被它吃掉')
-        const doc = await read({ wait: 1200 })
+        const wInk = await untilFile((d) => (d.strokes || []).some((x) => typeof x.cond === 'string' && x.cond.startsWith('ink:')), {
+          what: '文件里写上一个 ink: 条件',
+        })
+        if (!wInk.ok) bad(`等了 ${wInk.waited}ms，文件里一直没出现 ink: 条件`)
+        const doc = wInk.value || (await read())
         const inkCond = (doc.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('ink:'))
         if (inkCond.length === 1) ok('文件里写的是 ' + inkCond[0])
         else bad('文件里的 cond 不对：' + JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1])))
@@ -918,7 +960,9 @@ console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按
           const row4 = await rowInfo()
           if (row4 && /条件/.test(row4.cond) && !/你指的/.test(row4.cond)) ok(`↺ 回到按位置读了（${row4.cond}）`)
           else bad(`点了 ↺ 没回到按位置读：${JSON.stringify(row4)}`)
-          const doc2 = await read({ wait: 1200 })
+          const wClear2 = await untilFile((d) => !/"cond"/.test(JSON.stringify(d)), { what: '文件里那个 cond 又清掉了' })
+          if (!wClear2.ok) bad(`等了 ${wClear2.waited}ms，文件里的 cond 还在`)
+          const doc2 = wClear2.value || (await read())
           if (!/"cond"/.test(JSON.stringify(doc2))) ok('文件里那个字段也清掉了')
           else bad('文件里还留着 cond')
 
@@ -947,7 +991,9 @@ console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按
               const row5 = pickedCard.condRowInfo.find((r) => /推导/.test(r.kind))
               if (row5 && /你指的/.test(row5.cond)) ok(`点一张卡也能当条件：${row5.cond}`)
               else bad(`点卡片那条路没走通：${JSON.stringify(row5)}`)
-              const doc3 = await read({ wait: 1200 })
+              const wCard = await untilFile((d) => (d.strokes || []).some((x) => x.cond === 'card:lk-a'), { what: '文件里写上 card:lk-a' })
+              if (!wCard.ok) bad(`等了 ${wCard.waited}ms，文件里一直没出现 card:lk-a`)
+              const doc3 = wCard.value || (await read())
               const cardCond = (doc3.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('card:'))
               if (cardCond.length === 1 && /card:lk-a/.test(cardCond[0])) ok('文件里写的是 ' + cardCond[0])
               else bad('文件里的 cond 不对：' + JSON.stringify(cardCond))

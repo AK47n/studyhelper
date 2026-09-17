@@ -204,6 +204,60 @@ console.log('\n[6] body 抛异常：照样删夹具、放端口、报红（下�
   else bad('服务还在 5212 上跑着')
 }
 
+/* ═══════════════ 7. 「等到真的发生了」这道缝 ═══════════════ */
+console.log('\n[7] ctx.until / untilFile：等事实，不等毫秒（真浏览器里跑，验的是那道门）')
+{
+  await withBoard(
+    { tag: 'harness-until', port: 5213, cdpPort: 9253, text: serializeBoardDocument(newBoard('until 夹具')) },
+    async ({ ok, bad, until, untilFile, untilSaved, board, open, read }) => {
+      await open()
+      await sleep(1200) // 等应用把它自己那一趟（开板重量尺寸）跑完
+
+      /* ① 一开始就为真：立刻返回，不白等 */
+      const t0 = Date.now()
+      const a = await until(() => true)
+      if (a.ok && Date.now() - t0 < 200) ok(`谓词一开始就真 → 立刻返回（${Date.now() - t0}ms，不白等）`)
+      else bad(`立刻为真却也等了 ${Date.now() - t0}ms（ok=${a.ok}）—— 那不是"等到"，是"睡够"`)
+
+      /* ② 真的要等：第三趟才为真 —— 证明它是**轮询**，不是"看一眼就走" */
+      let n = 0
+      const b = await until(() => ++n >= 3, { every: 60 })
+      if (b.ok && n >= 3 && b.waited >= 100) ok(`第 ${n} 趟才为真 → 真的在轮询（等了 ${b.waited}ms）`)
+      else bad(`没有轮询：n=${n} waited=${b.waited} ok=${b.ok}`)
+
+      /* ③ 一直不为真：超时返回 ok:false，而且**不抛异常**（超时是一条 ✗，不该带走后面几十条断言） */
+      const c = await until(() => false, { timeout: 300, every: 50 })
+      if (!c.ok && c.waited >= 280) ok(`一直不真 → ${c.waited}ms 后返回 ok:false（没有抛异常）`)
+      else bad(`超时这条路不对：ok=${c.ok} waited=${c.waited}`)
+
+      /* ④ 谓词自己抛异常：当成"还没到"，不许把整条自检打挂 */
+      let throws = 0
+      const d = await until(() => {
+        if (++throws < 3) throw new Error('故意抛的')
+        return '到了'
+      }, { every: 40 })
+      if (d.ok && d.value === '到了') ok(`谓词抛了 2 次异常 → 照样等到（第 ${throws} 趟拿到值）`)
+      else bad(`谓词抛异常把整条路带坏了：ok=${d.ok} throws=${throws}`)
+
+      /* ⑤ untilFile：等到**夹具文件**长成某个样子（这是"真的落到盘了"那类判据的形状） */
+      const title = (read() || {}).title
+      const e = await untilFile((doc) => doc.title === title)
+      if (e.ok) ok(`untilFile 读得到夹具文件并解析（title=${JSON.stringify(title)}）`)
+      else bad('untilFile 等不到本来就成立的事实')
+      const f = await untilFile(() => false, { timeout: 300, what: '盘上多一笔' })
+      if (!f.ok) ok(`untilFile 超时也返回 ok:false（what 会写进调用方的报错里：${JSON.stringify('夹具文件里的 盘上多一笔')}）`)
+      else bad('untilFile 超时却报成了成功')
+
+      /* ⑥ untilSaved：等到应用说「已存」。刚开板、什么都没改 → 它本来就是"已存"，
+            所以立刻返回；改一下才该等 —— 这里只验"读得到那个诚实的时刻"（README 第 38 条）。 */
+      const g = await untilSaved({ timeout: 3000 })
+      if (g.ok) ok('untilSaved 读得到应用的「已存」（那一刻起，盘上那份就是最新的）')
+      else bad(`untilSaved 等不到「已存」（等了 ${g.waited}ms）—— 工具条那颗灯没在说这两个字？`)
+      if (/board-zz-harness-until\.md$/.test(board.path)) ok('新接口都在夹具板这道门上（不是各脚本自己拼的）')
+    }
+  )
+}
+
 /* ═══════════════ 收尾 ═══════════════ */
 console.log('\n' + '─'.repeat(56))
 console.log(fails ? `  ${fails} 项失败` : '  全部通过')

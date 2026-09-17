@@ -43,6 +43,7 @@
  */
 
 import { cardHeightFromContent, cardWidthFromContent } from './board.js'
+import { combinedScale, worldLenToScreen } from './view.js'
 
 /* 门槛与节奏 —— 只在**这一处**定，别在调用方写死。
    · ONCE：一次性拟合（刚插进来那张卡），量多准写多准。
@@ -79,7 +80,9 @@ export function fitPass(sample, opts = {}) {
      宽度还是旧的，文字就还是折成旧行数，高度会被算错并钉死。
      对不上就返回 'stale'，下一帧再来。
      （同族的记法：**提交完不能立刻再量 —— 你量的是上一次渲染的世界。**） */
-  const wantW = card.w * s * scale
+  /* 这张卡的屏幕宽度 —— 走 view.js 那条"带倍率的世界长度"，
+     别在这里手写 `card.w * s * scale`（渲染那一处也是同一个调用，口径只有一处）。 */
+  const wantW = worldLenToScreen(card.w, combinedScale(s, scale))
   const domW = Number(sample.domW) || 0
   if (Math.abs(domW - wantW) > FIT_STALE_PX) return { state: 'stale', wantW, domW }
 
