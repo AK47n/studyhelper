@@ -619,6 +619,27 @@ export function cardBounds(c) {
   return { x: c.x, y: c.y, w: c.w, h: c.h }
 }
 
+/* 一组笔迹的包围盒（世界坐标，**不带线宽**）。
+   用途：框选之后那个虚线框、以及"这一下是不是按在选区里"（见 Board.jsx 的 onPointerDown）。
+   ⚠ 和 `strokeBounds` 的分工：那个是**单笔**、而且把线宽/2 撑出去（命中测试要算笔尖的宽度）；
+   这个是**多笔**的外框、不撑 —— 虚线框要正好贴着你圈住的那几笔，撑出去看着就"框大了"。
+   （它原来住在 Board.jsx 底部，2026-09-16 跟着"选中那一族"一起收进 lib。） */
+export function strokesBBox(strokes) {
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (const s of strokes || []) {
+    for (const p of toPoints(s.points)) {
+      if (p.x < x0) x0 = p.x
+      if (p.y < y0) y0 = p.y
+      if (p.x > x1) x1 = p.x
+      if (p.y > y1) y1 = p.y
+    }
+  }
+  return Number.isFinite(x0) ? { x0, y0, x1, y1 } : null
+}
+
 export function rectCenter(r) {
   return { x: r.x + r.w / 2, y: r.y + r.h / 2 }
 }

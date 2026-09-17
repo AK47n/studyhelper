@@ -15,7 +15,7 @@ import { drawStroke, MIN_STEP } from '../lib/ink.js'
 import {
   CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH,
   fontCss, nextCardScale, buildRelations, descendantsOf,
-  freezeGroup, fitView, newCard, newStroke, parseBoardDocument, serializeBoardDocument,
+  fitView, newCard, newStroke, parseBoardDocument, serializeBoardDocument,
   simplifyPoints, strokeHitsCircle, textCardRect, toFlat, toPoints,
 } from '../lib/board.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
@@ -23,10 +23,15 @@ import {
 import { createCardFitter } from '../lib/card-fit.js'
 /* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
 import {
-  autoLinkKind, createLinkReader, deriveChains, chainOfStroke,
+  createLinkReader, deriveChains,
 } from '../lib/links.js'
+/* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
+   改词 / 反向 / 「不算连接」/ 回头路 / 固定 / 拆开 的规矩都在那儿，纯函数、有断言。 */
+import {
+  applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
+} from '../lib/selection.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { LINK_KINDS, LINK_NONE, isLinkKind, linkKind } from '../lib/link-kinds.js'
+import { LINK_KINDS, LINK_NONE, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
@@ -104,16 +109,6 @@ const PAPER_KEY = 'studyhelper.paper'
  * 3.5 秒的来历：比你抬笔看一眼再决定要长一点，又不至于一直挂在那儿碍事。
  * 指针停在那排词上时不会收（LinkChips 的 onPointerEnter）。 */
 const LINK_PICK_MS = 3500
-
-/* 把一笔的扁平点数组整个倒过来（[x,y,p] 三个一组）。
- * 用途：连接的"方向"就是"第一点 → 最后一点"，所以反向 = 把点倒过来。
- * 渲染出来一模一样（同一条路径），所以这是一次**纯语义**的操作，
- * 不用为方向单开一个字段 —— 也不会有"方向和笔迹对不上"的可能。 */
-function reverseFlat(flat) {
-  const out = []
-  for (let i = flat.length - 3; i >= 0; i -= 3) out.push(flat[i], flat[i + 1], flat[i + 2])
-  return out
-}
 
 /* ── 纸面在屏幕上的几何：格距 + 原点 ──
  * ★ 用户 2026-09-16 的第二条：「平移的时候有一种背景不动字动的感觉，
@@ -488,33 +483,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     () => new Map(links.flatMap((l) => (l.ids || [l.strokeId]).map((id) => [id, l]))),
     [links]
   )
-  /* 框选里如果**正好只有一条连接线**，就在框上那条浮层里多给一排词 ——
-     这是"事后改词"的入口（画完那 3.5 秒没点、或者改主意了）。 */
-  const selLink = useMemo(() => {
-    if (!inkSel || inkSel.size !== 1) return null
-    for (const id of inkSel) return linkByStroke.get(id) || null
-    return null
-  }, [inkSel, linkByStroke])
-  /* 框住的笔里有没有"你说过不算连接"的（见 LINK_NONE）——
-     有就给它一条回头路（不然那句话是单向门：点完只能 Ctrl+Z，重开之后就没路可走了）。 */
-  const inkNoLink = useMemo(() => {
-    if (!inkSel || !inkSel.size) return false
-    for (const id of inkSel) {
-      const s = board.strokes.find((x) => x.id === id)
-      if (s && s.link === LINK_NONE) return true
-    }
-    return false
-  }, [inkSel, board.strokes])
-  /* 框住的这些笔**正好就是**某一块固定块吗？（是的话浮层上给「拆开这块」）
-     判据用"集合完全相等"：少一笔都不算 —— 不然框一大片会把某块顺手拆了。 */
-  const inkGroup = useMemo(() => {
-    if (!inkSel || !inkSel.size) return null
-    for (const g of board.groups || []) {
-      if (g.ids.length !== inkSel.size) continue
-      if (g.ids.every((id) => inkSel.has(id))) return g
-    }
-    return null
-  }, [inkSel, board.groups])
+  /* ── 框住的那些笔意味着什么 ───────────────────────────────────────────────
+     `sel.link`（框里正好一条连接线 → 改词那排）、`sel.noLink`（框里有"不算连接" →
+     回头路）、`sel.group`（框住的正好是一整块 → 拆开）、`sel.box`（那个虚线框）、
+     `sel.strokes`（选中的笔迹对象）—— 这五件事从前是这里五个 useMemo，现在收成
+     `readSelection` 一次读（规矩和来历见 src/lib/selection.js 的文件头）。
+     判据都在那个 module 里：集合完全相等才算"这一块"、正好一条才算"这条线"。 */
+  const sel = useMemo(() => readSelection(board, inkSel, links), [board, inkSel, links])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
     const set = descendantsOf(relations, selectedId)
@@ -541,16 +516,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     [commit]
   )
 
-  /* 选中的那组墨迹的包围盒（世界坐标）。
-     渲染那个虚线框、以及判断"这一下是不是按在选区里"，都用它。只在真有选中时才算。 */
-  const inkBox =
-    inkSel && inkSel.size ? strokesBBox(board.strokes.filter((s) => inkSel.has(s.id))) : null
-  /* 选中的**笔迹对象**（不只是 id）。美化要拿它们渲染成图发出去。 */
-  const inkStrokes = useMemo(
-    () => (inkSel && inkSel.size ? board.strokes.filter((s) => inkSel.has(s.id)) : []),
-    [inkSel, board.strokes]
-  )
-
   /* 谁在操作？只在"换了设备"时才更新一次状态。
      笔悬停时 pointerType 也已经是 'pen'（不用等落笔），所以笔一靠近光标就没了
      —— 那正好是写字前最碍眼的时候。 */
@@ -570,7 +535,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const deleteInkSel = useCallback(() => {
     if (!inkSel || !inkSel.size) return
     const ids = inkSel
-    commit((cur) => ({ ...cur, strokes: cur.strokes.filter((s) => !ids.has(s.id)) }))
+    commit((cur) => removeStrokes(cur, ids))
     setInkSel(null)
   }, [inkSel, commit])
 
@@ -624,10 +589,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
 
       /* ② 已经选着一组墨迹、又正好按在它的框里 → 整组拖着走。 */
       if (
-        inkBox &&
+        sel.box &&
         tool !== 'eraser' &&
-        wp.x >= inkBox.x0 && wp.x <= inkBox.x1 &&
-        wp.y >= inkBox.y0 && wp.y <= inkBox.y1
+        wp.x >= sel.box.x0 && wp.x <= sel.box.x1 &&
+        wp.y >= sel.box.y0 && wp.y <= sel.box.y1
       ) {
         // 把"选中那几条按下时的原样"存下来，拖动时拿它算偏移（不累加，见 onPointerMove）
         const origin = new Map()
@@ -667,7 +632,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, inkBox, inkSel, selectedId]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId]
   )
   const onPointerMove = useCallback(
     (e) => {
@@ -970,8 +935,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         /* ★ 固定的卡片不给删。它是"锁住"的语义，而 Delete 是最容易误按的一个键。
            （它平时选不中，所以正常路径下也走不到这儿；但关系面板里点一下名字
            是会选中的 —— 那条路得挡住。）想删就先点 📌 解开。 */
-        const sel = boardRef.current.cards.find((c) => c.id === selectedId)
-        if (sel && sel.locked === true) {
+        const card0 = boardRef.current.cards.find((c) => c.id === selectedId)
+        if (card0 && card0.locked === true) {
           flash('这张卡固定着，先点它左下角的 📌 解开再删', 'warn')
           return
         }
@@ -1082,71 +1047,30 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    * 那就必须有一条"一句话改回来"的路，否则猜错了只能重画。
    */
   function applyLink(strokeId, kind, opt = {}) {
-    /* ★ 「不算连接」：你说了它不是连接 —— 存在**这一笔**上（`link: 'none'`），
-       buildLinks 见到就跳过（见 lib/board.js 的 LINK_NONE）。
-       为什么必须有这条路：自动读出来的连接会读错（一条长竖笔正好跨过两坨字），
-       在那之前认错了只能擦掉那一笔重画 —— 那就成了"猜错还锁死"。
-       它是**一步正常的撤销**（Ctrl+Z 就回来了），不是不可逆的标记。 */
+    /* 改词这一整套规矩（⇄ 反向 = 把点倒过来、"和自动读出来的相同时不写字段"、
+       「不算连接」写在**整条链**上）都在 src/lib/selection.js 的 `applyStrokeLink` 里，
+       纯函数、有断言（check-board [6m]）。这里只管"写进板 + 说一句话"。
+       返回 null = 那个词不认识 —— 什么都不做，也不弹提示。 */
+    const next = applyStrokeLink(boardRef.current, links, strokeId, kind, opt)
+    if (!next) return
+    commit(next)
+    setLinkPick(null)
     if (kind === LINK_NONE) {
-      const known = linkByStroke.get(strokeId)
-      const ids = new Set(known ? known.ids : [strokeId])
-      commit((cur) => ({
-        ...cur,
-        strokes: cur.strokes.map((st) => (ids.has(st.id) ? { ...st, link: LINK_NONE } : st)),
-      }))
-      setLinkPick(null)
+      /* 「不算连接」= 这道门要有回头路：清掉选中，免得那排词留在屏幕上
+         （框住它还能改回来，见 clearNoLink）。 */
       setInkSel(null)
       flash('这条不算连接了（框住它还能恢复；Ctrl+Z 也能）', 'ok')
       return
     }
-    if (!isLinkKind(kind)) return
-    commit((cur) => ({
-      ...cur,
-      strokes: cur.strokes.map((st) => {
-        if (st.id !== strokeId) return st
-        /* ⇄ 反向 = 把这笔的点**倒过来**。
-           倒过来渲染出来一模一样（都是同一条路径），但"第一点 → 最后一点"变了 ——
-           箭头方向就是靠这个表达的，所以不用另存一个方向字段。 */
-        const points = opt.reverse ? reverseFlat(st.points) : st.points
-        /* ★ auto 取**连接这一层**读出来的那个（buildLinks 的结果），不是单看这一笔：
-           用户的箭头常常是"一杆 + 一个 V 尖"两笔画的 —— 单看那根杆永远是"相关"，
-           只有连接层知道旁边那个尖是它的。所以选"因果"时不能写进文件（写进去就是噪音，
-           而且以后擦掉尖它也不会自己回来）。
-           ⇄ 反向时形状变了（回勾跑到另一头去），这时退回单笔判断。 */
-        const known = linkByStroke.get(strokeId)
-        const auto = !opt.reverse && known ? known.auto : autoLinkKind({ ...st, points })
-        const next = { ...st, points }
-        /* ★ 选的就是"形状自动读出来那一档" → **不写这个字段**（回到自动）。
-           于是文件里只有"你特意改过的"那几个词：一条没动过的连接是零字节，
-           老文件也不会因为我们加了这个功能而变脏。 */
-        if (kind === auto) delete next.link
-        else next.link = kind
-        return next
-      }),
-    }))
-    setLinkPick(null)
     flash(opt.reverse ? `方向反过来了：${linkKind(kind).name}` : `这条线：${linkKind(kind).name}`, 'ok')
   }
 
-  /* 把选中的那几笔从"不算连接"改回来：去掉 `link: 'none'` → 回到按形状自动判。
-     这是那道单向门的回头路（见 applyLink 里的 LINK_NONE）。
-     ★ 要按**整条链**清（`chainOfStroke`），不能只清框住的那一笔：
-     `link:'none'` 当初是写在整条链上的，链里还剩一笔 none，buildLinks 仍然整条跳过 ——
-     用户点了按钮却什么都没发生（审查挑出来的）。 */
+  /* 把选中的那几笔从"不算连接"改回来（那道单向门的回头路）。
+     ★ 要按**整条链**清 —— 只清框住那一笔的话，链里还剩一笔 none，
+     buildLinks 仍然整条跳过：用户点了按钮却什么都没发生（审查挑出来的那条）。 */
   function clearNoLink() {
     if (!inkSel || !inkSel.size) return
-    const board0 = boardRef.current
-    const ids = new Set()
-    for (const id of inkSel) for (const cid of chainOfStroke(board0, id)) ids.add(cid)
-    commit((cur) => ({
-      ...cur,
-      strokes: cur.strokes.map((st) => {
-        if (!ids.has(st.id) || st.link !== LINK_NONE) return st
-        const next = { ...st }
-        delete next.link
-        return next
-      }),
-    }))
+    commit((cur) => clearNoLinkMarks(cur, inkSel))
     setInkSel(null)
     flash('又算回连接了（按形状重新判）', 'ok')
   }
@@ -1158,23 +1082,22 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    * 只在你说过时才写这个字段：没固定过的板一个字节都不多。 */
   function freezeInkGroup() {
     if (!inkSel || !inkSel.size) return
-    const ids = [...inkSel]
-    /* `freezeGroup` 会把这几笔从别的组里拿走（一笔只能属于一个组）——
-       不这么干的话，界面能造出"内存里重叠、文件里只认一笔"的状态，下次打开分组悄悄变。 */
-    const taken = (boardRef.current.groups || []).filter((g) => g.ids.some((id) => inkSel.has(id)))
-    commit((cur) => ({ ...cur, groups: freezeGroup(cur.groups, ids) }))
+    /* `freezeSelection` 会把这几笔从**别的块**里拿走（一笔只能属于一个组），
+       并告诉你原来装着它们的那些块 —— 提示语要照实说"其中几笔原来在别处"。 */
+    const { board: next, movedFrom } = freezeSelection(boardRef.current, inkSel)
+    commit(next)
     flash(
-      taken.length
-        ? `固定成一块了（${ids.length} 笔）—— 其中几笔原来在别的块里，已经挪过来了`
-        : `固定成一块了（${ids.length} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`,
+      movedFrom.length
+        ? `固定成一块了（${inkSel.size} 笔）—— 其中几笔原来在别的块里，已经挪过来了`
+        : `固定成一块了（${inkSel.size} 笔）—— 它以后永远是独立的一块，按 ⧉ 拆开`,
       'ok'
     )
   }
 
   function dissolveInkGroup() {
-    if (!inkGroup) return
-    const gid = inkGroup.id
-    commit((cur) => ({ ...cur, groups: (cur.groups || []).filter((g) => g.id !== gid) }))
+    if (!sel.group) return
+    const gid = sel.group.id
+    commit((cur) => dissolveGroup(cur, gid))
     setInkSel(null)
     flash('拆开了 —— 这一块又回到"按邻近自动聚"', 'ok')
   }
@@ -1260,7 +1183,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   function insertFromInk({ mode, text, font, src, tex, erase }) {
     const isFormula = mode === 'formula'
     if (isFormula ? !String(src || '').trim() : !String(text || '').trim()) return
-    const box = inkBox || { x0: 0, y0: 0, x1: 0, y1: 0 }
+    const box = sel.box || { x0: 0, y0: 0, x1: 0, y1: 0 }
     /* 尺寸先按估算来（真实尺寸下一帧会量出来）。
        落点用你圈的左上角，宽度先按那块笔迹 —— 这只是"先摆上去"的初值。 */
     const rect = textCardRect(box, isFormula ? 'x' : text)
@@ -1328,13 +1251,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     sceneRef, liveRef, view: board.view, size,
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, hoverEdge, eraserAt,
-    links, selLink, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
-    inkNoLink, onClearNoLink: clearNoLink, inkGroup, onFreezeInk: freezeInkGroup, onDissolveInk: dissolveInkGroup,
+    links, selLink: sel.link, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
+    inkNoLink: sel.noLink, onClearNoLink: clearNoLink, inkGroup: sel.group, onFreezeInk: freezeInkGroup, onDissolveInk: dissolveInkGroup,
     onLinkHover: (inside) => {
       linkLeftRef.current = inside
     },
     onPointerDown, onPointerMove, onPointerUp,
-    lasso, inkBox, onDeleteInk: deleteInkSel,
+    lasso, inkBox: sel.box, onDeleteInk: deleteInkSel,
     onFormulaInk: () => openInkPanel('formula'),
     onBeautifyInk: () => openInkPanel('text'),
     /* 卡片层作为 children 传进画布组件 —— 它必须和两层 canvas 待在**同一个**
@@ -1533,7 +1456,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       {inkMode && (
         <InkToCard
           mode={inkMode}
-          strokes={inkStrokes}
+          strokes={sel.strokes}
           onInsert={insertFromInk}
           onClose={() => setInkMode(null)}
           onOpenSettings={() => setSettingsOpen(true)}
@@ -2270,22 +2193,7 @@ function strokeHitsRect(stroke, r) {
   return false
 }
 
-/* 一组笔迹的包围盒（世界坐标）。选中之后画那个虚线框要用它。 */
-function strokesBBox(strokes) {
-  let x0 = Infinity
-  let y0 = Infinity
-  let x1 = -Infinity
-  let y1 = -Infinity
-  for (const s of strokes) {
-    for (const p of toPoints(s.points)) {
-      if (p.x < x0) x0 = p.x
-      if (p.y < y0) y0 = p.y
-      if (p.x > x1) x1 = p.x
-      if (p.y > y1) y1 = p.y
-    }
-  }
-  return Number.isFinite(x0) ? { x0, y0, x1, y1 } : null
-}
+/* 一组笔迹的包围盒搬去了 lib/board.js 的 `strokesBBox`（跟着"选中那一族"一起走的）。 */
 
 /* 整笔平移。★ points 必须保持那个**扁平**数组格式（x, y, 压力 三连），
    这是这个项目的铁律 —— 见 lib/board.js 顶部的说明，

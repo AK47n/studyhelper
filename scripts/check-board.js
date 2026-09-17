@@ -25,6 +25,11 @@ import { LINK_NONE } from '../src/lib/link-kinds.js'
 /* 卡片「按内容量尺寸」那一套规矩搬去了 card-fit.js（2026-09-16）：DOM 读数是注入的，
    所以"提交完不能立刻再量"这类坑在这儿断言得到（见 [6l]）。 */
 import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
+/* 选中这一族（框住的笔意味着什么 + 改词/反向/否决/回头路/固定/拆开）搬去了 selection.js
+   （2026-09-16）：纯函数、有断言（见 [6m]）。 */
+import {
+  applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
+} from '../src/lib/selection.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, panBy, screenToWorld, viewTransformAttr, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 import { readFileSync } from 'node:fs'
@@ -1673,6 +1678,174 @@ console.log('\n[6l] 卡片量尺寸（`createCardFitter`）：DOM 读数是注�
     gone.pass()
     eq(gone.fitter.size, 0, '卡片已经从板里没了 → 立刻出队')
     eq(gone.frames.length, 0, '也不会再排下一帧（空转的 rAF 就是这么来的）')
+  }
+}
+
+// ═════════════════════ 6m. 选中那一族 ═════════════════════
+/* 这一节钉的是"框住一笔之后能干什么"——从前散在 Board.jsx 的 5 个 useMemo + 6 个处理器 +
+ * BoardCanvas 的 3 段条件渲染里，全是踩过坑的规矩却没有一条在纯逻辑里钉得住：
+ * 「不算连接」要写在整条链上（只清框住那一笔 = 点了按钮没反应）、
+ * 选的词和形状自动读出来的一样就**不写字段**（没动过的连接是零字节）、
+ * ⇄ 反向 = 把点倒过来、框住"正好一整块"才算那一块、固定时要把笔从别的块里拿走。
+ * 现在它们在 src/lib/selection.js 里，纯函数 —— 这一节就是它们的断言。 */
+console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着什么 + 你对它说的那几句话')
+{
+  /* 一张板：两张卡 + 一条直线连接（k1 → k2）。返回 {board, links, id} */
+  const mkConnected = () => {
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 0, id: 'k1', text: 'A' },
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 0, id: 'k2', text: 'B' },
+    ]
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 300, y: 41 }, { x: 660, y: 40 }])), id: 'lk' },
+    ]
+    return b
+  }
+
+  /* ① 什么都没框：五个读数都要给"空"，而不是 undefined（浮层靠它决定画不画） */
+  {
+    const b = mkConnected()
+    const r = readSelection(b, null, reader.read(b))
+    eq([r.count, r.empty, r.strokes.length, r.box, r.link, r.noLink, r.group], [0, true, 0, null, null, false, null], '没框东西 → 全空（empty=true）')
+  }
+
+  /* ② 框住一笔普通墨迹：有 strokes 和 box，但"不是一条线、不是一块、没有否决" */
+  {
+    const b = makeBoard()
+    b.strokes = [{ ...newStroke('pen', toFlat([{ x: 10, y: 10 }, { x: 40, y: 30 }])), id: 's1' }]
+    const r = readSelection(b, new Set(['s1']), [])
+    eq([r.count, r.strokes.length, r.link, r.noLink, r.group], [1, 1, null, false, null], '普通一笔：有一条 box、其余都是空')
+    eq(r.box, { x0: 10, y0: 10, x1: 40, y1: 30 }, 'box 就是这一笔的包围盒（世界坐标、不撑线宽）')
+  }
+
+  /* ③ 「框里正好**一条**连接线」才算 selLink —— 两条就不是"这条线"了（该让用户框窄点） */
+  {
+    const b = mkConnected()
+    /* 第二对卡 + 第二条线（离第一对远远的，各自都是一条正经连接）——
+       ⚠ 别把第二条线摆在卡的外面：那样它连不上任何东西，`reader.read` 只给回 1 条，
+       报出来是"夹具里真的有两连接 实际 1"（夹具错，不是代码错）。 */
+    b.cards.push(
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 300, id: 'k3', text: 'C' },
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 300, id: 'k4', text: 'D' }
+    )
+    b.strokes.push({ ...newStroke('pen', toFlat([{ x: 60, y: 340 }, { x: 300, y: 341 }, { x: 660, y: 340 }])), id: 'lk2' })
+    const links = reader.read(b)
+    eq(links.length, 2, '夹具里真的有两连接')
+    const one = readSelection(b, new Set(['lk']), links)
+    eq(one.link && one.link.strokeId, 'lk', '框里正好一条线 → 拿到那条（改词那排的入口）')
+    const two = readSelection(b, new Set(['lk', 'lk2']), links)
+    eq(two.link, null, '框里两条线 → **不给**"这条线"（不替用户挑一条）')
+  }
+
+  /* ④ 有「不算连接」就给回头路；没有就不给 */
+  {
+    const b = mkConnected()
+    b.strokes.push({ ...newStroke('pen', toFlat([{ x: 60, y: 240 }, { x: 660, y: 240 }])), id: 'no' , link: LINK_NONE })
+    eq(readSelection(b, new Set(['no']), []).noLink, true, '框住标过"不算连接"的笔 → noLink')
+    eq(readSelection(b, new Set(['lk']), []).noLink, false, '普通笔 → 不给回头路')
+    eq(readSelection(b, new Set(['no', 'lk']), []).noLink, true, '一框多笔里有一笔是 → 也给（不然点不到）')
+  }
+
+  /* ⑤ 「框住的**正好是一整块**」才算那一块：少一笔都不算（不然框一大片会顺手拆了某块） */
+  {
+    const b = makeBoard()
+    b.strokes = ['a', 'b', 'c'].map((id, i) => ({ ...newStroke('pen', toFlat([{ x: i * 10, y: 0 }, { x: i * 10 + 5, y: 5 }])), id }))
+    b.groups = [{ id: 'g1', ids: ['a', 'b'] }]
+    eq(readSelection(b, new Set(['a', 'b']), []).group && readSelection(b, new Set(['a', 'b']), []).group.id, 'g1', '正好框住一块 → 拿到那一块（浮层给「拆开这块」）')
+    eq(readSelection(b, new Set(['a']), []).group, null, '只框住一块里的一笔 → 不算（少一笔都不算）')
+    eq(readSelection(b, new Set(['a', 'b', 'c']), []).group, null, '多框了一笔 → 也不算（不顺手拆）')
+  }
+
+  /* ⑥ 改词：选的和形状自动读出来的一样 → **不写字段**（一条没动过的连接是零字节） */
+  {
+    const b = mkConnected()
+    const links = reader.read(b)
+    eq(links[0].kind, 'rel', '夹具那条直线自动读成"相关"')
+    const same = applyStrokeLink(b, links, 'lk', 'rel')
+    eq(same.strokes.find((s) => s.id === 'lk').link, undefined, '选的就是自动那一档 → 不写 link（等于回到自动）')
+    const other = applyStrokeLink(b, links, 'lk', 'cause')
+    eq(other.strokes.find((s) => s.id === 'lk').link, 'cause', '选了别的词 → 写进去')
+    eq(b.strokes.find((s) => s.id === 'lk').link, undefined, '★ 原 board 一个字节没动（纯函数）')
+    eq(other.strokes.length, b.strokes.length, '别的笔一个不多一个不少')
+  }
+
+  /* ⑦ 「不算连接」写在**整条链**上（那条链可能是几笔接起来的） */
+  {
+    const b = makeBoard()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }])), id: 'q1' },
+      { ...newStroke('pen', toFlat([{ x: 100, y: 0 }, { x: 200, y: 0 }])), id: 'q2' },
+      { ...newStroke('pen', toFlat([{ x: 400, y: 0 }, { x: 460, y: 0 }])), id: 'other' },
+    ]
+    eq(chainOfStroke(b, 'q1').sort(), ['q1', 'q2'], '夹具里这两笔是一条链')
+    /* 假装连接层认出来的是整条链（`ids` 就是链上那几笔） */
+    const links = [{ strokeId: 'q1', ids: ['q1', 'q2'], kind: 'rel', auto: 'rel', dir: false }]
+    const next = applyStrokeLink(b, links, 'q1', LINK_NONE)
+    eq([next.strokes.find((s) => s.id === 'q1').link, next.strokes.find((s) => s.id === 'q2').link], [LINK_NONE, LINK_NONE], '「不算连接」写在整条链上（不是只写框住那一笔）')
+    eq(next.strokes.find((s) => s.id === 'other').link, undefined, '链外的笔不动')
+  }
+
+  /* ⑧ 回头路：按整条链清（只清框住那一笔的回归闸） */
+  {
+    const b = makeBoard()
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }])), id: 'q1', link: LINK_NONE },
+      { ...newStroke('pen', toFlat([{ x: 100, y: 0 }, { x: 200, y: 0 }])), id: 'q2', link: LINK_NONE },
+      { ...newStroke('pen', toFlat([{ x: 400, y: 0 }, { x: 460, y: 0 }])), id: 'keep' },
+    ]
+    const before = b.strokes[2]
+    const next = clearNoLinkMarks(b, new Set(['q1']))
+    eq([next.strokes[0].link, next.strokes[1].link], [undefined, undefined], '只框链里一笔，整条链的 none 都清掉（不然 buildLinks 仍然整条跳过）')
+    eq(next.strokes[2], before, '没标过的笔原样返回（同一个对象引用，不做无谓的重建）')
+    eq(b.strokes[0].link, LINK_NONE, '★ 原 board 没动')
+  }
+
+  /* ⑨ ⇄ 反向 = 把点倒过来；而且反向之后**退回单笔判断**（连接层那个 auto 是给没反向的） */
+  {
+    const b = mkConnected()
+    const links = reader.read(b)
+    const before = b.strokes[0].points.slice()
+    const rev = applyStrokeLink(b, links, 'lk', links[0].kind, { reverse: true })
+    const after = rev.strokes[0].points
+    eq(after.length, before.length, '点还是那些点（三个一组，不多不少）')
+    eq(after.slice(0, 3), before.slice(-3), '第一个点变成了原来的最后一个点（方向反了）')
+    eq(after.slice(-3), before.slice(0, 3), '最后一个点变成了原来的第一个点')
+    /* 反向时形状变了（回勾跑到另一头）→ 用 autoLinkKind 单笔重判，而不是连接层那个 auto */
+    eq(rev.strokes[0].link, undefined, '反向之后"相关"仍然是自动那一档 → 还是不写字段')
+    eq(b.strokes[0].points, before, '★ 原 board 的点没被倒过来')
+  }
+
+  /* ⑩ 不认识的词 → null（什么都没改，调用方也别弹提示） */
+  {
+    const b = mkConnected()
+    eq(applyStrokeLink(b, reader.read(b), 'lk', 'nonsense'), null, '词不认识 → null（不许猜、不许退回默认再写回去）')
+    eq(applyStrokeLink(b, reader.read(b), '不存在的一笔', 'cause').strokes.length, b.strokes.length, '笔不存在也不会炸（照常返回一张板）')
+  }
+
+  /* ⑪ 删 / 固定 / 拆开：三步都有"只动该动的"这条底线 */
+  {
+    const b = makeBoard()
+    b.cards = [{ ...newCard('note', 0, 0, { w: 100, h: 60 }), id: 'kc' }]
+    b.strokes = ['s1', 's2', 's3'].map((id, i) => ({ ...newStroke('pen', toFlat([{ x: i * 20, y: 0 }, { x: i * 20 + 8, y: 8 }])), id }))
+    const del = removeStrokes(b, new Set(['s2']))
+    eq(del.strokes.map((s) => s.id), ['s1', 's3'], '删掉框住的那一笔，别的都在')
+    eq(del.cards, b.cards, '卡片一个没动（同一个数组引用）')
+    eq(removeStrokes(b, new Set()), b, '没框东西 → 原样返回（不造新对象，免得白记一步撤销）')
+
+    /* 先固定 {s1,s2}，再把 {s2,s3} 固定成一块：s2 只能属于一个组，
+       所以它要从第一块里被拿走，而且 movedFrom 要说得出"原来在哪"（提示语照实说）。 */
+    const first = freezeSelection(b, new Set(['s1', 's2']))
+    eq(first.board.groups.length, 1, '第一次固定：多了一块')
+    eq(first.movedFrom.length, 0, '第一次固定：没有"从别的块挪过来"这回事')
+    const second = freezeSelection(first.board, new Set(['s2', 's3']))
+    eq(second.movedFrom.length, 1, '第二次固定和第一块重叠 → movedFrom 报出那一块（提示语要照实说）')
+    const gs = second.board.groups
+    eq(gs.filter((g) => g.ids.includes('s2')).length, 1, '★ 一笔只能属于一个组（s2 只在一个块里）')
+    eq(gs.map((g) => [...g.ids].sort()).sort().join('|'), ['s1', 's2,s3'].sort().join('|'), '第一块里只剩 s1，新块是 s2+s3')
+    const dissolved = dissolveGroup(second.board, gs[0].id)
+    eq(dissolved.groups.length, 1, '拆开一块 → 只剩另一块')
+    eq(dissolveGroup(b, null), b, '没有块可拆 → 原样返回')
   }
 }
 
