@@ -46,6 +46,12 @@ import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 /* "那颗词摆哪"（浮层锚点别跑出画布、别压到底部工具条）是一条**屏幕像素的政策**，
    单独一个文件 —— 和上面那条映射是两件事（2026-09-17 架构 review 候选 1 的尾巴）。 */
 import { chipPlacement } from '../lib/chip-placement.js'
+/* 焦点仲裁（"现在焦点在谁身上"是一个值、按键该谁管是纯函数）在 focus.js 里 ——
+   从前它是四个 useState + 二十处 ad hoc 的互斥 if + 一串按键 if（候选 7）。 */
+import {
+  FOCUS_NONE, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit, escapeIntent,
+  focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkIds, isTextField,
+} from '../lib/focus.js'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
  *
@@ -171,8 +177,22 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [tool, setTool] = useState('pen')
   const [color, setColor] = useState(COLORS[0].v)
   const [width, setWidth] = useState(WIDTHS[1])
-  const [selectedId, setSelectedId] = useState(null)
-  const [editingId, setEditingId] = useState(null)
+  /* ── 焦点：**一个值**（2026-09-17 架构 review 候选 7）────────────────────────
+     从前是四个 useState（`selectedId` / `inkSel` / `selectedFrameId` / `editingId` /
+     `frameEditId`），而"它们互斥"这条不变量没人写下来 —— 靠二十处 ad hoc 的 if 维持
+     （"选卡片要清板框""选板框要清卡片""点空白清三个""Esc 清另一个子集"…），
+     Delete 的含义甚至是一个表达式 `selectedFrameId && !inkSel && !selectedId`。
+     现在互斥是**结构**的：一个记录只有一种 kind（`src/lib/focus.js`）。
+     下面五行是"读"那一侧 —— 界面各处照旧问这几个名字，行为一个字没改。 */
+  const [focus, setFocus] = useState(FOCUS_NONE)
+  const selectedId = focusCardId(focus)
+  const selectedFrameId = focusFrameId(focus)
+  const editingId = editingCardId(focus)
+  const frameEditId = editingFrameId(focus)
+  const inkSel = useMemo(() => {
+    const ids = focusInkIds(focus)
+    return ids ? new Set(ids) : null
+  }, [focus])
   const [dirty, setDirty] = useState(false)
   const [hist, setHist] = useState({ undo: 0, redo: 0 })
   const [variant, setVariant] = useState(readVariant)
@@ -186,9 +206,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      penModeRef 是为了只在真的换了设备时才 setState —— 每次 pointermove 都 set 会白重渲染。 */
   const [penMode, setPenMode] = useState(false)
   const penModeRef = useRef(false)
-  /* 笔杆键框选出来的那一组墨迹（存 id）。
-     和卡片的 selectedId 是两码事：那个是单选一张卡，这个是多选一堆笔迹。 */
-  const [inkSel, setInkSel] = useState(null) // Set<strokeId> | null
   const [lasso, setLasso] = useState(null) // 正在拖的那个框（世界坐标，已经规范化成 x0<x1 / y0<y1）
   const lassoRef = useRef(null)
   const inkMoveRef = useRef(null)
@@ -208,10 +225,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
   /* 「∈ 条件」武装着的那条连接（null = 没武装）。一次性：点完目标就收（见 armCond）。 */
   const [condArm, setCondArm] = useState(null)
-  /* 板框：正在改标题的那个（双击框上的名字）、选中的那个。
-     和卡片的 selectedId / editingId 是同一个路子，只是对象是"框"（见 ADR-0001）。 */
-  const [frameEditId, setFrameEditId] = useState(null)
-  const [selectedFrameId, setSelectedFrameId] = useState(null)
 
   const wrapRef = useRef(null)
   const sceneRef = useRef(null)
@@ -384,8 +397,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const b = load(initialText, file)
     boardRef.current = b
     setBoard(b)
-    setSelectedId(null)
-    setEditingId(null)
+    /* 换了一份板 → 焦点整块归零（从前只清 selectedId / editingId，上一张板留下的
+       "框选中 / 墨迹选中"会跟着过来 —— 换成焦点值之后顺手没了，这是这一刀买到的）。 */
+    setFocus(FOCUS_NONE)
     setDirty(false)
     /* 换了一份板 → 账本归零（从前是三行手写的：两个 ref 清空 + setHist）。 */
     ledger.reset()
@@ -591,7 +605,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     if (!inkSel || !inkSel.size) return
     const ids = inkSel
     commit((cur) => removeStrokes(cur, ids))
-    setInkSel(null)
+    setFocus(FOCUS_NONE)
   }, [inkSel, commit])
 
   const onPointerDown = useCallback(
@@ -688,12 +702,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          ★ 卡片也要一起取消。原来这里只清 inkSel，**selectedId 一直留着** ——
            于是刚插进来的那张卡永远保持选中、右上角永远挂着一个 ×，
            用户 2026-09-16 报的「一直是右上角有 x，容易误删除」就是这么来的。
-           选中这个东西只在"你正在动它"的时候才该亮着。 */
-      if (inkSel) setInkSel(null)
-      if (selectedId) setSelectedId(null)
-      /* 板框的选中也一样：按在空白处取消。在框里写字不该把它取消 ——
-         所以这一下只有在**没落在任何框的把手/内容上**时才走到（事件先被它们接走）。 */
-      if (selectedFrameId) setSelectedFrameId(null)
+           选中这个东西只在"你正在动它"的时候才该亮着。
+         ★ 现在焦点是一个值 —— 这一下就是"整个取消"，不用再逐个清
+           （从前是三行、"清三个"，漏一个就是"Delete 说不清删谁"，见 focus.js）。 */
+      if (focus.kind !== 'none') setFocus(FOCUS_NONE)
 
       /* 会"擦"的两种情况：
          ① 工具条上选着橡皮；
@@ -888,7 +900,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           const hit = boardRef.current.strokes.find((s) => linkByStroke.has(s.id) && strokeHitsCircle(s, cx, cy, r))
           if (hit) ids = [hit.id]
         }
-        setInkSel(ids.length ? new Set(ids) : null)
+        /* 框住了 → 焦点变成"这一撮笔"；框空了 → 只取消墨迹那一种（卡片 / 板框的选中留着，
+           和从前一样：从前这里也只清 inkSel）。 */
+        setFocus((f) => (ids.length ? focusInk(ids) : clearInkFocus(f)))
         /* 空框说一句人话。静默什么都不发生是最让人迷惑的 ——
            用户会以为"框选坏了"，而其实只是框小了/框到空白上了。 */
         if (!ids.length) flash('框里没有笔迹 —— 框大一点，或者框到字上', 'warn')
@@ -953,10 +967,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
 
   // ── 键盘 ──
   useEffect(() => {
-    function inField(t) {
-      const tag = (t && t.tagName) || ''
-      return /^(INPUT|TEXTAREA)$/.test(tag) || (t && t.isContentEditable)
-    }
+    /* "在输入框里打字"这条判据住在 focus.js（它和"冲纸面还是冲面板"是姊妹条 ——
+       从前这里是一条 `/^(INPUT|TEXTAREA)$/`，而面板上的 `<button>` 不算 input，
+       于是面板上的 Backspace 被当成了纸面上的删除，见 focus.js 的文件头）。 */
+    const inField = isTextField
     function onKey(e) {
       if (e.code === 'Space' && !inField(e.target)) {
         spaceRef.current = true
@@ -1000,39 +1014,55 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         applyLink(linkPick, LINK_DELETE)
         return
       }
-      if (linkPick && e.key === 'Escape') {
-        setLinkPick(null)
-        return
-      }
       if (e.key === 'Escape') {
-        /* 武装着「∈ 条件」时，Esc 先收掉它（不然你以为取消了、其实下一下点还是会指过去）。 */
-        if (condArm) {
+        /* ★「一次只收一层」这个顺序住在 `focus.js` 的 `escapeIntent` 里（候选 7）：
+           浮着的那排词 → 武装着的「∈ 条件」→ 板框改名 → 取消焦点。
+           （Esc 是**全局**的：在面板上按 Esc 也该收掉武装 —— 只有删除那一族要分纸面/面板。） */
+        const it = escapeIntent({ focus, linkPick, condArm })
+        if (it.kind === 'none') return
+        e.preventDefault()
+        if (it.kind === 'dismiss-link') return setLinkPick(null)
+        if (it.kind === 'disarm-cond') {
           setCondArm(null)
           flash('不收条件了', 'ok')
           return
         }
-        /* 正在给板框改名 → Esc 先收编辑（别顺手把选中的东西也一起取消，
-           那会让你觉得"我按一下 Esc，框也没了"）。 */
-        if (frameEditId) {
-          setFrameEditId(null)
-          return
-        }
-        setSelectedId(null)
-        setEditingId(null)
-        setInkSel(null)
-        setSelectedFrameId(null)
+        if (it.kind === 'end-frame-edit') return setFocus(endEdit)
+        setFocus(FOCUS_NONE)
         return
       }
-      /* 选中一个板框时，Delete 把那几样东西从框里**拿出来**（框还在、内容一个字不动）——
-         它和"删内容"是两件事：想删内容得先框住内容本身。 */
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedFrameId && !inkSel && !selectedId) {
+      /* ★ 删除 / 拆开："该谁管、管什么"整个在 `focus.js` 的 `deleteIntent` 里 ——
+         焦点是一个值，所以"先看谁"写在**类型**里（从前是三个分支各查一个子集，
+         而且不区分纸面和面板：点一下关系面板里那一行再按 Backspace 会把板框拆开，
+         `preventDefault` 还顺手吞掉浏览器的后退 —— review 当场走到的那个 bug）。 */
+      const del = deleteIntent(focus, e.key, e.target)
+      if (del.kind === 'dissolve-frame') {
         e.preventDefault()
-        const f = (boardRef.current.frames || []).find((x) => x.id === selectedFrameId)
+        const f = (boardRef.current.frames || []).find((x) => x.id === del.id)
         if (f) {
           commit((cur) => dissolveFrame(cur, f.id))
-          setSelectedFrameId(null)
+          setFocus(FOCUS_NONE)
           flash('拆开了 —— 里面的东西照旧留在板上', 'ok')
         }
+        return
+      }
+      if (del.kind === 'delete-ink') {
+        e.preventDefault()
+        deleteInkSel()
+        return
+      }
+      if (del.kind === 'delete-card') {
+        e.preventDefault()
+        /* ★ 固定的卡片不给删。它是"锁住"的语义，而 Delete 是最容易误按的一个键。
+           （它平时选不中，所以正常路径下也走不到这儿；但关系面板里点一下名字
+           是会选中的 —— 那条路得挡住。）想删就先点 📌 解开。 */
+        const card0 = boardRef.current.cards.find((c) => c.id === del.id)
+        if (card0 && card0.locked === true) {
+          flash('这张卡固定着，先点它左下角的 📌 解开再删', 'warn')
+          return
+        }
+        commit((cur) => ({ ...cur, cards: cur.cards.filter((c) => c.id !== del.id) }))
+        setFocus(FOCUS_NONE)
         return
       }
       if (e.key === 'p' || e.key === 'P') return setTool('pen')
@@ -1051,26 +1081,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         setPadOpen((v) => !v)
         return
       }
-      /* 框选着一组墨迹时，Delete / Backspace 删掉它们。
-         用笔的时候不一定按得到键盘，所以画布上还浮着一个删除按钮兜着。 */
-      if ((e.key === 'Delete' || e.key === 'Backspace') && inkSel) {
-        e.preventDefault()
-        deleteInkSel()
-        return
-      }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
-        e.preventDefault()
-        /* ★ 固定的卡片不给删。它是"锁住"的语义，而 Delete 是最容易误按的一个键。
-           （它平时选不中，所以正常路径下也走不到这儿；但关系面板里点一下名字
-           是会选中的 —— 那条路得挡住。）想删就先点 📌 解开。 */
-        const card0 = boardRef.current.cards.find((c) => c.id === selectedId)
-        if (card0 && card0.locked === true) {
-          flash('这张卡固定着，先点它左下角的 📌 解开再删', 'warn')
-          return
-        }
-        commit((cur) => ({ ...cur, cards: cur.cards.filter((c) => c.id !== selectedId) }))
-        setSelectedId(null)
-      }
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         const d = e.key === 'ArrowRight' ? 1 : -1
         setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + d + 3) % 3], setVariant)
@@ -1085,7 +1095,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keydown', onKey)
       window.removeEventListener('keyup', onUp)
     }
-  }, [undo, redo, setView, selectedId, commit, variant, inkSel, deleteInkSel, linkPick, linkByStroke, condArm, frameEditId, selectedFrameId])
+  /* 依赖里那个 `focus` 就是这一刀的收成：从前这里是 selectedId / inkSel / frameEditId /
+     selectedFrameId 四个 —— 四个里漏一个，"按键读到的是旧的焦点"（删错东西）。 */
+  }, [undo, redo, setView, focus, commit, variant, deleteInkSel, linkPick, linkByStroke, condArm])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -1111,8 +1123,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const c = newCard('formula', stageCenterWorld().x, stageCenterWorld().y)
     commit((cur) => ({ ...cur, cards: [...cur.cards, { ...c, src: tex, tex }] }))
     setPadOpen(false)
-    setSelectedId(c.id)
-    setEditingId(c.id)
+    setFocus(focusCard(c.id, true))
     /* ★ 写字板这条路上来的公式卡**也要量一次尺寸**：完全贴着式子。
        不量的话它就是默认的 260 宽：一行 `E = mc²` 只有 60 宽，居中之后左右全是空的
        （用户 2026-09-16 报的"识别公式留白依旧很多"，多半就是这张）。
@@ -1157,7 +1168,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === id ? { ...x, locked } : x)) }))
     /* 锁上 → 顺手取消选中（不然手柄留在锁定的卡上，看着像还能动，其实点不动）；
        解开 → 顺手选中它，手柄立刻出来，接着拖就行。 */
-    setSelectedId(locked ? null : id)
+    setFocus(locked ? FOCUS_NONE : focusCard(id))
     flash(locked ? '固定住了：拖不动、双击也不会进编辑（点 📌 解开）' : '解开了，可以拖了', 'ok')
   }
 
@@ -1239,7 +1250,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       const ids = new Set(link.ids && link.ids.length ? link.ids : [link.strokeId])
       commit((cur) => removeStrokes(cur, ids))
       setLinkPick(null)
-      setInkSel(null)
+      setFocus(clearInkFocus)
       flash('删掉这条线了 —— 关系跟着那一笔一起没了（Ctrl+Z 能退回）', 'ok')
       return
     }
@@ -1313,7 +1324,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const cards = membersInBox(b, box).cards
     const { board: next, movedFrom } = freezeFrameSelection(b, ids, cards)
     commit(next)
-    setInkSel(null)
+    setFocus(clearInkFocus)
     flash(
       movedFrom.length
         ? `留下板框了（${ids.length} 笔 + ${cards.length} 张卡）—— 其中几样原来在别的框里，已经挪过来了`
@@ -1326,8 +1337,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     if (!sel.frame) return
     const id = sel.frame.id
     commit((cur) => dissolveFrame(cur, id))
-    setInkSel(null)
-    setSelectedFrameId((cur) => (cur === id ? null : cur))
+    /* 拆的就是当前焦点那个框 → 焦点跟着归零（"别的选中留着"在这里没有意义：
+       焦点只能有一种 kind，那个框就是它）。 */
+    setFocus(FOCUS_NONE)
     flash('拆开了 —— 里面的东西照旧留在板上', 'ok')
   }
 
@@ -1341,7 +1353,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      （从前这里是"两个数组还是不是同一个引用"，四个手势里唯一有 Ctrl+Z 断言的一条）。 */
   function frameDragStart(frameId) {
     frameDragRef.current = { id: frameId, g: ledger.begin() }
-    setSelectedFrameId(frameId)
+    setFocus(focusFrame(frameId))
   }
 
   function frameDrag(frameId, dxScreen, dyScreen) {
@@ -1454,9 +1466,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       strokes: kill ? cur.strokes.filter((s) => !kill.has(s.id)) : cur.strokes,
     }))
     setInkMode(null)
-    setInkSel(null)
-    setSelectedId(card.id)
-    setEditingId(card.id)
+    setFocus(focusCard(card.id, true))
     /* 卡片落进 DOM 之后按真实内容量一次尺寸（"留白太多"就是这一步治的）——
        两条轴都收，公式卡和文字卡一样（"就让框贴合公式和字"）。
        勾不勾"擦掉原笔迹"只影响**那几笔还在不在**，不再影响卡片多大。
@@ -1521,13 +1531,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     frames: framesToDraw,
     frameEditId,
     selectedFrameId,
-    onFrameSelect: setSelectedFrameId,
+    onFrameSelect: (id) => setFocus(focusFrame(id)),
     onFrameDragStart: frameDragStart,
     onFrameDrag: frameDrag,
     onFrameDragEnd: frameDragEnd,
     onFrameTitle: renameFrame,
-    onFrameEdit: setFrameEditId,
-    onFrameEditClose: () => setFrameEditId(null),
+    onFrameEdit: (id) => setFocus(focusFrame(id, true)),
+    onFrameEditClose: () => setFocus(endEdit),
     onLinkHover: (inside) => {
       linkLeftRef.current = inside
     },
@@ -1555,11 +1565,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
                （笔迹那边是 onPointerDown 拦的，见上面 ⓪）。 */
             onSelect={() => {
               if (condArm) pickCond(condArm, { cardId: c.id })
-              else {
-                setSelectedId(c.id)
-                /* 选中一张卡 = 板框不再是"当前这个"（两套选中不并存，免得 Delete 说不清删谁）。 */
-                setSelectedFrameId(null)
-              }
+              /* 选中一张卡 = 焦点是它（板框自然不再是"当前这个" —— 互斥在类型里，
+                 不用再手写一句 setSelectedFrameId(null)，见 focus.js）。 */
+              else setFocus(focusCard(c.id))
             }}
             onStartDrag={() => {
               const c0 = boardRef.current.cards.find((x) => x.id === c.id)
@@ -1567,11 +1575,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
               dragStartRef.current = c0 ? { id: c.id, x: c0.x, y: c0.y, g: ledger.begin() } : null
             }}
             onStartEdit={() => {
-              setSelectedId(c.id)
-              setEditingId(c.id)
+              setFocus(focusCard(c.id, true))
             }}
             onCommit={(patch) => commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, ...patch } : x)) }))}
-            onCloseEdit={() => setEditingId(null)}
+            onCloseEdit={() => setFocus(endEdit)}
             onDrag={(dxScreen, dyScreen) => {
               /* 中途每一帧只改板、不记账 —— 这一次拖动的那一步由 onDragEnd 的 `end()` 记。 */
               const g = dragStartRef.current && dragStartRef.current.g
@@ -1604,7 +1611,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             onToggleLock={() => toggleLock(c.id)}
             onDelete={() => {
               commit((cur) => ({ ...cur, cards: cur.cards.filter((x) => x.id !== c.id) }))
-              setSelectedId(null)
+              setFocus(FOCUS_NONE)
             }}
           />
         ))}
@@ -1618,7 +1625,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       inkPairs={inkPairs}
       links={links}
       selectedId={selectedId}
-      onSelect={setSelectedId}
+      onSelect={(id) => setFocus(focusCard(id))}
       onHoverEdge={setHoverEdge}
       /* 「这个条件不算」那颗 ✕ / 回头路 ↺ —— 面板是另一个组件，得把动作递进去
          （见 RelationPanel 的说明：它是纯展示，改板一律回到 Board 这边做）。 */
@@ -1630,7 +1637,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       onArmCond={armCond}
       condArmId={condArm ? linkKey(condArm) : null}
       /* 板框那一行（见 ADR-0001）：点一下 = 选中它 + 视野居到它身上。 */
-      onFrameSelect={setSelectedFrameId}
+      onFrameSelect={(id) => setFocus(focusFrame(id))}
       onFocusFrame={(id) => {
         const f = (boardRef.current.frames || []).find((x) => x.id === id)
         const el = wrapRef.current

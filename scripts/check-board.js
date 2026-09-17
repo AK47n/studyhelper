@@ -53,6 +53,12 @@ import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 /* "那颗词摆哪"（浮层锚点夹进可用区域）是一条屏幕像素的政策，单开一个文件
    （2026-09-17 收的候选 1 尾巴 `chipPlacement`）—— 见 [3]⑨。 */
 import { CHIP_MARGIN_BOTTOM, CHIP_MARGIN_TOP, CHIP_MARGIN_X, chipPlacement } from '../src/lib/chip-placement.js'
+/* 焦点仲裁（"现在焦点在谁身上"是一个值、按键该谁管是纯函数）在 focus.js ——
+   那一节拿假 target 就能钉住整张表（见 [6t]）。 */
+import {
+  FOCUS_NONE, PAPER_SELECTOR, beginEdit, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit,
+  escapeIntent, focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkIds, isTextField, onPaper,
+} from '../src/lib/focus.js'
 
 /* 连接那一层只从这个入口进（module 自己的 internal seam 另说）——见 board.js 的注释。 */
 const reader = createLinkReader()
@@ -2640,6 +2646,99 @@ console.log('\n[6s] 撤销账本（`history.js`）：一次手势 = 一步，判
     led.reset()
     eq(led.counts(), { undo: 0, redo: 0 }, 'reset：换了一份板 → 账本归零（两个栈都清）')
     eq(led.undo(), false, '归零之后没有东西可撤')
+  }
+}
+
+// ═════════════════════ 6t. 焦点仲裁 ═════════════════════
+console.log('\n[6t] 焦点仲裁（`focus.js`）：焦点是一个值、按键该谁管是纯函数')
+{
+  /* 为什么单开一节（2026-09-17 架构 review 候选 7）：焦点从前是四个 useState，
+     "它们互斥"这条不变量**没有人写下来**（靠二十处 ad hoc 的 if），Delete 的含义是一个
+     表达式 `selectedFrameId && !inkSel && !selectedId`，而"面板上的按键"和"纸面上的按键"
+     只靠一条 `/^(INPUT|TEXTAREA)$/` 区分 —— 点一下关系面板里那一行再按 Backspace
+     会把板框拆开（review 当场走到的那个 bug）。这一节钉住那个值、那些转移、和那张表。 */
+
+  /* ① 一个值：不可能"同时选中两样"（互斥是**结构**，不是约定） */
+  eq(FOCUS_NONE.kind, 'none', '空焦点')
+  eq(focusCard('k1'), { kind: 'card', id: 'k1', editing: false }, '选中一张卡')
+  eq(focusCard('k1', true), { kind: 'card', id: 'k1', editing: true }, '在编辑那张卡（编辑态挂在焦点上）')
+  eq(focusFrame('f1'), { kind: 'frame', id: 'f1', editing: false }, '选中一个板框')
+  eq(focusInk(['s1', 's2']), { kind: 'ink', ids: ['s1', 's2'] }, '框住两笔')
+  eq(focusInk([]), FOCUS_NONE, '什么也没框住 → 空焦点（不是"空的墨迹选中"）')
+  eq(focusCard(null), FOCUS_NONE, '给个 null 也是空焦点（调用方不用先判）')
+  {
+    const f = focusCard('k1', true)
+    eq([focusCardId(f), focusFrameId(f), focusInkIds(f)], ['k1', null, null], '焦点在卡片上：板框 / 墨迹那两个问题都是 null')
+    eq([editingCardId(f), editingFrameId(f)], ['k1', null], '  （编辑态也只属于卡片那一种）')
+    const g = focusFrame('f9', true)
+    eq([focusCardId(g), focusFrameId(g), editingFrameId(g)], [null, 'f9', 'f9'], '焦点在板框上：另外那几个问题都是 null')
+  }
+
+  /* ② 转移都是纯的（不动原值） */
+  {
+    const f = focusCard('k1')
+    const e = beginEdit(f)
+    eq([f.editing, e.editing], [false, true], 'beginEdit：原值没动、新值是编辑态')
+    eq(endEdit(e), { kind: 'card', id: 'k1', editing: false }, 'endEdit：退出编辑、焦点留着')
+    eq(clearInkFocus(focusInk(['s1'])), FOCUS_NONE, 'clearInkFocus：墨迹那一种清掉')
+    eq(clearInkFocus(f), f, 'clearInkFocus：卡片那种**原样返回**（那几处从前就只清 inkSel，不改行为）')
+  }
+
+  /* ③ 假 target：模块只用 tagName / isContentEditable / closest 三样（所以这儿的断言是纯的） */
+  const el = (tag, inside = false) => ({
+    tagName: tag,
+    isContentEditable: false,
+    closest: (sel) => (inside && sel === PAPER_SELECTOR ? {} : null),
+  })
+  const fakePanel = el('BUTTON', false) // 关系面板里那一行 / 工具条上的按钮
+  const fakeCanvas = el('CANVAS', true)
+  const fakeBody = el('BODY', true)
+  if (onPaper(fakeCanvas) && onPaper(fakeBody) && !onPaper(fakePanel)) ok('冲纸面还是冲面板：画布 / body 算纸面，面板上的按钮不算')
+  else bad('onPaper 判错了')
+  eq(onPaper(null), true, '  （没有 target：当成纸面）')
+  if (isTextField(el('INPUT')) && !isTextField(fakeCanvas)) ok('输入框算"正在打字"（那些快捷键要放行）')
+  else bad('isTextField 判错了')
+  eq(onPaper({ tagName: 'INPUT', isContentEditable: false, closest: () => ({}) }), false, '  （输入框即使在画布里也不算纸面按键）')
+
+  /* ④ ★ 删除那张表：Delete / Backspace → 该谁管、管什么 */
+  {
+    const k = (focus, key = 'Delete', target = fakeCanvas) => deleteIntent(focus, key, target)
+    eq(k(FOCUS_NONE), { kind: 'none' }, '没选中任何东西 → 不管')
+    eq(k(focusCard('k1')), { kind: 'delete-card', id: 'k1' }, '焦点在卡片上 → 删那张卡')
+    eq(k(focusInk(['s1', 's2'])), { kind: 'delete-ink', ids: ['s1', 's2'] }, '焦点在一撮笔上 → 删那几笔')
+    eq(k(focusFrame('f1')), { kind: 'dissolve-frame', id: 'f1' }, '焦点在板框上 → 拆开那个框（框还在、内容不动）')
+    eq(k(focusCard('k1'), 'x'), { kind: 'none' }, '不是删除键 → 不管')
+    /* ★★ 就是那个 bug：面板上的 Backspace 不该动板上的东西 */
+    eq(k(focusFrame('f1'), 'Backspace', fakePanel), { kind: 'none' }, '★ 焦点在面板上（不是冲纸面）→ 一个字节都不动')
+    eq(k(focusCard('k1'), 'Delete', fakePanel), { kind: 'none' }, '  （卡片同理：面板上的 Delete 不算）')
+    eq(k(focusInk(['s1']), 'Backspace', fakeBody), { kind: 'delete-ink', ids: ['s1'] }, '  （body / 画布上的照样算）')
+    /* ★ 互斥是结构："先看谁"不用再排先后（同一个键 + 同一个焦点只有一个答案） */
+    eq(deleteIntent(focusFrame('f1'), 'Delete', fakeCanvas).kind, 'dissolve-frame', '同一个键在同一个焦点上只有一个答案（没有"三个分支各查一个子集"）')
+  }
+
+  /* ⑤ Esc：一次只收一层，顺序写在一处 */
+  {
+    const esc = (ui) => escapeIntent(ui).kind
+    eq(esc({ focus: focusFrame('f1', true), condArm: { id: 'x' } }), 'disarm-cond', '武装着条件 → 先收武装（面板上按也算：Esc 是全局的）')
+    eq(esc({ focus: focusFrame('f1', true) }), 'end-frame-edit', '正在给板框改名 → 先收编辑（别顺手把框也取消）')
+    eq(esc({ focus: focusCard('k1') }), 'clear-focus', '选着一张卡 → 取消焦点')
+    eq(esc({ focus: focusInk(['s1']) }), 'clear-focus', '框着一撮笔 → 取消焦点')
+    eq(esc({ focus: FOCUS_NONE }), 'none', '什么都没有 → 不管（别 preventDefault 白吞按键）')
+    eq(esc({ focus: FOCUS_NONE, linkPick: { strokeId: 's1' } }), 'dismiss-link', '浮着那排词 → 先收词')
+    eq(esc({ focus: FOCUS_NONE, condArm: { id: 'x' }, linkPick: { strokeId: 's1' } }), 'dismiss-link', '  （词比武装更靠外一层）')
+  }
+
+  /* ⑥ ★ 静态读一遍 Board.jsx：那五个 setState 不许回来（互斥靠结构，不靠二十处 if）。
+     ⚠ 先把注释剥掉再找 —— 注释里提到这些名字是**好事**（讲历史），
+       而"代码里又用回老状态"才是要挡的（第一次跑这条就栽在我自己写的注释上）。 */
+  {
+    const src = readFileSync(new URL('../src/components/Board.jsx', import.meta.url), 'utf8')
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+    const back = ['setSelectedId', 'setInkSel', 'setSelectedFrameId', 'setEditingId', 'setFrameEditId'].filter((w) => code.includes(w))
+    if (!back.length) ok('★ Board.jsx 里没有那五个 setState 了（焦点只有一个值）')
+    else bad(`Board.jsx 里又出现了：${back.join(' / ')} —— 焦点该只有 focus 一个值（见 focus.js）`)
+    if (/const \[focus, setFocus\] = useState/.test(src)) ok('  （焦点就是 focus 那一个 useState）')
+    else bad('Board.jsx 里找不到 focus 那个 useState')
   }
 }
 

@@ -1162,6 +1162,68 @@ console.log('\n[15] 你连的那条也能说条件：∈ 指一个 → 写进那
   }
 }
 
+/* ═════════════════ 15b. 面板上的按键不是纸面上的按键（架构 review 候选 7） ═════════════════ */
+console.log('\n[15b] 点一下关系面板里那一行，再按 Backspace —— 板上的东西一个字节都不许动')
+{
+  /* 这是 review 当场走到的那条路：关系面板里的行是 `<button>`，而键处理器当时唯一的闸是
+     `/^(INPUT|TEXTAREA)$/` —— 点一行（它顺手把那个板框选中了）再按 Backspace，
+     板框**当场被拆开**，`preventDefault()` 还顺手把浏览器的后退也吞了。
+     现在"这一下是冲纸面还是冲面板"是一个纯判据（`focus.js` 的 `onPaper`），
+     Delete / Backspace 只在**冲纸面**时才算；而 Esc / Ctrl+Z 这些仍然是全局的。 */
+  const framesNow = () => s.eval(`document.querySelectorAll('[data-frame-row]').length`)
+  const before = await read()
+  const nFrames = (before.frames || []).length
+  const rows = await framesNow()
+  if (!nFrames || !rows) {
+    bad(`夹具里这一刻没有板框（frames=${nFrames}，面板行=${rows}）—— 这一节没意义`)
+  } else {
+    const rowBox = await s.eval(`(() => {
+      const r = document.querySelector('[data-frame-row]')
+      const b = r.getBoundingClientRect()
+      return { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) }
+    })()`)
+    await s.mouse(rowBox.x, rowBox.y, { steps: 0 })
+    await s.sleep(250)
+    const selected = await s.eval(`!!document.querySelector('.bd-frame.on')`)
+    if (selected) ok('点面板里那一行 → 那个板框被选中了（屏幕上亮起来）')
+    else bad('点了面板里那一行，板框没被选中 —— 后面那条断言就没意义了')
+    /* ★ 这一下是在**面板**上按的 —— 板上的东西一个字节都不许动 */
+    await s.key('Backspace', 'Backspace', 8)
+    await s.sleep(600)
+    const after = await read()
+    if ((after.frames || []).length === nFrames) ok(`★ 面板上的 Backspace 没有动板：板框还是 ${nFrames} 个（从前这里会被拆开）`)
+    else bad(`面板上的 Backspace 把板框拆了：${nFrames} → ${(after.frames || []).length}`)
+    const stillSel = await s.eval(`!!document.querySelector('.bd-frame.on')`)
+    if (stillSel) ok('  （那个框还选着 —— 这一下只是被忽略了，不是"顺手取消选中"）')
+    else bad('面板上那一下把选中也取消了（不该）')
+    /* 而**纸面上**的 Backspace 照样算（别把这条修成"Delete 彻底坏了"）：
+       把焦点交回纸面 —— 那个框还选着（面板那一行点的），这时 Backspace 就该拆开它。
+       ⚠ 不点板上那颗名字来选：这一刻它可能被卡片压着（`elementFromPoint` 给的是卡片，
+         点下去就变成"选中那张卡"，实测正是这样）—— 那是另一件事，
+         记在 README 的「还没做的」里（"板框那颗名字可能被卡片压住"）。 */
+    const chipHit = await s.eval(`(() => {
+      const t = document.querySelector('.bd-frame-t')
+      if (!t) return '(没有名字)'
+      const r = t.getBoundingClientRect()
+      const el = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2))
+      return el ? (String(el.className || el.tagName)) : '(无)'
+    })()`)
+    console.log(`      诊断：这一刻板框名字中心命中的是 ${chipHit}`)
+    const act = await s.eval(`(() => {
+      const a = document.activeElement
+      if (a && a.blur) a.blur()
+      return document.activeElement ? document.activeElement.tagName : '(无)'
+    })()`)
+    if (act === 'BODY') ok('  （把焦点交回纸面：activeElement = BODY —— 这时那一族按键才算数）')
+    else bad(`没能把焦点交回纸面（activeElement=${act}）`)
+    await s.key('Backspace', 'Backspace', 8)
+    await s.sleep(700)
+    const after2 = await read()
+    if ((after2.frames || []).length === nFrames - 1) ok(`★ 纸面上的 Backspace 照样算：板框被拆开（${nFrames} → ${(after2.frames || []).length}）`)
+    else bad(`纸面上的 Backspace 没拆开板框（还是 ${(after2.frames || []).length} 个）—— 修错了方向`)
+  }
+}
+
 /* ═════════════════ 16. 一次手势 = 一步撤销（真鼠标走四条路） ═════════════════ */
 console.log('\n[16] 一次手势 = 一步撤销：拖卡片 / 缩放卡片 / 挪笔迹 / 空点不吃掉重做')
 {
