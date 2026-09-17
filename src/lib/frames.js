@@ -19,7 +19,7 @@
  *   所以"整体挪一下"挪的是**成员**，不是框。
  */
 import { linkId, newFrameId } from './board.js'
-import { toFlat } from './geometry.js'
+import { cardBounds, frameBounds, pointInRect, toFlat } from './geometry.js'
 import { ARROW_LINK, isLinkKind } from './link-kinds.js'
 
 /* 一个东西属于哪个框（笔迹和卡片都问这一个入口）。不属于任何框 → null。 */
@@ -186,6 +186,46 @@ export function declareLink(board, from, to, kind = ARROW_LINK) {
 
 export function linkOf(board, from, to) {
   return (((board && board.links) || []).find((l) => linkId(l.from, l.to) === linkId(from, to))) || null
+}
+
+/* ── 松手时"这一头落在谁身上"（箭头工具的吸附）─────────────────────────────
+ *
+ * 和从前那套位置判据的区别，一句话：**只认你亲眼看得见的那些方块** ——
+ * 卡片和板框，都是"有边框的东西"。不再去猜"这一撮墨是不是一个东西"
+ * （墨迹块那套在真实笔迹上 92:0，见 ADR-0001）。
+ *
+ * 判据两条，顺序是有意的：
+ *   ① **点在框里** → 直接赢，而且**卡片比板框优先**（卡片更具体：一张卡可以落在板框里，
+ *      那时候你指的是那张卡，不是外面那个大框）；
+ *   ② 都不在里面 → 离**边**最近的那个（≤ radius 世界像素）才算。
+ * 半径给得宽（40px）：手画的箭头**常常停在东西前面一点**（尖得留出画 V 的地方），
+ * 而"停在前面"和"没连上"在手感上是两件事。 */
+export const ARROW_SNAP = 40
+
+export function snapNode(board, p, radius = ARROW_SNAP) {
+  if (!p) return null
+  const cards = ((board && board.cards) || []).map((c) => ({ kind: 'card', id: c.id, label: '', box: cardBounds(c) }))
+  const frames = ((board && board.frames) || [])
+    .map((f) => ({ kind: 'frame', id: f.id, label: f.title ? String(f.title) : '板框', box: frameBounds(board, f) }))
+    .filter((x) => x.box)
+  for (const list of [cards, frames]) {
+    const inside = list.find((n) => pointInRect(p, n.box))
+    if (inside) return inside
+  }
+  let best = null
+  let bd = radius
+  for (const list of [cards, frames]) {
+    for (const n of list) {
+      const dx = Math.max(n.box.x - p.x, 0, p.x - (n.box.x + n.box.w))
+      const dy = Math.max(n.box.y - p.y, 0, p.y - (n.box.y + n.box.h))
+      const d = Math.hypot(dx, dy)
+      if (d <= bd) {
+        bd = d
+        best = n
+      }
+    }
+  }
+  return best
 }
 
 /* 换个词（点线上那颗词、或者那排词里选一个）。 */

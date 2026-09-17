@@ -2,35 +2,32 @@
  *
  * 为什么单开一个 module（2026-09-16 架构 review 的 C3）：
  *   "框住一笔之后能干什么"这件事，从前散在三个地方 ——
- *   Board.jsx 里 5 个 useMemo（`selLink` / `inkNoLink` / `inkGroup` / `inkBox` / `inkStrokes`）
- *   加 6 个处理器（删 / 改词 / 反向 / 否决 / 回头路 / 固定 / 拆开）、
+ *   Board.jsx 里几个 useMemo（`selLink` / `selBox` / `selFrame` / …）
+ *   加一串处理器（删 / 改词 / 反向 / 留下板框 / 拆开）、
  *   BoardCanvas 里 3 段各自 `{xx && …}` 的条件渲染，外加 11 个 prop。
  *   而这里面全是**踩过坑的规矩**，却没有一条在纯逻辑里钉得住：
- *     · 「不算连接」要写在**整条链**上（`chainOfStroke`），只清框住那一笔 =
- *       点了按钮什么都没发生（审查挑出来的那条）；
- *     · 选的那个词**正好等于形状读出来的** → **不写字段**（一条没动过的连接是零字节）；
- *     · ⇄ 反向 = 把这笔的点**倒过来**（方向就是"第一点 → 最后一点"），
- *       而反向之后形状变了，得退回**单笔**判断（连接层那个 auto 是给没反向时用的）；
- *     · 框住"正好一整块"才算那一块（少一笔都不算，不然框一大片会顺手把某块拆了）；
- *     · 固定一块时要把这些笔从**别的块**里拿走（一笔只能属于一个组）。
- *   现在这些规矩都在这里，一处、可断言：读（`readSelection`）+ 写（下面那 5 个纯函数）。
+ *     · 选的那个词**正好等于默认那一档** → **不写字段**（一条没动过的连接是零字节）；
+ *     · ⇄ 反向 = 把这笔的点**倒过来**（方向就是"第一点 → 最后一点"）；
+ *     · 框住"正好是一个板框的笔"才算那个框（少一笔都不算，不然框一大片会顺手拆了它）；
+ *     · 留下板框时要把这些东西从**别的框**里拿走（一个成员只属于一个框）。
+ *   现在这些规矩都在这里，一处、可断言：读（`readSelection`）+ 写（下面那几个纯函数）。
+ *
+ * ⚠ 第二刀之后这个 module 变短了：`clearNoLinkMarks`（"又算回连接"）跟着「不算连接」
+ *   一起删掉 —— 那个口子的前提是"形状判读会猜错"，而形状判读整族已经删了（ADR-0001）。
  *
  * ── interface ─────────────────────────────────────────────────────────────
  *   readSelection(board, ids, links) → {
  *     ids, count, empty, strokes, box,
  *     link,     // 框里**正好一条**连接线时是那条连接（改词那排的入口），否则 null
- *     noLink,   // 框住的笔里有没有"你说过不算连接"的（有就给一条回头路）
- *     frame,    // 框住的这些笔**正好就是**某个板框吗（是 → 浮层给「拆开这块」）
+ *     frame,    // 框住的这些笔**正好就是**某个板框吗（是 → 浮层给「拆开这个框」）
  *   }
  *   applyStrokeLink(board, links, strokeId, kind, { reverse }) → board' | null
- *     kind = 词表里的词 → 写/清那个字段；kind = LINK_NONE → 写在整条链上；
- *     词不认识 → **null**（什么都没改，调用方也别弹提示）。
- *   clearNoLinkMarks(board, ids) → board'   按**整条链**把 `link:'none'` 清掉（回头路）
+ *     kind = 词表里的词 → 写/清那个字段；词不认识 → **null**（什么都没改，调用方也别弹提示）。
  *   removeStrokes(board, ids) → board'      删掉这些笔（顺手把板框里的死成员摘掉）
  *   freezeFrameSelection(board, ids, cards) → { board, movedFrom }   留下板框；movedFrom 是被挪过的别的框
  *   这些函数都是**纯的**：不动原对象、只返回新的 board（约定见 board.js 顶部）。
  *   「拆开一个板框」在 frames.js 的 `dissolveFrame`（它只认 board + frameId）。
- */
+ *   `clearNoLinkMarks`（"又算回连接"）第二刀删掉了 —— 见下面那段说明。 */
 
 /* 板框那一族（留下 / 拆开 / 改标题 / 整体挪）搬去了 frames.js（2026-09-17）：
    从前的 `groups`（"固定成一块"）在这里，现在它长成了板框 —— 成员多了卡片、多了标题，
@@ -38,8 +35,7 @@
 import { freezeFrame, pruneFrames } from './frames.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）。 */
 import { strokesBBox } from './geometry.js'
-import { autoLinkKind, chainOfStroke } from './links.js'
-import { COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
+import { COND_NONE, DEFAULT_LINK, isLinkKind, parseCond } from './link-kinds.js'
 
 /** 把扁平点数组整个倒过来（[x,y,p] 三个一组）。⇄ 反向就是它。 */
 export function reverseFlat(flat) {
@@ -67,10 +63,6 @@ export function readSelection(board, ids, links = []) {
   let link = null
   if (set.size === 1) for (const id of set) link = byStroke.get(id) || null
 
-  /* 框住的笔里有没有"你说过不算连接"的 —— 有就给它一条回头路
-     （不然那句话是单向门：点完只能 Ctrl+Z，重开之后就没路可走了）。 */
-  const noLink = strokes.some((s) => s.link === LINK_NONE)
-
   /* 框住的这些笔**正好就是**某个板框的笔吗？判据是"集合完全相等"：
      少一笔都不算 —— 不然框一大片会把某个框顺手拆了。
      （框里可以还有卡片成员：卡片框不进来，所以只比笔迹这一半。） */
@@ -91,22 +83,15 @@ export function readSelection(board, ids, links = []) {
     strokes,
     box: set.size ? strokesBBox(strokes) : null,
     link,
-    noLink,
     frame,
   }
 }
 
-/* 改一条连接的词。opt.reverse = ⇄ 反向。
- * ★ 「不算连接」（LINK_NONE）走的是另一条语义：它回答的是"它根本不是关系"，
- *   而且**要写在整条链上**（那一笔可能只是链里的一段）—— 跟"是什么关系"那排词不是一回事。 */
+/* 改一条连接（你画出来的那条线）的词。opt.reverse = ⇄ 反向。
+ * ★ 第二刀之后这里只剩"是什么关系"这一件事：「不算连接」连同形状判读一起删掉了
+ *   （见 ADR-0001）—— 现在"删掉这条连接"由 Board.jsx 直接调用 removeStrokes。 */
 export function applyStrokeLink(board, links, strokeId, kind, opt = {}) {
   const byStroke = linkMap(links)
-
-  if (kind === LINK_NONE) {
-    const known = byStroke.get(strokeId)
-    const ids = new Set(known ? known.ids : [strokeId])
-    return { ...board, strokes: board.strokes.map((st) => (ids.has(st.id) ? { ...st, link: LINK_NONE } : st)) }
-  }
   if (!isLinkKind(kind)) return null // 词不认识：什么都没改
 
   return {
@@ -116,43 +101,21 @@ export function applyStrokeLink(board, links, strokeId, kind, opt = {}) {
       /* ⇄ 反向 = 把这笔的点**倒过来**。倒过来渲染出来一模一样（都是同一条路径），
          但"第一点 → 最后一点"变了 —— 箭头方向就是靠这个表达的，所以不用另存一个方向字段。 */
       const points = opt.reverse ? reverseFlat(st.points) : st.points
-      /* ★ auto 取**连接这一层**读出来的那个（buildLinks 的结果），不是单看这一笔：
-         用户的箭头常常是"一杆 + 一个 V 尖"两笔画的 —— 单看那根杆永远是"相关"，
-         只有连接层知道旁边那个尖是它的。所以选"因果"时不能写进文件（写进去就是噪音，
-         而且以后擦掉尖它也不会自己回来）。
-         ⇄ 反向时形状变了（回勾跑到另一头去），这时退回单笔判断。 */
-      const known = byStroke.get(strokeId)
-      const auto = !opt.reverse && known ? known.auto : autoLinkKind({ ...st, points })
       const next = { ...st, points }
-      /* ★ 选的就是"形状自动读出来那一档" → **不写这个字段**（回到自动）。
+      /* ★ 选的就是这一档的默认词（「相关」）→ **不写这个字段**（回到默认）。
          于是文件里只有"你特意改过的"那几个词：一条没动过的连接是零字节，
-         老文件也不会因为我们加了这个功能而变脏。 */
-      if (kind === auto) delete next.link
+         老文件也不会因为我们加了这个功能而变脏。
+         （从前这里比的是"形状读出来的那一档"，形状判读删掉之后就是 DEFAULT_LINK。） */
+      if (kind === DEFAULT_LINK) delete next.link
       else next.link = kind
       return next
     }),
   }
 }
 
-/* 把"不算连接"改回来：去掉 `link: 'none'` → 回到按形状自动判（那道单向门的回头路）。
- * ★ 要按**整条链**清（`chainOfStroke`），不能只清框住的那一笔：
- *   `link:'none'` 当初是写在整条链上的，链里还剩一笔 none，buildLinks 仍然整条跳过 ——
- *   用户点了按钮却什么都没发生（审查挑出来的）。 */
-export function clearNoLinkMarks(board, ids) {
-  const set = asSet(ids)
-  if (!set.size) return board
-  const all = new Set()
-  for (const id of set) for (const cid of chainOfStroke(board, id)) all.add(cid)
-  return {
-    ...board,
-    strokes: board.strokes.map((st) => {
-      if (!all.has(st.id) || st.link !== LINK_NONE) return st
-      const next = { ...st }
-      delete next.link
-      return next
-    }),
-  }
-}
+/* 把"不算连接"改回来：删掉了（2026-09-17 第二刀）——
+ * 它存在的前提是"形状判读会猜错"，而形状判读整族已经删掉（见 ADR-0001）。
+ * 现在"删掉这条连接"由 frames.js 的 `removeLink`（宣告的那种）/ 删掉那一笔（画出来的那种）负责。 */
 
 /** 删掉这些笔（撤销栈由调用方管：这是"一步"操作）。
  *  顺手把板框里的**死成员**摘掉（框围着空气的样子很怪），空掉的框自己消失。 */

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { relationCurve } from '../lib/geometry.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { LINK_KINDS, LINK_NONE } from '../lib/link-kinds.js'
+import { LINK_DELETE, LINK_KINDS } from '../lib/link-kinds.js'
 import { applyViewTo, viewTransformAttr, worldRectToScreen, worldToScreen } from '../lib/view.js'
 import { drawStroke } from '../lib/ink.js'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
@@ -29,7 +29,6 @@ export default function BoardCanvas({
   hoverEdge, eraserAt, onPointerDown, onPointerMove, onPointerUp,
   lasso, inkBox, onDeleteInk, onBeautifyInk, onFormulaInk, inkFrame = null, onKeepFrame, onDissolveFrame,
   links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
-  inkNoLink = false, onClearNoLink,
   /* 板框（见 ADR-0001）：`frames` 是 [{frame, box}]（box 是按成员现算的框线，世界坐标）。 */
   frames = [], frameEditId = null, selectedFrameId = null,
   onFrameSelect, onFrameDragStart, onFrameDrag, onFrameDragEnd, onFrameEdit, onFrameTitle, onFrameEditClose,
@@ -303,7 +302,7 @@ export default function BoardCanvas({
                 框住那条线就能再改一次 —— 不用把线擦掉重画。
                 （框选本来就是这条路：圈住东西 → 框上方浮出能对它做的事。） */}
             {selLink && (
-              <span className="bd-inklink" data-sel-link={selLink.strokeId}>
+              <span className="bd-inklink" data-sel-link={selLink.strokeId || selLink.id}>
                 {LINK_KINDS.map((k) => (
                   <button
                     key={k.id}
@@ -313,7 +312,7 @@ export default function BoardCanvas({
                     onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation()
-                      onApplyLink?.(selLink.strokeId, k.id)
+                      onApplyLink?.(selLink, k.id)
                     }}
                     title={k.hint}
                   >
@@ -327,46 +326,33 @@ export default function BoardCanvas({
                     onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation()
-                      onApplyLink?.(selLink.strokeId, selLink.kind, { reverse: true })
+                      onApplyLink?.(selLink, selLink.kind, { reverse: true })
                     }}
                     title="方向反一下"
                   >
                     ⇄
                   </button>
                 )}
-                {/* 「这条不算连接」：自动读出来的关系会读错（一条长竖笔正好跨过两坨字）。
-                    没有这个口子的话，猜错了只能擦掉那一笔重画 —— 那就成了"猜错还锁死"。 */}
+                {/* 「删掉这条连接」（2026-09-17 第二刀，见 ADR-0001）：
+                    它顶掉了从前那个「不算连接」。框住那条线 = "我就是要动这一条"，
+                    所以这颗按钮在这儿比在别处都顺手。 */}
                 <button
                   className="bd-linkchip none"
-                  data-link-kind={LINK_NONE}
+                  data-link-kind={LINK_DELETE}
                   onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation()
-                    onApplyLink?.(selLink.strokeId, LINK_NONE)
+                    onApplyLink?.(selLink, LINK_DELETE)
                   }}
-                  title="它其实不是连接：记在那一笔上，以后不再读成关系（Ctrl+Z 能退回）"
+                  title="删掉这条连接：你连的删那条记录、你画的删掉那一笔（Ctrl+Z 能退回）"
                 >
-                  不算连接
+                  删掉这条连接
                 </button>
               </span>
             )}
-            {/* 框住的笔里有"你说过不算连接"的 → 给一条回头路。
-                那句话点下去之后，唯一的另一条路是 Ctrl+Z；重开之后连它也没了。 */}
-            {inkNoLink && (
-              <span className="bd-inklink" data-ink-nolink="1">
-                <button
-                  className="bd-linkchip"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onClearNoLink?.()
-                  }}
-                  title="去掉「不算连接」，让它按形状重新判"
-                >
-                  又算回连接
-                </button>
-              </span>
-            )}
+            {/* 「又算回连接」那一块第二刀删掉了（ADR-0001）：它的前提是"形状判读会猜错"，
+                而形状判读整族已经删掉。现在"这条连错了"只有一句话：那排词里 `0` 那颗
+                「删掉这条连接」。 */}
           </div>
         </>
       )}
@@ -475,7 +461,7 @@ export default function BoardCanvas({
                   e.stopPropagation()
                   onPickLink?.(l)
                 }}
-                title={l.manual ? '你标过的关系：点一下可以改' : '按笔迹形状读出来的：点一下可以改'}
+                title={l.declared ? '你连的关系：点一下可以改词 / 删掉' : l.manual ? '你点过词的关系：点一下可以改' : '你画的一条线（默认「相关」）：点一下可以改'}
               >
                 {l.name}
                 {l.dir ? ' →' : ''}
@@ -485,8 +471,8 @@ export default function BoardCanvas({
         {linkPick && (
           <LinkChips
             at={linkPick}
-            onPick={(kind) => onApplyLink?.(linkPick.strokeId, kind)}
-            onReverse={() => onApplyLink?.(linkPick.strokeId, linkPick.kind, { reverse: true })}
+            onPick={(kind) => onApplyLink?.(linkPick, kind)}
+            onReverse={() => onApplyLink?.(linkPick, linkPick.kind, { reverse: true })}
             onHover={onLinkHover}
           />
         )}
@@ -503,7 +489,7 @@ function LinkChips({ at, onPick, onReverse, onHover }) {
   return (
     <div
       className="bd-linkchips"
-      data-link-pick={at.strokeId}
+      data-link-pick={at.id || at.strokeId}
       style={{ left: at.x, top: at.y }}
       onPointerDown={(e) => e.stopPropagation()}
       onPointerEnter={() => onHover?.(true)}
@@ -534,21 +520,24 @@ function LinkChips({ at, onPick, onReverse, onHover }) {
             e.stopPropagation()
             onReverse()
           }}
-          title="方向反一下：把这一笔的起止倒过来（渲染出来一模一样，只是箭头换一边）"
+          title={at.declared ? '方向反一下：把两端对调（箭头换一边）' : '方向反一下：把这一笔的起止倒过来（渲染出来一模一样，只是箭头换一边）'}
         >
           ⇄
         </button>
       )}
+      {/* `0` 那颗：**删掉这条连接**（2026-09-17 第二刀）。
+          它顶掉了从前那个「不算连接」—— 那个口子是给"猜错了"配的否决权，
+          而形状判读整族已经删掉了；这颗位置本来就在手边。 */}
       <button
         className="bd-linkchip none"
-        data-link-kind={LINK_NONE}
+        data-link-kind={LINK_DELETE}
         onClick={(e) => {
           e.stopPropagation()
-          onPick(LINK_NONE)
+          onPick(LINK_DELETE)
         }}
-        title="它其实不是连接（按 0）：记在那一笔上，以后不再读成关系"
+        title="删掉这条连接（按 0）：你连的那条删记录，你画的那条删掉那一笔 —— 都能 Ctrl+Z 退回"
       >
-        不算连接
+        删掉这条连接
       </button>
       <span className="bd-linkchips-x">不点也行</span>
     </div>

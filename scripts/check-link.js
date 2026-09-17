@@ -271,179 +271,121 @@ console.log('\n[5] 框住那条线，在浮层里选「推导」')
   await s.key('Escape', 'Escape', 27)
 }
 
-/* ═════════════════ 6. 带箭头的一笔：自动读成因果，但不写盘 ═════════════════ */
-console.log('\n[6] 一笔画成的箭头：自动读成「因果」，而且**不写进文件**')
+/* ═════════════════ 6. 箭头工具：划一笔 = 一条连接（你宣告的） ═════════════════ */
+console.log('\n[6] 箭头工具（A）：从一张卡划到另一张卡 —— 一条宣告的连接，画完自动回笔')
 {
-  const st3 = await readBoard()
-  /* 从 B 画回 A，末端回勾出箭头。方向、垂直方向都从两卡位置算出来 ——
-     夹具横着摆还是竖着摆都成立（第一版写死"水平往左"，夹具一换就全错）。 */
-  const from = { x: st3.b.cx + 10, y: st3.b.cy - 10 }
-  const to = { x: st3.a.cx + 10, y: st3.a.cy + 10 }
-  const len = Math.hypot(to.x - from.x, to.y - from.y)
-  const ux = (to.x - from.x) / len
-  const uy = (to.y - from.y) / len
-  const px = -uy
-  const py = ux
-  const steps = []
-  const N = 12
-  for (let i = 1; i <= N; i++) steps.push({ x: Math.round(from.x + ((to.x - from.x) * i) / N), y: Math.round(from.y + ((to.y - from.y) * i) / N) })
-  /* 回勾：先沿反方向退 26px、再往侧面让开 15px（这就是"手画箭头"的动作）。
-     世界像素要够大（judge 的阈值是 6/7 世界像素），屏幕缩放 ~1 时 26/15 稳稳够。 */
-  steps.push({ x: Math.round(to.x - ux * 26 + px * 15), y: Math.round(to.y - uy * 26 + py * 15) })
-  steps.push({ x: Math.round(to.x - ux * 6 - px * 12), y: Math.round(to.y - uy * 6 - py * 12) })
-  await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none', buttons: 0, pointerType: 'pen' })
-  await sleep(140)
-  await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'pen' })
-  for (const p of steps) {
-    await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'left', buttons: 1, pointerType: 'pen' })
-    await sleep(12)
-  }
-  const last = steps[steps.length - 1]
-  await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: last.x, y: last.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'pen' })
-  await sleep(300)
+  /* 见 ADR-0001：连接不再从笔迹形状里猜（那一族 92:0），改由你**宣告**。
+     这一节走的是那颗按钮 + 一次划动的完整真鼠标路径，钉四件事：
+       · 栏上那颗按钮**点得到**（elementFromPoint —— 浮出来的东西被盖住是踩过的坑）；
+       · 划完文件里出现 links 记录（kind=因果）、屏幕上出现"合成"的线 + 尖 + 那颗词；
+       · **一次性**：画完工具回到笔（按钮高亮跟着回去）；
+       · 那条记录改词走的是同一个口子（点那颗词 → 按 2 选「并列」）。 */
+  const st6 = await readBoard()
+  if (st6.count === 1) ok('开始这一步时有 1 条连接（就是你画的那一条）')
+  else bad(`开始这一步时应该是 1 条连接，实际 ${st6.count}`)
+
+  const toolBtn = await s.eval(`(() => {
+    const b = document.querySelector('.bd-tools .bd-t[data-tool="arrow"]')
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: b.textContent.trim() }
+  })()`)
+  if (toolBtn) ok(`工具条上有那颗「${toolBtn.text}」按钮`)
+  else bad('工具条上没有箭头工具那颗按钮')
+  const toolHit = await hitAt(toolBtn.x, toolBtn.y)
+  if (String(toolHit).includes('bd-t')) ok(`那颗按钮**点得到**（命中的是 ${toolHit}）`)
+  else bad(`箭头按钮中心命中的是「${toolHit}」—— 用户点不到`)
+
+  /* 用键盘 A 起手（用笔的人就是这么用的），再从 A 卡划到 B 卡。 */
+  await s.key('a', 'KeyA', 65)
+  const armed = await s.eval(`!!document.querySelector('.bd-tools .bd-t[data-tool="arrow"].on')`)
+  if (armed) ok('按 A 之后箭头工具亮着（准备划）')
+  else bad('按 A 没有切到箭头工具')
+
+  const from = { x: st6.a.cx, y: st6.a.cy }
+  const to = { x: st6.b.cx, y: st6.b.cy }
+  await s.mouse(from.x, from.y, { steps: 10, dx: to.x - from.x, dy: to.y - from.y })
+  await sleep(1200)
+
   const now = await readBoard()
-  if (now.count === 2) ok('第二条连接也认出来了')
-  else bad(`连接数变成 ${now.count}，应该是 2`)
-  const causeRow = now.kinds.find((k) => k === '因果')
-  if (causeRow) ok('带箭头那一笔自动读成「因果」（形状读出来的，不用点）')
-  else bad(`带箭头那一笔读成了 ${JSON.stringify(now.kinds)}`)
-  const links = await fileLinks()
-  if (links && links.join(',') === 'derive') ok('文件里仍然只有你手动标过的那一个词（形状读出来的没写进去）')
-  else bad(`文件里的 link 变了：${JSON.stringify(links)} —— 形状读出来的东西不该写盘`)
+  if (now.count === 2) ok('面板里多了一条（"你连的"那一条进了文件）')
+  else bad(`划完应该是 2 条连接，实际 ${now.count}`)
+  const doc6 = await read()
+  const rec = (doc6.links || [])[0]
+  if (rec && rec.kind === 'cause') ok(`文件里写着 ${JSON.stringify(rec)}（默认就是因果）`)
+  else bad(`文件里的 links 不对：${JSON.stringify(doc6.links)}`)
+  if (doc6.strokes.length === 1) ok('纸上**没有多出墨迹**（箭头工具不落墨，那条线是应用画的）')
+  else bad(`墨迹多出来了：${doc6.strokes.length} 笔`)
+  const drawn = await s.eval(`(() => ({
+    line: !!document.querySelector('[data-link-line]'),
+    arrow: document.querySelectorAll('[data-link-arrow]').length,
+    pill: (document.querySelector('.bd-linkpill[data-link-pill]') || {}).textContent || null,
+  }))()`)
+  if (drawn.line && drawn.arrow >= 1 && drawn.pill === '因果 →') ok(`屏幕上：一条合成的线 + ${drawn.arrow} 个尖 + 那颗词「${drawn.pill}」`)
+  else bad(`屏幕上没画全：${JSON.stringify(drawn)}`)
+  const backToPen = await s.eval(`!!document.querySelector('.bd-tools .bd-t[data-tool="pen"].on')`)
+  if (backToPen) ok('★ 一次性：画完自动回到笔（不用再点一下）')
+  else bad('画完没有回到笔 —— "一次性"没做到')
+  const chips = await s.eval(`!!document.querySelector('.bd-linkchips')`)
+  if (chips) ok('那排词浮出来了（想改成推导/并列/等价当场就能点）')
+  else bad('画完没有浮出那排词')
+
+  /* 改词：按 4 = 「并列」（1=相关 2=因果 3=推导 **4=并列** 5=等价）——
+     和上面那条"你画的"区分开：**你连的**那个词存在 links 记录里、**你画的**那个存在笔迹上。 */
+  await s.key('4', 'Digit4', 52)
+  await sleep(1200)
+  const after = await readBoard()
+  if (after.kinds.includes('并列')) ok('按 4 之后面板里是「并列」')
+  else bad(`面板里是 ${JSON.stringify(after.kinds)}`)
+  const doc6b = await read()
+  if ((doc6b.links || [])[0] && doc6b.links[0].kind === 'para') ok('改完的词写进了那条记录（kind=para）')
+  else bad(`记录里的词没改：${JSON.stringify(doc6b.links)}`)
 }
 
-/* ═════════════════ 6b. 他本人画的箭头（两笔：一杆 + 一个 V 尖）═════════════════ */
-console.log('\n[6b] 用他本人的笔迹（scripts/fixtures/hand-arrows.json）：一杆 + 一个 V 尖，两笔')
+/* ═════════════════ 6b. 箭头工具的两条护栏 ═════════════════ */
+console.log('\n[6b] 箭头工具的护栏：没吸到东西 / 两头是同一个东西 —— 都不许留下记录')
 {
-  /* ★ 这一节为什么值得存在：**判据的阈值是从这里来的。**
-     用户 2026-09-16 把两张手画箭头的截图发来，scripts/extract-hand-arrows.py
-     把墨迹解成骨架、按纸的横线反推出缩放，得到"杆 / 两只臂"的真实点列。
-     这里就是把那两条真实点列**按屏幕映射画一遍**（真笔事件），
-     再看应用认不认 —— 判据只在合成图形上验过，是不算数的。
-     ⚠ 这条也顺带钉住"合成的箭头不许叠在你自己画的尖上"（headInk）。 */
-  const fix = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'fixtures', 'hand-arrows.json'), 'utf8'))
-  const img = fix.images.find((x) => x.key === 'long')
-  const role = Object.fromEntries(img.strokes.map((x) => [x.role, toPoints(x.points)]))
-  const V = role.barbA.slice().reverse().concat(role.barbB) // 一个 V：臂A 的末端 → 尖 → 臂B 的末端
+  const st6b = await readBoard()
+  await s.key('a', 'KeyA', 65)
+  /* ① 空白处划一笔：两头都吸不到 → 不产生记录，而且要说一句人话 */
+  const x = st6b.a.x - 260
+  const y = Math.round((st6b.a.y + st6b.a.h + st6b.b.y) / 2)
+  await s.mouse(x, y, { steps: 8, dx: 140, dy: 40 })
+  await sleep(700)
+  const after1 = await readBoard()
+  if (after1.count === 2) ok('空白处划一笔：一条记录都没多（吸不到就不猜）')
+  else bad(`空白处划一笔却多了记录（现在 ${after1.count} 条）`)
+  if (/没落在东西上|画到卡片或板框/.test(after1.toast)) ok(`还给了一句人话：${after1.toast}`)
+  else bad(`没有提示"没吸到"：${JSON.stringify(after1.toast)}`)
+  const stillArrow = await s.eval(`!!document.querySelector('.bd-tools .bd-t[data-tool="arrow"].on')`)
+  if (stillArrow) ok('没连上的那一次**不回笔**（你可以接着划，不用重新按 A）')
+  else bad('没连上却把工具收回去了 —— 那会让人以为"按一下只能用一次"')
 
-  /* 摆法：**全部按屏幕上量到的卡片位置算**，不去猜卡片的"世界坐标"。
-     ★ 为什么不能猜：应用打开板子时会**按内容重算一次卡片尺寸**（第 16 条踩过的坑），
-       夹具里写的 w:220 到屏幕上就不是 220 了 —— 拿它反推世界坐标会整体偏上百像素，
-       箭头画到两张卡外面去（第一版就是这么"画了但不算连接"的）。
-     世界→屏幕只用一次：把**应用自己存下来的点**映回来，跟我要画的位置对一下
-     （这一步验的是"我算的屏幕坐标和应用算的是不是同一套"）。 */
-  const bt = await readBoard()
-  const A = bt.a
-  const B = bt.b
-  const tailW = role.shaft[0]
-  const tipW0 = role.shaft[role.shaft.length - 1]
-  const shaftLen = Math.hypot(tipW0.x - tailW.x, tipW0.y - tailW.y)
-  /* 杆尾放在 A 里靠下 3/4 处；尖停在 B 上边往上 16px ——
-     他真实的画法就是"停在卡前面一点"（尖得留出画 V 的地方）。 */
-  const tailS = { x: A.cx, y: A.y + Math.round(A.h * 0.75) }
-  const tipS = { x: B.cx, y: B.y - 16 }
-  const k = Math.hypot(tipS.x - tailS.x, tipS.y - tailS.y) / shaftLen
-  /* 旋转量：把**夹具里"杆 → 尖"的方向**转到**屏幕上"A → B"的方向**。
-     ⚠ 这里必须是"世界方向 → 屏幕方向"的**角度差**（两套坐标系的朝向不一样：
-       他的箭头在世界里指向 +x，而这两张卡是上下摆的，屏幕上要指向 +y）。
-       第一版把世界方向当屏幕方向直接用了，于是箭头整个横过来，
-       尖落到两张卡外面 —— 症状是"画了但不算连接"。 */
-  const angW = Math.atan2(tipW0.y - tailW.y, tipW0.x - tailW.x)
-  const angS = Math.atan2(B.cy - A.cy, B.cx - A.cx)
-  const cosR = Math.cos(angS - angW)
-  const sinR = Math.sin(angS - angW)
-  const place = (p) => {
-    const vx = (p.x - tailW.x) * k
-    const vy = (p.y - tailW.y) * k
-    return { x: tailS.x + vx * cosR - vy * sinR, y: tailS.y + vx * sinR + vy * cosR }
-  }
-  const shaftS = role.shaft.map(place)
-  const vS = V.map(place)
-  console.log(`  （贴在卡片上：杆尾 (${Math.round(shaftS[0].x)},${Math.round(shaftS[0].y)}) → 尖 (${Math.round(tipS.x)},${Math.round(tipS.y)})，B 的上边在 y=${B.y}）`)
-
-  /* 沿点列走真笔事件（点之间插值，别让浏览器看到几像素一跳的折线）。 */
-  const drawScreen = async (pts) => {
-    const first = pts[0]
-    await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: first.x, y: first.y, button: 'none', buttons: 0, pointerType: 'pen' })
-    await sleep(140)
-    await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: first.x, y: first.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'pen' })
-    let last = first
-    for (const p of pts.slice(1)) {
-      const d = Math.hypot(p.x - last.x, p.y - last.y)
-      const n = Math.max(1, Math.ceil(d / 4))
-      for (let i = 1; i <= n; i++) {
-        await s.send('Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x: last.x + ((p.x - last.x) * i) / n, y: last.y + ((p.y - last.y) * i) / n,
-          button: 'left', buttons: 1, pointerType: 'pen',
-        })
-        await sleep(8)
-      }
-      last = p
-    }
-    await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: last.x, y: last.y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'pen' })
-    await sleep(260)
-  }
-
+  /* ② 从一张卡划回它自己：同一个东西不算一条连接 */
+  await s.mouse(st6b.a.cx, st6b.a.cy, { steps: 6, dx: 30, dy: 10 })
+  await sleep(700)
+  const after2 = await readBoard()
+  if (after2.count === 2) ok('同一张卡里划一笔：也不算连接')
+  else bad(`同一张卡里划一笔却多了记录（现在 ${after2.count} 条）`)
+  await s.key('p', 'KeyP', 80)
   await s.key('Escape', 'Escape', 27)
-  await drawScreen(shaftS) // ① 一杆
-  await s.key('Escape', 'Escape', 27) // 把这杆浮出来的那排词收掉（不然下面数词会数到它）
-  await drawScreen(vS) // ② 一个 V 尖（单独一笔）
-
-  /* 验一次"我算的屏幕坐标 = 应用算的"：把**应用自己存下来的点**（板文件里的最后一笔）
-     用同一个公式映回屏幕，跟我打算画的位置比。差一点点没关系（应用会抽稀），
-     差几十像素就说明 dpr / 原点 / 缩放有一样算错了。 */
-  await sleep(1100)
-  let mapOk = null
-  try {
-    const doc = await read()
-    const last = doc.strokes[doc.strokes.length - 1]
-    const w0 = { x: last.points[0], y: last.points[1] }
-    const vi = await s.eval(`(() => {
-      const [xs, xtx, xty] = document.querySelector('canvas.bd-ink').dataset.xform.split(',').map(Number)
-      const dpr = window.devicePixelRatio || 1
-      const st = document.querySelector('.bd-stagewrap').getBoundingClientRect()
-      return { s: xs / dpr, tx: xtx / dpr, ty: xty / dpr, left: st.left, top: st.top }
-    })()`)
-    const back = { x: vi.left + w0.x * vi.s + vi.tx, y: vi.top + w0.y * vi.s + vi.ty }
-    mapOk = Math.hypot(back.x - vS[0].x, back.y - vS[0].y)
-    if (mapOk <= 6) ok(`世界→屏幕的映射对得上（应用存下的第一点映回来离我要画的地方 ${mapOk.toFixed(1)}px，缩放 ${vi.s.toFixed(3)}）`)
-    else bad(`映射差了 ${mapOk.toFixed(1)}px：应用存的是 ${JSON.stringify(w0)}，映回屏幕是 (${Math.round(back.x)},${Math.round(back.y)})，我要画的是 (${Math.round(vS[0].x)},${Math.round(vS[0].y)})`)
-  } catch (e) {
-    bad('读不到板文件里的最后一笔：' + e.message)
-  }
-
-  const now = await readBoard()
-  if (now.count === 3) ok('连接变成 3 条（这一杆连着 A → B）')
-  else bad(`连接数是 ${now.count}，应该是 3`)
-  if (now.kinds.filter((x) => x === '因果').length === 2) ok('两笔分开画的箭头也被读成「因果」—— 尖是旁边那一笔，但它认出来了')
-  else bad(`面板里的词是 ${JSON.stringify(now.kinds)}，应该出现两次「因果」`)
-  if (now.pills === 3) ok('三条连接各一颗词（手动标的「推导」+ 两条读出来的「因果」）')
-  else bad(`屏幕上挂着 ${now.pills} 颗词，应该是 3`)
-  /* ★ 合成箭头的数：只有**手动标了方向**的那条（[5] 标的「推导」）才画一个。
-     这一节的两条箭头（[6] 的回勾 + 这里的真箭头）都应该**一个都不画** ——
-     尖是用户自己画上去的，再叠一个就是"一支箭上长两个头"。 */
-  if (now.arrows === 1) ok('屏幕上只有 1 个合成箭头（[5] 那条手动标了「推导」的）；你自己画了尖的两条都不叠')
-  else bad(`屏幕上有 ${now.arrows} 个合成箭头 —— 应该是 1（手动标的那条）`)
-  const links = await fileLinks(200)
-  if (links && links.join(',') === 'derive') ok('文件里还是只有你手动标过的那一个词（形状读出来的一律不写盘）')
-  else bad(`文件里的 link 变了：${JSON.stringify(links)}`)
 }
 
 /* ═════════════════ 7. 空白处的乱笔不算连接 ═════════════════ */
 console.log('\n[7] 在空白处乱画一笔：不算连接，也不浮词')
 {
   /* ★ 先把上一笔留下的那排词收掉再测。
-     踩过：上一步（带箭头那一笔）也浮了词，3.5 秒才自己收走 ——
-     不等它收就画乱笔，看到的还是**上一步那排词**，报出来却是"乱画也浮词"。
-     这类"上一屏的东西还没走"的假红，在这一族自检里很常见（浮层都有停留时间）。 */
+     踩过：上一步也浮了词、3.5 秒才自己收走 —— 不等它收就画乱笔，
+     看到的还是**上一步那排词**，报出来却是"乱画也浮词"。 */
   await s.key('Escape', 'Escape', 27)
-  const st4 = await readBoard()
-  if (!st4.chipsOpen) ok('先把上一步那排词收干净了（不然下面看到的是它）')
+  const st7 = await readBoard()
+  if (!st7.chipsOpen) ok('先把上一步那排词收干净了（不然下面看到的是它）')
   else bad('那排词没收掉 —— 这一条没测准')
-  if (st4.count !== 3) bad(`开始这一步时连接应该是 3 条，实际 ${st4.count}`)
+  if (st7.count === 2) ok(`开始这一步时有 ${st7.count} 条连接`)
+  else bad(`开始这一步时应该是 2 条连接，实际 ${st7.count}`)
   /* 空白处：两张卡中间那一带的**侧面**（中轴上是那条连线）。 */
-  const x = st4.a.cx + Math.round(st4.a.w * 0.75)
-  const y = Math.round((st4.a.y + st4.a.h + st4.b.y) / 2)
+  const x = st7.a.cx + Math.round(st7.a.w * 0.75)
+  const y = Math.round((st7.a.y + st7.a.h + st7.b.y) / 2)
   await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0, pointerType: 'pen' })
   await sleep(120)
   await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'pen' })
@@ -454,102 +396,97 @@ console.log('\n[7] 在空白处乱画一笔：不算连接，也不浮词')
   await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x + 72, y, button: 'left', buttons: 0, clickCount: 1, pointerType: 'pen' })
   await sleep(300)
   const now = await readBoard()
-  if (now.count === 3) ok('连接还是 3 条（乱笔没有变成关系）')
+  if (now.count === 2) ok('连接还是 2 条（乱笔没有变成关系）')
   else bad(`连接变成了 ${now.count} 条 —— 空白处的笔被当成连线了`)
   if (!now.chipsOpen) ok('也没有浮出那排词（不该打断你）')
   else bad('乱画一笔也浮出了那排词')
 }
 
-/* ═════════════════ 8. 重开：你标过的词还在 ═════════════════ */
-console.log('\n[8] 重开一次：你标过的那个词还在')
+/* ═════════════════ 8. 重开：两种连接都活得下来 ═════════════════ */
+console.log('\n[8] 重开一次：你点的词还在（画出来的那种存在笔迹上、连出来的那种存在记录里）')
 {
   await open()
   const now = await readBoard()
-  if (now.count === 3) ok('重开之后还是 3 条连接（都是从笔迹现算的）')
+  if (now.count === 2) ok('重开之后还是 2 条连接')
   else bad(`重开之后连接数变成 ${now.count}`)
-  if (now.kinds.includes('推导')) ok('你标过的「推导」还在（存在那一笔上）')
-  else bad(`你标过的词丢了：${JSON.stringify(now.kinds)}`)
-  if (now.kinds.filter((k) => k === '因果').length === 2) ok('两条形状读出来的「因果」也都在（每次从笔迹重算）')
-  else bad(`形状读出来的词丢了：${JSON.stringify(now.kinds)}`)
+  if (now.kinds.includes('推导')) ok('「你画的」那条上的词还在（存在那一笔的 link 字段里）')
+  else bad(`"你画的"那条的词丢了：${JSON.stringify(now.kinds)}`)
+  if (now.kinds.includes('并列')) ok('「你连的」那条上的词也还在（存在 links 记录里）')
+  else bad(`"你连的"那条的词丢了：${JSON.stringify(now.kinds)}`)
+  const doc = await read()
+  if ((doc.links || []).length === 1) ok('文件里那条记录还在（重开读得回来）')
+  else bad(`文件里的 links 不对：${JSON.stringify(doc.links)}`)
 }
 
-/* ═════════════════ 9. 「这条不算连接」：读错了要能一键改回来 ═════════════════ */
-console.log('\n[9] 「不算连接」：自动读错了能一键改回来（点错了还能改回去）')
+/* ═════════════════ 9. 「删掉这条连接」：两种来源，一个动作 ═════════════════ */
+console.log('\n[9] 「删掉这条连接」（那排词里 `0` 那颗）：你连的删记录、你画的删那一笔')
 {
-  /* 为什么这一条这么要紧：形状/位置读出来的连接**会读错**（实测：一条 121px 的手写竖笔
-     正好跨过两坨字就被读成连接）。没有这个口子的话，猜错了只能擦掉那一笔重画 ——
-     那就成了"猜错还锁死"。这里走一遍真实路径：画一条线 → 点「不算连接」→ 它不再是关系、
-     文件里写着 link:"none" → 再框住它 → 点「又算回连接」→ 它又回来了。 */
-  const st5 = await readBoard()
-  if (st5.count === 3) ok(`开始这一步时有 ${st5.count} 条连接`)
-  else bad(`开始这一步时应该是 3 条连接，实际 ${st5.count}`)
+  /* 这颗位置原来写着「不算连接」（那是给"猜错了"配的否决权）。第二刀把猜删掉之后，
+     它换成了这个动作 —— 而一条连接有两种来源，所以同一个动作要翻译成两件事。 */
+  const st9 = await readBoard()
+  if (st9.count === 2) ok(`开始这一步时有 ${st9.count} 条连接`)
+  else bad(`开始这一步时应该是 2 条连接，实际 ${st9.count}`)
 
-  /* ① 再画一条 A→B 的线（从卡片里偏一点起手，免得和 [1] 那条完全重合） */
-  const from = { x: st5.a.cx - Math.round(st5.a.w * 0.25), y: st5.a.cy }
-  const to = { x: st5.b.cx + Math.round(st5.b.w * 0.25), y: st5.b.cy }
+  /* ① 你**连**的那条：点它那颗词 → 那排词 → 按 0 */
+  const pill = await s.eval(`(() => {
+    const p = document.querySelector('.bd-linkpill[data-link-pill]')
+    if (!p) return null
+    const r = p.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), id: p.getAttribute('data-link-pill') }
+  })()`)
+  if (pill) ok(`找到"你连的那条"那颗词（${pill.id}）`)
+  else bad('屏幕上找不到"你连的那条"那颗词')
+  await s.mouse(pill.x, pill.y)
+  const opened = await readBoard()
+  if (opened.chipsOpen) ok('点那颗词 → 那排词又浮出来了')
+  else bad('点那颗词没有浮出那排词')
+  const hasDelete = await s.eval(`!!document.querySelector('.bd-linkchips .bd-linkchip[data-link-kind="delete"]')`)
+  if (hasDelete) ok('那排词里有一颗「删掉这条连接」（data-link-kind="delete"）')
+  else bad('那排词里没有「删掉这条连接」那颗')
+  await s.key('0', 'Digit0', 48)
+  await sleep(1200)
+  const after = await readBoard()
+  if (after.count === 1) ok('删掉之后只剩 1 条（那条记录真的走了）')
+  else bad(`删完还剩 ${after.count} 条`)
+  const doc9 = await read()
+  if (!doc9.links || doc9.links.length === 0) ok('文件里的 links 字段也没了（不留空壳）')
+  else bad(`文件里还留着：${JSON.stringify(doc9.links)}`)
+  const gone = await s.eval(`!document.querySelector('[data-link-line]') && !document.querySelector('.bd-linkpill[data-link-pill]')`)
+  if (gone) ok('屏幕上那条线和那颗词一起消失了')
+  else bad('删完了屏幕上还挂着那条连线')
+  if (doc9.strokes.length === 1) ok('纸上那一笔一个字都没动（删的是记录，不是墨迹）')
+  else bad(`墨迹被动了：${doc9.strokes.length} 笔`)
+
+  /* ② 你**画**的那条：再画一条 A→B 的线 → 那排词 → 按 0 → 删的是**那一笔** */
+  const st9b = await readBoard()
+  const from = { x: st9b.a.cx - Math.round(st9b.a.w * 0.25), y: st9b.a.cy }
+  const to = { x: st9b.b.cx + Math.round(st9b.b.w * 0.25), y: st9b.b.cy }
   await pickTool('笔')
   await s.sleep(150)
   await s.penStroke(from, to, { steps: 10, hover: true })
   const drew = await readBoard()
-  if (drew.count === 4) ok('新画的这条也成了连接（4 条）')
-  else bad(`画完应该是 4 条连接，实际 ${drew.count}`)
-  if (drew.chipsOpen) ok('那排词浮出来了（「不算连接」就在这排里）')
-  else bad('没浮出那排词，后面点不到「不算连接」')
-
-  /* ② 点那排词里的「不算连接」 */
-  const clicked = await s.eval(`(() => {
-    const chips = document.querySelector('.bd-linkchips')
-    if (!chips) return 'no-chips'
-    const b = chips.querySelector('.bd-linkchip[data-link-kind="none"]')
-    if (!b) return 'no-btn'
-    b.click()
-    return 'ok'
-  })()`)
-  if (clicked === 'ok') ok('点了「不算连接」')
-  else bad(`点不到「不算连接」那颗（${clicked}）`)
-  await s.sleep(400)
-  const after = await readBoard()
-  if (after.count === 3) ok('它不再是连接了（回到 3 条）')
-  else bad(`点完还剩下 ${after.count} 条连接，应该是 3 条`)
-  const links9 = await fileLinks()
-  if (links9 && links9.includes('none')) ok('文件里那一笔写着 link: "none"（重开也丢不了）')
-  else bad(`文件里没有 link: "none"：${JSON.stringify(links9)}`)
-
-  /* ③ 重开一次：这句"不算连接"还在 */
-  await open()
-  const reopened = await readBoard()
-  if (reopened.count === 3) ok('重开之后它仍然不算连接（那句话是存在笔迹上的）')
-  else bad(`重开之后连接数变成 ${reopened.count}`)
-
-  /* ④ 回头路：框住那一笔 → 浮层里出现「又算回连接」→ 点它 → 它又回来了 */
-  await pickTool('框选')
-  await s.sleep(200)
-  const st6 = await readBoard()
-  /* ⚠ 框子要从**卡片外面的空白**起手、一路框过两张卡（和 [5] 同一套写法）：
-     起点落在卡片上就成了"拖卡片"，画不出框 —— 第一次写这一步时框了 80×80 的小框、
-     起点正好在卡上，于是"[data-ink-nolink] 没出现"，看起来像功能坏了。
-     框大一点没关系：选中一条 noLink 的笔就够了（清的时候只清它）。 */
-  const f2 = { x: st6.a.x - 70, y: st6.a.y - 60 }
-  const t2 = { x: st6.b.x + st6.b.w + 70, y: st6.b.y + st6.b.h + 60 }
-  await s.mouse(f2.x, f2.y, { steps: 8, dx: t2.x - f2.x, dy: t2.y - f2.y })
-  const sel = await readBoard()
-  if (sel.inkNoLink) ok('框住它之后，浮层里出现了「又算回连接」')
-  else bad('框住之后没看到回头路（[data-ink-nolink]）')
-  const back = await s.eval(`(() => {
-    const b = document.querySelector('[data-ink-nolink] .bd-linkchip')
-    if (!b) return 'no-btn'
-    b.click()
-    return 'ok'
-  })()`)
-  if (back === 'ok') ok('点了「又算回连接」')
-  else bad(`点不到「又算回连接」（${back}）`)
-  await s.sleep(400)
-  const restored = await readBoard()
-  if (restored.count === 4) ok('它又算回连接了（4 条）')
-  else bad(`恢复之后是 ${restored.count} 条，应该是 4 条`)
-  const links9b = await fileLinks()
-  if (links9b && !links9b.includes('none')) ok('文件里那个 link: "none" 也去掉了')
-  else bad(`文件里还留着 link: "none"：${JSON.stringify(links9b)}`)
+  if (drew.count === 2) ok('新画的这条也成了连接（2 条）')
+  else bad(`画完应该是 2 条连接，实际 ${drew.count}`)
+  if (drew.chipsOpen) ok('那排词浮出来了')
+  else bad('没浮出那排词，后面点不到')
+  const inkBefore = drew.ink
+  await s.key('0', 'Digit0', 48)
+  await sleep(1200)
+  const del = await readBoard()
+  if (del.count === 1) ok('这条不算连接了（回到 1 条）')
+  else bad(`删完还剩 ${del.count} 条`)
+  if (del.ink === inkBefore - 1) ok(`那一笔也从墨迹层里删掉了（${inkBefore} → ${del.ink}）—— "删掉这条连接"对画出来的那条就是删那一笔`)
+  else bad(`墨迹层笔数不对：${inkBefore} → ${del.ink}`)
+  const doc9b = await read()
+  if (doc9b.strokes.length === 1) ok('文件里也只剩那一笔（画出来的那条不留记录、删了就是删了）')
+  else bad(`文件里的笔数不对：${doc9b.strokes.length}`)
+  /* 一步撤销能把它找回来（和别处一样：删是一条正常的撤销步） */
+  await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
+  await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, modifiers: 2 })
+  await sleep(900)
+  const undone = await readBoard()
+  if (undone.count === 2) ok('Ctrl+Z 一步就把它找回来了（2 条）')
+  else bad(`Ctrl+Z 之后是 ${undone.count} 条（应该 2 条）`)
 }
 
 /* ═════════════════ 10. 板框：留下 / 起名 / 整体挪 / 拆开 ═════════════════ */
@@ -560,7 +497,9 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
        · 顶栏那颗名字**点得到**（elementFromPoint）——浮出来的把手被盖住是踩过的坑；
        · 双击它就地改名、回车落盘；
        · 拖它 = **成员整体挪**（框线是成员的函数，跟着走）。 */
-  const docBefore = await read()
+  /* ⚠ 这一段要读**文件**（不是屏幕），所以每处读之前都要给它自动存盘的时间：
+     应用的自动存盘是"停手 0.7 秒后写盘"（README「别按 Ctrl+S」那一节）。 */
+  const docBefore = await read({ wait: 900 })
   const pointsOf = (doc, ids) =>
     JSON.stringify(
       (doc.strokes || [])
@@ -602,7 +541,6 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
   if (fr && fr.ids.length >= 2) ok(`文件里写下了 1 个板框（${fr.ids.length} 笔）`)
   else bad(`文件里的 frames 不对：${JSON.stringify(doc1.frames)}`)
   const memberIds = fr ? fr.ids : []
-  const ptsBefore = pointsOf(docBefore, memberIds)
 
   /* 屏幕上出现框 + 那颗名字（它是唯一的把手） */
   const chip = await s.eval(`(() => {
@@ -650,7 +588,11 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
   if (chip2 && chip2.text.includes('这一节')) ok('屏幕上的名字跟着变了')
   else bad(`屏幕上的名字没变：${JSON.stringify(chip2)}`)
 
-  /* 拖它 → **成员整体挪**（框线是成员的函数，自己跟着走） */
+  /* 拖它 → **成员整体挪**（框线是成员的函数，自己跟着走）。
+     ⚠ "拖前的位置"要在**这一刻**重新读一次文件：上面刚改过标题、而自动存盘是停手 0.7 秒后 ——
+     拿 [10] 开头那份快照会比现在的文件少几笔（第一次跑就是栽在这儿：拖前的点里少了一笔）。 */
+  const docPreDrag = await read({ wait: 900 })
+  const ptsBefore = pointsOf(docPreDrag, memberIds)
   await s.mouse(chip2.x, chip2.y, { steps: 8, dx: 60, dy: 40 })
   await sleep(1200)
   const doc3 = await read()
@@ -670,7 +612,7 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
   await sleep(900)
   const doc4 = await read()
   if (pointsOf(doc4, memberIds) === ptsBefore) ok('Ctrl+Z 一步就把整次拖动退回去了（一次拖动 = 一步撤销）')
-  else bad('Ctrl+Z 之后位置没回到拖动前')
+  else bad(`Ctrl+Z 之后位置没回到拖动前（拖前 ${ptsBefore.slice(0, 70)} / 撤销后 ${pointsOf(doc4, memberIds).slice(0, 70)}）`)
 
   /* 点那颗名字选中 → Delete 拆开（内容一个字都不动） */
   await s.mouse(chip2.x, chip2.y, { steps: 0 })

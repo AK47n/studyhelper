@@ -26,13 +26,13 @@ import {
 /* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
    改词 / 反向 / 「不算连接」/ 回头路 / 留下板框 的规矩都在那儿，纯函数、有断言。 */
 import {
-  applyStrokeLink, clearCond, clearNoLinkMarks, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
+  applyStrokeLink, clearCond, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
 } from '../lib/selection.js'
-/* 板框 / 连接这两个概念的**动作**（留下 / 加进来 / 改标题 / 拆开 / 整体挪 / 删掉连接）
-   在 frames.js —— 和 selection.js 一个路子：纯函数、有断言。见 ADR-0001。 */
-import { dissolveFrame, setFrameTitle, translateFrame } from '../lib/frames.js'
+/* 板框 / 连接这两个概念的**动作**（留下 / 加进来 / 改标题 / 拆开 / 整体挪 / 删掉连接 /
+   吸附到最近的卡片或板框）在 frames.js —— 和 selection.js 一个路子：纯函数、有断言。见 ADR-0001。 */
+import { declareLink, dissolveFrame, removeLink, setFrameTitle, setLinkKind, snapNode, translateFrame } from '../lib/frames.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { LINK_KINDS, LINK_NONE, condCard, condInk, linkKind } from '../lib/link-kinds.js'
+import { ARROW_LINK, LINK_DELETE, LINK_KINDS, condCard, condInk, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
@@ -219,6 +219,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const lastLassoRef = useRef(null)
   /* 板框整体拖动的起点：{ id, before }（before = 按下那一刻的板，松手时进撤销栈）。 */
   const frameDragRef = useRef(null)
+  /* 箭头工具那一次划动：{ from: 世界点, to: 世界点 }。
+     它是**一次性的手势**（画完就回笔、纸上不留墨）—— 见 ADR-0001。 */
+  const arrowRef = useRef(null)
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -496,11 +499,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     [links]
   )
   /* ── 框住的那些笔意味着什么 ───────────────────────────────────────────────
-     `sel.link`（框里正好一条连接线 → 改词那排）、`sel.noLink`（框里有"不算连接" →
-     回头路）、`sel.group`（框住的正好是一整块 → 拆开）、`sel.box`（那个虚线框）、
-     `sel.strokes`（选中的笔迹对象）—— 这五件事从前是这里五个 useMemo，现在收成
-     `readSelection` 一次读（规矩和来历见 src/lib/selection.js 的文件头）。
-     判据都在那个 module 里：集合完全相等才算"这一块"、正好一条才算"这条线"。 */
+     `sel.link`（框里正好一条连接线 → 改词那排）、`sel.frame`（框住的正好是一个板框的笔 →
+     拆开）、`sel.box`（那个虚线框）、`sel.strokes`（选中的笔迹对象）——
+     这几件事从前是这里一堆 useMemo，现在收成 `readSelection` 一次读
+     （规矩和来历见 src/lib/selection.js 的文件头）。
+     判据都在那个 module 里：集合完全相等才算"这个框"、正好一条才算"这条线"。 */
   const sel = useMemo(() => readSelection(board, inkSel, links), [board, inkSel, links])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
@@ -597,6 +600,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
+      /* ★ 箭头工具（一次性的，见 ADR-0001）：这一下不是画墨，是"拉一条关系"。
+         起点先记下来、拖动时画一条预览线（两端吸到谁就把谁圈一下），松手才写进 `links`。
+         纸上**不留墨** —— 屏幕上那条箭头是应用画的（见 links.js 的 readDeclaredLinks）。 */
+      if (tool === 'arrow') {
+        arrowRef.current = { from: wp, to: wp }
+        paintArrowLive(liveRef, boardRef.current, wp, wp, boardRef.current.view)
+        return
+      }
+
       // 中键 / 空格 / 手指 → 平移。手写笔永远只画画，这是 Surface 上最要紧的一条。
       if (e.button === 1 || spaceRef.current || e.pointerType === 'touch') {
         panRef.current = { lp, tx: boardRef.current.view.tx, ty: boardRef.current.view.ty }
@@ -683,6 +695,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         }
         lassoRef.current.box = box
         setLasso(box)
+        return
+      }
+
+      /* 箭头工具拖着的时候：预览线跟着走（含"吸到谁"的圈）。 */
+      if (arrowRef.current) {
+        const lp = localPoint(e)
+        const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
+        arrowRef.current.to = wp
+        paintArrowLive(liveRef, boardRef.current, arrowRef.current.from, wp, boardRef.current.view)
         return
       }
 
@@ -787,6 +808,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       pointersRef.current.delete(e.pointerId)
       if (pointersRef.current.size < 2) pinchRef.current = null
       panRef.current = null
+
+      /* ★ 箭头工具松手 = 这一步真的发生：两端吸到最近的卡片/板框，写进 `links`。
+         一次性：画完回笔（见 ADR-0001 的候选 3）。 */
+      if (arrowRef.current) {
+        const a = arrowRef.current
+        arrowRef.current = null
+        clearLive(liveRef)
+        finishArrow(a.from, a.to)
+        return
+      }
 
       /* 框选松手：把圈到的墨迹选上。
          用 lassoRef 里的 box 而不是 lasso 这个 state —— 两者在同一帧里可能差一步，
@@ -927,14 +958,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const k = LINK_KINDS[Number(e.key) - 1]
         if (k) {
           e.preventDefault()
-          applyLink(linkPick.strokeId, k.id)
+          applyLink(linkPick, k.id)
           return
         }
       }
-      /* `0` = 这条不算连接（和 1~5 同一排，手不用离开键盘）。 */
+      /* `0` = 删掉这条连接（和 1~5 同一排，手不用离开键盘）。 */
       if (linkPick && e.key === '0') {
         e.preventDefault()
-        applyLink(linkPick.strokeId, LINK_NONE)
+        applyLink(linkPick, LINK_DELETE)
         return
       }
       if (linkPick && e.key === 'Escape') {
@@ -976,6 +1007,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       if (e.key === 'e' || e.key === 'E') return setTool('eraser')
       // S = select：框选。挑 S 是因为它没被占（P 是笔、E 是橡皮、W 是写字板、Space 是平移）
       if (e.key === 's' || e.key === 'S') return setTool('select')
+      /* A = arrow：箭头工具（一次性的，见 ADR-0001）。挑 A 是因为它没被占，
+         而且"Arrow"这个词本身就带着它 —— 用笔的人不用跑去点栏上那颗按钮。 */
+      if (e.key === 'a' || e.key === 'A') {
+        setTool('arrow')
+        flash('箭头工具：从一样东西划到另一样东西（画完自动回到笔）', 'ok')
+        return
+      }
       // W = write：写字板。挑 W 是因为它没被占（P 是笔、E 是橡皮、Space 是平移）
       if (e.key === 'w' || e.key === 'W') {
         setPadOpen((v) => !v)
@@ -1091,47 +1129,98 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash(locked ? '固定住了：拖不动、双击也不会进编辑（点 📌 解开）' : '解开了，可以拖了', 'ok')
   }
 
+  /* ── 箭头工具：一次划动 = 一条连接（见 ADR-0001）───────────────────────────
+   *
+   * 用户 2026-09-17：「现在在识别上箭头啊、墨迹块啊很可能达不到用户的需求，
+   * 所以我需要的是**直接把这些功能交给用户**」。
+   * 于是"一条连接从哪来"这件事换了个来源：从**猜**（形状/位置判据，实测 92:0）
+   * 换成**宣告** —— 你选一次箭头工具、划一笔、松手定两头。
+   *
+   * ★ 一次性：画完自动回到笔。理由是他自己的用法 ——
+   *   「往往两个板块画完之后只要连一笔，而不是很多个板块后慢慢链接」。
+   * ★ 纸上不留墨：屏幕上那条箭头是应用画的（`readDeclaredLinks`），
+   *   所以它两端贴着框/卡的边、框一动跟着动。
+   * ⚠ 两头**都必须吸到东西**才算数：吸不到就说清楚是哪一头没吸上。
+   *   （"允许一头悬空"还没做 —— 那要给记录存一个世界坐标点、再加一条"以后把那一头接上去"
+   *     的交互，是独立的一刀；现在靠 40px 的吸附半径兜"停在东西前面一点"这种情况。） */
+  function finishArrow(from, to) {
+    const b = boardRef.current
+    const na = snapNode(b, from)
+    const nb = snapNode(b, to)
+    if (!na || !nb) {
+      const miss = !na && !nb ? '两头都没落在东西上' : !na ? '起点那一头没落在东西上' : '终点那一头没落在东西上'
+      flash(`${miss} —— 画到卡片或板框上（离得近一点也算）`, 'warn')
+      return
+    }
+    if (na.id === nb.id) {
+      flash('两头是同一个东西 —— 一条连接要连两个不同的卡片/板框', 'warn')
+      return
+    }
+    const next = declareLink(b, na.id, nb.id, ARROW_LINK)
+    if (next === b) {
+      flash('这两样之间已经有一条了 —— 点线上那颗词能改词、或者删掉', 'warn')
+      return
+    }
+    commit(next)
+    setTool('pen') // 一次性：画完回笔
+    /* 顺手把那排词浮出来：想改成「推导/并列/等价」当场就能点（3.5 秒不点自己收走）。 */
+    const hit = linkReader.read(next).find((l) => l.declared && l.a === na.id && l.b === nb.id)
+    if (hit) {
+      const { x, y } = linkPickAt(hit.mid)
+      setLinkPick({ id: hit.id, declared: true, a: hit.a, b: hit.b, x, y, kind: hit.kind, dir: hit.dir })
+    }
+    const nm = (n) => (n.kind === 'frame' ? n.label : '卡片')
+    flash(`连上了：${nm(na)} → ${nm(nb)}（因果；想改词点线上那颗词）`, 'ok')
+  }
+
   /* ── 连接线上的那一步（可选）──
    * 2026-09-16 用户：「我要更便捷的显示出两者之间的主次、因果、并列等关系」
    * 「我操作的速度是很快的，我没有时间去逐步花很多时间操作这个表示关系的步骤」
    *
-   * 所以这里的设计是**零步骤优先**：一条连接 = 你画的那一笔（形状决定类型，见
-   * lib/board.js 的 buildLinks / classifyLinkShape），画完就成立、屏幕上立刻有标记。
-   * 下面这几个函数只做一件事：**让你随时用一下（或者不用）去改那一个词** ——
-   * 画完 3.5 秒浮出来，不点就收走；以后想改，框住那条线还能再浮一次。
+   * 所以这里的设计是**零步骤优先**：**你画的**那条线（两张卡之间）画完就成立；
+   * **你连的**那条（箭头工具）连上就成立、屏幕上立刻有线有词。
+   * 下面这个函数只做一件事：**让你随时用一下（或者不用）去改那一个词** ——
+   * 画完 3.5 秒浮出来，不点就收走；以后想改，点线上那颗词 / 框住那条线还能再来一次。
    *
    * 为什么不用弹窗/必须点：你在想事情的时候，任何"必须先处理一下"的界面都是打断。
-   * 为什么还要留这一个口子：形状读不出箭头的手型是真实存在的（比如分两笔画），
-   * 那就必须有一条"一句话改回来"的路，否则猜错了只能重画。
-   */
-  function applyLink(strokeId, kind, opt = {}) {
-    /* 改词这一整套规矩（⇄ 反向 = 把点倒过来、"和自动读出来的相同时不写字段"、
-       「不算连接」写在**整条链**上）都在 src/lib/selection.js 的 `applyStrokeLink` 里，
-       纯函数、有断言（check-board [6m]）。这里只管"写进板 + 说一句话"。
+   * 为什么还要留这一个口子：五个词里只有「因果」是箭头工具的本意，
+   * 要表达"推导"必须有一条一句话改掉的路。
+   *
+   * ★ 一条连接有两种来源，`0` 那颗「删掉这条连接」翻译成两件事：
+   *   · **你连的**（`board.links` 里那条记录）→ 删掉记录；
+   *   · **你画的**（一笔线连了两张卡）→ 删掉那一笔（线没了，关系自然也没了）。 */
+  function applyLink(link, kind, opt = {}) {
+    if (!link) return
+    const b = boardRef.current
+    if (link.declared) {
+      const next = kind === LINK_DELETE ? removeLink(b, link.a, link.b) : setLinkKind(b, link.a, link.b, kind)
+      if (next === b) return
+      commit(next)
+      setLinkPick(null)
+      flash(kind === LINK_DELETE ? '删掉这条连接了（Ctrl+Z 能退回）' : `这条连接：${linkKind(kind).name}`, 'ok')
+      return
+    }
+    /* 画出来的那一条：整条规矩（改词、反向、和"自动那一档"相同时不写字段）都在
+       selection.js 的 `applyStrokeLink` 里，纯函数、有断言（check-board [6m]）。
        返回 null = 那个词不认识 —— 什么都不做，也不弹提示。 */
-    const next = applyStrokeLink(boardRef.current, links, strokeId, kind, opt)
+    if (kind === LINK_DELETE) {
+      const ids = new Set(link.ids && link.ids.length ? link.ids : [link.strokeId])
+      commit((cur) => removeStrokes(cur, ids))
+      setLinkPick(null)
+      setInkSel(null)
+      flash('删掉这条线了 —— 关系跟着那一笔一起没了（Ctrl+Z 能退回）', 'ok')
+      return
+    }
+    const next = applyStrokeLink(b, links, link.strokeId, kind, opt)
     if (!next) return
     commit(next)
     setLinkPick(null)
-    if (kind === LINK_NONE) {
-      /* 「不算连接」= 这道门要有回头路：清掉选中，免得那排词留在屏幕上
-         （框住它还能改回来，见 clearNoLink）。 */
-      setInkSel(null)
-      flash('这条不算连接了（框住它还能恢复；Ctrl+Z 也能）', 'ok')
-      return
-    }
     flash(opt.reverse ? `方向反过来了：${linkKind(kind).name}` : `这条线：${linkKind(kind).name}`, 'ok')
   }
 
-  /* 把选中的那几笔从"不算连接"改回来（那道单向门的回头路）。
-     ★ 要按**整条链**清 —— 只清框住那一笔的话，链里还剩一笔 none，
-     buildLinks 仍然整条跳过：用户点了按钮却什么都没发生（审查挑出来的那条）。 */
-  function clearNoLink() {
-    if (!inkSel || !inkSel.size) return
-    commit((cur) => clearNoLinkMarks(cur, inkSel))
-    setInkSel(null)
-    flash('又算回连接了（按形状重新判）', 'ok')
-  }
+  /* 「又算回连接」（那道单向门的回头路）第二刀删掉了 ——
+     它存在的理由是"形状判读会猜错"，而形状判读整族已经删掉（ADR-0001）。
+     现在"这条连错了"只有一句：删掉这条连接（那排词里 `0` 那颗）。 */
 
   /* ── 「这个条件不算」/「条件就是它」 ────────────────────────────────────────
    * 条件本来是**位置送的**：写在那条线弧长中点旁边的字/卡自动成为它的条件。
@@ -1267,7 +1356,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* 点那颗词（已经标过的连接上那个小标签）→ 再浮一次，方便改。 */
   function openLinkPick(link) {
     const { x, y } = linkPickAt(link.mid)
-    setLinkPick({ strokeId: link.strokeId, x, y, kind: link.kind, dir: link.dir })
+    setLinkPick({
+      strokeId: link.strokeId,
+      id: link.id,
+      declared: !!link.declared,
+      a: link.a,
+      b: link.b,
+      x,
+      y,
+      kind: link.kind,
+      dir: link.dir,
+    })
   }
 
   /* 3.5 秒不点就收走（指针停在那排词上就不收 —— 正在读的人别被打断）。 */
@@ -1402,7 +1501,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, hoverEdge, eraserAt,
     links, selLink: sel.link, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
-    inkNoLink: sel.noLink, onClearNoLink: clearNoLink, inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
+    inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
     /* 板框那一族（见 frames.js）：渲染要的是"框 + 框线矩形"，交互只有把手那三件事。 */
     frames: framesToDraw,
     frameEditId,
@@ -1581,8 +1680,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      笔的语义是"在纸上写"：笔尖落在卡片上应该写得出字，而不是把卡片拖走
      （用户 2026-09-16 报的「无法在卡片上写字」就是这一条）。
      鼠标不适用 —— 鼠标没法写字，而拖卡片 / 缩放 / 双击改内容对鼠标必须一直顺手。
-     「⬚ 框选」是例外：切到它，卡片对所有设备都可交互，用笔的人靠它管理卡片。 */
-  const penInk = penMode && tool !== 'select'
+     「⬚ 框选」是例外：切到它，卡片对所有设备都可交互，用笔的人靠它管理卡片。
+     ★ 「→ 箭头」也是例外，而且**不分设备**：那一下要"从卡片上起手划出去"
+       （起点常常落在卡片里），鼠标用户也得能划 —— 不然箭头工具对鼠标等于坏的。
+       （画完自动回笔，所以卡片让路只是这一下的事。） */
+  const penInk = tool === 'arrow' || (penMode && tool !== 'select')
 
   /* 纸面的类挂在**最外层 .bd 上**（不是 .bd-stagewrap）：
      写字板那块小板也要跟着换纸，而它是 .bd 的兄弟分支，不是 stagewrap 的孩子。
@@ -1963,18 +2065,32 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
   return (
     <div className="bd-tools">
       <div className="bd-group">
-        <button className={'bd-t' + (tool === 'pen' ? ' on' : '')} onClick={() => setTool('pen')} title="笔（P）：手写笔默认就是这个">
+        <button className={'bd-t' + (tool === 'pen' ? ' on' : '')} data-tool="pen" onClick={() => setTool('pen')} title="笔（P）：手写笔默认就是这个">
           ✎ 笔
         </button>
-        <button className={'bd-t' + (tool === 'highlighter' ? ' on' : '')} onClick={() => setTool('highlighter')} title="荧光笔：盖在字上做记号">
+        <button className={'bd-t' + (tool === 'highlighter' ? ' on' : '')} data-tool="highlighter" onClick={() => setTool('highlighter')} title="荧光笔：盖在字上做记号">
           ▬ 荧光
         </button>
-        <button className={'bd-t' + (tool === 'eraser' ? ' on' : '')} onClick={() => setTool('eraser')} title="橡皮（E）：碰到哪一笔就擦掉整笔">
+        <button className={'bd-t' + (tool === 'eraser' ? ' on' : '')} data-tool="eraser" onClick={() => setTool('eraser')} title="橡皮（E）：碰到哪一笔就擦掉整笔">
           ◻ 橡皮
+        </button>
+        {/* 箭头（A）：从一样东西划到另一样东西，松手就连上（见 ADR-0001）。
+            一次性的 —— 画完自己回到笔，因为"两个板块之间连一笔"通常就是一笔。
+            它**不落墨**：屏幕上那条箭头是应用画的（贴着框/卡的边、跟着它们走）。 */}
+        <button
+          className={'bd-t' + (tool === 'arrow' ? ' on' : '')}
+          data-tool="arrow"
+          onClick={() => {
+            setTool('arrow')
+            flash('箭头工具：从一样东西划到另一样东西（画完自动回到笔）', 'ok')
+          }}
+          title="箭头（A）：从一样东西划到另一样东西，松手就连上。一次性 —— 画完自动回到笔；纸上不留墨，那条线是应用画的"
+        >
+          → 箭头
         </button>
         {/* 框选（S）：拖一个矩形圈住笔迹。原来只有"笔杆侧键"这一条路，
             所以用鼠标、或者笔上没有侧键的人根本选不中笔迹 —— 认公式/美化也就无从谈起。 */}
-        <button className={'bd-t' + (tool === 'select' ? ' on' : '')} onClick={() => setTool('select')} title="框选（S）：拖一个框圈住要认的手写 —— 圈住之后框上方浮出「∑ 公式」「✨ 美化」「✕ 删除」。★ 用笔时卡片会给笔让路，想拖卡片 / 缩放 / 双击改字就切到这个工具">⬚ 框选</button>
+        <button className={'bd-t' + (tool === 'select' ? ' on' : '')} data-tool="select" onClick={() => setTool('select')} title="框选（S）：拖一个框圈住要认的手写 —— 圈住之后框上方浮出「∑ 公式」「✨ 美化」「✕ 删除」。★ 用笔时卡片会给笔让路，想拖卡片 / 缩放 / 双击改字就切到这个工具">⬚ 框选</button>
       </div>
 
       <div className="bd-group">
@@ -2191,7 +2307,7 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
                   key={l.strokeId}
                   className={'bd-link-row' + (l.dir ? ' dir' : '')}
                   onClick={() => onFocus(l.a)}
-                  title={l.manual ? '你标过的：' + l.name : '按笔迹形状读出来的：' + l.name}
+                  title={l.manual ? '你点过词的：' + l.name : '你画的一条线，默认按「相关」读：' + l.name}
                 >
                   <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
                     {l.name}
@@ -2258,8 +2374,8 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
             </>
           )}
           <div className="dim small pad">
-            画出来的那条线：形状读出来的（直线=相关、带箭头=因果）**不写进文件**，
-            你点过词的那几条才会记住；你**连**的那些（上面一节）都写在文件里。
+            你**连**的那些（上面一节）都写在文件里（`links`）；你**画**的那条线没点过词时
+            按「相关」读、**不写文件** —— 点过词的那几条才记住。
           </div>
         </div>
       )}
@@ -2534,4 +2650,38 @@ function paintLive(liveRef, stroke, view) {
   ctx.clearRect(0, 0, cv.width, cv.height)
   applyViewTo(ctx, view, dpr)
   drawStroke(ctx, stroke)
+}
+
+/* 箭头工具的预览（见 ADR-0001）：一条线 + 两端吸到谁就把谁的框圈一下。
+ * 为什么值得有预览：这个工具的全部意义是"我划的这一笔连的是哪两样东西" ——
+ * 松手之前看不见"吸到谁了"，就只能靠猜（而那正是这一刀要消灭的东西）。
+ * ★ 画在 live canvas 上、跟着视图变换走；线宽要**除以缩放**，
+ *   屏幕上才是恒定的 2.4px（世界坐标里的线宽会被 ctx 的 scale 放大）。 */
+function paintArrowLive(liveRef, board, from, to, view) {
+  const cv = liveRef.current
+  if (!cv) return
+  const dpr = Math.min(2.5, (typeof window !== 'undefined' && window.devicePixelRatio) || 1)
+  const ctx = cv.getContext('2d')
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.clearRect(0, 0, cv.width, cv.height)
+  applyViewTo(ctx, view, dpr)
+  const s = view && view.s ? view.s : 1
+  const color = linkKind('cause').color
+  ctx.save()
+  ctx.strokeStyle = color
+  ctx.lineWidth = 2.4 / s
+  ctx.lineCap = 'round'
+  ctx.beginPath()
+  ctx.moveTo(from.x, from.y)
+  ctx.lineTo(to.x, to.y)
+  ctx.stroke()
+  /* 吸到谁就圈谁：两头各圈一次（圈的是那个东西的框）。 */
+  for (const p of [from, to]) {
+    const n = snapNode(board, p)
+    if (!n) continue
+    ctx.setLineDash([6 / s, 4 / s])
+    ctx.lineWidth = 2 / s
+    ctx.strokeRect(n.box.x, n.box.y, n.box.w, n.box.h)
+  }
+  ctx.restore()
 }

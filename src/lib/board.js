@@ -15,14 +15,14 @@
  * 就变成了数据的一部分，改缩放等于改内容，撤销栈、Git 备份全跟着脏。
  */
 
-/* 关系的词表（LINK_KINDS / LINK_NONE / isLinkKind…）搬去了 link-kinds.js；
+/* 关系的词表（LINK_KINDS / isLinkKind…）搬去了 link-kinds.js；
    连接那一族的实现搬去了 links.js；点 / 几何 / 关系搬去了 geometry.js；
    「板框 / 连接」这些**动作**在 frames.js。
    board.js 只剩**数据模型**：一张板长什么样、怎么读写、卡片多大。
    这里只用得到 geometry 的一件：**toFlat**（所有入口都把点收敛成扁平数组）。
    （视图映射在 view.js —— 那个现在由 geometry.js 的 fitView 用，这边用不着了：
      读盘时的缩放归一是本地那个 clampScale。） */
-import { ARROW_LINK, COND_NONE, LINK_NONE, isLinkKind, parseCond } from './link-kinds.js'
+import { ARROW_LINK, COND_NONE, isLinkKind, parseCond } from './link-kinds.js'
 import { toFlat } from './geometry.js'
 
 export const BOARD_VERSION = 4
@@ -460,15 +460,12 @@ function normalizeStroke(s) {
        这一条放在归一化里，所以**老文件里的笔迹下次打开也会自动修好**
        （不用你去把画过的荧光笔重描一遍）。 */
     pressure: tool === 'highlighter' ? false : s.pressure !== false,
-    /* 连线的类型（见上面 LINK_KINDS）。
+    /* 连线的词（见 link-kinds.js 的 LINK_KINDS）。
        ★ 认不出的值一律**丢掉**（不退回默认再写回去）—— 手改文件写个 "因果"、
-         "Cause"、或者别的版本的 id，都不该让这一笔变成"手动标过 rel"；
-         丢掉之后它就回到"按形状自动判"，屏幕上的表现是对的。
+         "Cause"、或者别的版本的 id，都不该让这一笔变成"手动标过 rel"。
        ★ 而且这里**不补默认值**：绝大多数笔迹没有这个字段（也永远不该有），
-         补一个 `link: 'rel'` 出去就等于给整本板子造一次假 diff。
-       ★ `'none'`（"这条不算连接"）要原样保留 —— 它是你明确说过的一句话，
-         丢了它，下次打开那条假连接就自己回来了。 */
-    ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
+         补一个 `link: 'rel'` 出去就等于给整本板子造一次假 diff。 */
+    ...(isLinkKind(s.link) ? { link: s.link } : {}),
     /* 条件那一族（见 link-kinds.js 的 parseCond）：`'none'`（这个条件不算）/
        `'card:<id>'` / `'ink:<id>'`（条件就是它）。位置送的条件本身**不存盘**
        （随时能重算），只有你亲口说的那三种值才写。
@@ -564,12 +561,10 @@ export function serializeBoardDocument(board) {
       color: s.color,
       width: round(s.width, 1),
       pressure: s.pressure !== false,
-      /* 连线的类型：**只有你手动标过才写**。
-         形状读出来的（直线 = 相关、带箭头 = 因果）不写 —— 那是从点算出来的，
-         随时能重算；写出去反而会和笔迹对不上（后来把箭头擦掉、补一笔直线，
-         文件里那个"因果"就成了谎话）。老文件里没有这个字段，所以往返仍然字节级一致。
-         `'none'`（"这条不算连接"）同样只在你说过时才写。 */
-      ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
+      /* 连线的词：**只有你手动点过那排词才写**。
+         没点过的连接按最弱那一档读（「相关」，见 DEFAULT_LINK），不写字节日志 ——
+         老文件、没改过的文件在 Git 里纹丝不动。 */
+      ...(isLinkKind(s.link) ? { link: s.link } : {}),
       /* 条件那一族同理，只在你说过时才写；**指的东西还在**才写（死 id 不留尸体 ——
          和板框一样。判据必须按"这一批真会写出去的卡/笔"算，和上面那段同一个道理）。 */
       ...(condToWrite(s.cond) ? { cond: condToWrite(s.cond) } : {}),
