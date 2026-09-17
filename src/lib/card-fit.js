@@ -38,8 +38,16 @@
  *     · sample(cardId, { fitWidth }) → 上面的 sample（**唯一的 DOM 依赖**）
  *     · commit(cardId, patch)        → 把尺寸写进板（Board.jsx 走它那个 commit）
  *     · frame(fn) / later(fn, ms)    → 下一帧 / 稍后再来一趟（注入，好在自检里把握节奏）
+ *     · read()                       → 现在这一版板（"把所有公式卡排上"要用它）
+ *     · fontsReady()                 → 字体就绪的承诺（KaTeX 换上去宽度会变一次）
+ *     · clearLater(handle)           → 撤销一个 later（默认 clearTimeout）
  *     · report(card, info)           → 诊断：把这一趟量到了什么记在 data-fit 上（自检读它）
- *     → { queue, queueFormulaRefits, kick, clear, run, size }
+ *     → { notify, queue, queueFormulaRefits, kick, clear, run, size }
+ *   notify({ reason })  ★ 这条政策的**唯一入口**（2026-09-17 架构 review 候选 6）：
+ *     'load'（换文件 / 重载：清队 + 排上所有公式卡）· 'board-changed'（板变了：防抖
+ *     `FIT_IDLE_MS` 之后再排）· 'editing-ended'（退出编辑：之前挂起的那张再来一趟）·
+ *     'fonts-ready'（字体就绪）。"排完队要开跑""字体就绪补一趟"都在里面 ——
+ *     调用方只报"发生了什么"，不再需要记得同时做两件事。
  */
 
 import { cardHeightFromContent, cardWidthFromContent } from './board.js'
@@ -58,6 +66,12 @@ export const FIT_TOL_AUTO = 1.5
 export const FIT_STABLE_EPS = 1
 export const FIT_MAX_TRIES = 12
 export const FIT_LATER_MS = 150
+/* 板子**安静下来**多久才算安静（"板变了"那条路要防抖一下再量）。
+   400ms 的用意：它比"存盘 700ms"短，所以屏幕上先贴合、再落盘；
+   又比一次连续擦除/画一笔的节奏长，所以一整串手势只量最后一趟。
+   ⚠ 这个数以前住在 Board.jsx（`REFIT_IDLE_MS` + 那个 setTimeout），2026-09-17（候选 6）
+     跟着政策一起搬进来了 —— "什么时候算安静"是这一族的知识，不是调用方的。 */
+export const FIT_IDLE_MS = 400
 /* DOM 上的宽度和数据里的宽度差多少算"还没跟上"（屏幕像素）。
    高度不一样没关系 —— 写的是 min-height，布局尺寸只由宽度决定。 */
 export const FIT_STALE_PX = 1
@@ -110,9 +124,13 @@ export function fitPass(sample, opts = {}) {
 }
 
 /* 量尺寸的队列 + 稳定性/重试策略。所有外部动作（读 DOM、提交、调度）都是注入的。 */
-export function createCardFitter({ sample, commit, frame, later, report, maxTries = FIT_MAX_TRIES } = {}) {
+export function createCardFitter({
+  sample, commit, frame, later, report, maxTries = FIT_MAX_TRIES,
+  read, fontsReady, clearLater, idleMs = FIT_IDLE_MS,
+} = {}) {
   const pending = new Map()
   let framePending = false
+  let idleTimer = null
 
   const run = () => {
     let retryFrame = false
@@ -172,16 +190,18 @@ export function createCardFitter({ sample, commit, frame, later, report, maxTrie
     })
   }
 
-  /* ★ 排队**自己就会开跑**：排了队不叫 scheduleFits 就等于什么都没发生，而且屏幕上
-     完全看不出来（第一版就是这样：卡片纹丝不动，量尺寸那几趟一趟都没跑）。
+  /* ★ 排队**自己就会开跑**：排了队不叫它跑就等于什么都没发生，而且屏幕上完全看不出来
+     （第一版就是这样：卡片纹丝不动，量尺寸那几趟一趟都没跑）。
      已经在队里的**不覆盖** —— 刚插进来那张可能带着自己的选项（比如 keepCenterX）。 */
   function queue(id, opts = {}) {
     if (!pending.has(id)) pending.set(id, { ...opts })
     kick()
   }
 
-  /* 把这张板上所有**有内容的公式卡**排进"重新量一次"的队里。两个调用点共用这一份规矩：
-     换文件/重载那一趟（先 clear 再排）、以及板子安静下来之后那一趟（防抖 400ms）。
+  /* 把这张板上所有**有内容的公式卡**排进"重新量一次"的队里。
+     ⚠ internal seam：调用方走 `notify({ reason })`（'load' / 'board-changed' 两条路都会
+       调它），**别在 module 外面直接调**（2026-09-17 候选 6 之前 Board.jsx 就是这么干的，
+       于是"排完队要开跑"变成了调用方必须记得的第二件事）。只给自检用。
      ⚠ **只管公式卡，便签/文字卡不在这里自动收**：便签在这个应用里有个"容器"身份
        （关系面板那条「公式卡整个落在便签里 → 包含」就是靠"便签比自己的字大一圈"成立的）——
        实测把便签也一起自动收之后，样板板的 3 条连线当场变成 0 条，关系推理整块塌掉。
@@ -198,10 +218,50 @@ export function createCardFitter({ sample, commit, frame, later, report, maxTrie
     kick()
   }
 
+  /* ★ 一条政策、一个入口（2026-09-17 架构 review 候选 6）。
+     "排完队要开跑""字体就绪要补一趟""板安静 400ms 再量"这三件事从前散在
+     Board.jsx 的**六个调用点**里（其中两行逐字抄了两遍），而 card-fit.js 自己的注释里
+     正记着"排了队不叫它开跑就等于什么都没发生"那个坑 —— 它在上一层又出现了一次。
+     现在调用方只报**发生了什么**：load / board-changed / editing-ended / fonts-ready。 */
+  function kickAndWaitFonts() {
+    kick()
+    /* 字体就绪那一趟非有不可：KaTeX 用的是自带 woff2，字体换上去会让宽度变一次，
+       而宽度写的是硬约束（写小了当场裁内容，实测裁掉 `E = mc²` 的 c²）。
+       试过两道"等字体"的闸都不可靠（document.fonts.ready 可能在那张卡触发加载之前
+       就 resolve；fonts.check('1em KaTeX_Main') 对没注册的自定义家族按规范返回 true）——
+       所以不猜：既多量几趟（FIT_LATER_MS × FIT_MAX_TRIES，两条轴都稳才算数），
+       也在字体就绪时再补一脚。 */
+    const f = fontsReady && fontsReady()
+    if (f && typeof f.then === 'function') f.then(() => kick())
+  }
+
+  function notify({ reason } = {}) {
+    if (reason === 'load') {
+      /* 换文件 / 点重载：整队清掉重来（上一张板的那些 id 一个都不该留着）。 */
+      pending.clear()
+      queueFormulaRefits(read ? read() : null)
+      kickAndWaitFonts()
+      return
+    }
+    if (reason === 'board-changed') {
+      /* 防抖：一整串连续操作（画一笔、擦一笔、拖一下、连点几下）只量最后一趟。
+         ⚠ 定时器住在这里 —— 从前它是调用方那个 useEffect 里的 setTimeout。 */
+      if (idleTimer != null) (clearLater || clearTimeout)(idleTimer)
+      idleTimer = later(() => {
+        idleTimer = null
+        queueFormulaRefits(read ? read() : null)
+        kickAndWaitFonts()
+      }, idleMs)
+      return
+    }
+    /* 'editing-ended' / 'fonts-ready' / 别的：就是"现在补一趟"。 */
+    kickAndWaitFonts()
+  }
+
   /** 全清（换文件/重载时用） */
   function clear() {
     pending.clear()
   }
 
-  return { queue, queueFormulaRefits, kick, clear, run, get size() { return pending.size } }
+  return { notify, queue, queueFormulaRefits, kick, clear, run, get size() { return pending.size } }
 }

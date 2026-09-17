@@ -72,10 +72,9 @@ import { displayTex, snippetFor, toTex } from '../lib/formula.js'
 const SAVE_DEBOUNCE_MS = 700
 /* 写盘失败之后隔多久再试（见 flushSave）：宁可重试，也不能让「已存」撒谎。 */
 const SAVE_RETRY_MS = 3000
-/* 笔停下来多久之后，公式卡重新量一次尺寸（见下面那个 effect）。
-   取 400ms 的用意：它比"存盘 700ms"短，所以屏幕上先贴合、再落盘；
-   又比一次连续擦除/画一笔的节奏长，所以一整串手势只量一趟。 */
-const REFIT_IDLE_MS = 400
+/* "板安静多久才算安静"（公式卡重新量尺寸那个防抖）跟着那条政策搬去了
+   `src/lib/card-fit.js` 的 `FIT_IDLE_MS`（2026-09-17 架构 review 候选 6）——
+   这个文件里不再留一份。 */
 /* 橡皮圈的半径：**屏幕像素**（约一个字宽）—— 屏幕上大小恒定，不跟着纸缩放走。
    ⚠ 名字里带单位：它以前叫 `ERASER_R`、注释写着"世界坐标半径"，而用法一直在 `÷ view.s`
      （世界半径）。**注释和名字都撒谎**，正是 ADR-0002 那类"单位的账没人管"的温床。
@@ -283,6 +282,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           commit((c) => ({ ...c, cards: c.cards.map((x) => (x.id === id ? { ...x, ...patch } : x)) }), false),
         frame: (fn) => requestAnimationFrame(fn),
         later: (fn, ms) => setTimeout(fn, ms),
+        clearLater: (h) => clearTimeout(h),
+        /* "什么时候重量"这条政策需要的三样东西，只有这一层拿得到（架构 review 候选 6）：
+           板怎么读、字体就绪的承诺、以及那个防抖定时器本身（定时器现在住 module 里）。 */
+        read: () => boardRef.current,
+        fontsReady: () => (typeof document !== 'undefined' && document.fonts && document.fonts.ready) || null,
         report: (card, info) => {
           const wrap = wrapRef.current
           const el = wrap ? wrap.querySelector('[data-card-id="' + card.id + '"]') : null
@@ -394,10 +398,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        还额外带 1.5 世界像素的余量（`FIT_TOL_AUTO`）—— 所以不会每次打开都造一条假 diff。
        那一整套规矩和三个坑的来历都在 src/lib/card-fit.js 的文件头。
        ⚠ 空白卡（"双击写公式"/"双击写字"那个占位）不量 —— 还没有内容可量。 */
-    fitter.clear()
-    fitter.queueFormulaRefits(b)
-    /* 排队那一步自己会下一帧开跑；再补一趟"字体就绪"（字体换上去会让宽度变一次）。 */
-    scheduleFits()
+    /* ★ 换文件 / 点重载：账本（量尺寸的队列）清掉重来 + 排上所有公式卡 + 等字体补一趟 ——
+       这三件事现在是一句话（`notify`），从前是这里三行、别处又抄一遍。 */
+    fitter.notify({ reason: 'load' })
     // 视野没被你亲手定过 → 每次打开都重新适配一遍。
     // 这么做的原因见 lib/board.js 里 viewPinned 的说明：tx/ty 是相对容器的坐标，
     // 容器一变旧坐标就是错的，与其迁移不如"没定过就重算"。
@@ -426,7 +429,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* 退出编辑态（回车 / 取消 / Esc）时，把"插进来还没量过高度"的卡片量一次。
      编辑态量不得 —— 那时候卡片里装的是编辑器，量出来是编辑器的高度。 */
   useEffect(() => {
-    scheduleFits()
+    fitter.notify({ reason: 'editing-ended' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingId])
 
@@ -442,16 +445,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      而它们跟尺寸无关，白量一趟要强制一次布局。这里盯的是
      `board.strokes` / `board.cards` 这两个**数组的引用**
      （commit 是纯函数式更新，视图变化不会换掉它们）—— 也就是说：
-     **只有笔迹或卡片真的变了才排队**，而且按 REFIT_IDLE_MS 防抖，
-     一整串连续操作只量最后一趟。
+     **只有笔迹或卡片真的变了才排队**；防抖（"安静 400ms"）和"排完队要开跑"
+     现在都在 `card-fit.js` 里（`FIT_IDLE_MS` + `notify`，2026-09-17 候选 6）——
+     这里只报一句"板变了"，不再自己拿一个 setTimeout。
 
      ⚠ 正在编辑的那张会挂起来等（card-fit.js 的 'wait'）。 */
   useEffect(() => {
-    const t = setTimeout(() => {
-      fitter.queueFormulaRefits(boardRef.current)
-      scheduleFits() // 补"字体就绪"那一趟（排队自己已经会下一帧开跑）
-    }, REFIT_IDLE_MS)
-    return () => clearTimeout(t)
+    fitter.notify({ reason: 'board-changed' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board.strokes, board.cards])
 
@@ -1422,20 +1422,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setInkMode(mode)
   }
 
-  /* 排上量尺寸的头几趟：**字体就绪**那一趟非有不可 —— KaTeX 用的是自带 woff2，
-     字体换上去会让宽度变一次，而宽度写的是硬约束（写小了当场裁内容，实测裁掉 `E = mc²` 的 c²）。
-     试过两道"等字体"的闸都不可靠（document.fonts.ready 可能在那张卡触发加载之前就 resolve；
-     document.fonts.check('1em KaTeX_Main') 对没注册的自定义家族按规范返回 true）。
-     所以不猜：**多量几趟**（每 150ms 一趟 = `FIT_LATER_MS`，最多 12 趟 = `FIT_MAX_TRIES`），
-     连续两趟量出同一个数才算准 —— 字体换上去那一次必然被抓住（见 card-fit.js）。
-     排队（fitter.queue / queueFormulaRefits）自己已经会下一帧开跑，这里只补这一趟。 */
-  function scheduleFits() {
-    fitter.kick()
-    const fonts = typeof document !== 'undefined' ? document.fonts : null
-    if (fonts && fonts.ready && typeof fonts.ready.then === 'function') {
-      fonts.ready.then(() => fitter.kick())
-    }
-  }
+  /* 排上量尺寸的头几趟（字体就绪那一趟、以及"排完队要开跑"）已经不在这里了 ——
+     整套"什么时候重量"搬进了 `src/lib/card-fit.js` 的 `notify({ reason })`
+     （2026-09-17 架构 review 候选 6）。这个文件只报"发生了什么"：
+     load / board-changed / editing-ended，外加插入那张卡的定向 `queue`。
+     ★ 那条坑还在原处记着：**排了队不叫它开跑就等于什么都没发生**，
+       而现在没有哪条路能忘掉这一脚（`queue` 和 `notify` 内部都会 kick）。 */
 
   /* 识别结果落成一张卡（文字卡或公式卡）。
    *
@@ -1474,7 +1466,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        两条轴都收，公式卡和文字卡一样（"就让框贴合公式和字"）。
        勾不勾"擦掉原笔迹"只影响**那几笔还在不在**，不再影响卡片多大。
        ★ 插完是进编辑态的，所以这一次量不着（编辑器不是内容）——
-         排进队里，等退出编辑时那一趟（editingId 一变就 scheduleFits）量。 */
+         排进队里，等退出编辑时那一趟（`notify('editing-ended')`）量。 */
     fitter.queue(card.id, { fitWidth: true })
     flash(
       (isFormula ? '公式卡放上去了' : '放上去了') +

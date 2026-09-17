@@ -33,7 +33,7 @@ import {
 import { COND_NONE, LINK_DELETE, condCard, condInk, parseCond } from '../src/lib/link-kinds.js'
 /* 卡片「按内容量尺寸」那一套规矩搬去了 card-fit.js（2026-09-16）：DOM 读数是注入的，
    所以"提交完不能立刻再量"这类坑在这儿断言得到（见 [6l]）。 */
-import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
+import { FIT_IDLE_MS, FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
 /* 选中这一族（框住的笔意味着什么 + 改词/反向/否决/回头路/固定/拆开）搬去了 selection.js
    （2026-09-16）：纯函数、有断言（见 [6m]）。 */
 import {
@@ -1640,6 +1640,68 @@ console.log('\n[6l] 卡片量尺寸（`createCardFitter`）：DOM 读数是注�
     gone.pass()
     eq(gone.fitter.size, 0, '卡片已经从板里没了 → 立刻出队')
     eq(gone.frames.length, 0, '也不会再排下一帧（空转的 rAF 就是这么来的）')
+  }
+
+  /* ⑩ ★ 「什么时候重量」这条政策只有一个入口（2026-09-17 架构 review 候选 6）：
+     调用方（Board.jsx）只报一句"发生了什么"，剩下的三件事 —— 排上所有公式卡、
+     等字体就绪补一趟、板安静 FIT_IDLE_MS 之后再量 —— 全在 module 里。
+     从前它们在 Board.jsx 的**六个调用点**上（其中两行逐字抄了两遍）。 */
+  {
+    const board = {
+      cards: [
+        { id: 'f1', kind: 'formula', tex: 'a=b', w: 100, h: 40 },
+        { id: 'f2', kind: 'formula', tex: '', w: 100, h: 40 },
+        { id: 'n1', kind: 'note', text: '一段话', w: 200, h: 60 },
+      ],
+    }
+    const timed = []
+    const cleared = []
+    let fontKicks = 0
+    const { fitter, frames } = mkFitter({
+      sample: () => mkSnap(mkCard()),
+      read: () => board,
+      /* 假的"字体就绪"：立刻 resolve（真的那个是 document.fonts.ready） */
+      fontsReady: () => ({ then: (fn) => { fontKicks++; fn() } }),
+      later: (fn, ms) => { timed.push({ fn, ms }); return timed.length },
+      clearLater: (h) => cleared.push(h),
+    })
+    fitter.queue('old', { fitWidth: true }) // 上一张板留下的
+    eq(fitter.size, 1, '先排一张（模拟上一张板留下的队）')
+    fitter.notify({ reason: 'load' })
+    eq(fitter.size, 1, "notify('load')：清队重来 → 队里只剩这张板上那个有内容的公式卡")
+    eq(frames.length, 1, '  （排队自己排一帧；字体那一脚合进同一帧 —— 一次只跑一趟）')
+    eq(fontKicks, 1, "notify('load') 会顺手等一次字体就绪（KaTeX 换上去宽度会变一次）")
+    eq(timed.length, 0, "  （'load' 不防抖：换文件那一刻就该量）")
+
+    fitter.notify({ reason: 'board-changed' })
+    eq(timed.length, 1, "notify('board-changed')：**不立刻量**，先挂一个定时器（防抖）")
+    eq(timed[0].ms, FIT_IDLE_MS, `  （等的是 FIT_IDLE_MS=${FIT_IDLE_MS}）`)
+    const sizeBefore = fitter.size
+    fitter.notify({ reason: 'board-changed' })
+    eq(cleared.length, 1, '★ 再报一次：**上一个定时器被撤掉**（一整串连续操作只量最后一趟）')
+    if (fitter.size === sizeBefore) ok('  （还没到点，队里没动静）')
+    else bad('防抖期间不该排队')
+    timed[timed.length - 1].fn()
+    eq(fitter.size, 1, '定时器到点：才真的排上公式卡')
+    eq(fontKicks, 2, '  （也补了字体那一脚）')
+
+    const framesBefore = frames.length
+    fitter.notify({ reason: 'editing-ended' })
+    if (frames.length >= framesBefore) ok("notify('editing-ended')：不防抖、不等定时器（这一下本身就是'安静了'）")
+    else bad("'editing-ended' 反而把帧撤了")
+    eq(timed.length, 2, '  （没有再多一个定时器）')
+    /* 换一个"没有帧在飞"的账本，才看得见它真的排了一帧（同一帧里的多次请求会被合并） */
+    {
+      const fresh = mkFitter({ sample: () => mkSnap(mkCard()) })
+      fresh.fitter.notify({ reason: 'editing-ended' })
+      eq(fresh.frames.length, 1, "  （它确实排了一帧 —— 编辑时挂起来的那张现在量得上）")
+    }
+
+    /* ★ 政策的家：这几个名字不该在 Board.jsx 里再出现（谁把它抄回去，这条当场红） */
+    const boardSrc = readFileSync(new URL('../src/components/Board.jsx', import.meta.url), 'utf8')
+    const left = ['REFIT_IDLE_MS', 'scheduleFits', 'queueFormulaRefits'].filter((w) => boardSrc.includes(w))
+    if (!left.length) ok('★ Board.jsx 里没有这套时序的残留（防抖 / 开跑 / 排公式卡都在 card-fit.js 一处）')
+    else bad(`Board.jsx 里还留着：${left.join(' / ')} —— 这条政策应该只有 card-fit.js 一处`)
   }
 }
 
