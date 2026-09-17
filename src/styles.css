@@ -1190,6 +1190,21 @@ kbd {
 .bd-links-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
 /* 条件（写在线中点旁边那几个字）：不算词，是"附着在这条线上的内容" —— 淡一点、小一点 */
 .bd-cond { margin-left: 6px; color: #8b95a8; font-size: calc(11px * var(--s)); }
+/* 「这个条件不算」：那句话本身 + 那颗 ✕ / 回头路 ↺。
+   ★ 那句"你说过条件不算"**不能复用 .bd-cond** —— 它不是条件，是"这句话作废"的痕迹；
+     共用类名会让"面板上显示的条件"这类查询把它一起数进去（自检里当场撞过一次）。 */
+.bd-cond-note { margin-left: 6px; color: #d9a06a; font-size: calc(11px * var(--s)); }
+/* ★ ✕ / ↺ 是**行内按钮**（那一行本身是个 button，里面不能再套一个真的 button），
+     所以自己画成一颗小按钮的样子：可点区域给足（18px 见方），hover 才亮 ——
+     平时不显眼，但 `elementFromPoint` 命中的必须是它自己（自检就从它的中心按下去，
+     见 check:link [12]）。 */
+.bd-cond-no {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 5px; cursor: pointer;
+  color: #8b95a8; border: 1px solid transparent; font-size: calc(11px * var(--s));
+}
+.bd-cond-no:hover { background: #2b3444; color: #dde3ee; border-color: #3a4457; }
+.bd-cond-no.back { color: #7fb2e5; }
 /* 推导链：A →(条件) B →(缺条件) C */
 .bd-chain-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
 .bd-chain { margin: 6px 0 10px 2px; }

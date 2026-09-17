@@ -64,6 +64,26 @@ export function isNoLink(stroke) {
   return !!stroke && stroke.link === LINK_NONE
 }
 
+/* 「这个条件不算」—— 2026-09-16 加的第三个手动口子（前两个：改词、不算连接）。
+ *
+ * 条件本来是**位置送的**：写在那条线**弧长中点**旁边的字/卡自动成为它的条件
+ * （见 links.js 的 linkCondition）。可位置会读错 —— 中点旁边那撮字可能根本是
+ * 另一条线的东西，或者只是你随手写的旁注。在那之前认错了**没有任何说法**：
+ * 面板上就一直挂着那个错的条件（README「还没做的」里那条小尾巴就是这个）。
+ *
+ * 存法：`stroke.cond = 'none'`（和 LINK_NONE 一个路子：不是新字段之外的机制，
+ * 也不是往词表里加一项 —— 它回答的是"这个条件不成立"，不是"条件是什么"）。
+ * 只认这一个字面值；别的值一律当没写（读盘时丢掉）。
+ *
+ * ⚠ 否决之后那一步会**回到"缺条件"**，不是"不需要条件"：
+ *   你说的是"那撮字不是这条线的条件"，它到底有没有条件还是未知的 ——
+ *   面板照实说"缺条件"，再补的办法还是老规矩：在中点旁边把该写的写上。 */
+export const COND_NONE = 'none'
+
+export function isCondNone(v) {
+  return v === COND_NONE
+}
+
 export function linkKind(id) {
   return LINK_KINDS.find((k) => k.id === (isLinkKind(id) ? id : DEFAULT_LINK))
 }

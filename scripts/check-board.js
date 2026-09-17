@@ -21,7 +21,7 @@ import {
   inkBlocks, inkNodeAt, createInkIndex, readArrowHead, tipNearEnd,
 } from '../src/lib/links.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { LINK_NONE } from '../src/lib/link-kinds.js'
+import { COND_NONE, LINK_NONE } from '../src/lib/link-kinds.js'
 /* 卡片「按内容量尺寸」那一套规矩搬去了 card-fit.js（2026-09-16）：DOM 读数是注入的，
    所以"提交完不能立刻再量"这类坑在这儿断言得到（见 [6l]）。 */
 import { FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib/card-fit.js'
@@ -1942,6 +1942,124 @@ console.log('\n[6n] 板文件这一步（`files.js`）：data/ 怎么读写 + �
     /* 服务端的错误要**原样透传**（调用方靠 r.error 决定弹什么） */
     const errApi = createFileApi({ fetch: () => Promise.resolve({ json: () => Promise.resolve({ error: '非法文件名' }) }) })
     eq((await errApi.create('x', 'y')).error, '非法文件名', '服务端回的错误原样透传（不吞、不改写）')
+  }
+}
+
+// ═════════════════════ 6o. 「这个条件不算」 ═════════════════════
+/* 条件本来是**位置送的**（写在线弧长中点旁边那几个字/那张卡）。位置会读错，
+ * 而这个口子就是"你说了不算"：写在那条链上任意一笔的 `cond: 'none'`，
+ * 读连接时**否决权优先**。规矩和前两个手动口子一模一样：
+ *   ① 只在你说过时才写字段（没说过 → 文件一个字节都不多）；
+ *   ② 值只认那一个字面值（手改出来的别的值一律丢掉 = 回到按位置读）；
+ *   ③ 必须有一条回头路（清掉字段），而且是一步正常的撤销。
+ * 端到端对手是 check:link 的 [13]（真浏览器：面板上那颗 ✕ / ↺）。 */
+console.log('\n[6o] 「这个条件不算」（`COND_NONE`）：位置读错了要能一句话作废')
+{
+  /* 一条连接 + 中点旁边一撮字：夹具要让"条件"真的被读出来（不然否决也没什么可否决的）。 */
+  const mk = () => {
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 0, id: 'k1', text: 'A' },
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 0, id: 'k2', text: 'B' },
+    ]
+    b.strokes = [
+      { ...newStroke('pen', toFlat([{ x: 60, y: 40 }, { x: 300, y: 40 }, { x: 660, y: 40 }])), id: 'lk' },
+      /* 中点 (360,40) 旁边那几个字（3 笔一撮，够大） */
+      { ...newStroke('pen', toFlat([{ x: 352, y: 84 }, { x: 392, y: 84 }])), id: 'c1' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 92 }, { x: 400, y: 92 }])), id: 'c2' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 100 }, { x: 388, y: 100 }])), id: 'c3' },
+    ]
+    return b
+  }
+
+  /* 基线：不否决时，条件从位置读出来 */
+  {
+    const l0 = reader.read(mk())[0]
+    if (l0 && l0.cond && l0.cond.kind === 'ink') ok(`条件从位置读出来了（${l0.cond.label}）—— 否决才有东西可否决`)
+    else bad(`夹具没读出条件，后面几条没意义：${JSON.stringify(l0 && l0.cond)}`)
+    eq(l0 && l0.condManual, false, '没说过话的板：condManual 是 false')
+  }
+
+  /* ① 否决之后：cond 作废，但仍留下"你说过"的痕迹（面板要据此给回头路） */
+  {
+    const b = mk()
+    b.strokes = b.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: COND_NONE } : s))
+    const l = reader.read(b)[0]
+    eq(l.cond, null, '★ 你说过不算 → 位置读出来的那个作废（cond = null）')
+    eq(l.condManual, true, '而且记得"这是你说过的话"（condManual）')
+    /* 挂在**别的笔**上不算数：那句话是给这条链说的（和手动改词同一个口径）。 */
+    const b2 = mk()
+    b2.strokes = b2.strokes.map((s) => (s.id === 'c1' ? { ...s, cond: COND_NONE } : s))
+    if (reader.read(b2)[0].cond) ok('别的一笔（不在那条链上）标了也不算数 —— 它只对那条链生效')
+    else bad('链外一笔的 cond 把别人的条件否决了')
+  }
+
+  /* ② 否决只影响那条线：别的连接照旧按位置读 */
+  {
+    const b = mk()
+    b.cards.push(
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 0, y: 300, id: 'k3', text: 'C' },
+      { ...newCard('note', 0, 0, { w: 120, h: 80 }), x: 600, y: 300, id: 'k4', text: 'D' }
+    )
+    b.strokes = b.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: COND_NONE } : s))
+    b.strokes.push(
+      { ...newStroke('pen', toFlat([{ x: 60, y: 340 }, { x: 300, y: 340 }, { x: 660, y: 340 }])), id: 'lk2' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 384 }, { x: 392, y: 384 }])), id: 'd1' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 392 }, { x: 400, y: 392 }])), id: 'd2' },
+      { ...newStroke('pen', toFlat([{ x: 352, y: 400 }, { x: 388, y: 400 }])), id: 'd3' }
+    )
+    const links = reader.read(b)
+    const vetoed = links.find((l) => l.strokeId === 'lk')
+    const other = links.find((l) => l.strokeId === 'lk2')
+    eq(vetoed.cond, null, '被否决的那条：没有条件')
+    if (other && other.cond) ok('另一条线照旧按位置读出了条件（否决不是全局开关）')
+    else bad(`另一条线的条件被连累了：${JSON.stringify(other && other.cond)}`)
+  }
+
+  /* ③ 推导链那一步会回到"缺条件"（不是"不需要条件"）—— 面板据此照实催你补 */
+  {
+    const b = mk()
+    b.strokes = b.strokes.map((s) => (s.id === 'lk' ? { ...s, link: 'derive', cond: COND_NONE } : s))
+    const chains = deriveChains(reader.read(b))
+    eq(chains.length, 1, '标成"推导"之后读出一条链')
+    eq(chains[0].steps[0].missing, true, '★ 否决之后那一步**缺条件**（你说的是"那撮字不是它的条件"）')
+    eq(chains[0].steps[0].cond, null, '链上那一步的条件是空的')
+  }
+
+  /* ④ 存盘：只在你说过时才写；不认识的值丢掉（回到按位置读） */
+  {
+    const b = mk()
+    b.strokes = b.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: COND_NONE } : s))
+    const text = serializeBoardDocument(b)
+    if (/"cond":\s*"none"/.test(text)) ok('落盘写了 cond: "none"')
+    else bad('落盘没写 cond —— 重开之后那句话就丢了')
+    const back = parseBoardDocument(text, 'x')
+    eq(back.strokes.find((s) => s.id === 'lk').cond, COND_NONE, '读得回来')
+    eq(reader.read(back)[0].cond, null, '重开之后仍然"不算"（否决是存在笔迹上的）')
+    /* 回头路：清掉字段 → 又按位置读 */
+    const cleared = {
+      ...back,
+      strokes: back.strokes.map((s) => {
+        if (s.id !== 'lk') return s
+        const next = { ...s }
+        delete next.cond
+        return next
+      }),
+    }
+    if (reader.read(cleared)[0].cond) ok('清掉那句话 → 条件又按位置读出来了（回头路是通的）')
+    else bad('清掉之后条件没回来 —— 那这条回头路是假的')
+
+    /* 没说过话的板：文件里不该出现这个字段（零字节） */
+    if (!/"cond"/.test(serializeBoardDocument(mk()))) ok('没说过话的板一个字节都不多（没有 cond 字段）')
+    else bad('没说过话的板也被写上了 cond 字段')
+
+    /* 手改出来的怪值：一律丢掉，回到按位置读（不认它、也不写回去） */
+    const dirty = mk()
+    dirty.strokes = dirty.strokes.map((s) => (s.id === 'lk' ? { ...s, cond: 'xxx' } : s))
+    const dirtyBack = parseBoardDocument(serializeBoardDocument(dirty), 'x')
+    eq(dirtyBack.strokes.find((s) => s.id === 'lk').cond, undefined, '不认识的值丢掉（手改文件不会把它变成一个说法）')
+    if (reader.read(dirtyBack)[0].cond) ok('丢掉之后它回到"按位置读"（屏幕上的表现是对的）')
+    else bad('丢掉怪值之后条件没回来')
   }
 }
 

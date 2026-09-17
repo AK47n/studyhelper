@@ -28,7 +28,7 @@ import {
   applyStrokeLink, clearNoLinkMarks, dissolveGroup, freezeSelection, readSelection, removeStrokes,
 } from '../lib/selection.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { LINK_KINDS, LINK_NONE, linkKind } from '../lib/link-kinds.js'
+import { COND_NONE, LINK_KINDS, LINK_NONE, isCondNone, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
@@ -1072,6 +1072,40 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash('又算回连接了（按形状重新判）', 'ok')
   }
 
+  /* ── 「这个条件不算」 ──────────────────────────────────────────────────────
+   * 条件本来是**位置送的**：写在那条线弧长中点旁边的字/卡自动成为它的条件。
+   * 位置会读错（那撮字可能是另一条线的、或者只是随手写的旁注），而这个口子就是
+   * "你说了不算"：写在那一笔上（`cond: 'none'`，见 link-kinds.js 的 COND_NONE），
+   * 读连接的时候**否决权优先**（不再去位置里读）。
+   * ★ 要有回头路（`condBack`）：一句话说出口、重开之后就没路了，那还是单向门 ——
+   *   和「不算连接」的「又算回连接」是同一个道理。
+   * ⚠ 只说"那个不是条件"，不是"这一步不需要条件" —— 否决之后面板照实回到"缺条件"，
+   *   补的办法还是老规矩：在中点旁边把该写的写上。 */
+  function noCond(link) {
+    if (!link) return
+    commit((cur) => ({
+      ...cur,
+      strokes: cur.strokes.map((s) => (s.id === link.strokeId ? { ...s, cond: COND_NONE } : s)),
+    }))
+    flash('这个条件不算了 —— 那撮字照旧留在板上（想改回来点 ↺）', 'ok')
+  }
+
+  function condBack(link) {
+    if (!link) return
+    /* 清的是**整条链**上的那句话（链里任意一笔挂着都算数，见 links.js）。 */
+    const ids = new Set(link.ids && link.ids.length ? link.ids : [link.strokeId])
+    commit((cur) => ({
+      ...cur,
+      strokes: cur.strokes.map((s) => {
+        if (!ids.has(s.id) || !isCondNone(s.cond)) return s
+        const next = { ...s }
+        delete next.cond
+        return next
+      }),
+    }))
+    flash('又按位置读了（那条线中点旁边写什么就是什么）', 'ok')
+  }
+
   /* ── 固定 / 拆开一块（见 lib/board.js 的 normalizeGroups）──
    * 自动聚类会把挨得近的两坨并成一块。后果虽然轻（"多连了一个"，绝不改你的字），
    * 但**你得有地方纠正它** —— 这里就是：框住一块 → 固定成一块（写进 `groups`）。
@@ -1339,6 +1373,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       selectedId={selectedId}
       onSelect={setSelectedId}
       onHoverEdge={setHoverEdge}
+      /* 「这个条件不算」那颗 ✕ / 回头路 ↺ —— 面板是另一个组件，得把动作递进去
+         （见 RelationPanel 的说明：它是纯展示，改板一律回到 Board 这边做）。 */
+      onNoCond={noCond}
+      onCondBack={condBack}
       onFocus={(id) => {
         const el = wrapRef.current
         if (!el) return
@@ -1882,7 +1920,7 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
 
 // ────────────────────────────── 关系面板 ──────────────────────────────
 
-function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus }) {
+function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack }) {
   const byId = new Map(board.cards.map((c) => [c.id, c]))
   const label = (c) => {
     if (!c) return '(没了)'
@@ -1945,8 +1983,35 @@ function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect
               <span className="bd-er">{endName(l, 'a')}</span>
               <span className="dim">{l.dir ? '→' : '—'}</span>
               <span className="bd-er">{endName(l, 'b')}</span>
-              {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。 */}
-              {l.cond && <span className="bd-cond" title="写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件">条件 {condName(l.cond)}</span>}
+              {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。
+                  ★ 读错了就在这儿说一句：那颗 ✕ 是「这个条件不算」——
+                    位置读出来的那个作废（存进这一笔的 cond:'none'），
+                    旁边的 ↺ 是它的回头路（见 noCond / condBack）。 */}
+              {l.cond && (
+                <span className="bd-cond" title="写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件">
+                  条件 {condName(l.cond)}
+                </span>
+              )}
+              {l.condManual && (
+                <span className="bd-cond-note" title="你说过：这个条件不算（位置读出来的那个作废）；点右边的 ↺ 改回来">
+                  条件不算
+                </span>
+              )}
+              {(l.cond || l.condManual) && (
+                <span
+                  className={'bd-cond-no' + (l.condManual ? ' back' : '')}
+                  role="button"
+                  data-cond-btn={l.condManual ? 'back' : 'no'}
+                  title={l.condManual ? '改回来：还是按位置读' : '这个条件不是给这条线的（位置读错了）'}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (l.condManual) onCondBack && onCondBack(l)
+                    else onNoCond && onNoCond(l)
+                  }}
+                >
+                  {l.condManual ? '↺' : '✕'}
+                </span>
+              )}
             </button>
           ))}
           <div className="dim small pad">

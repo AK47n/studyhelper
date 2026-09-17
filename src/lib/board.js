@@ -21,7 +21,7 @@
    这里只用得到 geometry 的一件：**toFlat**（所有入口都把点收敛成扁平数组）。
    （视图映射在 view.js —— 那个现在由 geometry.js 的 fitView 用，这边用不着了：
      读盘时的缩放归一是本地那个 clampScale。） */
-import { LINK_NONE, isLinkKind } from './link-kinds.js'
+import { COND_NONE, LINK_NONE, isCondNone, isLinkKind } from './link-kinds.js'
 import { toFlat } from './geometry.js'
 
 export const BOARD_VERSION = 3
@@ -385,6 +385,11 @@ function normalizeStroke(s) {
        ★ `'none'`（"这条不算连接"）要原样保留 —— 它是你明确说过的一句话，
          丢了它，下次打开那条假连接就自己回来了。 */
     ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
+    /* 「这个条件不算」（见 link-kinds.js 的 COND_NONE）：条件本来是位置送的
+       （写在线中点旁边那几个字），位置会读错，所以给你一句否决。
+       ★ 和上面那条一模一样的规矩：**只认这个字面值**、**不补默认值** ——
+         没说过这句话的板一个字节都不多。 */
+    ...(isCondNone(s.cond) ? { cond: COND_NONE } : {}),
     points: pts,
   }
 }
@@ -467,6 +472,8 @@ export function serializeBoardDocument(board) {
          文件里那个"因果"就成了谎话）。老文件里没有这个字段，所以往返仍然字节级一致。
          `'none'`（"这条不算连接"）同样只在你说过时才写。 */
       ...(isLinkKind(s.link) || s.link === LINK_NONE ? { link: s.link } : {}),
+      /* 同理：`'none'`（"这个条件不算"）也只在你说过时才写（见 link-kinds.js 的 COND_NONE）。 */
+      ...(isCondNone(s.cond) ? { cond: COND_NONE } : {}),
       // ★ 必须过 toFlat，不能直接 Array.from 遍历。
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
       //   直接遍历再用 Number(n) 读，每个点都会变成 0 —— 又一次静默毁数据。

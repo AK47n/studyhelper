@@ -104,6 +104,17 @@ const readBoard = () => s.eval(`(() => {
     chainMissing: document.querySelectorAll('.bd-chain-cond.miss').length,
     chainConds: [...document.querySelectorAll('.bd-chain-cond')].map((e) => e.textContent.trim()),
     condRows: [...document.querySelectorAll('.bd-link-row .bd-cond')].map((e) => e.textContent.trim()),
+    /* 「这个条件不算」那颗 ✕ / 回头路 ↺（见 check-link [12]）——
+       ★ 按**行**看：夹具上有好几条连接，只有"推导"那一行会被否决，
+         别的行照旧显示自己的条件（所以不能用"页面上还有没有 ✕"来判）。 */
+    condNoCount: document.querySelectorAll('[data-cond-btn="no"]').length,
+    condBackCount: document.querySelectorAll('[data-cond-btn="back"]').length,
+    condRowInfo: rows.map((r) => ({
+      kind: ((r.querySelector('.bd-link-kind') || {}).textContent || '').replace(/[→⇒]/g, '').trim(),
+      cond: ((r.querySelector('.bd-cond') || {}).textContent || '').trim(),
+      note: ((r.querySelector('.bd-cond-note') || {}).textContent || '').trim(),
+      btn: (r.querySelector('[data-cond-btn]') || { dataset: {} }).dataset.condBtn || null,
+    })),
     a: card('lk-a'),
     b: card('lk-b'),
     toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
@@ -655,8 +666,123 @@ console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上
   else bad('文件里出现了 cond 字段 —— 位置推断不该存盘')
 }
 
-/* ═════════════════ 12. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[12] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 12. 「这个条件不算」 ═════════════════ */
+/* 用户 2026-09-16 那条小尾巴：「写在中点旁边的字算条件，但没法说'这个条件不是给这条线的'」。
+ * 这一步就走那条路：面板连接那一行上的 ✕（位置读错了）→ 那句话作废 → 文件里写下来 →
+ * 重开还在 → 旁边的 ↺ 改回来（一步正常的撤销，不是单向门）。
+ * ★ 全用真鼠标，而且先问 elementFromPoint —— 它是一颗 18px 的小按钮，
+ *   和「📌 点得到」那类断言同一个道理（README 第 11 条）。 */
+console.log('\n[12] 「这个条件不算」：位置读错了，一句话作废（而且能改回来）')
+{
+  /* ★ 按**行**看：夹具上有 4 条连接，条件可能不止一条有；
+     这一节只认「推导」那一行（[5] 标的那条，[11] 在中点旁边写了字）。 */
+  const rowOf = (st) => (st.condRowInfo || []).find((r) => /推导/.test(r.kind)) || null
+  const btnRect = (which) =>
+    s.eval(`(() => {
+      const rows = [...document.querySelectorAll('.bd-link-row')]
+      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
+      const el = row && row.querySelector('[data-cond-btn="' + ${JSON.stringify(which)} + '"]')
+      if (!el) return null
+      const r = el.getBoundingClientRect()
+      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) }
+    })()`)
+
+  const before = await readBoard()
+  const row0 = rowOf(before)
+  if (!row0 || row0.btn !== 'no') {
+    bad('面板「推导」那一行上没有那颗 ✕ —— [11] 那一步没读出条件，这一节验不了')
+  } else {
+    ok(`「推导」那一行显示着条件、右边有一颗 ✕（${row0.cond}）`)
+    if (row0.cond && !row0.note) ok('还没说过话 → 没有"你说过条件不算"那句，也没有 ↺')
+    else bad('一上来就有那句痕迹 —— 板上有别人留下的 cond 字段')
+    const miss0 = before.chainMissing
+
+    const btn = await btnRect('no')
+    const hit = await hitAt(btn.cx, btn.cy)
+    if (String(hit).includes('bd-cond-no')) ok(`✕ 中心那一点命中的就是它自己（${btn.w}×${btn.h}）`)
+    else bad(`✕ 中心命中的是「${hit}」—— 它被别的东西盖住了，用户点不到`)
+
+    /* 真鼠标点一下 */
+    await s.mouse(btn.cx, btn.cy)
+    await s.sleep(500)
+    const after = await readBoard()
+    const row1 = rowOf(after)
+    if (row1 && !row1.cond) ok('那条线的条件从面板上撤掉了（位置读出来的那个不算数了）')
+    else bad(`条件还在：${JSON.stringify(row1)}`)
+    if (row1 && /不算/.test(row1.note)) ok(`面板照实说"你说过条件不算"（${row1.note}）`)
+    else bad(`没显示那句"你说过不算"：${JSON.stringify(row1)}`)
+    if (row1 && row1.btn === 'back') ok('★ 同一颗位置变成了 ↺（回头路就在手边）')
+    else bad('点完 ✕ 没出现 ↺ —— 那这句话就成了单向门')
+    if (after.condBackCount === before.condBackCount + 1 && after.condNoCount === before.condNoCount - 1) {
+      ok(`只有这一行的按钮翻了面（✕ ${before.condNoCount}→${after.condNoCount}，↺ ${before.condBackCount}→${after.condBackCount}）`)
+    } else {
+      bad(`别的行的按钮也动了：✕ ${before.condNoCount}→${after.condNoCount}，↺ ${before.condBackCount}→${after.condBackCount}`)
+    }
+    if (after.chainMissing > miss0) ok(`推导链那一步回到"缺条件"（${miss0} → ${after.chainMissing}）—— 你说的是"那撮字不是它的条件"`)
+    else bad(`链上那一步没回到缺条件（${miss0} → ${after.chainMissing}）`)
+    if (after.count === before.count) ok('否决条件没有多出/少掉连接')
+    else bad(`连接数变了：${before.count} → ${after.count}`)
+
+    /* 留一张图给人自己看一眼（"那句痕迹 + ↺"长什么样）—— 这一块没有像素自检，只能眼看 */
+    {
+      const clip = await s.eval(`(() => {
+        const el = document.querySelector('.bd-rel')
+        if (!el) return null
+        const r = el.getBoundingClientRect()
+        return {
+          x: Math.max(0, Math.round(r.x - 4)), y: Math.max(0, Math.round(r.y - 4)),
+          width: Math.round(r.width + 8), height: Math.min(520, Math.round(r.height + 8)), scale: 1,
+        }
+      })()`)
+      if (clip) {
+        const shot = await s.send('Page.captureScreenshot', { format: 'png', clip })
+        fs.writeFileSync('.cache/cond-veto.png', Buffer.from(shot.data, 'base64'))
+        console.log('     截图：.cache/cond-veto.png（关系面板那一块）')
+      }
+    }
+
+    /* 落盘：那句话写在那一笔上（cond: "none"），重开还在 */
+    const doc = await read({ wait: 1200 })
+    const withCond = (doc.strokes || []).filter((x) => x.cond === 'none')
+    if (withCond.length === 1) ok('文件里正好一笔写着 cond: "none"')
+    else bad(`文件里的 cond 不对：${JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1]))}`)
+
+    await open()
+    const reopened = await readBoard()
+    const row2 = rowOf(reopened)
+    if (row2 && row2.btn === 'back' && /不算/.test(row2.note)) ok('重开之后那句话还在（不是只活在这一屏）')
+    else bad(`重开之后那句话丢了：${JSON.stringify(row2)}`)
+    if (row2 && !row2.cond) ok('重开之后条件仍然不算')
+    else bad(`重开之后条件又回来了：${JSON.stringify(row2 && row2.cond)}`)
+    if (reopened.chainMissing > miss0) ok('重开之后链上那一步仍然缺条件')
+
+    /* 回头路：点 ↺ → 又按位置读 */
+    const back = await btnRect('back')
+    if (!back) {
+      bad('重开之后找不到 ↺（那这条回头路断了）')
+    } else {
+      const hit2 = await hitAt(back.cx, back.cy)
+      if (String(hit2).includes('bd-cond-no')) ok('↺ 中心那一点命中的也是它自己')
+      else bad(`↺ 中心命中的是「${hit2}」`)
+      await s.mouse(back.cx, back.cy)
+      await s.sleep(500)
+      const restored = await readBoard()
+      const row3 = rowOf(restored)
+      if (row3 && /条件/.test(row3.cond)) ok(`改回来了：条件又按位置读出来了（${row3.cond}）`)
+      else bad(`点了 ↺ 条件没回来：${JSON.stringify(row3)}`)
+      if (row3 && row3.btn === 'no' && !row3.note) ok('↺ 收走了，那颗 ✕ 回到原位')
+      else bad(`按钮没回到 ✕：${JSON.stringify(row3)}`)
+      if (restored.chainMissing <= miss0) ok(`推导链那一步又不缺条件了（${restored.chainMissing}）`)
+      else bad(`链上那一步还缺着：${restored.chainMissing}`)
+      const doc2 = await read({ wait: 1200 })
+      if (!JSON.stringify(doc2).includes('"cond"')) ok('文件里那个字段也没了（回头路清得干净）')
+      else bad('文件里还留着 cond 字段')
+    }
+  }
+}
+
+/* ═════════════════ 13. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[13] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })

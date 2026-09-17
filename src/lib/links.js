@@ -17,7 +17,7 @@
 
 import { cardBounds, pointInRect, toFlat, toPoints } from './geometry.js'
 import {
-  ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isLinkKind, isNoLink, linkKind,
+  ARROW_LINK, DEFAULT_LINK, LINK_KINDS, LINK_NONE, isCondNone, isLinkKind, isNoLink, linkKind,
 } from './link-kinds.js'
 
 /* ═══════════ 形状判据：这一笔是不是箭头 ═══════════
@@ -1174,15 +1174,26 @@ function buildLinks(board, inkInput) {
     }
   }
   for (const l of out) {
-    l.cond = linkCondition(
-      ink,
-      boxes,
-      l.midInk,
-      linkStrokeIdx,
-      { kind: l.aKind, id: l.a },
-      { kind: l.bKind, id: l.b },
-      'c:' + l.ids.join('+')
-    )
+    /* ★ 你手动说过"这个条件不算"的那条：**别再读**（cond 留 null）。
+       和 linkCondition 的关系是"否决权优先"：位置读得再像也不算数。
+       `condManual` 给面板用 —— 它要显示"（你说过不算）"并给一条回头路，
+       不然那句话就是单向门（点完只能 Ctrl+Z，重开之后没路可走）。 */
+    const vetoed = l.ids.some((id) => {
+      const s = byId.get(id)
+      return !!s && isCondNone(s.cond)
+    })
+    l.condManual = vetoed
+    l.cond = vetoed
+      ? null
+      : linkCondition(
+          ink,
+          boxes,
+          l.midInk,
+          linkStrokeIdx,
+          { kind: l.aKind, id: l.a },
+          { kind: l.bKind, id: l.b },
+          'c:' + l.ids.join('+')
+        )
   }
   return out
 }
