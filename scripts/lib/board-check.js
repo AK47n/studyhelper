@@ -39,7 +39,7 @@
  *   spec.profile    浏览器 profile 目录（默认放 os.tmpdir()）
  *   spec.settleMs   导航完再等多久（默认 2200，原来是各脚本写死 2500~2800）
  *   body(ctx)       断言写在这儿；抛异常也会被收下来（不会挂住不退出）
- *   ctx.s           CDP 会话：send / eval / sleep / mouse / doubleClick / key / drag / penStroke
+ *   ctx.s           CDP 会话：send / eval / sleep / mouse / hover / doubleClick / key / drag / penStroke
  *                   / exceptions（页面里的报错）/ errors()（滤掉 favicon 那种噪音）
  *   ctx.board       { name, title, path }，tag 为 null 时是 null
  *   ctx.open(opts)  导航到夹具并等它挂上；opts.settleMs 覆盖等待时长
@@ -68,6 +68,76 @@ import { BOARD_PREFIX, newBoard, serializeBoardDocument } from '../../src/lib/bo
 export const ROOT = path.resolve(import.meta.dirname, '..', '..')
 export const DATA = path.join(ROOT, 'data')
 
+/* ══════════ 服务端要哪些文件（临时目录自检的复制清单）══════════
+ *
+ * 「把服务复制到临时目录里跑」的自检（check-storage / check-export）需要先知道
+ * **复制哪些文件**。这份清单从前是各脚本手写的 —— 于是 2026-09-18 加了
+ * `server-export.js` 之后，`server.js` 多了一条 `import`，而两处手写清单
+ * 都还停在旧的三个文件上。症状：临时目录里那一份服务**起不来**，
+ * 报出来的话是 `Node.js v24.19.0` 加一堆空行 —— 看着像"Node 坏了"，
+ * 其实是文件不齐。（同一个坑 check-export 已经踩过一次，然后 check-storage
+ * 又踩着它躺了一次 —— 因为它俩抄的是同一份手写清单。）
+ *
+ * 所以这份清单**从 server.js 的 import 里推出来**，不手写：
+ *   · 顶层 `.js`（`./server-ocr.js`）→ 服务端自己的模块，得复制
+ *   · `./src/...` → `src/` 整个目录都会复制，不用单列
+ *   · 裸包名（`node:fs` / `katex`）→ 不是文件，跳过（第三方依赖另说，见 katex 那条）
+ * 加文件时忘了改这里，也不会有事 —— 它自己会跟着 import 走。
+ *
+ * ⚠ 只认**静态** `import ... from './x.js'`。动态 `import()` 推不出来，
+ *   真加了就手工往 `extra` 里补。
+ */
+export function serverModules(entry = 'server.js', extra = []) {
+  const seen = new Set(['package.json', ...extra])
+  const queue = [entry]
+  while (queue.length) {
+    const rel = queue.shift()
+    if (seen.has(rel)) continue
+    seen.add(rel)
+    let src = ''
+    try {
+      src = fs.readFileSync(path.join(ROOT, rel), 'utf8')
+    } catch {
+      continue
+    }
+    const re = /^import\s[^'"]*from\s*['"](\.[^'"]+)['"]/gm
+    let m
+    while ((m = re.exec(src))) {
+      const spec = m[1]
+      if (spec.startsWith('./src/') || spec.startsWith('../src/')) continue // src/ 整个复制
+      const dep = path.posix.normalize(path.posix.join(path.posix.dirname(rel), spec))
+      if (dep.startsWith('..')) continue
+      queue.push(dep)
+    }
+  }
+  return [...seen]
+}
+
+/* ══════════ katex 也要进临时目录（不然导出静默降级）══════════
+ *
+ * ★ 2026-09-18：`server-export.js` 用动态 `import('katex')`，**推不出来**（见上面 ⚠）。
+ *   而它找不到时**故意不报错**（"没装 katex 也得能开"是那条底线），
+ *   于是临时目录里所有公式都悄悄走"原文摆出来" —— 自检**全绿**，
+ *   却在测一个用户手上根本不存在的丑状态。
+ *
+ * 所以拿目录**联接**（junction，Windows 上不要管理员权限）把真的 katex 挂进去。
+ * 只挂这一个包，不挂整个 node_modules：导出真正用到的第三方依赖只有它。
+ *
+ * @returns {boolean} 挂上了没有（挂不上就退回降级路跑，调用方该在屏幕上说明）
+ */
+export function linkRuntimeDeps(tmpDir) {
+  const from = path.join(ROOT, 'node_modules', 'katex')
+  const to = path.join(tmpDir, 'node_modules', 'katex')
+  if (!fs.existsSync(from)) return false
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'node_modules'), { recursive: true })
+    fs.symlinkSync(from, to, 'junction')
+    return fs.existsSync(to)
+  } catch {
+    return false
+  }
+}
+
 /* 夹具板的名字只允许长这样：board- 前缀（应用才认它是板）+ zz- 标记（一眼看得出是自检造的）。
    ★ 清理只删得掉匹配这个名字的文件 —— 传错一个 tag 也不会删到用户的东西。 */
 export const LEGAL_FIXTURE = /^board-zz-[A-Za-z0-9-]+\.md$/
@@ -78,29 +148,60 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
    守卫的判据是**内容哈希**，不是 mtime：应用写盘常常写出一样的内容
    （"差这么点就不写盘"那套规矩），拿 mtime 判会天天报假警。
    恢复用的是内存里那份原文 —— 只恢复"跑之前就存在、而且被改过"的文件，
-   跑出来的新文件一个都不删（那可能是自检自己故意造的，见 check-default-mode）。 */
+   跑出来的新文件一个都不删（那可能是自检自己故意造的，见 check-default-mode）。
 
-/** 拍一张 data/ 的快照：名字 → { hash, buf }。跑夹具之前拍。 */
+   ★ 2026-09-17：`data/` 可以带层次了，所以这一族**必须递归**。
+     从前它只 `readdirSync` 顶层 —— 用户的板一旦挪进 `data/大物/电磁学/`，
+     守卫就会一声不吭地不再保护它（"跑了自检、你的东西被改了，而报告是绿的"）。
+     递归的判据：跳过以 `.` 开头的（`.git` 不是笔记），剩下的文件和目录都算。 */
+
+/** 递归列出 data/ 里所有文件的**相对路径**（跳过 `.` 开头的目录） */
+export function listDataFiles(dir = DATA, prefix = '', out = []) {
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue
+    const rel = prefix ? `${prefix}/${e.name}` : e.name
+    if (e.isDirectory()) listDataFiles(path.join(dir, e.name), rel, out)
+    else if (e.isFile()) out.push(rel)
+  }
+  return out
+}
+
+/** 拍一张 data/ 的快照：**相对路径** → { hash, buf, mtimeMs }。跑夹具之前拍。
+ *
+ * ★ 快照里**不收自检自己的夹具**（`board-zz-*`，见 LEGAL_FIXTURE）：
+ *   这张快照的用途只有一个 —— "自检有没有动**你的**文件"，判据是
+ *   `changedSince()` 报出来的名单。而夹具是自检造、自检删的，
+ *   把它算进去就必然报一条假红。2026-09-18 就是这么踩的：
+ *   `check:paper` 跑完红着脸说「自检动了你的文件：board-zz-papercheck.md（不见了）」——
+ *   它报的是自检自己刚删掉的那个夹具。这种红比漏报更坏（狼来了）：
+ *   真动了用户文件时，报出来的名单里会混着一条假的，看的人就分不清哪条是真的了。
+ *
+ *   ⚠ 只按**名字**排除（和清理用的是同一条 LEGAL_FIXTURE）。
+ *     别改成"path 以 DATA 开头就跳过"之类 —— 那会把用户文件也一起放过。
+ */
 export function snapshotData(dir = DATA) {
   const files = new Map()
-  let names = []
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return { dir, files }
-  }
-  for (const n of names) {
+  for (const n of listDataFiles(dir)) {
+    const base = n.split('/').pop()
+    if (LEGAL_FIXTURE.test(base)) continue
     const p = path.join(dir, n)
     let buf = null
+    let mtimeMs = 0
     try {
-      if (!fs.statSync(p).isFile()) continue
       buf = fs.readFileSync(p)
+      mtimeMs = fs.statSync(p).mtimeMs
     } catch {
       continue
     }
-    files.set(n, { hash: crypto.createHash('sha256').update(buf).digest('hex'), buf })
+    files.set(n, { hash: crypto.createHash('sha256').update(buf).digest('hex'), buf, mtimeMs })
   }
-  return { dir, files }
+  return { dir, files, at: Date.now() }
 }
 
 /** 快照之后，这些**原有的**文件里谁的内容变了（返回名字数组；新文件不算）。 */
@@ -118,6 +219,50 @@ export function changedSince(snap, dir = snap.dir) {
     if (hash !== was.hash) out.push(n)
   }
   return out
+}
+
+/* ═══════════ 万一真的动了用户的文件：先把人那一版救下来，再谈恢复 ═══════════
+ *
+ * ★ 2026-09-18 踩到的：用户**正开着程序编辑那张板**，而自检也动了同一个文件。
+ *   原来的收尾是 `restoreChanged(before)` —— 无条件按跑前快照写回去。
+ *   那等于**把用户刚敲的字直接抹掉**，而且抹得干净（`fs.writeFileSync`，
+ *   不进回收站、也没有第二份）。症状最阴的地方是：屏幕上什么都不报，
+ *   自检只报一句"自检动了你的文件 —— 已经恢复回去了"，
+ *   而"恢复回去了"听起来像好事，其实是我吃掉了人家的输入。
+ *
+ * 所以改成两步，顺序不能换：
+ *   ① **先把"现在盘上这一版"另存**到 .cache/lost-found/（那才是用户最新的东西）
+ *   ② 再按快照恢复
+ * 恢复仍然是必要的：自检的纪律是"data/ 跑完必须哈希一致"。
+ * 但恢复的**代价**不该由用户承担 —— 所以第①步是这条纪律的前提。
+ *
+ * ⚠ 只备份"原有的、被改过的"文件。新出现的文件（比如夹具）不归这里管，
+ *   它们的清理在 withBoard 的 finally 里（按 board-zz-* 名字删）。
+ */
+const LOST_FOUND = path.join(ROOT, '.cache', 'lost-found')
+
+/**
+ * 把被改过的原有文件的**当前版本**先落一份到 .cache/lost-found/。
+ * 返回 [{ name, saved }]。`name` 里的 `/` 换成 `__` 当文件名（避免子目录）。
+ */
+export function preserveChanged(snap, dir = snap.dir) {
+  const done = []
+  for (const n of changedSince(snap, dir)) {
+    const missing = n.endsWith('（不见了）')
+    const rel = missing ? n.replace('（不见了）', '') : n
+    const src = path.join(dir, rel)
+    try {
+      if (!fs.existsSync(src)) continue
+      fs.mkdirSync(LOST_FOUND, { recursive: true })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const dest = path.join(LOST_FOUND, `${stamp}__${rel.replace(/[\\/]/g, '__')}`)
+      fs.copyFileSync(src, dest)
+      done.push({ name: rel, saved: dest })
+    } catch {
+      /* 存不下也要继续 —— 恢复那一步还在后面，不能因为备份失败就不收拾现场 */
+    }
+  }
+  return done
 }
 
 /** 把被改过的原有文件按快照恢复回去，返回恢复过的名字数组。新文件不动。 */
@@ -152,14 +297,34 @@ export class Session {
        "处理器抛了个异常"和"处理器压根没跑"在界面上长得一模一样 ——
        都是"点了没反应"。有了这个才不用靠猜。 */
     this.exceptions = []
+    /* ★ 页面自己打的 console 日志（只收 `log`，不收 warn/error —— 那两个已经被
+       exceptions 收走了）。为什么要留一份：**读数分不清原因的时候，人就会去改错的地方。**
+       出过一次红："框住之后那一排动作没出现 —— 框选没选中？"，而框选其实完全正常，
+       真正的因素是判读阈值没放过那个圆。自检顺手把应用自己打的日志收下来当**证据**，
+       红了之后一眼就能分清"框没罩住"和"罩住了但认不出来"。
+       ⚠ 它只当证据，别拿它当断言判据（console 文案是给人看的，随时会改）。 */
+    this.logs = []
+    this.onLog = null
     ws.addEventListener('message', (ev) => {
       const msg = JSON.parse(ev.data)
       if (msg.method === 'Runtime.exceptionThrown') {
         const d = msg.params.exceptionDetails
         this.exceptions.push((d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))
       }
-      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-        this.exceptions.push('console.error：' + msg.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 160))
+      if (msg.method === 'Runtime.consoleAPICalled') {
+        const type = msg.params.type
+        const text = (msg.params.args || [])
+          .map((a) => (a && a.value != null ? String(a.value) : a && a.description ? String(a.description) : ''))
+          .join(' ')
+        if (type === 'error') {
+          this.exceptions.push('console.error：' + text.slice(0, 160))
+        } else if (type === 'log' && text) {
+          this.logs.push(text)
+          if (this.logs.length > 400) this.logs.shift()
+          try {
+            if (this.onLog) this.onLog(text)
+          } catch {}
+        }
       }
       if (msg.id && this.pending.has(msg.id)) {
         const { resolve, reject } = this.pending.get(msg.id)
@@ -184,8 +349,7 @@ export class Session {
     })
   }
 
-  async eval(expr) {
-    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
+  async eval(expr) {    const r = await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || 'eval 出错')
     return r.result.value
   }
@@ -202,6 +366,15 @@ export class Session {
     await sleep(220)
   }
 
+  /* ★ 悬停：只把指针移过去，**不按**（`mouse()` 是"按 + 松"，用来 hover 会顺手点一下）。
+     为什么需要它：左栏文件行上那几个动作（导出 / 改名）是 `:hover` 才显示的 ——
+     不 hover，"那颗按钮在不在、点不点得到"根本量不出来（实测拿到 rect 0×0）。
+     ⚠ 判据仍然是 `elementFromPoint`：hover 过了也不等于它点得到（可能被别的层盖着）。 */
+  async hover(x, y) {
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 })
+    await sleep(160)
+  }
+
   /* 双击：CDP 里靠 clickCount 表达（两次 pressed/released，第二次 clickCount=2）。
      ⚠ 别用元素上的 dispatchEvent('dblclick')：那绕过命中测试，
      证明不了"用户双击得到它"（README 第 11 条）。 */
@@ -214,9 +387,42 @@ export class Session {
     await sleep(320)
   }
 
+  /* 按一个键。
+     ★ `char` 那一发是**必需**的，不是可选的（2026-09-17 拿五种发法实测出来的）：
+       `<form method="dialog">` 的**隐式提交**是浏览器从键盘事件序列里派生的 ——
+       只发 keyDown/keyUp 的话，`keydown` 到得了、`keypress` 和 `submit` 永远不来。
+       症状极具迷惑性：字打进去了、页面上一点报错都没有，就是"回车没反应"。
+       实测（check-ask 那条，五个变体各试一遍）：
+         keyDown + keyUp             → {keydown:1, keypress:0, submit:0}  ✗
+         rawKeyDown + keyUp          → {keydown:1, keypress:0, submit:0}  ✗
+         rawKeyDown + char + keyUp   → {keydown:1, keypress:1, submit:1}  ✓
+         keyDown + char + keyUp      → {keydown:1, keypress:1, submit:1}  ✓（用这个）
+       所以：**任何键都补一发 `char`**，`char` 才是 keypress 的来源。
+     ★ 但 `text` 不能乱给，CDP 只收**一个字符**：
+       · **修饰键**（Shift / Control / Alt / Meta）给它 → 直接拒收
+         （`Invalid 'text' parameter`）
+       · **名字比一个字符长的任何键都一样被拒** —— `Escape` / `ArrowLeft` / `Tab` / `F5` …
+         （唯一的例外是 `'\r'`：Enter 就得那么写。）
+       踩过（2026-09-18，check-link 的 [5]）：原来判据是"是不是修饰键"，
+       于是 `await s.key('Escape','Escape',27)` 把 `text:'Escape'` 送了出去 →
+       CDP 当场报错 → **整条自检抛异常、后面 [6][7] 几十条断言全丢**，
+       而屏幕上只有一句 `Invalid 'text' parameter`，看不出是哪个键干的。
+     ⚠ 试过"只给单字符带 text"那条路 —— CDP 认键名，Enter 不带 text 就**不派发 char**，
+         结果回车永远提交不了。所以判据是**"键名是不是一个字符"**（Enter 单独放行 \r），
+       不是"是不是修饰键" —— 前者正好把 Enter 和修饰键都照顾到了。 */
   async key(k, code, vk) {
-    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code, windowsVirtualKeyCode: vk })
-    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk })
+    /* 能给 text 的只有两种：Enter（CDP 要 '\r'）和**单字符**键名（'a' '2' '$'…）。
+       其余（修饰键、Escape、Arrow*、Tab、F* …）只发 char、不带 text。
+       ⚠ 别退回"按修饰键判"：那样 Escape 会被拒，整条自检挂掉。 */
+    const text = k === 'Enter' ? '\r' : typeof k === 'string' && k.length === 1 ? k : null
+    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk })
+    await this.send(
+      'Input.dispatchKeyEvent',
+      text == null
+        ? { type: 'char', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk }
+        : { type: 'char', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, text, unmodifiedText: text }
+    )
+    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk })
     await sleep(260)
   }
 
@@ -323,6 +529,37 @@ export async function withBoard(spec, body) {
 
   const rep = makeReporter()
   const { ok, bad } = rep
+
+  /* ★ **跑之前先看一眼：现在有没有人正在编辑？**（2026-09-18 加的）
+   *
+   * 起因：用户开着 studyhelper 编辑 `board-熵增加.md`，而自检也跑着。
+   * 结果自检收尾把他刚敲的内容覆盖了。见下面 finally 里那段长说明
+   * （结论是：**自检收尾从此不再写回任何用户文件**）。
+   *
+   * ⚠ 既然收尾已经不覆盖了，这里就**不该拦住自检** —— 用户基本上天天开着
+   *   那个窗口，拦下来等于自检没法跑了。
+   *   但"你正开着程序"这件事仍然值得说一声，因为：
+   *     · 自检期间如果你的程序往同一个文件写，**报出来会是一堆假红**
+   *       （像 2026-09-18 那天 check-link 报的"自检动了你的文件"）；
+   *     · 反过来也一样：自检不会去改你的东西，但你也别在自检跑的时候
+   *       指望那份板一动不动 —— 你自己程序存的盘也会让守卫看见"变了"。
+   *   所以是**打印一句提醒**，不是抛异常。
+   *   想让它闭嘴：`BOARD_CHECK_QUIET_BUSY=1`。
+   */
+  if (!process.env.BOARD_CHECK_QUIET_BUSY) {
+    const busy = hotFiles()
+    /* 5177 是用户平时双击开的那个（DEV 走 5178）。每个自检脚本用自己那套端口
+       （5203/5204…），所以"5177/5178 有人听"是个干净信号。 */
+    const appOpen = (await portAlive('http://127.0.0.1:5177/')) || (await portAlive('http://127.0.0.1:5178/'))
+    if (appOpen || busy.length) {
+      console.log('')
+      console.log('  ⚠ 注意：' + (appOpen ? '5177 上有程序在听（你自己开着 studyhelper？）' : '') + (busy.length ? (appOpen ? '，而且' : '') + `这些文件刚被写过：${busy.join(' / ')}` : ''))
+      console.log('    自检**不会**改你的文件，但它跑的时候你的程序要是也在存盘，')
+      console.log('    下面的断言可能会因为"文件在我眼皮底下变了"而报假红。')
+      console.log('    想安静跑就关掉那个窗口，或者设 BOARD_CHECK_QUIET_BUSY=1。')
+      console.log('')
+    }
+  }
 
   /* ★ 顺序要紧：先拍快照，再写夹具。晚一步的话夹具自己会被算进"原有文件"。 */
   const before = snapshotData()
@@ -525,18 +762,128 @@ export async function withBoard(spec, body) {
     }
     const changed = changedSince(before)
     if (changed.length) {
-      const back = restoreChanged(before)
-      bad(`★ 自检动了你的文件：${changed.join(' / ')}${back.length ? ' —— 已经按跑前的快照恢复回去了' : '（恢复失败，去 .cache 里找备份）'}`)
+      /* ═══════════ 自检动了用户的文件：**不覆盖，报错 + 留证据** ═══════════
+       *
+       * ★ 2026-09-18 定下来的（这条路原来走错了两回）：
+       *
+       *   第一版：`restoreChanged(before)` —— 无条件按跑前快照写回去。
+       *           后果：用户正开着程序编辑那张板，自检把**他刚敲的字**抹掉了。
+       *           而报出来的话是"已经恢复回去了"，听起来像好事。
+       *
+       *   第二版：先 `preserveChanged` 另存，再恢复。
+       *           好了一点（丢之前至少留了一份），但"覆盖"这件事还在 ——
+       *           而且**应用内存里的状态和盘上不一致了**，用户下次一存又覆盖回来。
+       *           "两边都在写同一个文件"无论怎么收尾都是坏的。
+       *
+       *   现在这版：**一个字节都不动**。因为想明白了 ——
+       *     自检本来就不该碰用户文件。真碰了，那是**自检自己的 bug**，
+       *     该做的是**让人看见**，不是悄悄把现场抹平（那叫掩盖）。
+       *
+       *   而且"恢复"本身就是自检里最危险的一行：它是 `fs.writeFileSync`，
+       *   不进回收站、没有第二份、不弹确认。**用户的手稿不该由一条自检的收尾逻辑
+       *   来决定去留。**
+       *
+       * ── 一个文件变了，是谁干的？────────────────────────────────────
+       * ★ 2026-09-18 又踩了一下：用户开着程序在写 `board-熵增加.md`，
+       *   于是守卫**每次都报红**，报的还是他**没做过**的事。
+       *   这种红比"漏报"更坏 —— 久了就没人看告警了（狼来了）。
+       *   判据：**跑之前它是热的吗**（`wasHot`）。
+       *     凉 → 变热 = 自检的锅 → ✗
+       *     热 → 那它本来就在动，跟你开着程序有关 → 只说一句（不算失败）
+       *   两条判据都是**事实**（快照里记了 mtime），不是猜。
+       */
+      const hot = changed.filter((n) => !n.endsWith('（不见了）') && mtimeAfter(before, n))
+      const external = hot.filter((n) => wasHot(before, n))
+      const ours = changed.filter((n) => !external.includes(n))
+
+      if (ours.length) {
+        const kept = preserveChanged(before)
+        bad(`★ 自检动了你的文件：${ours.join(' / ')}`)
+        bad('  **没有帮你改回去** —— 这是故意的：自检不该碰你的笔记，碰了就是自检的错，')
+        bad('  而且"按快照写回去"是一行 fs.writeFileSync（不进回收站、没有第二份、不弹确认），')
+        bad('  用它决定你手稿的去留太危险。请自己打开看一下内容，需要的话 Ctrl+Z 或从 git 恢复。')
+        if (kept.length) {
+          bad(`  自检改动之后的版本已留证：.cache/lost-found/（${kept.map((k) => path.basename(k.saved)).join(' / ')}）`)
+        } else {
+          bad('  ⚠ 连留证都没成功（.cache/lost-found/ 写不进去？）—— 这个要查一下')
+        }
+      } else {
+        /* 全都能用"跑之前它就是热的"解释掉 → 不是自检干的，别报成失败。 */
+        ok(`data/ 里变了的文件都是**跑之前就在被写**的（${changed.join(' / ')}）—— 是你开着的程序存的盘，不是自检动的`)
+      }
+      if (external.length) {
+        console.log(`  （提示：${external.join(' / ')} 跑之前就是热的，自检期间还在变 —— 你的程序在存盘）`)
+      }
     } else {
       ok('data/ 里原有的文件一个字节都没动（你的板没被读、也没被写）')
     }
   }
 
   console.log('\n' + '─'.repeat(56))
-  console.log(rep.fails ? `  ${rep.fails} 项失败（共 ${rep.checks} 项）` : `  全部通过（${rep.checks} 项）`)
+  const total = rep.checks
+  console.log(rep.fails ? `  ${rep.fails} 项失败（共 ${total} 项）` : `  全部通过（${total} 项）`)
   console.log('')
   process.exitCode = rep.fails ? 1 : 0
   return rep.fails
+}
+
+/**
+ * 这个文件**在自检开始跑的那一刻**是不是热的（刚被人写过）。
+ *
+ * 用途：守卫分清"是自检改的"还是"是别人（你自己开着的程序）改的"。
+ *   跑之前它是凉的 → 跑完变热了 = **自检的锅**，报 ✗。
+ *   跑之前它就是热的 → 那它变了本来就在意料之中，报"提示"就够 ——
+ *   否则用户天天开着程序，自检就天天红，红的还是他**没做过**的事，
+ *   久了就没人看这些告警了（"狼来了"）。
+ *
+ * 阈值 15 秒：比 hotFiles 那个 10 秒稍宽，因为快照到"跑起来"之间还有几步。
+ */
+function wasHot(snap, rel) {
+  const was = snap.files.get(rel)
+  if (!was || !was.mtimeMs) return false
+  return snap.at - was.mtimeMs < 15000
+}
+
+/** 这个文件在自检跑完的这一刻，mtime 是不是"刚刚"（像有别人在写）。 */
+function mtimeAfter(snap, rel) {
+  try {
+    const st = fs.statSync(path.join(snap.dir, rel))
+    return Date.now() - st.mtimeMs < 4000
+  } catch {
+    return false
+  }
+}
+
+/**
+ * data/ 里哪些文件"此刻像有人在写"（mtime 很新）。给"跑之前"用的闸。
+ *
+ * 阈值 10 秒：够宽（防抖存盘 700ms、拟合几趟、人手动保存的间隔都在里面），
+ * 又够窄（不至于把"我昨晚改的"当成"现在有人在写"）。
+ * 不递归子目录的话会漏掉分层放的板（`大物/电磁学/board-第一章.md`），所以递归。
+ */
+function hotFiles(dir = DATA, withinMs = 10000) {
+  const out = []
+  const walk = (d, prefix) => {
+    let entries = []
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue
+      const rel = prefix ? `${prefix}/${e.name}` : e.name
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) walk(p, rel)
+      else if (e.isFile()) {
+        try {
+          if (Date.now() - fs.statSync(p).mtimeMs < withinMs) out.push(rel)
+        } catch {}
+      }
+    }
+  }
+  walk(dir, '')
+  return out
 }
 
 function parseMaybe(p) {

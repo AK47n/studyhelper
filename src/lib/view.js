@@ -39,6 +39,61 @@ export function worldToScreen(pt, view) {
   return { x: pt.x * view.s + view.tx, y: pt.y * view.s + view.ty }
 }
 
+/* ═══════════ 两层之间的"补正" ═══════════
+ *
+ * ── 为什么需要它（2026-09-18 用户报的）────────────────────────────
+ * 「移动画布的时候卡片和板框会相对于字产生相对滑动，虽然最后还是会滑动回去」
+ *
+ * 板上有两样东西，走的是**两条不同的路**去同一个屏幕位置：
+ *   · 墨迹（canvas）—— `ctx.setTransform`，在一个 useEffect 里直接写，
+ *     **不经过 React 的 render**，一帧内就到位。
+ *   · 卡片 / 板框（DOM）—— `left/top` 由 React 的 style prop 给，
+ *     要等 setState → render → reconciliation → commit → 浏览器 style recalc + layout。
+ * 于是拖动时 canvas 已经画到新位置了，卡片的 left/top **还停在上一次的值** ——
+ * 落后的那一两帧就是用户看到的"相对滑动"，松手后 React 追上来，又"滑回去"。
+ *
+ * ── 怎么补 ────────────────────────────────────────────────────────
+ * 卡片最终位置 = 世界 × s + t。React 那一份用的是**它渲染时的视图**（view），
+ * 而手指已经算出了**最新的视图**（live）。差的就是这两个视图之间的映射。
+ * 把"从 view 到 live 该怎么挪"算成一个 CSS 变换挂在两层共同的祖先上，
+ * **在写 canvas 的同一帧写下去**，两边就对齐了。
+ *
+ *   容器内一点 p 是按 view 摆的：p = 世界 × view.s + view.tx
+ *   它应该按 live 摆成：      世界 × live.s + live.tx
+ *   ⇒ live 下的位置 = p × k + (live.tx − view.tx × k)      k = live.s / view.s
+ *   所以是 `translate(tx', ty') scale(k)`（**transform-origin 必须是 0 0**，公式以原点推的）。
+ *
+ * ⚠⚠ **`view` 必须是"已经摆上屏幕的那一版"，不是"已经提交的那一版"。**
+ *   这个基准搞错一次，补正就把偏差**翻一倍**（2026-09-18 第二版修的就是它）：
+ *   `Board.jsx` 的 `boardRef.current` 在 `commit` 里是**同步**改的，而那一刻 React
+ *   还没重渲染 —— 拿它当基准，算出来的差多算了整整一步（实测一次 pointermove = 30px），
+ *   紧接着 React 用新视图重渲染卡片，于是这一份差在屏幕上**被做了两遍** ⇒
+ *   卡片冲出 60px，下一帧才收回去。用户看到的就是"卡片相对于字滑动"。
+ *   所以调用方传的是 `renderedViewRef`，而且它只在 `useLayoutEffect` 里更新
+ *   （浏览器绘制**之前**，所以"补正 + 新 left/top 叠在一起"那一帧一次都不会被画出来）。
+ *   ⚠ 用 `useEffect` 也不行：它在绘制**之后**跑，晚的那一帧正好把错误的那一版画出去。
+ *
+ * ★ 它是个**补正**，不是又做一遍平移：React 追上之后 live === view，
+ *   于是 k = 1、tx' = 0 —— 单位变换，自己没有残留。
+ *   （这正是这个仓库那条老注释担心的事："加了就等于把同一次平移做两遍"。
+ *    做两遍的**前提是那个变换和 left/top 表达同一份平移**；这里表达的是
+ *    "两者的**差**"，差在追上后就是 0。别把它改成"直接写 live 的 tx/ty"。）
+ *
+ * 返回可直接写进 style 的字符串；`null` 表示"不用补"（调用方应当清掉这个属性，
+ * 而不是写一个 'none' —— 少一个合成层就少一分开销）。
+ */
+export function viewCorrection(view, live) {
+  if (!view || !live) return null
+  const k = view.s ? live.s / view.s : 1
+  const tx = live.tx - view.tx * k
+  const ty = live.ty - view.ty * k
+  /* 严格相等才收手：浮点上"差一点点"在屏幕上不会有人看得见，
+     而这种量通常正好是 0（视图对象没变就是同一个数）—— 判得太松反而
+     会在原地反复建销合成层。 */
+  if (k === 1 && tx === 0 && ty === 0) return null
+  return `translate(${tx}px, ${ty}px) scale(${k})`
+}
+
 /* 世界矩形 → 绝对定位用的 CSS 盒子：`{left, top, width, height}`。
  * `pad` 是"每边往外让多少屏幕像素"（虚线选框比真实笔迹范围大一圈那种）。
  * 为什么要它：`left/top` 是**映射**、`width/height` 是**长度 × s**，

@@ -18,13 +18,13 @@
  *     外加"这一下是冲纸面还是冲面板"的 `onPaper`。
  *
  * interface：
- *   FOCUS_NONE · focusCard(id, editing?) · focusFrame(id, editing?) · focusInk(ids)
- *   focusCardId(f) / focusFrameId(f) / focusInkIds(f) / editingCardId(f) / editingFrameId(f)
+ *   FOCUS_NONE · focusCard(id, editing?) · focusFrame(id, editing?) · focusInk(ids, cards?)
+ *   focusCardId(f) / focusFrameId(f) / focusInkIds(f) / focusInkCards(f) / editingCardId(f) / editingFrameId(f)
  *   beginEdit(f) / endEdit(f) / clearInkFocus(f)
  *   isTextField(t) · PAPER_SELECTOR · onPaper(t, selector?)
  *   deleteIntent(focus, key, target, opts?) → { kind: 'none' | 'delete-card' | 'delete-ink' | 'dissolve-frame', … }
- *   escapeIntent({ focus, linkPick, condArm }) → { kind: 'none' | 'dismiss-link' | 'disarm-cond' |
- *                                                  'end-frame-edit' | 'clear-focus' }
+ *   escapeIntent({ focus, linkPick }) → { kind: 'none' | 'dismiss-link' |
+ *                                         'end-frame-edit' | 'clear-focus' }
  * ⚠ 这里**不认识 React、也不认识板**：焦点是普通对象，target 只用到 `tagName` /
  *   `isContentEditable` / `closest()` 三样 —— 所以 `check-board` 的 [6t] 拿假 target 就能钉住整张表。
  */
@@ -32,21 +32,33 @@
 /* ── 焦点值（一个记录，只有一种 kind）─────────────────────────────────────────
  * kind: 'none' | 'card' | 'frame' | 'ink'
  *   card / frame 带 `editing`（在就地改内容 / 改标题）
- *   ink 带 `ids`（框住的那几笔）
- * ★ 没有"同时选中一张卡和一个板框"这种状态 —— 这正是这一刀要买的东西。 */
+ *   ink 带 `ids`（框住的那几笔），可能还带 `cards`（**框住的卡片**）
+ * ★ 没有"同时选中一张卡和一个板框"这种状态 —— 这正是这一刀要买的东西。
+ *
+ * ★★ 2026-09-21：`ink` 这个 kind 里多了 `cards` —— 框选现在会把**中心落在框里的卡片**
+ *   一起框进来（用户的说法：「框选中任意的字迹——卡片都应该能够放大，旋转」）。
+ *   为什么不新开一个 kind：**框住的那一撮东西仍然只有一种**（一次框选的产物），
+ *   它不是"另外选中了一张卡"（那种互斥正是这个 module 要挡的）。
+ *   为什么卡片**可以不写**（空数组时整个字段不出现）：和板文件里那些字段同一条纪律 ——
+ *   "没有卡片"是绝大多数框选的状态，写一个 `cards: []` 出去只会让 deep-equal 断言
+ *   和 UI 状态多一份噪音。读的那一侧一律走 `focusInkCards()`，拿到的是 `[]` 而不是 undefined。 */
 export const FOCUS_NONE = Object.freeze({ kind: 'none' })
 
 export const focusCard = (id, editing = false) => (id ? { kind: 'card', id, editing: !!editing } : FOCUS_NONE)
 export const focusFrame = (id, editing = false) => (id ? { kind: 'frame', id, editing: !!editing } : FOCUS_NONE)
-export const focusInk = (ids) => {
+export const focusInk = (ids, cards = []) => {
   const list = [...(ids || [])].filter(Boolean)
-  return list.length ? { kind: 'ink', ids: list } : FOCUS_NONE
+  const clist = [...(cards || [])].filter(Boolean)
+  if (!list.length && !clist.length) return FOCUS_NONE
+  return clist.length ? { kind: 'ink', ids: list, cards: clist } : { kind: 'ink', ids: list }
 }
 
 /* 读：把那个值翻译成界面各处要问的那几个问题（每个问题都只有一个答案）。 */
 export const focusCardId = (f) => (f && f.kind === 'card' ? f.id : null)
 export const focusFrameId = (f) => (f && f.kind === 'frame' ? f.id : null)
 export const focusInkIds = (f) => (f && f.kind === 'ink' ? f.ids : null)
+/* 框里那些**卡片**的 id（没框卡片时是空数组，绝不是 undefined —— 调用方不用先判）。 */
+export const focusInkCards = (f) => (f && f.kind === 'ink' ? f.cards || [] : [])
 export const editingCardId = (f) => (f && f.kind === 'card' && f.editing ? f.id : null)
 export const editingFrameId = (f) => (f && f.kind === 'frame' && f.editing ? f.id : null)
 
@@ -93,7 +105,15 @@ export function deleteIntent(focus, key, target, opts = {}) {
   if (key !== 'Delete' && key !== 'Backspace') return { kind: 'none' }
   if (!onPaper(target, opts.paperSelector)) return { kind: 'none' }
   const f = focus || FOCUS_NONE
-  if (f.kind === 'ink') return { kind: 'delete-ink', ids: f.ids.slice() }
+  /* ★ 框住的那些东西一起删（笔迹 + 顺手框进来的卡片，2026-09-21）。
+     卡片那半只在**真有**时才写（没有卡片时连字段都不出现，和 focusInk 同一条纪律）——
+     少了它，框住"几笔字 + 一张卡"按 Delete 会只删掉字，
+     而屏幕上看起来就是"删除只做了一半"（卡片还杵在原地）。 */
+  if (f.kind === 'ink') {
+    const out = { kind: 'delete-ink', ids: f.ids.slice() }
+    if (f.cards && f.cards.length) out.cards = f.cards.slice()
+    return out
+  }
   if (f.kind === 'frame') return { kind: 'dissolve-frame', id: f.id }
   if (f.kind === 'card') return { kind: 'delete-card', id: f.id }
   return { kind: 'none' }
@@ -101,12 +121,14 @@ export function deleteIntent(focus, key, target, opts = {}) {
 
 /* ── 按键：Esc ───────────────────────────────────────────────────────────
  * "一次只收一层"，顺序写在这里（从前散在 Board.jsx 的一串 if 里）：
- *   浮着的那排词 → 武装着的「∈ 条件」→ 板框改名 → 取消焦点。
- * ★ Esc 是**全局**的：在面板上按 Esc 也该收掉武装（只有 Delete 那一族要区分纸面 / 面板）。 */
+ *   浮着的那排词 → 板框改名 → 取消焦点。
+ * ★ Esc 是**全局**的（只有 Delete 那一族要区分纸面 / 浮层）。
+ * ⚠ 这里原来还有一层「∈ 条件」的武装（`ui.condArm` → 'disarm-cond'）——
+ *   它唯一的入口是关系面板，面板 2026-09-19 删掉了，这一层跟着走。
+ *   把"指条件"请回来时这一层也要回来，而且必须排在"收词"**后面**（词更靠外一层）。 */
 export function escapeIntent(ui = {}) {
   const f = ui.focus || FOCUS_NONE
   if (ui.linkPick) return { kind: 'dismiss-link' }
-  if (ui.condArm) return { kind: 'disarm-cond' }
   if (f.kind === 'frame' && f.editing) return { kind: 'end-frame-edit' }
   return f.kind === 'none' ? { kind: 'none' } : { kind: 'clear-focus' }
 }

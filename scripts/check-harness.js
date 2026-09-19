@@ -36,6 +36,32 @@ const hashOf = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).dig
 const USER_BOARD = path.join(DATA, 'board-新白板.md')
 const userHashBefore = fs.existsSync(USER_BOARD) ? hashOf(USER_BOARD) : null
 
+/* ═══════════════ 0. 自检脚本自己也别写坏（纯语法，不碰 data/）═══════════════
+   ★ 为什么这条在这儿（2026-09-17 踩的）：
+     `check-ask.js` 里写了个 `/^rgb\\((\\d+),/` —— 双反斜杠，落在正则里就是
+     "反斜杠 + 未闭合的左括号"。Node 24 把这个**非法转义**当语法错误，
+     于是整个文件被拒收："Unterminated group"，而栈里只报行号、
+     报出来像"正则写错了"，看两眼也找不出是"多打了一个反斜杠"。
+     这类毛病的共同点：**静态就能查出来，但只有真的跑到它才炸** ——
+     而"跑到它"要起服务、起浏览器、等二十几秒。放这儿一条 `node --check` 秒回。
+   ⚠ 只 `--check`，不执行：这些脚本大多要服务/浏览器，执行起来是另一码事。 */
+console.log('\n[0] 自检脚本本身语法过关（含"别写非法转义"这条）')
+{
+  const dir = path.resolve(import.meta.dirname)
+  const { execFileSync } = await import('node:child_process')
+  const files = fs.readdirSync(dir).filter((n) => /^(check|diag|probe)-.*\.(js|mjs)$/.test(n))
+  const broken = []
+  for (const f of files) {
+    try {
+      execFileSync(process.execPath, ['--check', path.join(dir, f)], { stdio: 'pipe' })
+    } catch (e) {
+      broken.push(f + '（' + String(e.stderr || e.message).split('\n').find((l) => /Error/.test(l)) + '）')
+    }
+  }
+  if (!broken.length) ok(`${files.length} 个自检脚本全部 node --check 过关（没有非法转义 / 括号不配对这类静默毛病）`)
+  else bad('有脚本连语法都过不了（跑起来只会报"Unterminated group"这种误导人的话）：' + broken.join(' | '))
+}
+
 /* ═══════════════ 1. 守卫本身（纯函数，临时目录，不碰 data/）═══════════════ */
 console.log('\n[1] 用户数据守卫：能发现被改的、能恢复、不碰没改的、不删新文件')
 {

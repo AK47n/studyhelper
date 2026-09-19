@@ -19,11 +19,14 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { withBoard, DATA } from './lib/board-check.js'
+import { withBoard, DATA, listDataFiles } from './lib/board-check.js'
 import { isBoardName } from '../src/lib/board.js'
 
-const before = fs.readdirSync(DATA)
-console.log('\n  data/ 现在有：' + before.join(' · '))
+/* ★ 递归列（2026-09-17 起 data/ 可以带层次）：以前是 `readdirSync` 顶层，
+   用户的板一旦挪进 data/大物/电磁学/，这条自检就**看不出有板** ——
+   于是它会跑"一张板都没有"那个场景，而那个场景会**往盘上补一张空板**。 */
+const before = listDataFiles(DATA)
+console.log('\n  data/ 现在有：' + (before.join(' · ') || '(空)'))
 
 /* 有板就跳过 —— 这个场景的前提是"一张板都没有"。
    ★ 不能为了造场景去删/改用户的板。 */
@@ -38,7 +41,7 @@ const fails = await withBoard({ tag: null, port: 5199, cdpPort: 9229 }, async ({
 /* 只删**本次跑出来的**文件。绝不动跑之前就在 data/ 里的任何东西。
    ★ 注册给 after()：它在浏览器/服务被收掉之后才跑，那时候没人再往盘上写了。 */
 after(() => {
-  for (const n of fs.readdirSync(DATA)) {
+  for (const n of listDataFiles(DATA)) {
     if (!before.includes(n)) {
       try {
         fs.rmSync(path.join(DATA, n), { force: true })
@@ -76,7 +79,7 @@ else bad('打开不是白板界面（board=' + st.board + ' note=' + st.note + '
 if (st.note) bad('反而渲染了笔记界面（.topbar 在）—— 这就是这条自检要拦的回归')
 else ok('没有掉进笔记界面')
 
-const added = fs.readdirSync(DATA).filter((n) => !before.includes(n))
+const added = listDataFiles(DATA).filter((n) => !before.includes(n))
 console.log('  data/ 新出现：' + (added.join(' · ') || '(无)'))
 const made = added.find((n) => isBoardName(n))
 if (made) ok('自动补了一张板：' + made)
@@ -102,6 +105,6 @@ await open({ settle: 600 })
 const st2 = await s.eval(probe)
 if (st2 && st2.board) ok('刷新后还是白板')
 else bad('刷新后又不是白板了')
-if (fs.readdirSync(DATA).some((n) => n.includes('新白板 2'))) bad('又补了一张（重名探测没生效）')
+if (listDataFiles(DATA).some((n) => n.includes('新白板 2'))) bad('又补了一张（重名探测没生效）')
 else ok('没有重复补板（重名探测生效）')
 })

@@ -59,7 +59,6 @@ const out = await ev(`(() => {
     card0MeasuredRel: c0 ? [rect(c0).l - rect(wrap).l, rect(c0).t - rect(wrap).t] : null,
     nCards: document.querySelectorAll('.bd-card').length,
     nEdges: document.querySelectorAll('.bd-edge').length,
-    panel: rect(document.querySelector('.bd-cpanel')),
     toolbar: rect(document.querySelector('.bd-tools')),
   }
 })()`)

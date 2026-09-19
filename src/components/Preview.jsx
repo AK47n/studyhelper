@@ -1,42 +1,20 @@
 import React, { useMemo } from 'react'
-import katex from 'katex'
 import { displayBody } from '../lib/parse.js'
+/* ★ 「怎么读一小段文本」搬去了 lib/inline.js（2026-09-18）——
+   因为导出（lib/export-html.js）也要用**同一份**读法。从前它只住在这个文件里，
+   谁再要一份就只能抄，而"同一句话有两份实现"这个仓库已经踩过两次
+   （一份带自检、一份真在路上跑，出错的是路上那份）。
+   ⚠ 那个文件**不许 import katex**（服务端也要用它，而服务端不装依赖）——
+     所以排公式单独放在 lib/renderMath.js，切文本放在那边。
+   这里只负责把零件的**样子**变成 React 节点。 */
+import { splitInline } from '../lib/inline.js'
+import { renderMathToHtml } from '../lib/renderMath.js'
 
-/** 一小段文本 → HTML：$公式$ 走 KaTeX，[[引用]] 变成可点的小标签 */
+/** 一小段文本 → React 节点：$公式$ 走 KaTeX，[[引用]] 变成可点的小标签 */
 function inlineHtml(text, { resolve, onRefTitle } = {}) {
-  const src = String(text ?? '')
-  const DEC = '\u0002'
-  const parts = []
-  let work = src.replace(/\\\$/g, DEC)
-
-  // 先切公式，再切引用，最后转义剩余的尖括号
-  const chunks = work.split('$')
-  chunks.forEach((chunk, i) => {
-    if (i % 2 === 1) {
-      const latex = chunk.replaceAll(DEC, '$')
-      parts.push({ type: 'math', latex })
-    } else {
-      let rest = chunk.replaceAll(DEC, '$')
-      const re = /\[\[([^[\]]+)\]\]/g
-      let last = 0
-      let m
-      while ((m = re.exec(rest))) {
-        if (m.index > last) parts.push({ type: 'text', text: rest.slice(last, m.index) })
-        parts.push({ type: 'ref', title: m[1].trim() })
-        last = m.index + m[0].length
-      }
-      if (last < rest.length) parts.push({ type: 'text', text: rest.slice(last) })
-    }
-  })
-
-  return parts.map((p, i) => {
+  return splitInline(text).map((p, i) => {
     if (p.type === 'math') {
-      let html
-      try {
-        html = katex.renderToString(p.latex, { throwOnError: false, displayMode: false, output: 'html' })
-      } catch {
-        html = null
-      }
+      const html = renderMathToHtml(p.latex)
       if (html) {
         return <span key={i} className="math" dangerouslySetInnerHTML={{ __html: html }} />
       }
@@ -57,16 +35,13 @@ function inlineHtml(text, { resolve, onRefTitle } = {}) {
             e.stopPropagation()
             onRefTitle && onRefTitle(p.title)
           }}
-          dangerouslySetInnerHTML={{ __html: `[[${esc(p.title)}]]` }}
-        />
+        >
+          {`[[${p.title}]]`}
+        </button>
       )
     }
-    return <span key={i} dangerouslySetInnerHTML={{ __html: esc(p.text) }} />
+    return <span key={i}>{p.text}</span>
   })
-}
-
-function esc(s) {
-  return String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])
 }
 
 function NodeRow({ node, doc, selectedId, onSelect, onRefTitle }) {

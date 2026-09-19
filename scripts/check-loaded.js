@@ -57,9 +57,11 @@ const countInk = `(() => {
 const inkBefore = await ev(countInk)
 
 /* 画点必须落在**真正的空白纸面**上，不是"视口内"就行。
-   板上压着两块浮层：右上角的关系面板、底下的工具条。
+   板上压着浮层：右上角那块关系面板（2026-09-19 删掉了）、底下的工具条。
    第一版按 left/top 加偏移算出一个点，它正好落在关系面板上 —— 事件被面板吃掉，
    画布一点墨都没有，看起来就像"笔坏了"。
+   （所以下面那句 `x > panel.left` 的排除条件现在没有了 —— 面板不在了；
+     但**这条教训还在**：以后往画布上加任何浮层，落点都得重新挑。）
    2026-09-16 又踩了一次（这次落在**工具条的按钮**上，打印出来是 `bd-t on`）：
    那一下不是在画，是**点了一个工具**；点到橡皮的话，后面那 16 个 mouseMoved
    就变成擦除。所以现在：逐个候选点用 elementFromPoint 验，验不上就**不画**。 */
@@ -67,13 +69,11 @@ const spot = await ev(`(() => {
   const hit = document.querySelector('.bd-hit')
   if (!hit) return null
   const r = hit.getBoundingClientRect()
-  const panel = document.querySelector('.bd-cpanel') ? document.querySelector('.bd-cpanel').getBoundingClientRect() : null
   const bar = document.querySelector('.bd-tools') ? document.querySelector('.bd-tools').getBoundingClientRect() : null
   for (const fy of [0.88, 0.8, 0.72, 0.94, 0.62]) {
     for (const fx of [0.06, 0.12, 0.2, 0.3]) {
       const x = Math.round(r.left + r.width * fx)
       const y = Math.round(r.top + r.height * fy)
-      if (panel && x > panel.left - 8) continue
       if (bar && y > bar.top - 10) continue
       const el = document.elementFromPoint(x, y)
       if (el && el.classList && el.classList.contains('bd-hit')) return { x: x, y: y }

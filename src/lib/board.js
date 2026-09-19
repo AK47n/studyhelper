@@ -23,7 +23,11 @@
    （视图映射在 view.js —— 那个现在由 geometry.js 的 fitView 用，这边用不着了：
      读盘时的缩放归一是本地那个 clampScale。） */
 import { ARROW_LINK, COND_NONE, isLinkKind, parseCond } from './link-kinds.js'
+import { normalizeShape, serializeShape, bakeShapePoints, normAngle } from './shape-object.js'
 import { toFlat } from './geometry.js'
+/* 只借一个"最后一截是什么" —— data/ 里的路径从 2026-09-17 起可以带层
+   （`大物/电磁学/board-第一章.md`），拆路径这件事只在 paths.js 里有一份。 */
+import { baseName } from './paths.js'
 
 export const BOARD_VERSION = 4
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
@@ -388,8 +392,10 @@ export function isStrokePointsOK(flat) {
   return toFlat(flat).length >= 6 // 两个点 × (x, y, p)
 }
 
+/* 是不是一个**板文件名**。只看**最后一段**：`大物/电磁学/board-第一章.md` 也是一张板
+ * （data/ 里可以分层了 —— 分层只改它存在哪，不改"什么算一张板"这条口径）。 */
 export function isBoardName(name) {
-  return new RegExp(`^${BOARD_PREFIX}.*\\.md$`, 'i').test(String(name || ''))
+  return new RegExp(`^${BOARD_PREFIX}.*\\.md$`, 'i').test(baseName(name))
 }
 
 export function isBoardDocument(text) {
@@ -470,6 +476,23 @@ function normalizeStroke(s) {
   const pts = toFlat(s.points) // ★ 一律归成扁平数组，见下方说明
   if (!isStrokePointsOK(pts)) return null
   const tool = s.tool === 'highlighter' ? 'highlighter' : 'pen'
+  /* ★★ 图形的身份：先归一化一次，**算出来的点才是真相**。
+   *
+   * 规矩（和 shape-object.js 文件头那条铁律是同一句）：**`shape` 和 `points`
+   * 任何时候都必须对得上**。而"对得上"这件事不能靠"存的时候记得两边一起写"
+   * ——那种纪律一定会漏（手改文件、旧版本、哪天多一条写入路径都会漏）。
+   * 所以在**读盘这一步**就把不变量立起来：有 `shape` 就按它重烤一遍点。
+   *
+   * ⚠ 为什么要重烤而不是"信文件里那些点"：一个图形的位置/大小/旋转**只有
+   *   `shape` 说了算**（那是它的全部参数）。文件里那份 points 是**导出物**，
+   *   就像板框的框线是成员的函数一样 —— 两份都当真，就会出现
+   *   "拖一下手柄，图形跳回文件里那个旧位置"这种一次性的错位。
+   * ⚠ 重烤的代价是"手改文件里的 points 对图形不起作用了"（改 shape 才有效）——
+   *   这是**要的**：手改一堆 72 个点去挪一个圆本来就没人做得到。 */
+  const shape = normalizeShape(s.shape)
+  const baked = shape ? bakeShapePoints(shape) : null
+  const finalPts = baked && baked.length >= 6 ? baked : pts
+  if (!isStrokePointsOK(finalPts)) return null
   return {
     id: typeof s.id === 'string' && s.id ? s.id : newId('s'),
     tool,
@@ -502,7 +525,17 @@ function normalizeStroke(s) {
          变成一个说法）、**不补默认值**（没说过这句话的板一个字节都不多）。
        ★ 指的东西后来没了 → 这个字段在解析的最后一步被清掉（那里看得到所有 id）。 */
     ...(parseCond(s.cond) ? { cond: s.cond } : {}),
-    points: pts,
+    /* 「这一笔是个**图形**」（规整过的圆/矩形/三角形/直线，见 shape-object.js）。
+       ★ 它和 link / cond 是同一条纪律，一个字都不改：
+         · **形状不认的一律丢掉**（`normalizeShape` 就是那道闸 —— 手改文件写个
+           `{k:"star"}`、或者写了个半截的 `{k:"rect",cx:12}`，都不该变成一个图形）；
+         · **不补默认值**（没规整过的笔一个字节都不多，老文件在 Git 里纹丝不动）。
+       ★ 为什么它必须**存**（而不是像"关系"那样每次现算）：规整完的笔迹在文件里
+         和一条普通笔迹长得一模一样（就是一堆点），现算是**算不回来**的 ——
+         打开时没有任何线索说明"这是个圆"，于是手柄、缩放、旋转全没了。
+         `check-shape` 的 [10] 钉着这一条（重开之后手柄还在）。 */
+    ...(shape ? { shape } : {}),
+    points: finalPts,
   }
 }
 
@@ -547,6 +580,12 @@ function normalizeCard(c) {
     /* 倍率：认不出的值（负数、NaN、字符串）一律退回 1。
        "手改一个怪值就把卡片的字号搞成 0"这种事故，挡在这一层最省事。 */
     scale: clampCardScale(c.scale),
+    /* 旋转（弧度，绕卡片自己的中心）。默认 0 = 没转过。
+       ★ 归一化用的是 shape-object.js 的 `normAngle`（全仓库只有那一份）：把角度归到
+         (−π, π] 并清掉浮点噪声与 `-0` —— 不然"转一圈回来"会在文件里留一个 `rot: 1e-17`。
+       ★ 认不出的值（NaN / 字符串 / null）一律当 0：这里退的不是"默认样式"，
+         而是一个会让卡片整个歪掉的变换，挡在这一层最省事（和 scale 同一条理由）。 */
+    rot: normAngle(c.rot),
     /* 固定（钉住）：**只有真的是 true 才算固定**。
        认 "true" / 1 这种字符串和数字是不行的 —— 手改文件写个 "false"
        会变成"固定的"，而用户以为自己是解开。严格判 true，别的一律当没固定。 */
@@ -597,6 +636,10 @@ export function serializeBoardDocument(board) {
       /* 条件那一族同理，只在你说过时才写；**指的东西还在**才写（死 id 不留尸体 ——
          和板框一样。判据必须按"这一批真会写出去的卡/笔"算，和上面那段同一个道理）。 */
       ...(condToWrite(s.cond) ? { cond: condToWrite(s.cond) } : {}),
+      /* 图形的身份（见 normalizeStroke 里那一段）。**只在真有时写** ——
+         没规整过的板一个字节都不多；写的是短字段版（`serializeShape`），
+         而且它自己也会过一遍 `normalizeShape`（出关和进关同一个出口）。 */
+      ...(serializeShape(s.shape) ? { shape: serializeShape(s.shape) } : {}),
       // ★ 必须过 toFlat，不能直接 Array.from 遍历。
       //   内存里的点有可能是**对象数组**（parseBoardDocument 规范化出来的就是），
       //   直接遍历再用 Number(n) 读，每个点都会变成 0 —— 又一次静默毁数据。
@@ -634,6 +677,12 @@ export function serializeBoardDocument(board) {
       /* 同理：倍率是 1（原样）就不写。老文件里一张卡都没有这个字段，
          凭空写出去会让所有老板文件在 Git 里变成"已修改"。 */
       ...(c.scale && clampCardScale(c.scale) !== DEFAULT_CARD_SCALE ? { scale: round(clampCardScale(c.scale), 3) } : {}),
+      /* ★ 旋转（`rot`，弧度）：和 `scale` 同一条纪律 —— **只在真转过时才写**。
+         没转过 = 0 = 不写，老文件一个字节都不动；`-0` / 1e-17 那种浮点噪声
+         由 normAngle 清掉（它连"转一圈回来"的 1e-17 都归零，见 [6] 的往返断言）。
+         ⚠ 写出去的就是 `normAngle` 的那个数（9 位小数量化）—— 出关和进关同一个规范形，
+           所以"打开 → 存回"逐字节一致，不会每次开板都留一条假 diff。 */
+      ...(normAngle(c.rot) ? { rot: normAngle(c.rot) } : {}),
       /* 固定（钉住）也只在**真的固定**时才写。默认不固定 = 不写这个字段，
          理由同上：老文件不该因为我们加了个功能就在 Git 里整块变脏。
          （"不固定"是绝大多数卡片的状态，写 `locked: false` 出去就是纯噪音。） */

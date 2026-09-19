@@ -16,7 +16,9 @@
  *   [5] 锁定后：拖它 → 位置纹丝不动
  *   [6] 锁定后：双击 → 不进编辑态（没有输入框）
  *   [7] 锁定后：在它上面画一笔 → 墨迹照画（还画在它上面），卡片照样不动
- *   [8] 锁定后：从关系面板里选中它、按 Delete → 删不掉，还会给一句人话提示
+ *   [8] 锁定后：点它选不中、按 Delete 也删不掉
+ *       （从前那条路是"关系面板里点一下名字能选中它" —— 面板 2026-09-19 删掉了，
+ *        但那道闸**留着**：它挡的是"以后又冒出一条能选中它的路"。）
  *   [9] 解开 → 手柄回来，拖得动了
  *   [10] 文件里只有那张卡带 "locked": true（别的卡不多这个字段）
  *   [11] 重开一次 → 它还是锁着的
@@ -32,9 +34,9 @@ import { withBoard } from './lib/board-check.js'
 import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument } from '../src/lib/board.js'
 
 /* 夹具：两张**文字卡**（我自己造的，**不动用户自己那张板**）。
-   为什么不用样板板：样板里第一张是公式卡，而关系面板里显示的"标签"是
-   渲染后的式子（displayTex），跟 DOM 里的文字对不上 —— 第 7 步要在面板里
-   按文字找那一行，所以夹具得是**文字可预测**的卡。
+   为什么不用样板板：样板里第一张是公式卡，而"这张卡上写的是什么"在公式卡上
+   跟 DOM 里的文字对不上（KaTeX 排出来的式子）—— 夹具的文字要**可预测**。
+   （更早的版本还要在关系面板里按文字找那一行，面板 2026-09-19 删掉了。）
    两张卡隔得远，第 6 步"在锁定的卡上画一笔"不会碰到另一张。 */
 const CARD_A = 'lockcheck-a'
 const TEXT_A = '固定自检甲的卡片'
@@ -225,36 +227,32 @@ console.log('\n[6] 锁定后：在它上面写字照样写得出来（墨迹画�
   else bad('画这一笔把卡片挪了 —— 用笔时卡片还是抢了指针')
 }
 
-/* ═════════════════ 7. 关系面板里选中它、按 Delete ═════════════════ */
-/* 锁定之后它在画布上选不中，但关系面板里点一下名字是会选中的 ——
-   那条路要是没挡，一个 Delete 就把锁定的卡删了。 */
-console.log('\n[7] 从关系面板里选中它、按 Delete：删不掉，而且给一句人话')
+/* ═════════════════ 7. 锁定之后：选不中它，也就删不掉 ═════════════════ */
+/* 锁定 = 整张卡 pointer-events: none、只留 📌 自己 auto，所以**画布上任一条路
+   都选不中它**，Delete 自然也就轮不到它。
+   ★ 从前这里测的是另一条路：关系面板里点一下名字是能选中它的（那行是个 button），
+     于是 Board.jsx 里得专门为"选中的卡固定着"补一句提示 —— 那条路 2026-09-19
+     随着面板一起删掉了。但**那扇闸留着**（`deleteIntent` 那一支），
+     因为"选不中"是 CSS 的 pointer-events 保证的，不是类型保证的：
+     哪天再冒出一条能选中它的路，Delete 就该在那儿被拦住。
+   这一节因此直接钉结果：点它 → 落点是纸面、它没被选中；按 Delete → 卡片还在。 */
+console.log('\n[7] 锁定的卡：点它落不到卡片上、也选不中；按 Delete 删不掉')
 {
   const c = await readCard(first)
-  const clicked = await s.eval(`(() => {
-    const rows = [...document.querySelectorAll('.bd-node-row')]
-    const row = rows.find((r) => (r.textContent || '').includes(${JSON.stringify(c.text)}))
-    if (!row) return false
-    row.click()
-    return true
-  })()`)
-  if (!clicked) {
-    console.log('  （⚠ 关系面板里没找到这一行，这一条跳过）')
-  } else {
-    await sleep(260)
-    const sel = await readCard(first)
-    if (sel.on) ok('面板里点一下确实能把它选中（所以这条路必须挡）')
-    else console.log('  （⚠ 面板点击没把它选中，还是照按一下 Delete 看看）')
-    await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 })
-    await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 })
-    await sleep(400)
-    const after = await readCard(first)
-    if (after) ok('按了 Delete，卡片还在 —— 锁定的卡不会被键盘删掉')
-    else bad('按 Delete 把锁定的卡片删掉了（它平时选不中，但面板那条路能选中）')
-    const toast = await s.eval(`((document.querySelector('.toast') || {}).textContent || '').trim()`)
-    if (/固定/.test(toast)) ok('还给了一句人话：' + toast)
-    else console.log(`  （⚠ 没读到提示（toast="${toast}"）—— 不拦，但记一下）`)
-  }
+  const hitEl = await hitAt(c.cx, c.cy)
+  if (String(hitEl).includes('bd-hit')) ok(`卡片正中间那一点命中的是纸面（${hitEl}）—— 它真的让开了指针事件`)
+  else console.log(`  （⚠ 卡片中心命中的是「${hitEl}」—— 记一下）`)
+  await s.mouse(c.cx, c.cy)
+  await sleep(260)
+  const sel = await readCard(first)
+  if (!sel.on) ok('点它之后也没被选中 —— 那 Delete 就轮不到它')
+  else bad('点一下就把锁定的卡选中了 —— 那 Delete 就危险了')
+  await s.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 })
+  await s.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 })
+  await sleep(400)
+  const after = await readCard(first)
+  if (after) ok('按了 Delete，卡片还在 —— 锁定的卡不会被键盘删掉')
+  else bad('按 Delete 把锁定的卡片删掉了')
 }
 
 /* ═════════════════ 8. 解开 → 又能拖了 ═════════════════ */

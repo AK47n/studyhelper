@@ -8,11 +8,11 @@
  * 断言清单：
  *   [1] 拿**笔**从一张卡画到另一张卡 → 连接当场成立（不用点任何东西）+ 浮出那排词，
  *       而且自动读出来的是「相关」（直线）
- *   [2] 点「因果」→ 面板改词、屏幕上出现一颗词 + 一个箭头、文件里写上 link
+ *   [2] 点「因果」→ 屏幕上那颗词跟着改 + 出现一个箭头、文件里写上 link
  *   [3] elementFromPoint 证明那颗词**点得到**（这是"回头改"的唯一入口）
  *   [4] 点那颗词 → 浮词再来一次；按 `1` 选回「相关」→ **文件里的 link 字段消失**
  *       （选的就是自动那一档 = 回到自动，不写字节）
- *   [5] 框住那条线（真框选）→ 浮层里多出一排词，选「推导」→ 面板和文件都跟上
+ *   [5] 框住那条线（真框选）→ 浮层里多出一排词，选「推导」→ 文件跟上
  *   [6] 画一条**带箭头**的线（一笔画成、末端回勾）→ 自动读成「因果」，
  *       而且**文件里没有 link 字段**（形状读出来的不存盘）
  *   [6b] 用**他本人画的箭头**（真实点列，两笔：一杆 + 一个 V 尖）→ 也读成「因果」，
@@ -21,6 +21,13 @@
  *   [8] 重开一次 → 你标过的那个词还在（存在笔迹上）
  *   [9] 「这条不算连接」：点它 → 不再是关系、文件里写 link:"none"、重开还在；
  *       再框住那一笔 → 浮层里「又算回连接」→ 点回去，文件里那个字段也去掉
+ *
+ * ★ 2026-09-19：原 [11][12][13]（条件从位置送 / 这个条件不算 / 条件就是它）、
+ *   [15]（宣告的连接上的条件）、[15b]（面板上的按键）整段删了 ——
+ *   它们的主语全是**关系面板那一行**（✕ / ↺ / ∈ 那三颗按钮），而那块面板删掉了，
+ *   那三个写入口没有界面了（数据层 vetoCond / specCond / clearCond 还在 selection.js 里）。
+ *   连接状态因此改从 .bd-linksvg 的 data-links / data-link-kinds 两个读数来
+ *   （见 readBoard 开头那段），不再读 .bd-link-row。
  *
  * 自己起服务（5203）和 headless Edge（9233），跑完都收掉；
  * 只碰自己造的夹具板 board-zz-linkcheck.md（跑完删）。
@@ -34,11 +41,9 @@ import { BOARD_PREFIX, newBoard, newCard, serializeBoardDocument } from '../src/
 import { toPoints } from '../src/lib/geometry.js'
 
 /* ── 夹具板：两张文字卡、**一笔都没有**，而且是**上下摆**不是左右摆 ──
- * ★ 左右摆踩过：屏幕右边 ~330px 是关系面板（.bd-cpanel，覆盖在画布上面），
- *   而"装回屏幕"会把这两张卡居中，于是右边那张正好钻到面板底下。
- *   症状是"第二笔怎么画都不出墨"，报出来像"画不出来"，其实是**在面板上按的**
- *   （面板在 .bd-stagewrap 外面，捕获阶段的监听都收不到 pointerdown）。
- *   上下摆之后两张卡都落在画布中轴附近，离面板远远的。
+ * ★ 上下摆是当年为**关系面板**定的（那块 320px 的浮层压在画布右缘，左右摆时
+ *   "装回屏幕"会把右边那张卡正好塞到面板底下，第二笔怎么画都不出墨）。
+ *   面板 2026-09-19 删掉了，右缘干净了 —— 但这个摆法没有理由再变，**别顺手改回左右摆**。
  * 为什么板上一笔都没有：第 5 步要"框住那条线"，而浮层只在
  *   "框里正好一条连接线"时出现（inkSel.size === 1）—— 板上多一笔就测不到那条路了。
  * 夹具的造/删、"打开的就是夹具"、"跑完 data/ 原有文件一字节不变"都由 withBoard 管。 */
@@ -66,9 +71,15 @@ const sleep = (ms) => s.sleep(ms)
 /* 打开夹具板（应用从 ?file= 直接开，不再"进界面之后点左栏那一行"） */
 await open()
 
-/* 读板上的情况：面板里那节"你画过的"、浮词那排、屏幕上的词、以及卡片位置。 */
+/* 读板上的情况：这一刻有几条连接、分别是什么词、浮词那排、屏幕上的词、卡片位置。
+   ★★ 「几条连接、什么词」现在来自 `.bd-linksvg` 上的两个 data-* 读数。
+   从前它读的是关系面板里那些行（`.bd-link-row`）—— 面板 2026-09-19 整块删掉了
+   （用户：「白板页面我觉得不需要右侧关系栏，可以删掉了」）。
+   而画布**替代不了**它：默认那一档「相关」连词都不画（见 BoardCanvas 里那条 filter），
+   所以"数屏幕上有几颗词"测的是"哪几条被标过词"，不是"有几条连接"—— 差得很远。
+   读数由渲染层如实报出来（和 `canvas.bd-ink` 的 `data-strokes` 同一条路），不让自检去猜。 */
 const readBoard = () => s.eval(`(() => {
-  const rows = [...document.querySelectorAll('.bd-link-row')]
+  const svg = document.querySelector('.bd-linksvg')
   const chips = document.querySelector('.bd-linkchips')
   const card = (id) => {
     const el = document.querySelector('.bd-card[data-card-id="' + id + '"]')
@@ -79,10 +90,9 @@ const readBoard = () => s.eval(`(() => {
   const pill = document.querySelector('.bd-linkpill')
   const pr = pill ? pill.getBoundingClientRect() : null
   return {
-    count: rows.length,
-    /* 词里带方向记号（「因果 →」），自检只关心词本身 —— 统一去掉箭头再比，
-       不然每个断言都得把方向符号抄一遍（抄错了就是假红）。 */
-    kinds: rows.map((r) => ((r.querySelector('.bd-link-kind') || {}).textContent || '').replace(/[→⇒]/g, '').trim()),
+    count: svg ? Number(svg.dataset.links) : 0,
+    /* 词本身（data 里放的就是名字，没有「因果 →」那种方向记号 —— 不用再去箭头）。 */
+    kinds: (svg && svg.dataset.linkKinds || '').split(',').filter(Boolean),
     chipsOpen: !!chips,
     chipsPick: chips ? chips.dataset.linkPick : null,
     chipsKinds: chips ? [...chips.querySelectorAll('.bd-linkchip')].map((b) => b.dataset.linkKind || 'rev') : [],
@@ -101,22 +111,6 @@ const readBoard = () => s.eval(`(() => {
     /* 框选浮层（虚线框 + 那一排动作）在不在 */
     inkBox: !!document.querySelector('.bd-inkbox'),
     inkActs: !!document.querySelector('.bd-inkacts'),
-    /* 推导链那一节（面板）：几条链、哪几步缺条件、每一步的条件写的是什么 */
-    chainCount: document.querySelectorAll('.bd-chain').length,
-    chainMissing: document.querySelectorAll('.bd-chain-cond.miss').length,
-    chainConds: [...document.querySelectorAll('.bd-chain-cond')].map((e) => e.textContent.trim()),
-    condRows: [...document.querySelectorAll('.bd-link-row .bd-cond')].map((e) => e.textContent.trim()),
-    /* 「这个条件不算」那颗 ✕ / 回头路 ↺（见 check-link [12]）——
-       ★ 按**行**看：夹具上有好几条连接，只有"推导"那一行会被否决，
-         别的行照旧显示自己的条件（所以不能用"页面上还有没有 ✕"来判）。 */
-    condNoCount: document.querySelectorAll('[data-cond-btn="no"]').length,
-    condBackCount: document.querySelectorAll('[data-cond-btn="back"]').length,
-    condRowInfo: rows.map((r) => ({
-      kind: ((r.querySelector('.bd-link-kind') || {}).textContent || '').replace(/[→⇒]/g, '').trim(),
-      cond: ((r.querySelector('.bd-cond') || {}).textContent || '').trim(),
-      note: ((r.querySelector('.bd-cond-note') || {}).textContent || '').trim(),
-      btn: (r.querySelector('[data-cond-btn]') || { dataset: {} }).dataset.condBtn || null,
-    })),
     a: card('lk-a'),
     b: card('lk-b'),
     toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
@@ -165,8 +159,8 @@ console.log('\n[1] 从一张卡画到另一张卡：连接当场成立，不用�
   const to = { x: st.b.cx, y: st.b.cy }
   await s.penStroke(from, to, { steps: 10, hover: true })
   const now = await readBoard()
-  if (now.count === 1) ok('面板里出现了 1 条"你画过的"连接')
-  else bad(`面板里"你画过的"是 ${now.count} 条，应该是 1 条`)
+  if (now.count === 1) ok('板上有 1 条连接（就是你画的那一条）')
+  else bad(`板上应该是 1 条连接，实际 ${now.count} 条`)
   if (now.kinds[0] === '相关') ok('直线自动读成「相关」（无向）')
   else bad(`直线读成了「${now.kinds[0]}」，应该是「相关」`)
   if (now.chipsOpen) ok('那排词自己浮出来了（画完就有，不用去点什么）')
@@ -180,7 +174,7 @@ console.log('\n[1] 从一张卡画到另一张卡：连接当场成立，不用�
 }
 
 /* ═════════════════ 2. 点一个词 ═════════════════ */
-console.log('\n[2] 点「因果」：面板改词、屏幕上出现词和箭头、文件里写上')
+console.log('\n[2] 点「因果」：屏幕上那颗词跟着改 + 出现词和箭头、文件里写上')
 {
   const clicked = await s.eval(`(() => {
     const chips = document.querySelector('.bd-linkchips')
@@ -194,8 +188,8 @@ console.log('\n[2] 点「因果」：面板改词、屏幕上出现词和箭头�
   else bad(`点不到「因果」那颗词（${clicked}）`)
   await s.sleep(300)
   const now = await readBoard()
-  if (now.kinds[0] === '因果') ok('面板里那一条改成了「因果」')
-  else bad(`面板里还是「${now.kinds[0]}」`)
+  if (now.kinds[0] === '因果') ok('那一条改成了「因果」')
+  else bad(`还是「${now.kinds[0]}」`)
   if (now.pillText === '因果 →') ok('屏幕上多了一颗词「因果 →」')
   else bad(`屏幕上那颗词是 ${JSON.stringify(now.pillText)}`)
   if (now.arrows === 1) ok('还画了一个箭头（有方向的词才有）')
@@ -226,8 +220,8 @@ console.log('\n[4] 点那颗词 → 按 1 选回「相关」：回到自动，�
   else bad('点那颗词没有重新浮出那排词')
   await s.key('1', 'Digit1', 49)
   const now = await readBoard()
-  if (now.kinds[0] === '相关') ok('面板里回到「相关」')
-  else bad(`面板里是「${now.kinds[0]}」`)
+  if (now.kinds[0] === '相关') ok('回到「相关」')
+  else bad(`现在是「${now.kinds[0]}」`)
   if (now.pillText === null && now.arrows === 0) ok('屏幕上那颗词和箭头都撤了（回到默认的样子）')
   else bad(`屏幕上还留着：词=${now.pillText} 箭头=${now.arrows}`)
   const links = await fileLinks()
@@ -263,8 +257,8 @@ console.log('\n[5] 框住那条线，在浮层里选「推导」')
   })()`)
   await s.sleep(300)
   const now = await readBoard()
-  if (picked && now.kinds[0] === '推导') ok('选「推导」之后面板跟着改了')
-  else bad(`点了「推导」，面板里却是「${now.kinds[0]}」`)
+  if (picked && now.kinds[0] === '推导') ok('选「推导」之后那条线跟着改了')
+  else bad(`点了「推导」，那条线却是「${now.kinds[0]}」`)
   const links = await fileLinks()
   if (links && links.join(',') === 'derive') ok('文件里改成 link: "derive"')
   else bad(`文件里的 link 不对：${JSON.stringify(links)}`)
@@ -310,7 +304,7 @@ console.log('\n[6] 箭头工具（A）：从一张卡划到另一张卡 —— �
   await sleep(1200)
 
   const now = await readBoard()
-  if (now.count === 2) ok('面板里多了一条（"你连的"那一条进了文件）')
+  if (now.count === 2) ok('板上多了一条（"你连的"那一条进了文件）')
   else bad(`划完应该是 2 条连接，实际 ${now.count}`)
   const doc6 = await read()
   const rec = (doc6.links || [])[0]
@@ -337,8 +331,8 @@ console.log('\n[6] 箭头工具（A）：从一张卡划到另一张卡 —— �
   await s.key('4', 'Digit4', 52)
   await sleep(1200)
   const after = await readBoard()
-  if (after.kinds.includes('并列')) ok('按 4 之后面板里是「并列」')
-  else bad(`面板里是 ${JSON.stringify(after.kinds)}`)
+  if (after.kinds.includes('并列')) ok('按 4 之后那条线是「并列」')
+  else bad(`现在是 ${JSON.stringify(after.kinds)}`)
   const doc6b = await read()
   if ((doc6b.links || [])[0] && doc6b.links[0].kind === 'para') ok('改完的词写进了那条记录（kind=para）')
   else bad(`记录里的词没改：${JSON.stringify(doc6b.links)}`)
@@ -664,356 +658,6 @@ console.log('\n[10] 板框（`frames`）：框住 → 留下板框 → 起名 �
   else bad('拆开之后屏幕上还挂着板框')
 }
 
-/* ═════════════════ 11. 条件从位置送 + 推导链 ═════════════════ */
-console.log('\n[11] 条件从位置送：线中点旁边写几个字，面板上的"缺条件"就变成"条件：…"')
-{
-  /* 用户的原话：「条件是位置送的。线中点附近那几个字 / 那张卡，自动成为这条关系的条件
-     —— 你本来就要写"仅当…"，不用再告诉它是谁的条件。」
-     这一步走的正是那句话：链上那一步缺条件 → 在线中点旁边写两笔 → 它自己补上。 */
-  const st8 = await readBoard()
-  if (st8.chainCount === 1) ok('面板里读出了 1 条推导链（[5] 标的那条「推导」）')
-  else bad(`推导链应该是 1 条，实际 ${st8.chainCount}（chainConds=${JSON.stringify(st8.chainConds)}）`)
-  const before = await readBoard()
-  const missBefore = before.chainMissing
-  if (missBefore >= 0) ok(`现在有 ${missBefore} 步是"缺条件"（下一步把它补上）`)
-  /* 在那条线的**中点**旁边写两个短笔 —— 尺寸要按**世界像素**算：
-     条件要过"块的最小个头"（18 世界像素）和"中点在 64 世界像素之内"两条闸，
-     而屏幕上看到的距离要乘/除视图缩放。缩放从"两张卡的屏幕距离 ÷ 世界距离"量出来
-     （踩过：第一次按屏幕像素画 22px，视图一缩小就只剩 11 世界像素 → 个头不够、条件读不出来）。 */
-  const fixture = await read()
-  const ca = fixture.cards.find((c) => c.id === 'lk-a')
-  const cb = fixture.cards.find((c) => c.id === 'lk-b')
-  const wDist = Math.hypot(ca.x + ca.w / 2 - (cb.x + cb.w / 2), ca.y + ca.h / 2 - (cb.y + cb.h / 2))
-  const sDist = Math.hypot(before.a.cx - before.b.cx, before.a.cy - before.b.cy)
-  const scale = wDist > 0 ? sDist / wDist : 1
-  const mx = Math.round((before.a.cx + before.b.cx) / 2)
-  const my = Math.round((before.a.cy + before.b.cy) / 2)
-  const wx = (n) => n * scale // 世界像素 → 屏幕像素
-  await pickTool('笔')
-  await s.sleep(150)
-  /* 两条 30 世界像素的短笔（< INK_LINK_MIN_LEN 48，所以不会变成新连接），
-     离中点 30 / 40 世界像素（< LINK_COND_RADIUS 64），彼此差 10 像素（< 24 → 聚成一块） */
-  await s.penStroke({ x: mx - wx(15), y: my - wx(40) }, { x: mx + wx(15), y: my - wx(38) }, { steps: 4, hover: true })
-  await s.penStroke({ x: mx - wx(14), y: my - wx(30) }, { x: mx + wx(16), y: my - wx(28) }, { steps: 4, hover: true })
-  await s.key('Escape', 'Escape', 27) // 收掉可能浮出来的那排词，别挡住读数
-  await s.sleep(500)
-  const after = await readBoard()
-  if (after.ink > before.ink) ok(`中点旁边真的写上了（墨迹层 ${before.ink} → ${after.ink}，缩放 ${scale.toFixed(2)}）`)
-  else bad(`那两笔没写上（墨迹层 ${before.ink} → ${after.ink}）—— 后面的读数没意义`)
-  if (after.chainMissing < missBefore || (missBefore === 0 && after.chainConds.length > 0)) {
-    ok(`写完那几个字，"缺条件"少了（${missBefore} → ${after.chainMissing}）`)
-  } else {
-    bad(`在中点旁边写了字，条件没被读出来（missing ${missBefore} → ${after.chainMissing}，conds=${JSON.stringify(after.chainConds)}）`)
-  }
-  if (after.condRows.some((t) => /条件/.test(t))) ok(`「你画过的」那一行也挂上了条件（${after.condRows[0]}）`)
-  else bad(`连接那一行没显示条件：${JSON.stringify(after.condRows)}`)
-  if (after.count === before.count) ok('这两笔短笔没有变成新连接（够短 → 不进连接那套判据）')
-  else bad(`短笔变成了连接：${before.count} → ${after.count}`)
-  /* 条件**不写盘**：它是从位置读出来的，文件里一个字段都不该多 */
-  const doc = await read()
-  if (!JSON.stringify(doc).includes('"cond"')) ok('条件没写进文件（位置读出来的，随时能重算）')
-  else bad('文件里出现了 cond 字段 —— 位置推断不该存盘')
-}
-
-/* ═════════════════ 12. 「这个条件不算」 ═════════════════ */
-/* 用户 2026-09-16 那条小尾巴：「写在中点旁边的字算条件，但没法说'这个条件不是给这条线的'」。
- * 这一步就走那条路：面板连接那一行上的 ✕（位置读错了）→ 那句话作废 → 文件里写下来 →
- * 重开还在 → 旁边的 ↺ 改回来（一步正常的撤销，不是单向门）。
- * ★ 全用真鼠标，而且先问 elementFromPoint —— 它是一颗 18px 的小按钮，
- *   和「📌 点得到」那类断言同一个道理（README 第 11 条）。 */
-console.log('\n[12] 「这个条件不算」：位置读错了，一句话作废（而且能改回来）')
-{
-  /* ★ 按**行**看：夹具上有 4 条连接，条件可能不止一条有；
-     这一节只认「推导」那一行（[5] 标的那条，[11] 在中点旁边写了字）。 */
-  const rowOf = (st) => (st.condRowInfo || []).find((r) => /推导/.test(r.kind)) || null
-  const btnRect = (which) =>
-    s.eval(`(() => {
-      const rows = [...document.querySelectorAll('.bd-link-row')]
-      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
-      const el = row && row.querySelector('[data-cond-btn="' + ${JSON.stringify(which)} + '"]')
-      if (!el) return null
-      const r = el.getBoundingClientRect()
-      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) }
-    })()`)
-
-  const before = await readBoard()
-  const row0 = rowOf(before)
-  if (!row0 || row0.btn !== 'no') {
-    bad('面板「推导」那一行上没有那颗 ✕ —— [11] 那一步没读出条件，这一节验不了')
-  } else {
-    ok(`「推导」那一行显示着条件、右边有一颗 ✕（${row0.cond}）`)
-    if (row0.cond && !row0.note) ok('还没说过话 → 没有"你说过条件不算"那句，也没有 ↺')
-    else bad('一上来就有那句痕迹 —— 板上有别人留下的 cond 字段')
-    const miss0 = before.chainMissing
-
-    const btn = await btnRect('no')
-    const hit = await hitAt(btn.cx, btn.cy)
-    if (String(hit).includes('bd-cond-no')) ok(`✕ 中心那一点命中的就是它自己（${btn.w}×${btn.h}）`)
-    else bad(`✕ 中心命中的是「${hit}」—— 它被别的东西盖住了，用户点不到`)
-
-    /* 真鼠标点一下 */
-    await s.mouse(btn.cx, btn.cy)
-    await s.sleep(500)
-    const after = await readBoard()
-    const row1 = rowOf(after)
-    if (row1 && !row1.cond) ok('那条线的条件从面板上撤掉了（位置读出来的那个不算数了）')
-    else bad(`条件还在：${JSON.stringify(row1)}`)
-    if (row1 && /不算/.test(row1.note)) ok(`面板照实说"你说过条件不算"（${row1.note}）`)
-    else bad(`没显示那句"你说过不算"：${JSON.stringify(row1)}`)
-    if (row1 && row1.btn === 'back') ok('★ 同一颗位置变成了 ↺（回头路就在手边）')
-    else bad('点完 ✕ 没出现 ↺ —— 那这句话就成了单向门')
-    if (after.condBackCount === before.condBackCount + 1 && after.condNoCount === before.condNoCount - 1) {
-      ok(`只有这一行的按钮翻了面（✕ ${before.condNoCount}→${after.condNoCount}，↺ ${before.condBackCount}→${after.condBackCount}）`)
-    } else {
-      bad(`别的行的按钮也动了：✕ ${before.condNoCount}→${after.condNoCount}，↺ ${before.condBackCount}→${after.condBackCount}`)
-    }
-    if (after.chainMissing > miss0) ok(`推导链那一步回到"缺条件"（${miss0} → ${after.chainMissing}）—— 你说的是"那撮字不是它的条件"`)
-    else bad(`链上那一步没回到缺条件（${miss0} → ${after.chainMissing}）`)
-    if (after.count === before.count) ok('否决条件没有多出/少掉连接')
-    else bad(`连接数变了：${before.count} → ${after.count}`)
-
-    /* 留一张图给人自己看一眼（"那句痕迹 + ↺"长什么样）—— 这一块没有像素自检，只能眼看 */
-    {
-      const clip = await s.eval(`(() => {
-        const el = document.querySelector('.bd-rel')
-        if (!el) return null
-        const r = el.getBoundingClientRect()
-        return {
-          x: Math.max(0, Math.round(r.x - 4)), y: Math.max(0, Math.round(r.y - 4)),
-          width: Math.round(r.width + 8), height: Math.min(520, Math.round(r.height + 8)), scale: 1,
-        }
-      })()`)
-      if (clip) {
-        const shot = await s.send('Page.captureScreenshot', { format: 'png', clip })
-        fs.writeFileSync('.cache/cond-veto.png', Buffer.from(shot.data, 'base64'))
-        console.log('     截图：.cache/cond-veto.png（关系面板那一块）')
-      }
-    }
-
-    /* 落盘：那句话写在那一笔上（cond: "none"），重开还在 —— 等的是**文件里真的有了** */
-    const wCond = await untilFile((d) => (d.strokes || []).filter((x) => x.cond === 'none').length === 1, {
-      what: '文件里出现一笔 cond:"none"',
-    })
-    if (!wCond.ok) bad(`等了 ${wCond.waited}ms，文件里一直没有 cond:"none" —— 那句话没落盘`)
-    const doc = wCond.value || (await read())
-    const withCond = (doc.strokes || []).filter((x) => x.cond === 'none')
-    if (withCond.length === 1) ok('文件里正好一笔写着 cond: "none"')
-    else bad(`文件里的 cond 不对：${JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1]))}`)
-
-    await open()
-    const reopened = await readBoard()
-    const row2 = rowOf(reopened)
-    if (row2 && row2.btn === 'back' && /不算/.test(row2.note)) ok('重开之后那句话还在（不是只活在这一屏）')
-    else bad(`重开之后那句话丢了：${JSON.stringify(row2)}`)
-    if (row2 && !row2.cond) ok('重开之后条件仍然不算')
-    else bad(`重开之后条件又回来了：${JSON.stringify(row2 && row2.cond)}`)
-    if (reopened.chainMissing > miss0) ok('重开之后链上那一步仍然缺条件')
-
-    /* 回头路：点 ↺ → 又按位置读 */
-    const back = await btnRect('back')
-    if (!back) {
-      bad('重开之后找不到 ↺（那这条回头路断了）')
-    } else {
-      const hit2 = await hitAt(back.cx, back.cy)
-      if (String(hit2).includes('bd-cond-no')) ok('↺ 中心那一点命中的也是它自己')
-      else bad(`↺ 中心命中的是「${hit2}」`)
-      await s.mouse(back.cx, back.cy)
-      await s.sleep(500)
-      const restored = await readBoard()
-      const row3 = rowOf(restored)
-      if (row3 && /条件/.test(row3.cond)) ok(`改回来了：条件又按位置读出来了（${row3.cond}）`)
-      else bad(`点了 ↺ 条件没回来：${JSON.stringify(row3)}`)
-      if (row3 && row3.btn === 'no' && !row3.note) ok('↺ 收走了，那颗 ✕ 回到原位')
-      else bad(`按钮没回到 ✕：${JSON.stringify(row3)}`)
-      if (restored.chainMissing <= miss0) ok(`推导链那一步又不缺条件了（${restored.chainMissing}）`)
-      else bad(`链上那一步还缺着：${restored.chainMissing}`)
-      const wClear = await untilFile((d) => !JSON.stringify(d).includes('"cond"'), { what: '回头看：文件里那个 cond 字段没了' })
-      if (!wClear.ok) bad(`等了 ${wClear.waited}ms，文件里那个 cond 字段还在（回头路没落盘）`)
-      const doc2 = wClear.value || (await read())
-      if (!JSON.stringify(doc2).includes('"cond"')) ok('文件里那个字段也没了（回头路清得干净）')
-      else bad('文件里还留着 cond 字段')
-    }
-  }
-}
-
-/* ═════════════════ 13. 「条件就是它」 ═════════════════ */
-/* 位置送的条件还有**读不到**的时候：条件写在别处（或者你后来把那几笔挪走了 ——
- * 那正是"位置送"的定义）。这时得能亲手指一个：那一行右边的 **∈** → 再点一下目标
- * （一撮字 / 一张卡）。存成 `cond: 'ink:<笔 id>'` / `'card:<卡 id>'`。
- * 入口为什么在**面板那一行**而不是框选浮层：板上几条线走同一条走廊时"只框住其中一条"
- * 很不好框，而"缺条件"本来就显示在那一行上（见 Board.jsx 的注释）。
- * ★ 全程真鼠标 + elementFromPoint：那颗 ∈ 是行内 span（那一行本身是 button），
- *   和「📌 点得到」那类断言同一个道理（README 第 11 条）。 */
-console.log('\n[13] 「条件就是它」：位置读不到时，在那一行按 ∈ 再点一下目标')
-{
-  const rowInfo = async () =>
-    (await readBoard()).condRowInfo.find((r) => /推导/.test(r.kind)) || null
-  const armBtn = () =>
-    s.eval(`(() => {
-      const rows = [...document.querySelectorAll('.bd-link-row')]
-      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
-      const el = row && row.querySelector('[data-arm-cond]')
-      if (!el) return null
-      const r = el.getBoundingClientRect()
-      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height), strokeId: el.dataset.armCond }
-    })()`)
-  const condBtn = (which) =>
-    s.eval(`(() => {
-      const rows = [...document.querySelectorAll('.bd-link-row')]
-      const row = rows.find((x) => /推导/.test(((x.querySelector('.bd-link-kind') || {}).textContent || '')))
-      const el = row && row.querySelector('[data-cond-btn="' + ${JSON.stringify(which)} + '"]')
-      if (!el) return null
-      const r = el.getBoundingClientRect()
-      return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) }
-    })()`)
-
-  const start = await readBoard()
-  const row0 = await rowInfo()
-  if (!row0 || !row0.cond) {
-    bad(`这一节要的前提不对（推导那一行现在没有条件显示）：${JSON.stringify(row0)}`)
-  } else {
-    ok(`推导那一行现在挂的是位置读出来的条件（${row0.cond}）`)
-    /* ① 有条件时**不给** ∈（那一行已经有 ✕ 了，别挤三颗按钮） */
-    if (!(await armBtn())) ok('这时候没有 ∈（有条件 → 给的是 ✕；设计如此，一行最多两颗按钮）')
-    else bad('有条件时也摆了一颗 ∈ —— 那一行会挤三颗按钮')
-
-    /* ② 先否决掉位置读错的那个 → 那一行变成"条件不算"，∈ 才出现 */
-    const veto = await condBtn('no')
-    if (!veto) {
-      bad('找不到那颗 ✕')
-    } else {
-      await s.mouse(veto.cx, veto.cy)
-      await s.sleep(450)
-      const row1 = await rowInfo()
-      if (row1 && /不算/.test(row1.note)) ok('否决成功（那一行显示"条件不算"）')
-      else bad(`否决没生效：${JSON.stringify(row1)}`)
-
-      /* ③ 按 ∈ → 武装：整块板换十字光标、按钮亮着、给一句人话 */
-      const btn = await armBtn()
-      if (!btn) {
-        bad('否决之后那一行上还是没有 ∈ —— 那"指一个"这条路就没有入口')
-      } else {
-        const hit = await hitAt(btn.cx, btn.cy)
-        if (String(hit).includes('bd-cond-no')) ok(`∈ 中心命中的就是它自己（${btn.w}×${btn.h}）`)
-        else bad(`∈ 中心命中的是「${hit}」—— 用户点不到`)
-        await s.mouse(btn.cx, btn.cy)
-        await s.sleep(350)
-        const armed = await s.eval(`(() => ({
-          cls: (document.querySelector('.bd') || {}).className || '',
-          on: !!document.querySelector('[data-arm-cond].on'),
-          toast: ((document.querySelector('.toast') || {}).textContent || '').trim(),
-        }))()`)
-        if (/condarm/.test(armed.cls)) ok('武装上了（.bd.condarm —— 整块板换成十字光标）')
-        else bad(`没武装：class=${armed.cls}`)
-        if (armed.on) ok('那颗 ∈ 亮着（知道自己正指着谁）')
-        else bad('∈ 没亮')
-        if (/点一下/.test(armed.toast)) ok('给了一句人话：' + armed.toast)
-        else bad('没提示怎么指：' + JSON.stringify(armed.toast))
-
-        /* ④ Esc 先收掉武装（不然你以为取消了、其实下一下点还是会指过去） */
-        await s.key('Escape', 'Escape', 27)
-        await s.sleep(250)
-        if (!(await s.eval("!!document.querySelector('.bd.condarm')"))) ok('Esc 收掉了武装')
-        else bad('Esc 没收掉武装')
-        await s.mouse(btn.cx, btn.cy)
-        await s.sleep(300)
-
-        /* ⑤ 点一下**那撮字**（[11] 写在中点旁边的那两笔）→ 它成了条件。
-              （这一步验的是"指"这条路的接线：指谁都能写进去；指得对不对是用户的事。） */
-        const fixture = await read()
-        const ca = fixture.cards.find((c) => c.id === 'lk-a')
-        const cb = fixture.cards.find((c) => c.id === 'lk-b')
-        const now = await readBoard()
-        const wDist = Math.hypot(ca.x + ca.w / 2 - (cb.x + cb.w / 2), ca.y + ca.h / 2 - (cb.y + cb.h / 2))
-        const sDist = Math.hypot(now.a.cx - now.b.cx, now.a.cy - now.b.cy)
-        const scale = wDist > 0 ? sDist / wDist : 1
-        const mx = Math.round((now.a.cx + now.b.cx) / 2)
-        const my = Math.round((now.a.cy + now.b.cy) / 2)
-        await s.mouse(mx, my - Math.round(34 * scale)) // 那两笔短笔之间（世界 -34 换算到屏幕）
-        await s.sleep(500)
-        const pickedInk = await readBoard()
-        const row2 = await rowInfo()
-        if (row2 && /条件/.test(row2.cond) && /你指的/.test(row2.cond)) ok(`那一行写上了"（你指的）"：${row2.cond}`)
-        else bad(`没写出"你指的"：${JSON.stringify(row2)}`)
-        if (!(await s.eval("!!document.querySelector('.bd.condarm')"))) ok('指完就收（一次性，不会留着影响下一次画）')
-        else bad('指完还武装着 —— 下次落笔会被它吃掉')
-        const wInk = await untilFile((d) => (d.strokes || []).some((x) => typeof x.cond === 'string' && x.cond.startsWith('ink:')), {
-          what: '文件里写上一个 ink: 条件',
-        })
-        if (!wInk.ok) bad(`等了 ${wInk.waited}ms，文件里一直没出现 ink: 条件`)
-        const doc = wInk.value || (await read())
-        const inkCond = (doc.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('ink:'))
-        if (inkCond.length === 1) ok('文件里写的是 ' + inkCond[0])
-        else bad('文件里的 cond 不对：' + JSON.stringify((doc.strokes || []).map((x) => [x.id, x.cond]).filter((x) => x[1])))
-
-        /* ⑥ 重开还在，然后 ↺ 回到按位置读 */
-        await open()
-        const row3 = await rowInfo()
-        if (row3 && /你指的/.test(row3.cond) && row3.btn === 'back') ok('重开之后还是你指的那一个（而且 ↺ 在）')
-        else bad(`重开之后丢了：${JSON.stringify(row3)}`)
-        const back = await condBtn('back')
-        if (!back) {
-          bad('找不到 ↺')
-        } else {
-          await s.mouse(back.cx, back.cy)
-          await s.sleep(450)
-          const row4 = await rowInfo()
-          if (row4 && /条件/.test(row4.cond) && !/你指的/.test(row4.cond)) ok(`↺ 回到按位置读了（${row4.cond}）`)
-          else bad(`点了 ↺ 没回到按位置读：${JSON.stringify(row4)}`)
-          const wClear2 = await untilFile((d) => !/"cond"/.test(JSON.stringify(d)), { what: '文件里那个 cond 又清掉了' })
-          if (!wClear2.ok) bad(`等了 ${wClear2.waited}ms，文件里的 cond 还在`)
-          const doc2 = wClear2.value || (await read())
-          if (!/"cond"/.test(JSON.stringify(doc2))) ok('文件里那个字段也清掉了')
-          else bad('文件里还留着 cond')
-
-          /* ⑦ 另一条路：点一张**卡**当条件（卡片自己收指针事件，所以那是另一段代码） */
-          const veto2 = await condBtn('no')
-          if (!veto2) {
-            bad('第二步找不到那颗 ✕')
-          } else {
-            await s.mouse(veto2.cx, veto2.cy)
-            await s.sleep(400)
-            const btn2 = await armBtn()
-            if (!btn2) {
-              bad('第二次没找到 ∈')
-            } else {
-              await s.mouse(btn2.cx, btn2.cy)
-              await s.sleep(300)
-              const card = await s.eval(`(() => {
-                const el = document.querySelector('.bd-card[data-card-id="lk-a"]')
-                if (!el) return null
-                const r = el.getBoundingClientRect()
-                return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) }
-              })()`)
-              await s.mouse(card.cx, card.cy)
-              await s.sleep(500)
-              const pickedCard = await readBoard()
-              const row5 = pickedCard.condRowInfo.find((r) => /推导/.test(r.kind))
-              if (row5 && /你指的/.test(row5.cond)) ok(`点一张卡也能当条件：${row5.cond}`)
-              else bad(`点卡片那条路没走通：${JSON.stringify(row5)}`)
-              const wCard = await untilFile((d) => (d.strokes || []).some((x) => x.cond === 'card:lk-a'), { what: '文件里写上 card:lk-a' })
-              if (!wCard.ok) bad(`等了 ${wCard.waited}ms，文件里一直没出现 card:lk-a`)
-              const doc3 = wCard.value || (await read())
-              const cardCond = (doc3.strokes || []).map((x) => x.cond).filter((v) => typeof v === 'string' && v.startsWith('card:'))
-              if (cardCond.length === 1 && /card:lk-a/.test(cardCond[0])) ok('文件里写的是 ' + cardCond[0])
-              else bad('文件里的 cond 不对：' + JSON.stringify(cardCond))
-              if (pickedCard.count === start.count) ok('"指一个条件"没有多出/少掉连接')
-              else bad(`连接数变了：${start.count} → ${pickedCard.count}`)
-              /* 收尾：把那句话清掉，别影响后面的收尾检查 */
-              const back2 = await condBtn('back')
-              if (back2) {
-                await s.mouse(back2.cx, back2.cy)
-                await s.sleep(400)
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  await s.key('Escape', 'Escape', 27)
-}
-
 /* ═════════════════ 14. 宣告的连接：屏幕上那条箭头是应用画的 ═════════════════ */
 console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是应用合成的、跟着框走')
 {
@@ -1022,7 +666,8 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
        · 一条合成的线（`.bd-linkline`，圆角、带一点点弧度）；
        · 一个尖（自己画的那个尖不存在，所以这次是应用画的）；
        · 线上那颗词；
-       · 面板里"你连的"和"板框（1 个）"两节。
+       · 板框按成员画出了框线（名字用你起的标题）。
+     （原来还要看面板里"你连的 / 板框"两节 —— 面板 2026-09-19 删掉了。）
      ★ 用"写进文件再重开"这条路，是因为第一刀还没有造它的界面入口 ——
        而这一段钉的正是"文件里写了，屏幕上就该有"。
      夹具是我们自己的（board-zz-linkcheck.md），改它不碰用户的数据。 */
@@ -1041,8 +686,6 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
     const arrow = document.querySelector('[data-link-arrow="fr1|lk-b"]')
     const pill = document.querySelector('.bd-linkpill[data-link-pill]')
     const frame = document.querySelector('.bd-frame')
-    const row = document.querySelector('[data-link-declared]')
-    const frameRow = document.querySelector('[data-frame-row]')
     const d = line ? line.getAttribute('d') : null
     return {
       hasLine: !!line,
@@ -1050,8 +693,6 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
       hasArrow: !!arrow,
       pill: pill ? pill.textContent.trim() : null,
       frameTitle: frame ? frame.getAttribute('data-frame-title') : null,
-      declaredRow: row ? row.textContent.replace(/\\s+/g, ' ').trim() : null,
-      frameRow: frameRow ? frameRow.textContent.replace(/\\s+/g, ' ').trim() : null,
     }
   })()`)
   if (rendered.hasLine) ok('屏幕上画出了那条合成的线（.bd-linkline）')
@@ -1064,13 +705,6 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
   else bad(`线上那颗词是 ${JSON.stringify(rendered.pill)}`)
   if (rendered.frameTitle === '第一节') ok('板框按成员算出了框线，名字用你起的标题')
   else bad(`板框没画出来 / 名字不对：${JSON.stringify(rendered.frameTitle)}`)
-  if (rendered.declaredRow && rendered.declaredRow.includes('因果') && rendered.declaredRow.includes('第一节')) {
-    ok(`面板「你连的」那一行读得懂：${rendered.declaredRow}`)
-  } else {
-    bad(`面板里「你连的」那一行不对：${JSON.stringify(rendered.declaredRow)}`)
-  }
-  if (rendered.frameRow && rendered.frameRow.includes('第一节')) ok(`面板「板框」那一行：${rendered.frameRow}`)
-  else bad(`面板里没有板框那一行：${JSON.stringify(rendered.frameRow)}`)
 
   /* 把那张卡挪走 → 线自己跟着走（"箭头跟着板块动"这条只有真渲染才看得出来） */
   const before = await s.eval(`document.querySelector('[data-link-line]').getAttribute('d')`)
@@ -1084,144 +718,6 @@ console.log('\n[14] 宣告的连接（`links`）：两端 + 一个词，线是�
   const after = await s.eval(`document.querySelector('[data-link-line]').getAttribute('d')`)
   if (before !== after) ok('把那张卡挪一下：那条线跟着变了（连接挂在两端上，不是一条死路径）')
   else bad('挪了卡片，那条线一动不动 —— 它被钉死在画出来的那一刻了')
-}
-
-/* ═════════════════ 15. 宣告的连接上的条件（架构 review 候选 4） ═════════════════ */
-console.log('\n[15] 你连的那条也能说条件：∈ 指一个 → 写进那条**记录** → 重开还在 → ↺ 清掉')
-{
-  /* 从前的三个写入口只看 `link.strokeId`，而宣告的连接那个字段**恒为 null** ——
-     面板上"你连的"那一节连一颗按钮都没有：你点了也没反应，而且**一句提示都没有**。
-     现在写入口按 `link.declared` 自己决定住哪（住笔上还是住记录上，见 selection.js），
-     两节共用同一份按钮。
-     ★ 这一节还钉住一条**真 bug**：读法里那个 `cards` 从前**根本没有定义**
-       （这条路走不到，所以一直没炸）—— 第一次真的指一下就 `ReferenceError`、白板白屏。 */
-  const declaredRow = () =>
-    s.eval(`(() => {
-      const row = document.querySelector('[data-link-declared]')
-      if (!row) return null
-      const at = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } }
-      const arm = row.querySelector('[data-arm-cond]')
-      const back = row.querySelector('[data-cond-btn="back"]')
-      const cond = row.querySelector('.bd-cond')
-      return { id: row.dataset.linkDeclared, arm: at(arm), armKey: arm ? arm.dataset.armCond : null, back: at(back), cond: cond ? cond.textContent.trim() : null }
-    })()`)
-
-  const row0 = await declaredRow()
-  if (!row0) {
-    bad('面板里找不到"你连的"那一行 —— 这一节整段没意义')
-  } else {
-    if (row0.arm) ok(`"你连的"那一行有「∈ 条件」（data-arm-cond=${row0.armKey}，从前这里是空的）`)
-    else bad('"你连的"那一行没有 ∈ —— 候选 4 那半件事没接上')
-    /* 命中测试：那一行本身是个 <button>，∈ 是它里面的 span —— 必须点得到它自己 */
-    const hit = await hitAt(row0.arm.x, row0.arm.y)
-    if (hit.includes('bd-cond-no')) ok(`那颗 ∈ 中心命中的就是它自己（${hit}）`)
-    else bad(`∈ 中心命中的是「${hit}」—— 点不到`)
-
-    const errsBefore = s.exceptions.length
-    await s.mouse(row0.arm.x, row0.arm.y, { steps: 0 })
-    await s.sleep(200)
-    const armed = await s.eval(`document.querySelector('.bd').classList.contains('condarm')`)
-    if (armed) ok('按它 → 武装上了（整块板换成十字光标）')
-    else bad('按了 ∈ 没武装')
-
-    /* 点一张卡 = "这张卡就是它的条件"（卡片自己收指针事件，所以走 Card 的 onSelect） */
-    const st15 = await readBoard()
-    await s.mouse(st15.a.cx, st15.a.cy, { steps: 0 })
-    const wLinkCond = await untilFile((d) => ((d.links || [])[0] || {}).cond, { what: '记录上写下了 cond' })
-    if (wLinkCond.ok) ok(`点一张卡 → 写进那条**记录**：${JSON.stringify(wLinkCond.value.links[0])}`)
-    else bad(`文件里的 links 记录上一直没有 cond：${JSON.stringify((await read()).links)}`)
-    const afterSpec = await read()
-    const strokeConds = (afterSpec.strokes || []).filter((x) => x.cond).length
-    if (strokeConds === 0) ok('★ 一笔都没被碰（宣告的连接没有笔可挂 —— 从前正是挂不上）')
-    else bad(`有 ${strokeConds} 笔被写上了 cond —— 那句话应该住在记录上`)
-    if (s.exceptions.length === errsBefore) ok('这一路没有 JS 报错（从前这里 `cards is not defined` —— 一写就白屏）')
-    else bad(`这一路抛了 ${s.exceptions.length - errsBefore} 条异常：` + s.exceptions.slice(errsBefore, errsBefore + 2).join(' ｜ '))
-
-    const row1 = await declaredRow()
-    if (row1 && row1.cond && /你指的/.test(row1.cond)) ok(`面板那一行跟上了：「${row1.cond}」`)
-    else bad(`面板那一行没跟上：${JSON.stringify(row1 && row1.cond)}`)
-    if (row1 && !row1.arm) ok('有条件时 ∈ 收起来了（一行最多两颗按钮，和"你画过的"那一节同一条规矩）')
-    else bad('有条件了 ∈ 还挂在那儿 —— 一行上挤了三颗')
-
-    /* 重开一次：这件事存在**记录**里，不是只活在屏幕上 */
-    await open()
-    const row2 = await declaredRow()
-    if (row2 && row2.cond && /你指的/.test(row2.cond) && row2.back) ok('重开之后那句话还在（而且 ↺ 在手边）')
-    else bad(`重开之后丢了：${JSON.stringify(row2)}`)
-
-    /* ↺ = 回头路：清掉记录上的那个字段 */
-    if (row2 && row2.back) {
-      await s.mouse(row2.back.x, row2.back.y, { steps: 0 })
-      const wClear = await untilFile((d) => !(d.links || []).some((r) => r.cond), { what: '记录上那个 cond 清掉了' })
-      if (wClear.ok) ok('↺ 清掉了记录上的条件（回到"这条连接没有条件"）')
-      else bad(`点了 ↺，文件里的 cond 还在：${JSON.stringify((await read()).links)}`)
-      const row3 = await declaredRow()
-      if (row3 && row3.arm && !row3.cond) ok('那一行回到 ∈（可以再指一个）')
-      else bad(`↺ 之后那一行不对：${JSON.stringify(row3)}`)
-    }
-  }
-}
-
-/* ═════════════════ 15b. 面板上的按键不是纸面上的按键（架构 review 候选 7） ═════════════════ */
-console.log('\n[15b] 点一下关系面板里那一行，再按 Backspace —— 板上的东西一个字节都不许动')
-{
-  /* 这是 review 当场走到的那条路：关系面板里的行是 `<button>`，而键处理器当时唯一的闸是
-     `/^(INPUT|TEXTAREA)$/` —— 点一行（它顺手把那个板框选中了）再按 Backspace，
-     板框**当场被拆开**，`preventDefault()` 还顺手把浏览器的后退也吞了。
-     现在"这一下是冲纸面还是冲面板"是一个纯判据（`focus.js` 的 `onPaper`），
-     Delete / Backspace 只在**冲纸面**时才算；而 Esc / Ctrl+Z 这些仍然是全局的。 */
-  const framesNow = () => s.eval(`document.querySelectorAll('[data-frame-row]').length`)
-  const before = await read()
-  const nFrames = (before.frames || []).length
-  const rows = await framesNow()
-  if (!nFrames || !rows) {
-    bad(`夹具里这一刻没有板框（frames=${nFrames}，面板行=${rows}）—— 这一节没意义`)
-  } else {
-    const rowBox = await s.eval(`(() => {
-      const r = document.querySelector('[data-frame-row]')
-      const b = r.getBoundingClientRect()
-      return { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) }
-    })()`)
-    await s.mouse(rowBox.x, rowBox.y, { steps: 0 })
-    await s.sleep(250)
-    const selected = await s.eval(`!!document.querySelector('.bd-frame.on')`)
-    if (selected) ok('点面板里那一行 → 那个板框被选中了（屏幕上亮起来）')
-    else bad('点了面板里那一行，板框没被选中 —— 后面那条断言就没意义了')
-    /* ★ 这一下是在**面板**上按的 —— 板上的东西一个字节都不许动 */
-    await s.key('Backspace', 'Backspace', 8)
-    await s.sleep(600)
-    const after = await read()
-    if ((after.frames || []).length === nFrames) ok(`★ 面板上的 Backspace 没有动板：板框还是 ${nFrames} 个（从前这里会被拆开）`)
-    else bad(`面板上的 Backspace 把板框拆了：${nFrames} → ${(after.frames || []).length}`)
-    const stillSel = await s.eval(`!!document.querySelector('.bd-frame.on')`)
-    if (stillSel) ok('  （那个框还选着 —— 这一下只是被忽略了，不是"顺手取消选中"）')
-    else bad('面板上那一下把选中也取消了（不该）')
-    /* 而**纸面上**的 Backspace 照样算（别把这条修成"Delete 彻底坏了"）：
-       把焦点交回纸面 —— 那个框还选着（面板那一行点的），这时 Backspace 就该拆开它。
-       ⚠ 不点板上那颗名字来选：这一刻它可能被卡片压着（`elementFromPoint` 给的是卡片，
-         点下去就变成"选中那张卡"，实测正是这样）—— 那是另一件事，
-         记在 README 的「还没做的」里（"板框那颗名字可能被卡片压住"）。 */
-    const chipHit = await s.eval(`(() => {
-      const t = document.querySelector('.bd-frame-t')
-      if (!t) return '(没有名字)'
-      const r = t.getBoundingClientRect()
-      const el = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2))
-      return el ? (String(el.className || el.tagName)) : '(无)'
-    })()`)
-    console.log(`      诊断：这一刻板框名字中心命中的是 ${chipHit}`)
-    const act = await s.eval(`(() => {
-      const a = document.activeElement
-      if (a && a.blur) a.blur()
-      return document.activeElement ? document.activeElement.tagName : '(无)'
-    })()`)
-    if (act === 'BODY') ok('  （把焦点交回纸面：activeElement = BODY —— 这时那一族按键才算数）')
-    else bad(`没能把焦点交回纸面（activeElement=${act}）`)
-    await s.key('Backspace', 'Backspace', 8)
-    await s.sleep(700)
-    const after2 = await read()
-    if ((after2.frames || []).length === nFrames - 1) ok(`★ 纸面上的 Backspace 照样算：板框被拆开（${nFrames} → ${(after2.frames || []).length}）`)
-    else bad(`纸面上的 Backspace 没拆开板框（还是 ${(after2.frames || []).length} 个）—— 修错了方向`)
-  }
 }
 
 /* ═════════════════ 16. 一次手势 = 一步撤销（真鼠标走四条路） ═════════════════ */

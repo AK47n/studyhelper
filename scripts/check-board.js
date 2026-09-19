@@ -16,7 +16,7 @@ import {
 } from '../src/lib/board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距、框选命中）2026-09-17 也进了那儿。 */
-import { NEAR_GAP, READABLE_FIT_S, buildRelations, descendantsOf, fitView, frameBounds, membersInBox, pointSegDist, relationCurve, simplifyPoints, strokeBounds, strokeHitsCircle, strokesBBox, toFlat, toPoints } from '../src/lib/geometry.js'
+import { NEAR_GAP, READABLE_FIT_S, buildRelations, cardBounds, cardVisualRect, descendantsOf, fitView, frameBounds, membersInBox, pointSegDist, relationCurve, simplifyPoints, strokeBounds, strokeHitsCircle, strokesBBox, toFlat, toPoints } from '../src/lib/geometry.js'
 /* 板框 / 连接这两个概念**动作**（留下 / 加进来 / 改标题 / 拆开 / 连上 / 删掉）在 frames.js。 */
 import {
   addToFrame, declareLink, dissolveFrame, frameById, frameMembers, frameOf, freezeFrame, linkOf,
@@ -37,11 +37,17 @@ import { FIT_IDLE_MS, FIT_TOL_AUTO, createCardFitter, fitPass } from '../src/lib
 /* 选中这一族（框住的笔意味着什么 + 改词/反向/否决/回头路/固定/拆开）搬去了 selection.js
    （2026-09-16）：纯函数、有断言（见 [6m]）。 */
 import {
-  applyStrokeLink, clearCond, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
+  applyStrokeLink, clearCond, freezeFrameSelection, pickBox, readSelection, removePick, specCond, transformPick, vetoCond,
 } from '../src/lib/selection.js'
 /* 板文件这一步（data/ 的读写 + 打开哪一个）搬去了 files.js（2026-09-16 C4）：
    "打开哪一个"是一个纯决定，于是那些入口情形在这儿断言得到（见 [6n]）。 */
-import { SEED_BOARD_NAME, boardFileName, createFileApi, nextBoardName, planStartup } from '../src/lib/files.js'
+import { SEED_BOARD_NAME, boardFileName, boardPath, createFileApi, nextBoardName, planStartup, splitTitlePath } from '../src/lib/files.js'
+/* data/ 里的路径（2026-09-17 起有分层）全在 paths.js 一处：服务端收请求、写盘、
+   前端摆树用的都是它 —— 所以那些"名字合法不合法、拆得对不对"的断言在这儿（[6q]）。 */
+import {
+  ancestors, baseName, buildFolderTree, isSafeSegment, isUnder, joinPath, layerNeeds, layerPath, levels,
+  normalizeRel, parentPath, pathTitle, pruneTree, sanitizeRel, splitPath, uniqueRelName, isRenamed, MAX_DEPTH, MAX_SEGMENT,
+} from '../src/lib/paths.js'
 /* 视图映射搬去了 src/lib/view.js（2026-09-16）：自检从这里 import，和 app 走同一个 module。 */
 import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, scaledRectToScreen, screenLenToWorld, screenToWorld, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen, zoomAt, zoomBetween } from '../src/lib/view.js'
 /* 撤销账本（一次手势 = 一步撤销）搬去了 history.js（2026-09-17 架构 review 候选 3）：
@@ -57,8 +63,29 @@ import { CHIP_MARGIN_BOTTOM, CHIP_MARGIN_TOP, CHIP_MARGIN_X, chipPlacement } fro
    那一节拿假 target 就能钉住整张表（见 [6t]）。 */
 import {
   FOCUS_NONE, PAPER_SELECTOR, beginEdit, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit,
-  escapeIntent, focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkIds, isTextField, onPaper,
+  escapeIntent, focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkCards, focusInkIds, isTextField, onPaper,
 } from '../src/lib/focus.js'
+/* 复制 / 粘贴（框住一块 → 装进剪贴板 → 落到任何一块板上）在 clipboard.js ——
+   三条规矩（只装内容不装关系 / 落点用相对偏移 / 贴出来是新 id）见 [6w]。 */
+import { CLIPBOARD_VERSION, copySelection, isPayload, pastePayload, payloadCount } from '../src/lib/clipboard.js'
+/* 常用形状规整（画个圆 → 变成真正的圆）在 shapes.js ——
+   "该认的必须认得 + 该拒的必须拒"两批一起钉，见 [6x]。 */
+import { fitShape, recognizeShape, recognizeShapeObject, recognizeStrokes, regularizeStrokes, shapeLabel } from '../src/lib/shapes.js'
+import {
+  bakeShapePoints,
+  normAngle,
+  normalizeShape,
+  oppositeCorner,
+  rotateShape,
+  retargetStroke,
+  scaleShape,
+  serializeShape,
+  shapeAABB,
+  shapeCenter,
+  shapeHandlePoints,
+  shapeName,
+  translateShape,
+} from '../src/lib/shape-object.js'
 
 /* 连接那一层只从这个入口进（module 自己的 internal seam 另说）——见 board.js 的注释。 */
 const reader = createLinkReader()
@@ -611,6 +638,28 @@ console.log('\n[6] 存取：round-trip 不能丢东西')
   eq(dirty.cards.length, 2, 'null 卡片丢掉，认不出的 kind 归成便签')
   eq(dirty.cards[0].w, 260, '尺寸太小的框被拉回默认值（不然框里什么都放不下）')
   near(dirty.view.s, 1, 1e-9, '非法的缩放被拉回 1')
+
+  /* ── ★ 卡片的 `rot`（2026-09-21：卡片能旋转了）─────────────────────────────
+     和 `scale` / `font` / `locked` 那三个字段**同一条纪律**，逐条钉住：
+       · 没转过 = 0 = **一个字节都不写**（老文件不许因为我们加了个功能就变脏）；
+       · 转过就写，而且"存→读→再存"逐字节一致（不然每次开板一条假 diff）；
+       · 认不出的值一律当 0（手改一个 `"abc"` 不该让卡片整个歪掉）。 */
+  {
+    const rot0 = parseBoardDocument(JSON.stringify({ cards: [{ kind: 'note', x: 0, y: 0, w: 200, h: 80, text: 'a' }] }))
+    eq(rot0.cards[0].rot, 0, '没写 rot 的卡 → 0（默认不转）')
+    eq(/"rot"/.test(serializeBoardDocument(rot0)), false, '★ 没转过的卡：文件里**没有** `rot` 这个字段（一个字节都不多）')
+    const r90 = { ...rot0, cards: [{ ...rot0.cards[0], rot: Math.PI / 2 }] }
+    const txt = serializeBoardDocument(r90)
+    eq(/"rot"/.test(txt), true, '转过之后写进文件')
+    const back2 = parseBoardDocument(txt)
+    near(back2.cards[0].rot, Math.PI / 2, 1e-9, '  …读回来还是那个角')
+    eq(serializeBoardDocument(back2) === txt, true, '  ★ 存→读→再存逐字节一致（不然每次开板一条假 diff）')
+    /* 转一圈回来：`1e-17` 和 `-0` 都必须被 normAngle 清成 0（JSON 里 `-0` 是另一个字符串）。 */
+    const spin = parseBoardDocument(JSON.stringify({ cards: [{ kind: 'note', w: 200, h: 80, rot: Math.PI * 2 + 1e-17 }] }))
+    eq(spin.cards[0].rot === 0 && !Object.is(spin.cards[0].rot, -0), true, '★ 转一整圈（+浮点噪声）→ 精确回到 0，不是 1e-17、也不是 -0')
+    const junk = parseBoardDocument(JSON.stringify({ cards: [{ kind: 'note', w: 200, h: 80, rot: 'abc' }] }))
+    eq(junk.cards[0].rot, 0, '★ 手改文件写个 "abc" → 当 0（一个怪值不该让整张卡歪掉）')
+  }
 }
 
 // ═════════════════════ 6b. 文字卡：字体和落点 ═════════════════════
@@ -1874,10 +1923,16 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     const b = makeBoard()
     b.cards = [{ ...newCard('note', 0, 0, { w: 100, h: 60 }), id: 'kc' }]
     b.strokes = ['s1', 's2', 's3'].map((id, i) => ({ ...newStroke('pen', toFlat([{ x: i * 20, y: 0 }, { x: i * 20 + 8, y: 8 }])), id }))
-    const del = removeStrokes(b, new Set(['s2']))
+    const del = removePick(b, new Set(['s2']))
     eq(del.strokes.map((s) => s.id), ['s1', 's3'], '删掉框住的那一笔，别的都在')
     eq(del.cards, b.cards, '卡片一个没动（同一个数组引用）')
-    eq(removeStrokes(b, new Set()), b, '没框东西 → 原样返回（不造新对象，免得白记一步撤销）')
+    eq(removePick(b, new Set()), b, '没框东西 → 原样返回（不造新对象，免得白记一步撤销）')
+    /* ★ 2026-09-21：卡片也归它删（框选把卡片一起框进来了，Delete 就该一起删）。
+       分成两处的话，"框住 3 笔 + 1 张卡按 Delete"会只删一半。 */
+    const delBoth = removePick(b, new Set(['s1']), new Set(['kc']))
+    eq(delBoth.strokes.map((s) => s.id), ['s2', 's3'], '  ★ 笔迹和卡片一起删（笔那半边）')
+    eq(delBoth.cards.length, 0, '  ★ …卡片那半边（只删框住的那张）')
+    eq(removePick(b, new Set(), new Set(['kc'])).strokes.length, 3, '  …只删卡片时笔迹一笔不动')
 
     /* 先留下 {s1,s2}，再把 {s2,s3} 留成一个框：s2 只能属于一个框，
        所以它要从第一个框里被拿走，而且 movedFrom 要说得出"原来在哪"（提示语照实说）。 */
@@ -1892,6 +1947,149 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
     const dissolved = dissolveFrame(second.board, gs[0].id)
     eq(dissolved.frames.length, 1, '拆开一个框 → 只剩另一个')
     eq(dissolveFrame(b, null).frames.length, 0, '没有框可拆 → 原样返回')
+  }
+
+  /* ⑫ ★★ 卡片也进选区（2026-09-21）：「框选中任意的字迹——卡片都应该能够放大，旋转」。
+     判据和「留下板框」「复制」当年那句一样（卡片**中心**落在框里才算）——
+     现在它发生在**框选那一刻**，不再是回头再拿矩形算一遍。 */
+  {
+    const b = makeBoard()
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 100, h: 60 }), id: 'in', x: 20, y: 20 },
+      { ...newCard('note', 0, 0, { w: 100, h: 60 }), id: 'out', x: 900, y: 900 },
+    ]
+    const r = readSelection(b, new Set(), [], ['in'])
+    eq(r.cardIds, ['in'], '⑫ 框住的卡片进选区（`sel.cardIds`）')
+    eq(r.cards.map((c) => c.id), ['in'], '  …而且拿到的是卡片对象（和 `strokes` 对称）')
+    eq([r.count, r.countAll, r.empty], [0, 1, false], '  ★ 只框住一张卡也是"选着东西"（empty=false，count 仍然是**笔数** 0）')
+    const both = readSelection(b, new Set(), [], ['in', 'out'])
+    eq(both.countAll, 2, '  …两张卡：countAll 说得出"框里一共几样"')
+    eq(readSelection(b, null, [], null).empty, true, '  （什么都没框 → empty=true，不是"空数组"）')
+    eq(focusInk([], []), FOCUS_NONE, '  ★ 笔和卡都没有 → 空焦点（focusInk 两边都收）')
+    eq(focusInkCards(focusInk(['s1'], ['k1'])), ['k1'], '  …焦点里卡片读得出来')
+    eq(focusInkCards(focusInk(['s1'])), [], '  …没框卡片时是空数组（绝不是 undefined，调用方不用先判）')
+    eq('cards' in focusInk(['s1']), false, '  ★ 没有卡片时**连字段都不写**（和板文件那些字段同一条纪律）')
+    eq(deleteIntent(focusInk(['s1'], ['k1']), 'Delete', { tagName: 'CANVAS', closest: () => ({}) }), { kind: 'delete-ink', ids: ['s1'], cards: ['k1'] }, '  ★ Delete 把卡片一起报出去（不然"删除只做了一半"）')
+  }
+
+  /* ⑬ ★★ 选区缩放 / 旋转（`transformPick`）—— 用户 2026-09-21 要的那件事本身。
+     纯几何在这里钉死；"手柄 → 手势 → 板"那条接线由 check:shape 的真浏览器那几节管。 */
+  {
+    const mkPickBoard = () => {
+      const b = makeBoard()
+      b.strokes = [
+        { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }]), { width: 2 }), id: 'a' },
+        { ...newStroke('pen', toFlat([{ x: 0, y: 50 }, { x: 100, y: 50 }]), { width: 2 }), id: 'b' },
+        { ...newStroke('pen', toFlat([{ x: 500, y: 500 }, { x: 520, y: 520 }]), { width: 2 }), id: 'far' },
+      ]
+      b.cards = [{ ...newCard('note', 200, 0, { w: 100, h: 50 }), id: 'k1', x: 200, y: 0, text: '卡' }]
+      return b
+    }
+    const boxOf = (bd, ids, cards) => pickBox(bd.strokes.filter((s) => ids.includes(s.id)), (bd.cards || []).filter((c) => cards.includes(c.id)))
+
+    /* (a) 包围盒：笔迹的点 ∪ 卡片的**可视**外框（含倍率和旋转） */
+    {
+      const b = mkPickBoard()
+      eq(boxOf(b, ['a', 'b'], []), { x0: 0, y0: 0, x1: 100, y1: 50 }, '(a) 两笔的包围盒')
+      eq(boxOf(b, ['a'], ['k1']), { x0: 0, y0: 0, x1: 300, y1: 50 }, '  ★ 卡片也进包围盒（框住的东西由同一个框圈着）')
+      b.cards[0] = { ...b.cards[0], scale: 2 }
+      eq(boxOf(b, ['a'], ['k1']), { x0: 0, y0: 0, x1: 400, y1: 100 }, '  ★ 卡片的**倍率**算进去（不然框比卡片小一圈）')
+      b.cards[0] = { ...b.cards[0], rot: Math.PI / 2 }
+      const r = cardVisualRect(b.cards[0])
+      eq([Math.round(r.w), Math.round(r.h)], [200, 100], '  …可视矩形（倍率乘过的布局框）')
+      eq(Math.round(cardBounds(b.cards[0]).h), 200, '  ★ 转 90° 之后**外接框**高 200（关系/框线吃的是它）')
+      /* 转过 90° 之后外接框是 x 250~350（中心 300,50 那一圈）——
+         用它而不是"没转的那个矩形"，卡片才不会被露在选区外面。 */
+      eq(boxOf(b, ['a'], ['k1']).x1, 350, '  …选区包围盒用的是外接框（转起来也不会把卡片露在框外）')
+    }
+
+    /* (b) 缩放：笔迹分轴、锚点不动；卡片等比 + 中心跟着走；不在选区的纹丝不动 */
+    {
+      const b = mkPickBoard()
+      const next = transformPick(b, { ids: ['a', 'b'], cardIds: ['k1'] }, { scale: { fx: 2, fy: 1, anchor: { x: 0, y: 0 } } })
+      const a = next.strokes.find((s) => s.id === 'a')
+      eq([a.points[0], a.points[1], a.points[3], a.points[4]], [0, 0, 200, 0], '(b) 笔迹横向拉 2 倍（分轴：y 不动）')
+      eq(a.width, 2.8, '  ★ 线宽跟着**几何平均**走并量化到 1/10（2 × √2 → 2.8）')
+      eq(next.strokes.find((s) => s.id === 'far').points, b.strokes[2].points, '  ★ 框外的笔一个点都不动')
+      const k = next.cards[0]
+      const kr = cardVisualRect(k)
+      eq(k.scale, Math.sqrt(2), '  ★ 卡片：倍率取**几何平均**（1 × √(2·1)）')
+      eq([Math.round(kr.cx), Math.round(kr.cy)], [500, 25], '  ★ …而中心按完整的 fx/fy 走（x 也拉了两倍：250 → 500）')
+      eq(b.cards[0].scale, 1, '  ★ 原 board 一个字节没动（纯函数）')
+      /* ⚠ 卡片**不能**跟着 fx/fy 分轴变：它的内容是文字（w 是硬约束，写小了当场裁内容）。
+         这一条断言就是"卡片只等比"那句话的对手盘。 */
+      const w0 = b.cards[0].w
+      eq(next.cards[0].w, w0, '  ★ 卡片的布局宽 `w` 不变（变的是倍率）—— 文字不会因为拉伸而重折行')
+
+      /* 锚点是"那个角的对角"：它一个数都不许动。 */
+      const b2 = mkPickBoard()
+      const n2 = transformPick(b2, { ids: ['a', 'b'], cardIds: [] }, { scale: { fx: 3, fy: 3, anchor: { x: 0, y: 0 } } })
+      const p0 = n2.strokes.find((s) => s.id === 'a').points
+      eq([p0[0], p0[1]], [0, 0], '  ★ 锚点（拖右下角时左上角）不动')
+
+      /* 拖到 0：倍率被**夹住**（剩 PICK_MIN_SPAN），不是"这一帧不算" —— 后者拖不回来。 */
+      const b3 = mkPickBoard()
+      const n3 = transformPick(b3, { ids: ['a', 'b'], cardIds: [] }, { scale: { fx: 0, fy: 0, anchor: { x: 0, y: 0 } } })
+      const p3 = n3.strokes.find((s) => s.id === 'a').points
+      const span = pickBox(n3.strokes.filter((s) => s.id !== 'far'), [])
+      eq(span.x1 - span.x0 > 0 && span.y1 - span.y0 > 0, true, '  ★ 倍率 0 也不会把选区压成一点（夹到还剩 PICK_MIN_SPAN，才拖得回来）')
+      eq(p3[0] === 0 && p3[3] <= 2.0001, true, '  …那一轴真的只剩 PICK_MIN_SPAN 那么大')
+    }
+
+    /* (c) 旋转：绕**选区包围盒中心**，笔迹和卡片一起转；没选中的不动 */
+    {
+      const b = mkPickBoard()
+      const center = { x: 50, y: 25 }
+      const b2 = { ...b, strokes: b.strokes.map((s) => (s.id === 'a' ? { ...s, points: toFlat([{ x: 0, y: 25 }, { x: 100, y: 25 }]) } : s)) }
+      const next = transformPick(b2, { ids: ['a', 'b'], cardIds: ['k1'] }, { rotate: { d: Math.PI / 2, center } })
+      const a = next.strokes.find((s) => s.id === 'a')
+      eq([Math.round(a.points[0]), Math.round(a.points[1])], [50, -25], '(c) 一笔绕选区中心转 90°（左端 → 上端）')
+      eq(a.points[3], 50, '  …另一端也落在同一条竖线上')
+      eq(next.strokes.find((s) => s.id === 'far').points, b.strokes[2].points, '  ★ 框外的笔一个点都不动')
+      const k = next.cards[0]
+      eq(Math.abs(k.rot - Math.PI / 2) < 1e-9, true, '  ★ 卡片的 `rot` 加上了这个角（重开之后它还是斜的）')
+      const r0 = cardVisualRect(b.cards[0])
+      const r1 = cardVisualRect(k)
+      /* 卡片中心也要绕着选区中心转 —— 只改 `rot` 不动位置的话，卡片会**原地自转**
+         （这正是 shape-object.js 里 rotateShape 那个"绕别人的中心转"的错）。 */
+      eq([Math.round(r1.cx), Math.round(r1.cy)], [Math.round(center.x - (r0.cy - center.y)), Math.round(center.y + (r0.cx - center.x))], '  ★ 卡片的位置也跟着绕中心转（不是原地自转）')
+      eq(b.cards[0].rot || 0, 0, '  ★ 原 board 没被动过（纯函数）')
+      /* 转过去再转回来：`rot` 精确回到 0（不许留 1e-17；也不许是 -0 —— JSON 里那是两个字符串）。
+         ⚠ 内存里 `rot` 恒有（和 `scale` / `locked` / `font` 同一条：默认值在 normalizeCard 里补齐），
+           "不写进文件"是 serializeBoardDocument 那一趟的事（见 [6y] 的落盘断言）。 */
+      const back = transformPick(next, { ids: ['a', 'b'], cardIds: ['k1'] }, { rotate: { d: -Math.PI / 2, center } })
+      eq(back.cards[0].rot === 0 && !Object.is(back.cards[0].rot, -0), true, '  ★ 转一圈回来 `rot` 精确归 0（不是 -0、也不是 1e-17）')
+    }
+
+    /* (d) 图形那一笔在缩放里必须走**参数**（不然"这是个圆"就改没了） */
+    {
+      const b = makeBoard()
+      /* 夹具直接**造一个图形对象**（`retargetStroke` 是唯一入口）——
+         不去走判读那一趟：这里要验的是变换，判读本身在 [6x] 有 64 项管着，
+         走判读还会被"采样密度闸 / 太小的一笔不参与判定"那些规矩挡回来（那是另一件事）。 */
+      const base = { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 0 }]), { width: 2 }), id: 'r1' }
+      b.strokes = [retargetStroke(base, { k: 'rect', cx: 50, cy: 30, w: 100, h: 60 })]
+      eq(!!b.strokes[0].shape, true, '(d) 夹具：这一笔是个矩形对象')
+      {
+        const scaled = transformPick(b, { ids: ['r1'], cardIds: [] }, { scale: { fx: 2, fy: 1, anchor: { x: 0, y: 0 } } })
+        const s2 = scaled.strokes[0]
+        eq(!!s2.shape, true, '  ★ 缩放之后它**还是那个图形**（手柄、旋转、重开都还在）')
+        eq(Math.round(s2.shape.w), 200, '  …参数跟着变了（宽 100 → 200）')
+        const pts = s2.points
+        eq(Math.abs(pts[0] - 0) < 0.2 && Math.abs(pts[3] - 200) < 0.2, true, '  …而点是**从参数重烤**出来的（那条铁律：shape 和 points 任何时候都对得上）')
+        const rot = transformPick(b, { ids: ['r1'], cardIds: [] }, { rotate: { d: Math.PI / 2, center: { x: 50, y: 30 } } })
+        eq(!!rot.strokes[0].shape, true, '  ★ 转完之后也还是图形（`rot` 是参数，不是"把点转一遍"）')
+        eq(Math.abs(rot.strokes[0].shape.rot - Math.PI / 2) < 1e-6, true, '  …`rot` 记下了这个角')
+        eq(Math.abs(rot.strokes[0].shape.cx - 50) < 0.2 && Math.abs(rot.strokes[0].shape.cy - 30) < 0.2, true, '  ★ 绕它自己的中心转：中心不动')
+        /* ★★ 绕**别处**转时中心必须跟着绕 —— 只改 `rot` 不动 cx/cy 的话，
+           图形会原地自转，而它周围的手写老老实实转走了（2026-09-21 修的正是这一处）。 */
+        /* 绕原点转 +90°：(50,30) → (-30,50)（正角是屏幕坐标里的顺时针，y 向下）。 */
+        const rot2 = transformPick(b, { ids: ['r1'], cardIds: [] }, { rotate: { d: Math.PI / 2, center: { x: 0, y: 0 } } })
+        eq(Math.abs(rot2.strokes[0].shape.cx + 30) < 0.2 && Math.abs(rot2.strokes[0].shape.cy - 50) < 0.2, true, '  ★★ 绕**别处**转时中心跟着走（只改 rot 的话图形会原地自转）')
+        /* 转 90° 之后它仍然是个**轴对齐**的矩形（`rot` 是参数，所以"规整"这件事没被破坏）。 */
+        eq(Math.abs(Math.abs(rot.strokes[0].shape.rot) - Math.PI / 2) < 1e-9, true, '  …而且仍然是精确的 90°（不是"把点转一遍"那种歪四边形）')
+      }
+    }
   }
 }
 
@@ -1982,9 +2180,48 @@ console.log('\n[6n] 板文件这一步（`files.js`）：data/ 怎么读写 + �
     await api.create('board-a.md', '# a')
     eq([calls[3].url, calls[3].init.method], ['/api/new', 'POST'], 'create → POST /api/new')
     eq(JSON.parse(calls[3].init.body), { name: 'board-a.md', text: '# a' }, 'create 的 body 是 { name, text }')
+    /* 分层（2026-09-17）：建一层 / 移动各是一个接口，URL 也只在这一处。
+       ★ get/put 传的是**整条相对路径**，所以编码要把 `/` 一起编成 `%2F` ——
+         漏了就是"路径被当成两段"，服务端收到 `a/b` 之外的怪东西，
+         症状和中文没编码一样：这张板打不开。 */
+    const NESTED = '大物/电磁学/board-第一章.md'
+    await api.get(NESTED)
+    eq(calls[4].url, '/api/file/' + encodeURIComponent(NESTED), 'get 用**整条路径**编码（`/` 也要编成 %2F）')
+    if (calls[4].url.includes('/api/file/大物')) bad('URL 里出现了裸路径 —— 没编码')
+    else ok('嵌套路径的 URL 里没有裸中文 / 裸斜杠')
+    await api.mkdir('大物/电磁学')
+    eq([calls[5].url, JSON.parse(calls[5].init.body)], ['/api/mkdir', { path: '大物/电磁学' }], 'mkdir → POST /api/mkdir { path }')
+    await api.move(NESTED, '大物')
+    eq([calls[6].url, JSON.parse(calls[6].init.body)], ['/api/move', { from: NESTED, to: '大物' }], 'move → POST /api/move { from, to }')
     /* 服务端的错误要**原样透传**（调用方靠 r.error 决定弹什么） */
     const errApi = createFileApi({ fetch: () => Promise.resolve({ json: () => Promise.resolve({ error: '非法文件名' }) }) })
     eq((await errApi.create('x', 'y')).error, '非法文件名', '服务端回的错误原样透传（不吞、不改写）')
+  }
+
+  /* ⑦ 分层：用户在"这一课叫什么"里打一条路径 —— 这是分层唯一的入口，
+     所以它必须容错（`大物\电磁学\第一章`、带 `.md`、两头空白都算数）。 */
+  {
+    eq(splitTitlePath('大物/电磁学/第一章'), { dir: '大物/电磁学', title: '第一章' }, '路径 → 层 + 名字')
+    eq(splitTitlePath('  复变函数  '), { dir: '', title: '复变函数' }, '只写一个名字 → 建在根上（dir 空）')
+    eq(splitTitlePath('大物/电磁学/第一章.md'), { dir: '大物/电磁学', title: '第一章' }, '结尾的 .md 不算名字的一部分')
+    eq(splitTitlePath('大物\\电磁学\\第一章'), { dir: '大物/电磁学', title: '第一章' }, '反斜杠也认（Windows 上打顺手了）')
+    eq(splitTitlePath('大物//电磁学/ /第一章'), { dir: '大物/电磁学', title: '第一章' }, '空段和空格段丢掉')
+    eq(boardPath('大物/电磁学', '第一章'), '大物/电磁学/board-第一章.md', 'boardPath：层 + 标题 → 存到哪儿')
+    eq(boardPath('', '第一章'), 'board-第一章.md', '根上就是老样子（前面不带斜杠）')
+    if (isBoardName(boardPath('大物/电磁学', '第一章'))) ok('深处的板名 isBoardName 照样认得出（它只看最后一段）')
+    else bad('深处的板名认不出来：' + boardPath('大物/电磁学', '第一章'))
+    eq(nextBoardName(['大物/board-新白板.md'], '大物'), '大物/board-新白板 2.md', '撞名只管**同一层**：大物/新白板 被占 → 2')
+    eq(nextBoardName(['board-新白板.md'], '大物'), '大物/board-新白板.md', '别的层的同名不算撞（不同层可以重名）')
+  }
+
+  /* ⑧ 分层以后"打开哪一个"照样成立：深处的板也是一张板，?file= 也认整条路径。 */
+  {
+    const DEEP = F('大物/电磁学/board-第一章.md')
+    const p = planStartup({ files: [NOTE, DEEP] })
+    eq([p.step, p.name], ['open', '大物/电磁学/board-第一章.md'], '一张板都没在根上时，深处的板照样是第一张板')
+    eq(planStartup({ files: [NOTE, DEEP], want: DEEP.name }).step, 'open', '?file= 认整条相对路径')
+    eq(planStartup({ files: [NOTE], want: DEEP.name }).step, 'none', '?file= 指了一条不在列表里的深路径 → 什么都不打开')
+    eq(planStartup({ files: [NOTE, F('大物/电磁学/打卡.md')] }).step, 'create-board', '只有笔记（哪怕在深一层）→ 还是补一张空板')
   }
 }
 
@@ -2500,6 +2737,26 @@ console.log('\n[6r] 端点（`nodes.js`）：谁算端点、这一点落在谁�
   eq(JSON.stringify(edgePointOf({ x: 0, y: 0, w: 100, h: 60 }, { x: 300, y: 30 })), JSON.stringify({ x: 100, y: 30 }), '边点：正右方打在右边中点')
   eq(JSON.stringify(edgePointOf({ x: 0, y: 0, w: 100, h: 60 }, { x: 50, y: -300 })), JSON.stringify({ x: 50, y: 0 }), '边点：正上方打在上边中点')
 
+  /* ★ 卡片转过之后的边点（2026-09-21）：箭头要**打在卡片的边上**。
+     判据的对手盘是"拿 AABB 求边点"那条错路 —— 一张 100×60 的卡绕中心转 90° 之后
+     外接框是 60×100，拿它去求"正右方"的边点会落在 x=130（卡片实际只到 80），
+     屏幕上就是尖端停在离卡片还有 50px 的空中。 */
+  {
+    const rect = { x: 0, y: 0, w: 100, h: 60, cx: 50, cy: 30, rot: Math.PI / 2 }
+    const p = edgePointOf(rect, { x: 300, y: 30 })
+    near(p.x, 80, 0.01, '★ 转 90° 的卡：正右方的边点打在 80（半高 30 那一侧），不是外接框的 130')
+    near(p.y, 30, 0.01, '  …竖直方向仍在中心')
+    const q = edgePointOf(rect, { x: 50, y: -300 })
+    near(q.y, -20, 0.01, '  …正上方的边点打在 −20（半宽 50 那一侧）')
+    /* 没转时和从前**逐位一致**（老路径一个像素都不动）。 */
+    eq(JSON.stringify(edgePointOf({ x: 0, y: 0, w: 100, h: 60, rot: 0 }, { x: 300, y: 30 })), JSON.stringify({ x: 100, y: 30 }), '  （rot=0 时和从前一模一样）')
+    /* nodeList 交出来的卡片带着 `rect`（转过的那个）—— 渲染端就是靠它打准的。 */
+    const turned = { ...b, cards: [{ ...b.cards[0], rot: Math.PI / 2 }, b.cards[1]] }
+    const n0 = nodeList(turned).cards[0]
+    near(n0.rect.rot, Math.PI / 2, 1e-9, '  …nodeList 给卡片带上没转的那个 rect（含 rot）')
+    near(n0.box.w, 60, 0.01, '  …而 box 仍然是外接框（进框判定/关系吃它）')
+  }
+
   /* ★★ "三处判据一致"：宣告 / 解析 / 写盘 对同一个死 id 必须说同一句话 */
   {
     const live = liveNodeIdFn(new Set(['ka']), new Set(['fa']))
@@ -2719,13 +2976,13 @@ console.log('\n[6t] 焦点仲裁（`focus.js`）：焦点是一个值、按键�
   /* ⑤ Esc：一次只收一层，顺序写在一处 */
   {
     const esc = (ui) => escapeIntent(ui).kind
-    eq(esc({ focus: focusFrame('f1', true), condArm: { id: 'x' } }), 'disarm-cond', '武装着条件 → 先收武装（面板上按也算：Esc 是全局的）')
+    /* ⚠ 这里原来还有一条「武装着条件 → 先收武装」（'disarm-cond'）——
+       它唯一的入口是关系面板，面板 2026-09-19 删掉了，focus.js 那一层也删了。 */
     eq(esc({ focus: focusFrame('f1', true) }), 'end-frame-edit', '正在给板框改名 → 先收编辑（别顺手把框也取消）')
     eq(esc({ focus: focusCard('k1') }), 'clear-focus', '选着一张卡 → 取消焦点')
     eq(esc({ focus: focusInk(['s1']) }), 'clear-focus', '框着一撮笔 → 取消焦点')
     eq(esc({ focus: FOCUS_NONE }), 'none', '什么都没有 → 不管（别 preventDefault 白吞按键）')
     eq(esc({ focus: FOCUS_NONE, linkPick: { strokeId: 's1' } }), 'dismiss-link', '浮着那排词 → 先收词')
-    eq(esc({ focus: FOCUS_NONE, condArm: { id: 'x' }, linkPick: { strokeId: 's1' } }), 'dismiss-link', '  （词比武装更靠外一层）')
   }
 
   /* ⑥ ★ 静态读一遍 Board.jsx：那五个 setState 不许回来（互斥靠结构，不靠二十处 if）。
@@ -2741,6 +2998,1007 @@ console.log('\n[6t] 焦点仲裁（`focus.js`）：焦点是一个值、按键�
     else bad('Board.jsx 里找不到 focus 那个 useState')
   }
 }
+
+// ═════════════════════ 6q. data/ 里的路径（分层） ═════════════════════
+/* 这一节钉的是**"什么名字能落到 data/ 里"**，以及"一串路径怎么摆成左栏那棵树"。
+ * 为什么值得单独一节：分层存储真正的危险不是"显示错了"，而是**写错地方** ——
+ * 一个没挡住的名字能跑到 data/ 外面去（`../../.ssh/authorized_keys` 那条老路）。
+ * 所以判据分两半：
+ *   ① 合法性：该拒的一个都不能放（穿越 / 绝对路径 / 盘符 / Windows 存不出来的字符）；
+ *   ② 展开：该拆的对（parentPath / levels / isUnder），不然后端挡得住、前端还是会摆错。
+ * 端到端对手是 `npm run check:storage`（真服务、真写盘，跑在临时目录里）。 */
+console.log('\n[6u] data/ 里的路径（`paths.js`）：什么样的名字能落进 data/')
+{
+  /* ① 合法的 */
+  eq(normalizeRel('board-x.md'), 'board-x.md', '老样子：根上一张板')
+  eq(normalizeRel('大物/电磁学/board-第一章.md'), '大物/电磁学/board-第一章.md', '分层路径原样通过')
+  eq(normalizeRel('大物\\电磁学\\board-1.md'), '大物/电磁学/board-1.md', '反斜杠归一成斜杠（浏览器/手打都可能是它）')
+  eq(normalizeRel('a//b.md'), 'a/b.md', '空段丢掉（多打一个斜杠不算错）')
+  eq(normalizeRel('大物/电磁学', { file: false }), '大物/电磁学', '{ file: false } 时最后一段可以不是 .md（目录）')
+  eq(normalizeRel('大物/电磁学'), null, '不给 { file: false } 时，目录看着就是"没写 .md 的文件" → 拒')
+  eq(normalizeRel('  board-x.md  '), 'board-x.md', '两头空白不算内容（整体 trim）')
+  eq(normalizeRel('第一章 静电场.md'), '第一章 静电场.md', '名字里可以有空格（只要不在两头）')
+
+  /* ② 该拒的（一个都不能放） */
+  eq(normalizeRel('../evil.md'), null, '穿越：../ 一律拒')
+  eq(normalizeRel('大物/../../evil.md'), null, '中间夹着的 .. 也拒')
+  eq(normalizeRel('/etc/passwd.md'), null, '绝对路径拒')
+  eq(normalizeRel('C:/Users/x.md'), null, 'Windows 盘符拒')
+  eq(normalizeRel('a/b'), null, '文件必须以 .md 结尾（不然列表里混进别的格式）')
+  eq(normalizeRel(''), null, '空路径拒')
+  eq(normalizeRel(null), null, '不是字符串拒（服务端收的是 JSON，什么都可能传进来）')
+  eq(normalizeRel('a/b:c.md'), null, '冒号拒（Windows 存不出来）')
+  eq(normalizeRel('a/ *?.md'), null, '通配符拒')
+  eq(normalizeRel('x'.repeat(90) + '.md'), null, `一段超过 ${MAX_SEGMENT} 个字拒`)
+  eq(normalizeRel(Array(MAX_DEPTH + 5).fill('d').join('/') + '/x.md'), null, `超过 ${MAX_DEPTH} 层拒（左栏缩进会缩成一条缝）`)
+  if (!isSafeSegment('..')) ok('isSafeSegment 认得 .. 不是一段合法名字')
+  if (isSafeSegment(' a')) bad('isSafeSegment 放过了两头有空白的段（Windows 会把空白悄悄吃掉，名字就对不上了）')
+  else ok('两头有空白的段拒（Windows 会悄悄吃掉空白，名字对不上）')
+
+  /* ③ 修（只给"用户手打的名字"这一侧）：坏字符换 -、补 .md、但穿越**两个都不修** */
+  eq(sanitizeRel('第一章?（上）'), '第一章-（上）.md', 'sanitize：坏字符换 `-`，没写 .md 就补上')
+  eq(sanitizeRel('大物/电磁学/第一章'), '大物/电磁学/第一章.md', 'sanitize：路径照拆')
+  eq(sanitizeRel('../../etc/passwd'), null, 'sanitize 遇到 .. 也是 null —— 修它等于**猜**用户想写到哪儿')
+  eq(normalizeRel('../../etc/passwd'), null, '同一个名字走 normalize：一样拒（收请求那一侧更不许修）')
+
+  /* ④ 拆 / 拼 —— 前端摆树全靠这几个，错了树就摆错 */
+  eq(parentPath('大物/电磁学/board-1.md'), '大物/电磁学', 'parentPath')
+  eq(parentPath('board-1.md'), '', '根上的文件 → 目录是空串（不是 "/"）')
+  eq(baseName('大物/电磁学/board-1.md'), 'board-1.md', 'baseName')
+  eq(pathTitle('大物/电磁学/board-1.md'), 'board-1', 'pathTitle：左栏那一行显示的字（不含 .md）')
+  eq(splitPath('a/b/c.md'), ['a', 'b', 'c.md'], 'splitPath')
+  eq(joinPath('a', 'b', 'c.md'), 'a/b/c.md', 'joinPath')
+  eq(joinPath('', 'a.md'), 'a.md', 'joinPath 根上：不能拼出 /a.md（那样树里会多一个空名字的节点）')
+  eq(levels('大物/电磁学'), ['大物', '大物/电磁学'], 'levels：一层层往下（目录用它来展开）')
+  eq(levels('大物/电磁学/board-1.md'), ['大物', '大物/电磁学', '大物/电磁学/board-1.md'], 'levels 连自己那一层也算上')
+  eq(ancestors('大物/电磁学/board-1.md'), ['大物', '大物/电磁学'], 'ancestors = levels(所在目录)：打开它时要展开哪几层')
+  if (isUnder('大物/电磁学/board-1.md', '大物/电磁学')) ok('isUnder：文件在那一层里')
+  else bad('isUnder 判错（它是拖拽/移动"不许挪进自己肚子里"那条闸）')
+  if (isUnder('大物/电磁学/board-1.md', '大物/电磁')) bad('isUnder 把"前缀一样但不是一层"算成了包含')
+  else ok('isUnder 不认前缀：`大物/电磁` 不是 `大物/电磁学` 的上一层')
+  if (isUnder('a/b.md', '')) ok('根目录包含一切（拖回根上那条路）')
+  else bad('isUnder 对空目录判错了')
+
+  /* ⑤ 摆成树 + 剪枝：左栏两个模式各看各的，空目录留着（那是"等着往里放东西"的那一层） */
+  {
+    const files = ['board-示例.md', '大物/电磁学/board-第一章.md', '大物/电磁学/打卡.md', '大物/力学/board-1.md']
+    const folders = ['大物', '大物/电磁学', '大物/力学', '空目录', '大物/电磁学/第三章']
+    const tree = buildFolderTree(files, folders)
+    eq(tree.path, '', '根节点的 path 是空串')
+    eq(tree.files.map((f) => f.name), ['board-示例.md'], '根上的文件挂在根节点上')
+    eq(tree.dirs.map((d) => d.name), ['大物', '空目录'], '第一层目录按名字排好（空目录也在）')
+    const em = tree.dirs.find((d) => d.name === '大物').dirs.find((d) => d.name === '电磁学')
+    eq(em.files.length, 2, '两层深的目录里：两张板/笔记都挂对了')
+    const boardOnly = pruneTree(tree, (f) => isBoardName(f.name))
+    const noteOnly = pruneTree(tree, (f) => !isBoardName(f.name))
+    eq(boardOnly.files.length, 1, '白板模式：根上那张板留着')
+    eq(noteOnly.files.length, 0, '笔记模式：根上那张板不显示')
+    /* 空目录（`data/空目录/`）两个模式都留着 —— 那是"刚建出来、等着往里放东西"的那一层，
+       剪掉它用户就没法把东西放进去了。判据是"它下面一个文件都没有"，不是"它曾经存在过"。 */
+    eq(boardOnly.dirs.map((d) => d.name), ['大物', '空目录'], '白板模式：空目录留着')
+    eq(noteOnly.dirs.map((d) => d.name), ['大物', '空目录'], '笔记模式：空目录也留着')
+    const li = boardOnly.dirs.find((d) => d.name === '大物').dirs.find((d) => d.name === '力学')
+    eq(li.files.map((f) => f.name), ['大物/力学/board-1.md'], '白板模式：有板的那一枝照常')
+    const em2 = noteOnly.dirs.find((d) => d.name === '大物').dirs.find((d) => d.name === '电磁学')
+    eq(em2.files.map((f) => f.name), ['大物/电磁学/打卡.md'], '笔记模式：同一层只剩那条笔记')
+    if (!noteOnly.dirs.find((d) => d.name === '大物').dirs.find((d) => d.name === '力学')) {
+      ok('笔记模式：整枝只有白板的目录消失（两个入口各看各的）')
+    } else bad('笔记模式里还留着一枝只有白板的目录')
+    eq(pruneTree(buildFolderTree([], ['a/b']), () => false).dirs.map((d) => d.name), ['a'], '一个文件都没有时，目录照旧摆出来（刚建出来那一层）')
+  }
+
+  /* ⑥ 探名字：撞名只算同一层 */
+  eq(uniqueRelName([], 'a/b', 'board-x').name, 'a/b/board-x.md', 'uniqueRelName：第一候选')
+  eq(uniqueRelName(['a/b/board-x.md'], 'a/b', 'board-x').i, 2, '撞了往后排')
+  eq(uniqueRelName(Array.from({ length: 99 }, (_, i) => joinPath('a', i ? `board-x ${i + 1}.md` : 'board-x.md')), 'a', 'board-x'), null, '99 个全占 → null')
+
+  /* ⑦ 改名改没改：**最后那一段**说了算。
+   * ★ 为什么单拎出来量：改名对话框靠它决定"确定"亮不亮、点下去算不算数。
+   *   判据一旦写成"整条路径比一比"，`大物/第一章` → `大物/第一章/x`（只换了归属、
+   *   名字没动）就会被当成一次改名，然后**把一个文件挪走**。 */
+  eq(isRenamed('a/board-1.md', 'a/board-2.md'), true, '改名：最后一段变了')
+  eq(isRenamed('a/board-1.md', 'b/board-1.md'), false, '只是换了所在的那一层 → 不算改名（那是移动）')
+  eq(isRenamed('a/board-1.md', 'a/board-1.md'), false, '原样交回来 → 没改')
+  eq(isRenamed('a/board-1.md', 'a/board-1.md.md'), true, '补一个 .md 也算改了（别把它当"没动"悄悄吞掉）')
+
+  /* ⑧ ★ "点出来的分层"：在**某一层里**新建（2026-09-18）。
+   * 用户原话：**「现在的分层不是很人性化我还要自己输入上层的名字才能生成，
+   * 你可以参考下 onenote 的分层规则这样靠点击来在分层下面建立新白板很人性化」**。
+   *
+   * 这一节的判据只有一句话：**"建到哪一层"由你点的那一行决定，不由输入框里的字符串决定。**
+   * 所以断言分两半：
+   *   · `layerPath` 拼出来的路径**不含**任何多余的段（打一段名字 = 多一层，不是多一个 `/`）；
+   *     而且**根那一层不能拼出一个前导 `/`** —— 那会在左栏树里多出一个空名字的节点（[6u] ① 那个坑）。
+   *   · `layerNeeds` 不许认错"这一层在不在"：判错的两种代价不对称 ——
+   *     说"不在"（其实在）只是多发一次 mkdir（服务端对已存在的层回 existed，不算错），
+   *     说"在"（其实不在）就是静默失败（点了「＋」什么都没发生）。
+   * 端到端对手是 `check:sidetree` 那一段真浏览器（点目录行的「＋」→ 只在那一层落盘）。 */
+  eq(layerPath('大物', '第一章'), '大物/第一章', 'layerPath：在这一层里 → 只多一段')
+  eq(layerPath('大物/电磁学', '第一章'), '大物/电磁学/第一章', 'layerPath：深处再往下也是一段一段拼')
+  eq(layerPath('', '第一章'), '第一章', '★ layerPath 在根上：**不能**拼出 `/第一章`（树里会多一个空名字的节点）')
+  eq(layerPath(null, '第一章'), '第一章', 'layerPath 收 null（"没点过任何一层"= 根）也不出错')
+  eq(layerPath('大物', '  第一章  '), '大物/第一章', 'layerPath 两头空白当没写（Windows 会悄悄吃掉空白，名字就对不上了）')
+  eq(layerPath('大物', ''), '大物', '只写了层（没写名字）→ 就是这一层本身，不凭空多一段空的')
+  /* 上一层的名字**只有点击这一个来源**：同一个"第一章"，点在根上和在"大物"里落的不是同一个地方 */
+  eq(layerPath('', '第一章') === layerPath('大物', '第一章'), false, '★ 同样一段名字：点根上和点大物上落点不同（"哪一层"只由点击决定）')
+
+  eq(layerNeeds('大物', []), true, 'layerNeeds：盘上一个目录都没有 → 这一层得先建出来')
+  eq(layerNeeds('大物', ['大物']), false, 'layerNeeds：已经在清单里 → 不用再建（少发一次请求）')
+  eq(layerNeeds('大物/电磁学', ['大物']), true, 'layerNeeds：**只看这个名字本身**在不在，不看它的前缀')
+  eq(layerNeeds('', []), false, '根永远在（空路径不是"一层"，不需要建）')
+  eq(layerNeeds(null, []), false, 'layerNeeds 收 null 也当根')
+  /* ⚠ 这一条是那条"两种代价不对称"的判据：`folders` 里没有 → 说"要建"，
+     而服务端对已存在的层**不算错**（回 existed）—— 所以宁可多问一次，也不能漏。 */
+  eq(layerNeeds('大物', ['大物', '大物/电磁学']), false, 'layerNeeds 只看自己那一个名字，不被邻居干扰')
+}
+
+// ═════════════════════ 6w. 复制 / 粘贴 ═════════════════════
+console.log('\n[6w] 复制 / 粘贴（`clipboard.js`）：只装内容不装关系、落点用相对偏移、贴出来是新 id')
+{
+  /* 为什么单开一节（2026-09-18 用户："框选后加入复制功能，能够黏贴在其他用户想要黏贴的画板上"）：
+   * 这三个坑**都不会报错**，只会在另一块板上呈现一个说不通的状态：
+   *   · 带过去的连接指向别人家的 id（那条线画在一个不存在的东西上）；
+   *   · 存了绝对坐标 → 贴出来在屏幕外（看着像"粘贴没反应"）；
+   *   · 沿用旧 id → 粘一次把原来那张卡改了（静默改数据）。
+   * 所以这一节钉的就是这三条，以及"板框跟着走、连接不跟着走"那条分界。 */
+
+  /* 一块有内容的板：两笔 + 一张卡，另外板上还有一个**没被选中**的东西
+     （用来验"没选中的不许被带上"） */
+  const mk = (x, y, id) => ({ ...newStroke('pen', [x, y, 0.5, x + 10, y + 10, 0.5]), id })
+  const base = () => {
+    const b = newBoard('源板')
+    b.title = '源板'
+    b.strokes = [mk(0, 0, 'sa'), mk(20, 30, 'sb'), mk(900, 900, 'sz')]
+    b.cards = [
+      { ...newCard('note', 0, 0, { w: 100, h: 40 }), id: 'ca', x: 0, y: -60 },
+      { ...newCard('note', 0, 0, { w: 100, h: 40 }), id: 'cz', x: 900, y: 900 },
+    ]
+    return b
+  }
+
+  /* ① 复制不到东西 → null（**不是空 payload**：调用方要保持原剪贴板不动） */
+  eq(copySelection(newBoard('空板'), [], {}), null, '什么都没框住 → null（别把原来的剪贴板清掉）')
+  eq(copySelection(base(), ['不存在的 id'], {}), null, '框里的 id 板上一笔都没有 → 也是 null')
+
+  /* ② 基本形状：只装被选中的那些，而且**原点归到内容左上角** */
+  const p1 = copySelection(base(), ['sa', 'sb'], { cards: ['ca'] })
+  eq(p1.v, CLIPBOARD_VERSION, '剪贴板带版本号（以后改了形状能认出"这份读不动"）')
+  eq(p1.strokes.length, 2, '装了两笔')
+  eq(p1.cards.length, 1, '装了跟着一起选的那张卡')
+  eq(p1.strokes.some((s) => s.id === 'sz'), false, '★ 没选中的那笔**没有**被带上')
+  eq(p1.cards.some((c) => c.id === 'cz'), false, '★ 没选中的那张卡也没有')
+  eq(payloadCount(p1), { strokes: 2, cards: 1, frames: 0 }, 'payloadCount 数得对（提示语用它）')
+  /* ★ 原点 = **全部被复制的东西**的左上角，卡片也算（这张卡在 y=-60，
+     所以整块的 y0 是 -60 —— 卡片的框比笔迹更靠上）。
+     ⚠ 一开头我在这里写错过：以为原点只看笔迹（y0=0），于是断言"第二笔还在 +30"，
+       实测是 **90**（= 30 − (−60)）。**测试算错了，不是代码错了** ——
+       而这条断言本身就是"同一个 offset 罩住笔和卡"的判据，算错原点等于没在验它。 */
+  eq(p1.box.h, 100, '★ 剪贴板的包围盒罩住**笔和卡两样**（这里 y 从 −60 的卡顶到 +40 的笔底 = 100）')
+  eq(p1.strokes[0].points[0], 0, '★ 笔迹按"选中内容的左上角"归零（存相对坐标，贴到哪儿都能原样摆）')
+  eq(p1.strokes[0].points[1], 60, '…y 也一样（−60 那个卡顶成了原点，所以这一笔落在 +60）')
+  eq(p1.strokes[1].points[0], 20, '…而且**笔之间的相对关系原样保留**（第二笔还在 +20 的位置）')
+  eq(p1.strokes[1].points[1], 90, '…两笔的 30 那段落差一点没变（90 − 60 = 30）')
+  eq(p1.cards[0].y, 0, '★ 卡片的 y 也用**同一个** offset 归零（不是各归各的）')
+  eq(p1.cards[0].x, 0, '…x 同理')
+  /* 同一个 offset 是关键：两样东西的相对位置不许变 */
+  {
+    const src = base()
+    const dy0 = src.strokes[0].points[1] - src.cards[0].y
+    const dy1 = p1.strokes[0].points[1] - p1.cards[0].y
+    eq(dy1, dy0, '★ 卡片相对笔迹的位移**一点没变**（同一个 offset 同时作用在两样上）')
+    eq(dy1, 60, '  （这一笔在卡片下面 60 —— 归零前后都是这个数）')
+  }
+
+  /* ③ 连接不跟着走，但**两端都在里面**的板框跟着走 */
+  {
+    const b = base()
+    b.frames = [{ id: 'fr1', title: '这一节', ids: ['sa', 'sb'], cards: ['ca'] }]
+    /* 板上还有一条指向框外的连接 —— 它不该被带（剪贴板里根本没有 links 这个字段） */
+    const pc = copySelection(b, ['sa', 'sb'], { cards: ['ca'] })
+    eq(pc.links, undefined, '★ 剪贴板里**没有 links** —— 连接的两端是 id，跨板之后指向的是别人家的东西')
+    eq(pc.frames.length, 1, '★ 板框跟着走（"这一块是一个整体"是你亲手宣告的，属于内容）')
+    eq(pc.frames[0].title, '这一节', '…连标题一起带（那是你要搬的那句话）')
+  }
+  {
+    /* 框里只有一半成员 → 只带那一半（用户框了半个框，他要的是"这半个也是一个整体"） */
+    const b = base()
+    b.frames = [{ id: 'fr1', ids: ['sa', 'sb'], cards: ['ca'] }]
+    const pc = copySelection(b, ['sa'], {})
+    eq(pc.frames.length, 1, '只框住半个框 → 这个框**还是带上**（用户要的是"这半个也是整体"）')
+    eq(pc.frames[0].ids, ['sa'], '…成员只留进来的那些（死引用在粘贴时会换名换掉）')
+    eq(pc.frames[0].cards, [], '…没进来的卡片成员不给')
+  }
+  {
+    /* 一个成员都没进来 → 这个框跟这次复制无关，别带 */
+    const b = base()
+    b.frames = [{ id: 'fr1', ids: ['sb'], cards: [] }]
+    const pc = copySelection(b, ['sa'], {})
+    eq(pc.frames.length, 0, '框里的成员一个都没被选 → 这个框**不带**（跟这次复制无关）')
+  }
+
+  /* ④ 指向框外的条件丢掉；不指别人的留着 */
+  {
+    const b = base()
+    b.strokes = b.strokes.map((s) =>
+      s.id === 'sa' ? { ...s, cond: 'card:cz' } : s.id === 'sb' ? { ...s, cond: 'card:ca' } : s
+    )
+    const pc = copySelection(b, ['sa', 'sb'], { cards: ['ca'] })
+    const byId = new Map(pc.strokes.map((s) => [s.id, s]))
+    eq(byId.get('sa').cond, undefined, '★ 指向**没被复制**的那张卡的条件丢掉（它指的是别人家的东西）')
+    eq(byId.get('sb').cond, 'card:ca', '…指向**被一起复制**的卡片的条件留着（那份关系搬过去还成立）')
+  }
+  eq(copySelection({ ...base(), strokes: [{ ...mk(0, 0, 'sa'), cond: 'none' }] }, ['sa'], {}).strokes[0].cond, 'none',
+    '★ `cond: none`（"这个条件不算"）**留着** —— 它说的是这一笔自己，不指别人')
+
+  /* ⑤ 粘贴：新 id、落点以"你要放的地方"为中心、内部关系不变 */
+  {
+    const b = base()
+    const res = pastePayload(b, p1, { world: { x: 500, y: 400 } })
+    eq(b.strokes.length, 3, '源板没被改（纯函数：返回新的 board）')
+    eq(res.board.strokes.length, 5, '贴完多了两笔')
+    eq(res.board.cards.length, 3, '贴完多了一张卡')
+    eq(res.board.strokes.filter((s) => s.id === 'sa').length, 1, '★ 原来那两笔还在（粘贴不是搬家）')
+    eq(res.ids.length, 2, '返回新笔的 id（界面拿它设焦点）')
+    eq(res.cards.length, 1, '返回新卡的 id')
+    /* ★ 新 id：**这次新造出来的那几个**，一个旧 id 都不许是它。
+       ⚠ 别写成"整块板上没有旧 id" —— 源板本来就有的那些（`sa`/`ca`…）当然还在，
+         粘贴是**加东西**不是搬家。判据要落在 `res.ids` / `res.cards` 这两个清单上。 */
+    const oldIds = new Set(['sa', 'sb', 'sz', 'ca', 'cz'])
+    eq(res.ids.some((id) => oldIds.has(id)), false, '★ 新笔的 id 都是新的（不然粘一次会把原来那笔改了）')
+    eq(res.cards.some((id) => oldIds.has(id)), false, '…新卡的 id 也都是新的')
+    eq(res.board.strokes.filter((s) => oldIds.has(s.id)).length, 3, '…而源板原来那 3 笔**一个都没少**')
+    eq(res.board.cards.filter((c) => oldIds.has(c.id)).length, 2, '…原来那 2 张卡也都在')
+    const allIds = [...res.board.strokes.map((s) => s.id), ...res.board.cards.map((c) => c.id)]
+    eq(new Set(allIds).size, allIds.length, '…整块板上 id 互不重复')
+    /* 落点：内容中心 ≈ 你要放的那个世界点 */
+    const box = { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity }
+    for (const s of res.board.strokes.filter((x) => res.ids.includes(x.id))) {
+      for (let i = 0; i + 2 < s.points.length; i += 3) {
+        box.x0 = Math.min(box.x0, s.points[i]); box.x1 = Math.max(box.x1, s.points[i])
+        box.y0 = Math.min(box.y0, s.points[i + 1]); box.y1 = Math.max(box.y1, s.points[i + 1])
+      }
+    }
+    const cx = (box.x0 + box.x1) / 2
+    const cy = (box.y0 + box.y1) / 2
+    if (Math.abs(cx - 500) < 60 && Math.abs(cy - 400) < 60) ok(`★ 落点以"你要放的地方"为中心（贴到 ${Math.round(cx)},${Math.round(cy)}，目标 500,400）`)
+    else bad(`落点偏了：贴到了 ${Math.round(cx)},${Math.round(cy)}，目标 500,400`)
+  }
+  /* ★ 这一条是那个"看着像粘贴没反应"的坑：**不许**沿用原板的绝对坐标。
+     源板的笔在 (0,0)，如果照搬，贴到 (5000,5000) 的时候它会留在 (0,0) ——
+     离用户正看的地方几屏远。 */
+  {
+    const res = pastePayload(base(), p1, { world: { x: 5000, y: 5000 } })
+    const s = res.board.strokes.find((x) => res.ids.includes(x.id))
+    if (s.points[0] > 4000) ok('★ 落点跟着 world 走（不是照搬原板的绝对坐标 —— 那会贴到屏幕外）')
+    else bad(`粘贴照搬了原坐标（落在 ${s.points[0]}）—— 用户会以为"粘贴没反应"`)
+  }
+
+  /* ⑥ 板框跨板之后成员换名换干净 */
+  {
+    const b = base()
+    b.frames = [{ id: 'fr1', title: '这一节', ids: ['sa', 'sb'], cards: ['ca'] }]
+    const pc = copySelection(b, ['sa', 'sb'], { cards: ['ca'] })
+    const res = pastePayload(b, pc, { world: { x: 0, y: 0 } })
+    eq(res.frames.length, 1, '板框跟着粘过来了')
+    const nf = res.board.frames.find((f) => f.id === res.frames[0])
+    eq(nf.title, '这一节', '…标题还在')
+    eq(nf.id === 'fr1', false, '★ 框的 id 也是新的（两个板框共用一个 id 是静默的错位）')
+    eq(nf.ids.every((id) => res.ids.includes(id)), true, '★ 成员 id 全部换成了**新造的那批**（换不掉的会变死引用）')
+    eq(nf.cards.every((id) => res.cards.includes(id)), true, '…卡片成员同理')
+    eq(nf.ids.length, 2, '两个笔迹成员都在')
+  }
+
+  /* ⑦ 条件的第二种说法在**笔上**：跨板之后 id 必须换成新的那一批 */
+  {
+    const b = base()
+    b.strokes = b.strokes.map((s) => (s.id === 'sa' ? { ...s, cond: 'card:ca' } : s))
+    const pc = copySelection(b, ['sa'], { cards: ['ca'] })
+    const res = pastePayload(b, pc, { world: { x: 0, y: 0 } })
+    const ns = res.board.strokes.find((s) => res.ids.includes(s.id))
+    eq(ns.cond, 'card:' + res.cards[0], '★ "条件就是它"里的 id 换成了**新卡**的 id（照搬就是指向别人家）')
+    /* ⚠ 判据必须是**整个 id 相等**，不能是"里面有没有出现过 `ca` 这个子串" ——
+       新 id 是 `nmu…` 那种随机串，**碰巧带上 `ca` 两个字母**是常有的事
+       （我第一版就是这么写的，于是断言红了，而代码其实是对的）。 */
+    eq(String(ns.cond).startsWith('card:'), true, '…形状还是"指向一张卡"')
+    eq(String(ns.cond).slice(5) === 'ca', false, '★ 它指的**不是**源板上那张旧卡（id 整个换了）')
+    eq(res.cards.includes(String(ns.cond).slice(5)), true, '…而确实指向**这次贴出来的**那张新卡')
+  }
+
+  /* ⑧ 版本 / 形状对不上的 payload 一律当"读不动" */
+  eq(isPayload(p1), true, '自己造出来的 payload 认得')
+  eq(isPayload(null), false, 'null 读不动')
+  eq(isPayload({}), false, '空对象读不动')
+  eq(isPayload({ ...p1, v: 999 }), false, '★ 版本对不上 → 读不动（宁可不粘，也不粘出一团乱的）')
+  eq(isPayload({ ...p1, strokes: 'nope' }), false, '形状不对（strokes 不是数组）→ 读不动')
+  eq(isPayload({ v: CLIPBOARD_VERSION, strokes: [], cards: [], frames: [] }), false, '★ 空的也读不动（"有剪贴板但里面没东西"不是一种状态）')
+  eq(pastePayload(base(), { v: 999, strokes: [{ id: 'x', points: [0, 0, 0.5] }], cards: [], frames: [] }, {}), null,
+    '★ 版本对不上时 pastePayload 返回 null（调用方据此提示"重新复制一次"）')
+
+  /* ⑨ payload 是**纯数据**（能过 JSON）—— 这是它能进 localStorage 的前提 */
+  {
+    const round = JSON.parse(JSON.stringify(p1))
+    eq(isPayload(round), true, '★ 过了 JSON 一圈照样认（剪贴板要能存进 localStorage / 跨窗口）')
+    const r2 = pastePayload(base(), round, { world: { x: 10, y: 20 } })
+    if (r2 && r2.ids.length === 2) ok('…而且过了 JSON 之后贴出来还是对的')
+    else bad('payload 过 JSON 之后贴不动了（说明里面有函数 / undefined 之类的非数据）')
+  }
+
+  /* ⑩ 贴到**空板**上（"另一块板"最干净的那种）：内容真的落进来了 */
+  {
+    const empty = newBoard('目标板')
+    const res = pastePayload(empty, p1, { world: { x: 0, y: 0 } })
+    eq(res.board.strokes.length, 2, '★ 贴到一张空板上：两笔都在')
+    eq(res.board.cards.length, 1, '…卡片也在')
+    eq(res.board.title, '目标板', '…而且没有把源板的标题带过来（标题是"哪块板"，不是内容）')
+  }
+}
+
+// ═════════════════════ 6x. 常用形状规整（`shapes.js`）═════════════════════
+console.log('\n[6x] 常用形状规整（`shapes.js`）：画个圆 → 变成真正的圆')
+{
+  /* 为什么单开一节（2026-09-18 用户："加入常用形状优化方式，比如我画个圆他给我优化成
+   * 真正的圆形，直线也是还有常用的矩形，三角形都能自动优化"）：
+   *
+   * ★ 这一族和 ADR-0001 砍掉的"形状判读"是**两件不同的事**（那三处本质差别写在
+   *   shapes.js 的文件头）。但那条教训（"阈值松了会 100% 误报"）照样适用 ——
+   *   所以这一节钉的不是"能不能认出来"，而是**两件事**：
+   *     ① 手抖的圆/矩形/三角/直线必须认得（认不出来 = 功能不存在）；
+   *     ② 汉字折笔、随手乱画、开口弧、碎笔迹必须认不出（认错 = 功能有害）。
+   *   两条**同时**成立才叫能用，只验一条是自欺欺人。
+   *
+   * ★ 只用手造的确定性样本（正弦抖动），不引入随机 —— 抖动幅度若随机，
+   *   某一晚刚好摇到边界上就会红，而那种红查不出是代码变了还是种子变了。 */
+
+  /* ── 造样本：拿极坐标 / 参数方程生成"人画的"点 ──────────────────────────
+   * 抖动用**确定性的正弦**（不同频率叠加），模拟手腕的不稳；
+   * 三段的周期互质，避免抖出一个看得见的规律。 */
+  const jit = (i) => Math.sin(i * 0.7) * 1.6 + Math.sin(i * 2.3) * 0.9
+  const mkStroke = (pts, extra) => ({ ...newStroke('pen', pts), ...extra })
+  /* 点数要够（shapes.js 有两道采样密度闸：MIN_PTS=24 / 点数÷对角线 ≥ 0.12）——
+     真手上画一个 r=80 的圆是两三百个点，这里取 160 已经比真笔疏。 */
+  const circle = (cx, cy, r, n = 160, sweep = 1) => {
+    const a = []
+    const steps = Math.round(n * sweep)
+    for (let i = 0; i <= steps; i++) {
+      const t = (i / steps) * Math.PI * 2 * sweep
+      a.push(cx + r * Math.cos(t) + jit(i), cy + r * Math.sin(t) + jit(i + 11), 0.5)
+    }
+    return a
+  }
+  const ellipse = (cx, cy, rx, ry, n = 160) => {
+    const a = []
+    for (let i = 0; i <= n; i++) {
+      const t = (i / n) * Math.PI * 2
+      a.push(cx + rx * Math.cos(t) + jit(i), cy + ry * Math.sin(t) + jit(i + 7), 0.5)
+    }
+    return a
+  }
+  const line = (x0, y0, x1, y1, n = 80) => {
+    const a = []
+    for (let i = 0; i <= n; i++) {
+      const u = i / n
+      /* 手画的直线总有一点点弯（这里给一点点弧度，但远小于 LINE_MAX_SAG） */
+      a.push(x0 + (x1 - x0) * u + jit(i) * 0.5, y0 + (y1 - y0) * u + jit(i + 4) * 0.5, 0.5)
+    }
+    return a
+  }
+  const rect = (x, y, w, h, per = 40) => {
+    const a = []
+    const corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+    for (let c = 0; c < 4; c++) {
+      const [ax, ay] = corners[c]
+      const [bx, by] = corners[(c + 1) % 4]
+      for (let i = 0; i < per; i++) {
+        const u = i / per
+        a.push(ax + (bx - ax) * u + jit(c * 97 + i), ay + (by - ay) * u + jit(c * 97 + i + 3), 0.5)
+      }
+    }
+    a.push(x, y) // 闭合
+    return a
+  }
+  const tri = (p1, p2, p3, per = 50) => {
+    const a = []
+    const vs = [p1, p2, p3]
+    for (let c = 0; c < 3; c++) {
+      const [ax, ay] = vs[c]
+      const [bx, by] = vs[(c + 1) % 3]
+      for (let i = 0; i < per; i++) {
+        const u = i / per
+        a.push(ax + (bx - ax) * u + jit(c * 61 + i), ay + (by - ay) * u + jit(c * 61 + i + 2), 0.5)
+      }
+    }
+    a.push(p1[0], p1[1])
+    return a
+  }
+
+  const recognize = (pts, extra) => recognizeShape(mkStroke(pts, extra))
+
+  /* ── ① 该认的：四类常用形状 ─────────────────────────────────────────────
+   * ⚠ 这些数都是**真跑出来的**，不是照抄的我以为的阈值 ——
+   *   写断言之前先让 shapes.js 自己说，然后把那个结果钉住（钉的是"别退化"，不是"我心想的数"）。 */
+  {
+    const s = recognize(circle(400, 400, 80))
+    eq(s && s.kind, 'circle', '★ 手抖的圆认成"圆"（用户原话第一句：我画个圆他给我优化成真正的圆形）')
+    if (s && s.kind === 'circle') {
+      if (Math.abs(s.r - 80) < 4) ok(`  …半径量得准（认成 ${s.r.toFixed(1)}，真值 80）`)
+      else bad(`半径偏了：${s.r.toFixed(1)}，真值 80`)
+      if (Math.hypot(s.cx - 400, s.cy - 400) < 4) ok(`  …圆心也准（偏 ${Math.hypot(s.cx - 400, s.cy - 400).toFixed(2)}px）`)
+      else bad(`圆心偏了：(${s.cx.toFixed(1)},${s.cy.toFixed(1)})，真值 (400,400)`)
+    }
+  }
+  eq(recognize(line(100, 300, 700, 340))?.kind, 'line', '★ 手抖的直线认成"直线"')
+  eq(recognize(line(100, 300, 100, 800))?.kind, 'line', '…竖的直线也是直线')
+  eq(recognize(rect(100, 100, 240, 160))?.kind, 'rect', '★ 手抖的矩形认成"矩形"')
+  eq(recognize(rect(100, 100, 300, 90))?.kind, 'rect', '…细长的矩形也认（300×90）')
+  eq(recognize(tri([120, 300], [360, 300], [250, 120]))?.kind, 'triangle', '★ 手抖的三角形认成"三角形"')
+  eq(recognize(tri([120, 300], [360, 300], [120, 120]))?.kind, 'triangle', '…直角三角形也认')
+  eq(recognize(ellipse(400, 400, 160, 80))?.kind, 'ellipse', '★ 明显的椭圆认成"椭圆"（2:1 那种，不是把圆硬掰成椭圆）')
+
+  /* ★ "圆先于椭圆"是判读顺序里的一条：正圆不许被贴成椭圆（那是过拟合，多一个自由度）。 */
+  {
+    const s = recognize(circle(400, 400, 80))
+    const s2 = recognize(ellipse(400, 400, 82, 78), {})
+    eq(s?.kind, 'circle', '★ 正圆就是圆')
+    /* 82:78 = 1.051，远在 ELLIPSE_MIN_RATIO(1.22) 之下 —— 必须还认成圆 */
+    eq(s2?.kind === 'circle' || s2 === null, true, '★ 只差一点点的"椭圆"不许被当成椭圆（没到 1.22:1 就不算）')
+  }
+
+  /* ── ② 该拒的：真手写内容必须原样不动 ─────────────────────────────────────
+   * 这一批比上面那批更重要 —— 上面漏一个只是"少认一个形状"，
+   * 这里错一个就是"把用户写的字揉成了一坨"。 */
+  {
+    /* 汉字里的折笔（横折钩那种）：有直线段、也有明显的角，但不是几何图形 */
+    const foldPts = []
+    for (let i = 0; i <= 60; i++) foldPts.push(100 + i * 3 + jit(i), 200 + jit(i + 1), 0.5)
+    for (let i = 0; i <= 40; i++) foldPts.push(280 + jit(i), 200 + i * 3 + jit(i + 5), 0.5)
+    eq(recognize(foldPts), null, '★ 一横一竖（汉字折笔）**不许**认成矩形/三角形')
+
+    /* 撇：一条带明显弯曲的笔画 */
+    const pie = []
+    for (let i = 0; i <= 80; i++) {
+      const u = i / 80
+      pie.push(300 - u * 120 + jit(i), 100 + u * 260 + Math.sin(u * Math.PI) * 40 + jit(i + 3), 0.5)
+    }
+    eq(recognize(pie), null, '★ 一撇（弯曲的长笔画）不许认成直线')
+
+    /* C 形开口弧：绕了大半圈但是**没闭合** */
+    const arc = []
+    for (let i = 0; i <= 140; i++) arc.push(400 + 120 * Math.cos(i / 140 * Math.PI * 1.7) + jit(i), 400 + 120 * Math.sin(i / 140 * Math.PI * 1.7) + jit(i + 2), 0.5)
+    eq(recognize(arc), null, '★ 开口的 C 形弧不许认成圆')
+
+    /* 随手乱涂：点乱跳 */
+    const scrib = []
+    for (let i = 0; i <= 120; i++) {
+      scrib.push(400 + Math.sin(i * 1.7) * 90 + jit(i), 400 + Math.cos(i * 2.9) * 90 + jit(i + 1), 0.5)
+    }
+    eq(recognize(scrib), null, '★ 随手乱涂不许认成任何形状')
+
+    /* 波浪线：一直在小幅转向 */
+    const wave = []
+    for (let i = 0; i <= 140; i++) wave.push(100 + i * 4 + jit(i), 400 + Math.sin(i / 9) * 34 + jit(i + 2), 0.5)
+    eq(recognize(wave), null, '★ 波浪线不许认成直线')
+
+    /* 极短的一勾 */
+    eq(recognize([300, 300, 0.5, 312, 316, 0.5, 308, 330, 0.5]), null, '★ 很短的一勾认不出来（MIN_DIAG 那道闸）')
+  }
+
+  /* ── ③ 两道采样密度闸（真板上量出来的，见 shapes.js 里那段注释）──────────────
+   * ★ 这一条是**真板上 42 笔误判的直接产物**：那批是 12~19 点、20~30px 的碎笔迹，
+   *   因为点太少、拟合毫无约束，全拿到 score = 1.000。
+   *   画出来是一堆散点，没有一笔是图形 —— 所以"分数高"在这里完全不能信。 */
+  {
+    /* 造一条"看着像圆、但点很少"的 —— 它的拟合分很高，必须被 MIN_PTS 挡下 */
+    const sparse = []
+    for (let i = 0; i < 16; i++) {
+      const t = (i / 16) * Math.PI * 2
+      sparse.push(400 + 60 * Math.cos(t), 400 + 60 * Math.sin(t), 0.5)
+    }
+    eq(recognize(sparse), null, '★ ★ 只有 16 个点的"圆"必须拒 —— 点太少时拟合分虚高（真板上 42 笔误报就是这么来的）')
+    eq(recognizeShape(mkStroke(sparse)), null, '…（认不出就是 null，不是"勉强低分认出来"——有否决权才敢开这个功能）')
+
+    /* 点够多但**整个形状太小**：直径 18px 的圈。真值 diag = √(19.35²+19.04²) ≈ 27.2，
+       刚好越过 MIN_DIAG=26 —— 所以它**会被认出来**，这是有意的：
+       "小"本身不是错，26 那条线是"小于这个尺寸的形状，认错了人也看不见、
+       而它更可能是字里的一个小圈"。所以这里钉的不是"小圈必须拒"，
+       而是"**明显更小**的圈（直径 < 26）必须拒" —— 那才是那道闸本身。 */
+    {
+      const micro = []
+      for (let i = 0; i <= 48; i++) {
+        const t = (i / 48) * Math.PI * 2
+        micro.push(400 + 6 * Math.cos(t) + jit(i) * 0.2, 400 + 6 * Math.sin(t) + jit(i) * 0.2, 0.5)
+      }
+      eq(recognize(micro), null, '★ 直径 12px 的小圈拒掉（MIN_DIAG=26 —— 字里的小圈比它大得多）')
+    }
+
+    /* ── ③b ★★★ **大图形必须照样认出来**（用户 2026-09-19 报的「我画的比较大的时候会识别不出来」）
+     *
+     * 这一条钉的是一个**已经删掉的闸**：`点数 / 对角线 ≥ MIN_PT_DENSITY(0.12)`。
+     * ⚠ 它为什么必然歧视大图形：分子（点数）几乎与尺寸无关（采点按**屏幕**距离去重、
+     *   抽稀按**世界**绝对像素容差 ⇒ 留下几个点是"手抖了几个波峰"决定的），
+     *   而分母（对角线）**线性增长** ⇒ 同一个圆画得越大，这个比值越小。
+     *   它测的不是"信息够不够判断形状"，而是"你画得够不够小"。
+     *
+     * 实测（用户真板 24 笔）：认出来的小笔密度 **0.11~0.23**、认不出来的大笔 **0.07~0.13**；
+     * 而**点间距**随尺寸同步变大（小笔 6~16px、大笔 13~24px）—— "稀"是采样的属性。
+     *
+     * ⇒ 现在的判据是：**同一个圆，越画越大也必须认得出来**（只要点数够 MIN_PTS=24）。
+     *   下面这组夹具就是"按真手的采样率"造的：点数固定在 24~80 之间（和尺寸无关），
+     *   半径从 60 一路长到 600 —— 旧闸下**后面几个全过不去**。
+     * ★ 反证在紧邻的上面那两条（16 点的碎圆必须拒、直径 12px 的必须拒）——
+     *   只放宽不设反证，就会变成"什么圆都认"。 */
+    {
+      const sizes = [
+        [60, 40], [80, 34], [120, 40], [200, 40],
+        [300, 48], [420, 52], [600, 56], [900, 60],
+      ]
+      let allBig = true
+      const detail = []
+      for (const [r, n] of sizes) {
+        const pts = []
+        for (let i = 0; i <= n; i++) {
+          const t = (i / n) * Math.PI * 2
+          pts.push(3000 + r * Math.cos(t) + jit(i) * 1.2, 3000 + r * Math.sin(t) + jit(i + 7) * 1.2, 0.5)
+        }
+        const got = recognize(pts)
+        const diag = 2 * r
+        const dens = (n + 1) / diag
+        detail.push(`r=${r}: ${got ? got.kind : '✗'}(密度 ${dens.toFixed(3)})`)
+        if (!got || got.kind !== 'circle') allBig = false
+      }
+      eq(allBig, true,
+        '★ ★ ★ **越画越大的圆也必须认得出来**（半径 60 → 900、点数和尺寸无关）——'
+        + ' 「点数 ÷ 对角线」那道闸必然歧视大图形，就是用户报的"画的比较大时识别不出来"。'
+        + ` 实测：${detail.join(' ｜ ')}`)
+      /* ★ 顺手把"点数闸没被一起删掉"钉住：同样大的圆，点少到 20 个还是必须拒。 */
+      {
+        const few = []
+        for (let i = 0; i < 20; i++) {
+          const t = (i / 20) * Math.PI * 2
+          few.push(3000 + 600 * Math.cos(t) + jit(i) * 1.2, 3000 + 600 * Math.sin(t) + jit(i + 7) * 1.2, 0.5)
+        }
+        eq(recognize(few), null, '…而**同一个大圆只给 20 个点**仍然要拒（MIN_PTS=24 才是"点够不够多"的负责人）')
+      }
+    }
+    {
+      /* ★ 而 27px 那个尺寸**是在里面的**：写下来，免得以后有人以为那道闸失灵了。 */
+      const tiny = []
+      for (let i = 0; i <= 48; i++) {
+        const t = (i / 48) * Math.PI * 2
+        tiny.push(400 + 9 * Math.cos(t) + jit(i) * 0.3, 400 + 9 * Math.sin(t) + jit(i) * 0.3, 0.5)
+      }
+      const s = recognize(tiny)
+      eq(s === null || s.kind === 'circle', true, '…直径 18px（diag≈27）在闸内侧：认成圆或认不出都行，但**不许**是别的形状')
+    }
+  }
+
+  /* ── ④ 拟合：认出来的那一笔真的变成"规整的"了吗 ───────────────────────────── */
+  {
+    const c = recognize(circle(400, 400, 80))
+    const pts = fitShape(mkStroke(circle(400, 400, 80)), c)
+    eq(pts.length, 72 * 3 + 3, '★ 圆排成 72 段 + 重复第一点（72×3 个数字 + 闭合那一个点）')
+    /* 每一个点到圆心的距离都该等于 r —— 这就是"真正的圆"那句话的判据 */
+    let worst = 0
+    for (let i = 0; i + 2 < pts.length; i += 3) {
+      worst = Math.max(worst, Math.abs(Math.hypot(pts[i] - c.cx, pts[i + 1] - c.cy) - c.r))
+    }
+    if (worst < 0.15) ok(`★ 拟合出来的每个点到圆心都是同一个 r（最大偏差 ${worst.toFixed(3)}px）= "真正的圆"`)
+    else bad(`不是正圆：最大半径偏差 ${worst.toFixed(3)}px`)
+    /* 首尾相接：闭合的一笔要显式重复第一点（不然 canvas 的 stroke() 缺一小段） */
+    eq(pts[0] === pts[pts.length - 3] && pts[1] === pts[pts.length - 2], true, '★ 闭合的那一笔**显式重复第一点**（stroke() 不会自动闭合）')
+    /* 压力统一 0.5（密度变了，逐点搬原压力没有意义） */
+    {
+      let allHalf = true
+      for (let i = 2; i < pts.length; i += 3) if (pts[i] !== 0.5) allHalf = false
+      eq(allHalf, true, '★ 压力统一 0.5（规整之后粗细均匀 —— 那才是"规整"该有的样子）')
+    }
+  }
+  {
+    const raw = line(100, 300, 700, 340)
+    const c = recognize(raw)
+    const pts = fitShape(mkStroke(raw), c)
+    eq(pts.length, 6, '★ 直线就是**两个点**（规整该让数据变干净，不是留两三百个点）')
+    /* ★ 端点是**拟合出来的**、不是照抄输入的第一/最后一个点：
+       真手起笔落笔那两下有抖动，取端点得把那一小段抖去掉（这就是"规整"的含义）
+       —— 所以这里容差 2px，而不是要求严格相等。 */
+    if (Math.hypot(pts[0] - 100, pts[1] - 300) < 2) ok(`…起点落在原笔的起点上（差 ${Math.hypot(pts[0] - 100, pts[1] - 300).toFixed(2)}px）`)
+    else bad(`起点偏了：(${pts[0]},${pts[1]})，真值 (100,300)`)
+    if (Math.hypot(pts[3] - 700, pts[4] - 340) < 2) ok(`…终点也是（差 ${Math.hypot(pts[3] - 700, pts[4] - 340).toFixed(2)}px）`)
+    else bad(`终点偏了：(${pts[3]},${pts[4]})，真值 (700,340)`)
+    /* 端点顺序不能反 —— 反了"从哪儿画到哪儿"就丢了（箭头方向那族会跟着坏） */
+    eq(pts[0] < pts[3], true, '★ 端点顺序按**你画的方向**排（起在前、终在后 —— 排反了箭头会翻边）')
+  }
+  {
+    const raw = rect(100, 100, 240, 160)
+    const c = recognize(raw)
+    const pts = fitShape(mkStroke(raw), c)
+    eq(pts.length, 15, '★ 矩形是 5 个点（四个角 + 回到起点）')
+    /* ★ 四条边必须**真的横平竖直**：相邻两角要么同 x、要么同 y。
+       （规整之前那些角是歪的 —— 这条就是"矩形被抻直了"的判据。） */
+    const corner = (i) => ({ x: pts[i * 3], y: pts[i * 3 + 1] })
+    const cs4 = [corner(0), corner(1), corner(2), corner(3)]
+    let square = true
+    for (let i = 0; i < 4; i++) {
+      const a = cs4[i]
+      const b = cs4[(i + 1) % 4]
+      /* 每一条边只能是"横的"或"竖的"，不许是斜的 */
+      if (Math.abs(a.x - b.x) > 0.11 && Math.abs(a.y - b.y) > 0.11) square = false
+    }
+    eq(square, true, '★ 四个角横平竖直（每条边非横即竖，没有一条是斜的）')
+    /* ★ 而"多大、在哪儿"是**从原笔量出来的**，不是把包围盒硬抄下来：
+       我这条夹具的抖动让它量出来 97.5 / 244.9×164.7（真值 100 / 240×160）——
+       这一点点出入正是"量出来"的证据（照抄包围盒的话会是精确的 100 / 240×160）。 */
+    if (Math.abs(cs4[0].x - 100) < 4 && Math.abs(cs4[0].y - 100) < 4) {
+      ok(`…左上角贴着原笔的位置（量到 ${cs4[0].x.toFixed(1)},${cs4[0].y.toFixed(1)}，真值 100,100）`)
+    } else bad(`左上角偏太多：(${cs4[0].x.toFixed(1)},${cs4[0].y.toFixed(1)})`)
+    const w = Math.abs(cs4[1].x - cs4[0].x)
+    const h = Math.abs(cs4[2].y - cs4[1].y)
+    if (Math.abs(w - 240) < 8 && Math.abs(h - 160) < 8) {
+      ok(`…而宽高也是量出来的（${w.toFixed(1)}×${h.toFixed(1)}，真值 240×160）`)
+    } else bad(`宽高偏太多：${w.toFixed(1)}×${h.toFixed(1)}`)
+  }
+  {
+    const raw = tri([120, 300], [360, 300], [250, 120])
+    const c = recognize(raw)
+    const pts = fitShape(mkStroke(raw), c)
+    eq(pts.length, 12, '★ 三角形是 4 个点（三个顶点 + 回到起点）')
+    /* ★ 三个顶点**从原笔里取**，不是从包围盒推 —— 见 fitShape 那段注释 */
+    eq(pts[9] === pts[0] && pts[10] === pts[1], true, '★ 最后一点回到第一个顶点（闭合）')
+  }
+
+  /* ── ⑤ `regularizeStrokes`：沿 id、保留字段、认不出的原样不动 ─────────────── */
+  {
+    const keep = mkStroke(circle(400, 400, 80), { id: 'keepme', color: '#f00', width: 5, link: { kind: 'cause' } })
+    const b = mkStroke(line(0, 0, 300, 300), { id: 'b' })
+    /* 这一笔是汉字折笔 —— 认不出来，**必须原样返回同一个对象** */
+    const noisePts = []
+    for (let i = 0; i <= 60; i++) noisePts.push(100 + i * 3 + jit(i), 200 + jit(i + 1), 0.5)
+    const noise = mkStroke(noisePts, { id: 'noise' })
+
+    const res = regularizeStrokes([keep, b, noise])
+    eq(res.strokes.length, 3, '规整不增不减笔数')
+    eq(res.changed.length, 2, '★ 认出来的两笔才有记录（认不出的不算"改了"）')
+    const after = new Map(res.strokes.map((s) => [s.id, s]))
+    eq(after.get('keepme').id, 'keepme', '★ **沿用 id**（板框成员存的就是 id，换 id 等于把这一笔踢出框）')
+    eq(after.get('keepme').color, '#f00', '★ 颜色原样保留（那是用户选的，规整不该改它）')
+    eq(after.get('keepme').width, 5, '…粗细也保留')
+    eq(after.get('keepme').link?.kind, 'cause', '★ ★ 挂在笔上的连接**跟着走**（它住在这条 stroke 上 —— 换 id 就丢了）')
+    eq(after.get('keepme').points === keep.points, false, '…而点确实换成规整的了')
+    eq(after.get('noise') === noise, true, '★ ★ 认不出的那一笔**是同一个对象**（连引用都没变）—— 原样不动')
+    eq(res.changed.map((c) => c.id).sort().join(','), 'b,keepme', '…改的是哪两笔，账上清清楚楚')
+    eq(res.changed.every((c) => typeof c.label === 'string' && c.label.length > 0), true, '…每一条都带人话的名字（界面要用它拼提示语）')
+  }
+  /* 一个都认不出时，`changed` 必须是空数组（界面据此说"没看出形状"，而不是"规整了 0 笔"） */
+  {
+    const noisePts = []
+    for (let i = 0; i <= 80; i++) noisePts.push(400 + Math.sin(i * 1.7) * 90 + jit(i), 400 + Math.cos(i * 2.9) * 90 + jit(i + 1), 0.5)
+    /* ⚠ 判据要落在**传进去的那个对象**上，不能落在 `noisePts` 上 ——
+       `newStroke` 会把扁平数组重建成一份新的，所以 identity 在造夹具那一步就已经换了。
+       拿 `noisePts` 比会红，而那是**测试算错了**，不是代码错了（这个坑这一族踩过三次）。 */
+    const src = mkStroke(noisePts, { id: 'x' })
+    const res = regularizeStrokes([src])
+    eq(res.changed.length, 0, '★ 一笔都没认出来 → changed 空（界面按这个说"没看出形状"，不是"规整了 0 笔"）')
+    eq(res.strokes[0] === src, true, '…那一笔原样返回（同一个对象，连引用都没变）')
+  }
+
+  /* ── ⑥ `recognizeStrokes`（界面的那一层）：返回的是**每一笔各认一遍**的结果 ── */
+  {
+    const hits = recognizeStrokes([
+      mkStroke(circle(400, 400, 80), { id: 'c1' }),
+      mkStroke(line(0, 0, 300, 300), { id: 'l1' }),
+      mkStroke([300, 300, 0.5, 312, 316, 0.5], { id: 'tiny1' }),
+    ])
+    eq(hits.length, 2, '★ 三笔里认出两笔（碎笔迹不算）')
+    eq(hits.map((h) => h.id).join(','), 'c1,l1', '…而且带 id（界面要按 id 去换板上的那一笔）')
+    eq(hits.map((h) => h.label).join(','), '圆,直线', '…带人话的名字（那颗按钮上写的就是它）')
+    eq(hits.every((h) => h.shape && typeof h.shape === 'object'), true, '…以及判读结果本身（拟合要用）')
+    /* ★★ 这一条是一次**真 bug** 换来的（2026-09-18）：
+       界面上那颗按钮的 `data-ink-shape` 我写成了 `h.kind`，而 hit 的形状住在 `h.shape` 里 ——
+       React 不报错，只会渲染成 `data-ink-shape=""`（看着像"属性没写"）。
+       所以这里把 hit 的**字段名**钉死：形状在 `shape.kind`，人话在 `label`。 */
+    eq(hits.map((h) => h.shape.kind).join(','), 'circle,line', '★ ★ 形状住在 `h.shape.kind`（不是 `h.kind`）—— 写错了不会报错，只会渲染出一个空属性')
+    eq('kind' in hits[0], false, '…顶层**没有** kind 这个字段（免得以后有人以为有）')
+    eq(recognizeStrokes([]).length, 0, '空框 → 没有结果（界面上那颗按钮就不该出现）')
+    eq(recognizeStrokes(null).length, 0, 'null 也当空的（别让界面崩）')
+  }
+
+  /* ── ⑦ 荧光笔不算 ─────────────────────────────────────────────────────────
+   * 高亮的横线看着也是一条直线（而且很直），但它的语义是"标出来"不是"画一条线" ——
+   * 把它规整成一根细线等于把高亮删了。 */
+  eq(recognizeShape(mkStroke(line(100, 300, 700, 320), { tool: 'highlighter' })), null,
+    '★ 荧光笔画的横不许规整（它那一下是"标记"，不是"画一条线"）')
+
+  /* ── ⑧ 判读的顺序与几何：几处"顺序错了就会错"的地方 ───────────────────────── */
+  {
+    /* ★ 圆先于椭圆：一个 1.05:1 的近圆，如果先试椭圆就会认成椭圆（多一个自由度的过拟合） */
+    const near = []
+    for (let i = 0; i <= 160; i++) {
+      const t = (i / 160) * Math.PI * 2
+      near.push(400 + 82 * Math.cos(t) + jit(i), 400 + 78 * Math.sin(t) + jit(i + 3), 0.5)
+    }
+    const s = recognize(near)
+    eq(s === null || s.kind === 'circle', true, '★ 近圆（82:78）只能是"圆"或"认不出"，**不许**是椭圆（那是过拟合）')
+  }
+  {
+    /* ★ 闭合的一笔要显式重复第一点 —— 检查真手上"多绕一小截"的那个圆也认得出 */
+    const over = circle(400, 400, 80, 160, 1.1)
+    const s = recognize(over)
+    eq(s?.kind, 'circle', '★ 收笔时多绕一小截的圆照样认得（真手画圆就是这样，不是缺陷）')
+  }
+  {
+    /* ★ 净转角 vs 累计转角：一条笔直的线上抖动全在噪声里，累计转角能到 200°+ 而净转角≈0。
+       这里用**很直的线**验"净转角那个量是对的"（用累计转角的话这条会被拒）。 */
+    eq(recognize(line(100, 300, 700, 300, 200))?.kind, 'line', '★ 很直的线认得出来 —— 抖动只进累计转角，不进净转角')
+  }
+  /* 形状名（界面拿它拼按钮上的字） */
+  eq(shapeLabel('line'), '直线', 'shapeLabel：line → 直线')
+  eq(shapeLabel('circle'), '圆', 'shapeLabel：circle → 圆')
+  eq(shapeLabel('rect'), '矩形', 'shapeLabel：rect → 矩形')
+  eq(shapeLabel('triangle'), '三角形', 'shapeLabel：triangle → 三角形')
+  eq(shapeLabel('ellipse'), '椭圆', 'shapeLabel：ellipse → 椭圆')
+  eq(shapeLabel('什么鬼'), '形状', '★ 不认识的词退回"形状"，不返回 undefined（不然按钮上会写"undefined"）')
+
+  /* ── ⑨ **图形对象那一层**（`shape-object.js`，2026-09-19）────────────────────
+   *
+   * 用户 2026-09-19 的第二句话：「然后你可以对图形放大缩小修正真正形状」。
+   * 上面那些验的是"认不认得出来"，这里验的是"认出来之后**它是不是一个东西**"：
+   * 能不能缩放、能不能旋转、**重开一张板还在不在**。
+   *
+   * ★★ 这一节最要紧的一条断言是 **(a) 点必须从 shape 重烤得出来**。
+   *   它是整个设计的地基（"shape 和 points 任何时候都对得上"）——
+   *   地基塌了的表现是"拖一下手柄图形跳回原处"，而那是**静默**的。
+   */
+  console.log('\n  [6x-2] 图形对象：能缩放、能转、重开还在')
+  {
+    /* (a) 判读结果 → 对象 → 烤点：**同一个图形烤两次必须一模一样**。
+       这一条听着像废话，但它钉的正是"不变量"：`normalizeStroke` 在**每一趟读盘**
+       都会按 shape 重烤一遍点，所以只要"烤两次不一样"，用户每次打开这张板
+       图形都会**悄悄变形**一点点（而且找不出是谁改的）。 */
+    const obj = recognizeShapeObject(mkStroke(circle(400, 400, 80)))
+    eq(!!obj, true, '(a) 一个圆 → 拿到图形对象（拿不到就没有手柄，见 shape-object 的文件头）')
+    eq(obj && obj.k, 'ellipse', '  …圆的存储形态是**椭圆**（圆 = rx===ry 的椭圆，一种东西一个字段）')
+    eq(obj && Math.abs(obj.rx - obj.ry) < 1e-9, true, '  …而且两个半轴精确相等（不许"差不多"——那会让它自称椭圆）')
+    const b1 = bakeShapePoints(obj)
+    const b2 = bakeShapePoints(normalizeShape(serializeShape(obj)))
+    eq(b1.length, b2.length, '  ★ 烤出来的点数一致')
+    eq(b1.every((v, i) => Math.abs(v - b2[i]) < 1e-9), true, '★ ★ **(a) 过一趟存盘再烤，一个数都不差**（这就是"shape 和 points 对得上"那条不变量）')
+    /* ★★ (a) 的**保证**：从判读结果一路到"写进文件"，**每一个点都不许变**。
+     *
+     * ⚠ 这一条是踩出来的，而且是本轮最贵的一个静默 bug：第一版 `normalizeShape`
+     *   **不量化参数**，而 `serializeShape` 量化 —— 于是：
+     *     · 内存里那份参数是判读层的原样数（半径 80.08663260372299）；
+     *     · 进文件的是量化过的（80.1）；
+     *     · 读盘时 `normalizeStroke` 按 shape **重烤**点 → 烤出来比盘上那份多 0.1px。
+     *   后果是"存→读→再存"不再逐字节一致（每次开板一条假 diff），
+     *   屏幕上那一丁点看不出来，只有字节能抓住。
+     *   ⇒ 现在的判据是**整条链一起验**（判读 → 对象 → 烤点 → 存 → 读回 → 再烤），
+     *     而不是分别验每一步 —— 这个 bug 恰恰住在"两步之间"。
+     */
+    {
+      const st0 = mkStroke(circle(400, 400, 80), { id: 'p1' })
+      const obj0 = recognizeShapeObject(st0)
+      const baked0 = bakeShapePoints(obj0)
+      const bd0 = makeBoard()
+      bd0.strokes = [retargetStroke(st0, obj0)]
+      const back0 = parseBoardDocument(serializeBoardDocument(bd0)).strokes[0]
+      eq(back0.points.length, baked0.length, '★ ★ **(a′) 判读 → 烤点 → 存 → 读回：点数一个不少**')
+      eq(back0.points.every((v, i) => Math.abs(v - baked0[i]) < 1e-9), true, '★ ★ **(a′) 而且每一个坐标都一模一样**（差一点就是"每次开板图形悄悄变形"）')
+      eq(
+        serializeBoardDocument(parseBoardDocument(serializeBoardDocument(bd0))) === serializeBoardDocument(bd0),
+        true,
+        '★ ★ **(a″) 存→读→再存 逐字节一致**（这是"开一次板就留一条假 diff"的唯一判据）'
+      )
+    }
+
+    /* (b) 圆的点签名：73 个（72 段 + 闭合那一点）。
+       ⚠ 这个数**不是随便挑的** —— `check-shape` 那条真浏览器自检就是按它认东西的
+         （见 README 第 49 条：73 / 5 / 4 / 2 是规整产物的签名）。改了它两处一起改。 */
+    eq(b1.length / 3, 73, '(b) 半径 80 的圆 → 73 个点（72 段 + 闭合；`check-shape` 按这个签名认它）')
+    /* ★ 段数**跟着半径长**：半径 600 的圆再用 72 段，弦高 0.57px，屏幕上看得出来是多边形。
+       这不是"优化"，是"规整"这件事能不能成立（用户要的是"看起来是个真正的圆"）。
+       ⚠ 判据**不写"半径 600 要有几个段"**（那是把一个中间量钉死，改公式就红）——
+         钉的是那个**目的**：弦高（多边形和真圆的最大偏差）必须一直在容差之内。
+         弦高 = r·(1 − cos(π/N))。 */
+    {
+      let worst = 0
+      let worstAt = null
+      for (const r of [20, 40, 80, 200, 600, 2000]) {
+        const pts = bakeShapePoints({ k: 'ellipse', cx: 0, cy: 0, rx: r, ry: r })
+        const N = (pts.length / 3 - 1)
+        const chord = r * (1 - Math.cos(Math.PI / N))
+        if (chord > worst) {
+          worst = chord
+          worstAt = r
+        }
+      }
+      eq(worst <= 0.4, true, `  ★ 从半径 20 到 2000，弦高一直 ≤ 0.4 世界像素（最差 ${worst.toFixed(3)}px @ r=${worstAt}）—— 屏幕上看不出是折线`)
+      eq(bakeShapePoints({ k: 'ellipse', cx: 0, cy: 0, rx: 600, ry: 600 }).length / 3 > 73, true, '  …半径 600 的圆确实比 72 段密')
+    }
+    const small = bakeShapePoints({ k: 'ellipse', cx: 0, cy: 0, rx: 12, ry: 12 })
+    eq(small.length / 3, 73, '  …小圆不加密（下限 72：文件别为看不见的精度白胖）')
+
+    /* (c) 端点/顶点那两族：矩形 5 点、三角形 4 点、直线 2 点（同样的签名家族）。 */
+    eq(bakeShapePoints({ k: 'rect', cx: 0, cy: 0, w: 100, h: 60 }).length / 3, 5, '(c) 矩形 5 个点（四角 + 闭合）')
+    eq(bakeShapePoints({ k: 'line', x1: 0, y1: 0, x2: 100, y2: 100 }).length / 3, 2, '  …直线 2 个点')
+    {
+      const t = recognizeShapeObject(mkStroke(tri([120, 300], [360, 300], [250, 120])))
+      eq(!!t && t.k, 'triangle', '  ★ 三角形 → 对象（它的身份是**三个顶点**，不是包围盒）')
+      if (t) {
+        const tb = bakeShapePoints(t)
+        eq(tb.length / 3, 4, '  …三角形 4 个点（三顶点 + 闭合）')
+        /* ★ 顶点必须**就是判读层用的那三个**（`fitShape` 也是从原笔里取的那三个）。
+           两套顶点 = 拖一下手柄图形就跳（shape-object.js 里 recognizeShapeObject 那段账）。 */
+        const drawn = fitShape(mkStroke(tri([120, 300], [360, 300], [250, 120])), recognize(tri([120, 300], [360, 300], [250, 120])))
+        let near = 0
+        for (let i = 0; i + 2 < tb.length && i + 2 < drawn.length; i += 3) {
+          if (Math.abs(tb[i] - drawn[i]) < 0.2 && Math.abs(tb[i + 1] - drawn[i + 1]) < 0.2) near++
+        }
+        eq(near >= 3, true, '★ ★ 对象里的顶点**就是屏幕上画出来那三个**（两套顶点会让图形拖一下就跳）')
+      }
+    }
+
+    /* (d) 缩放：分轴 → 圆变椭圆、正方形变长方形。这正是"修正真正形状"那句话的意思。 */
+    {
+      const s0 = { k: 'ellipse', cx: 100, cy: 100, rx: 50, ry: 50 }
+      const wide = scaleShape(s0, 2, 1, { x: 50, y: 50 })
+      eq(Math.round(wide.rx), 100, '(d) 横向拉 2 倍 → rx 100')
+      eq(Math.round(wide.ry), 50, '  …ry 不动（分轴缩放）')
+      eq(shapeName(wide), '椭圆', '★ 圆拉扁之后它**就是椭圆**了（"修正真正形状"就是这件事，不是 bug）')
+      const uni = scaleShape(s0, 3, 3, { x: 50, y: 50 })
+      eq(shapeName(uni), '圆', '  …等比放大还是圆')
+      eq(Math.round(uni.rx), 150, '  …倍率对（50→150）')
+      /* ★ 锚点不动：锚点是"对面那个角"，它的坐标一个数都不许变。 */
+      const anchored = scaleShape(s0, 4, 4, { x: 50, y: 50 })
+      eq(Math.round(anchored.cx - anchored.rx), 50, '★ 锚点那一点不动（拖右下角时左上角钉住）')
+      /* ★★ 拖到"比零还小"：倍率被**夹住**，图形不许消失。
+         这是 shape-object.js 里那段"拖不回来"的账 —— 第一版返回 null，
+         于是"拖到最小再往回拖"会先卡住再猛地跳回一个大尺寸。 */
+      const tiny = scaleShape(s0, 0, 0, { x: 50, y: 50 })
+      eq(!!tiny, true, '★ 倍率 0 也不许返回 null（那会让图形**消失**，而且拖不回来）')
+      const neg = scaleShape(s0, -3, -3, { x: 50, y: 50 })
+      eq(neg.rx > 0 && neg.ry > 0, true, '  …负倍率取正（翻面不做，不然手柄会跑到对角去）')
+    }
+
+    /* (e) 旋转：转的是**参数** `rot`，不是"把点转一遍"。
+       ★ 为什么这件事必须这样：矩形一转，靠改点是回不到**轴对齐**的 ——
+         而"轴对齐"正是"规整"的全部内容（shape-object.js 文件头 ②）。 */
+    {
+      const r0 = { k: 'rect', cx: 100, cy: 100, w: 120, h: 60 }
+      const r90 = rotateShape(r0, Math.PI / 2)
+      eq(Math.abs(r90.rot - Math.PI / 2) < 1e-6, true, '(e) 矩形转 90° → `rot` 记下这件事（不是把点转一遍）')
+      /* ⚠ 精度：`rot` 走的是**弧度**，不是坐标那种 1/10 像素的量化。
+         第一版按 6 位小数量化 → π/2 变成 1.570796，差 3.3e-7 ——
+         而它让"转了 90° 的矩形**不再精确轴对齐**"（轴对齐正是"规整"的全部内容）。 */
+      eq(Math.abs(r90.rot - Math.PI / 2) < 1e-9, true, '  ★ 而且精度到 1e-9（量化到 6 位会让它不再精确轴对齐）')
+      const back = rotateShape(r90, -Math.PI / 2)
+      eq(back.rot === 0 && !Object.is(back.rot, -0), true, '★ 转过去再转回来 → `rot` 精确回到 **0**（不是 -0：JSON 里那是两个不同的字符串）')
+      /* 转 90° 之后包围盒应该**反过来**（宽高互换）—— 这是"点确实跟着转了"的证明。 */
+      const box0 = shapeAABB(bakeShapePoints(r0))
+      const box90 = shapeAABB(bakeShapePoints(r90))
+      eq(Math.abs(box0.w - 120) < 0.2 && Math.abs(box0.h - 60) < 0.2, true, '  …转之前包围盒 120×60')
+      eq(Math.abs(box90.w - 60) < 0.5 && Math.abs(box90.h - 120) < 0.5, true, '★ 转 90° 之后包围盒变成 60×120（点真的转了）')
+      /* ★ 绕**形状自己的中心**转：中心那一点必须不动（绕包围盒中心转会"一边转一边跑"）。 */
+      const c0 = shapeCenter(r0)
+      const c1 = shapeCenter(r90)
+      eq(Math.hypot(c0.x - c1.x, c0.y - c1.y) < 1e-9, true, '★ 转轴是形状自己的几何中心 —— 转多少圈中心都不动')
+    }
+
+    /* (f) 平移：翻遍所有 kind，一个都不许漏（漏一个就是"整组拖动之后它自己弹回原处"）。 */
+    {
+      const kinds = [
+        { k: 'ellipse', cx: 10, cy: 20, rx: 30, ry: 20 },
+        { k: 'rect', cx: 10, cy: 20, w: 30, h: 20 },
+        { k: 'line', x1: 0, y1: 0, x2: 30, y2: 40 },
+        recognizeShapeObject(mkStroke(tri([120, 300], [360, 300], [250, 120]))),
+      ]
+      let allMoved = true
+      for (const sh of kinds) {
+        const before = bakeShapePoints(sh)
+        const after = bakeShapePoints(translateShape(sh, 7, 11))
+        if (!before || !after || before.length !== after.length) { allMoved = false; continue }
+        for (let i = 0; i + 2 < before.length; i += 3) {
+          if (Math.abs(after[i] - (before[i] + 7)) > 1e-6 || Math.abs(after[i + 1] - (before[i + 1] + 11)) > 1e-6) allMoved = false
+        }
+      }
+      eq(allMoved, true, '(f) 四种图形平移之后**每一个点都正好挪了 (7,11)**（三角形/直线搬的不是圆心，别漏）')
+    }
+
+    /* (g) 读盘那道闸：坏数据必须被丢掉，而不是变成一个"看不见的图形"。
+       ⚠ 一个 NaN 点在 canvas 上的表现是**整笔不画** —— 静默消失，最难查。 */
+    eq(normalizeShape(null), null, '(g) null → null')
+    eq(normalizeShape({ k: 'star', cx: 0, cy: 0 }), null, '  ★ 不认识的 kind 丢掉（手改文件写个 star 不该造出一个图形）')
+    eq(normalizeShape({ k: 'rect', cx: 0, cy: 0 }), null, '  ★ 缺 w/h 的矩形丢掉（拿它烤点会烤出 NaN）')
+    eq(normalizeShape({ k: 'rect', cx: 0, cy: 0, w: 0, h: 100 }), null, '  ★ 零宽的矩形丢掉（缩放手柄会除零）')
+    eq(normalizeShape({ k: 'line', x1: 0, y1: 0, x2: 0, y2: 0 }), null, '  ★ 零长度的直线丢掉（没有方向）')
+    eq(normalizeShape({ k: 'triangle', t: [[0, 0], [10, 0], [20, 0]] }), null, '  ★ 三点共线（面积 0）丢掉')
+    eq(normalizeShape({ k: 'ellipse', cx: 'x', cy: 0, rx: 10, ry: 10 }), null, '  ★ 坐标不是数的丢掉')
+
+    /* (h) 写盘：**只在真有时写、而且短**。老文件一个字节都不多
+       （和 link / cond / locked / font / scale 同一条规矩）。 */
+    eq(serializeShape(null), null, '(h) 没有形状 → 写盘返回 null（调用方据此不写这个字段）')
+    eq('rot' in serializeShape({ k: 'rect', cx: 0, cy: 0, w: 10, h: 10 }), false, '  ★ 没转过就不写 `rot`（凭空写个 0 出去就是给老文件造假 diff）')
+    eq(serializeShape({ k: 'circle', cx: 1.23456, cy: 0, rx: 10, ry: 10 }).k, 'ellipse', '  …圆的存储形态一律是 ellipse')
+    eq(serializeShape({ k: 'ellipse', cx: 1.23456, cy: 0, rx: 10, ry: 10 }).cx, 1.2, '  …坐标量化到 1/10 像素（不然文件里是一串 .123456789）')
+
+    /* (i) `shapeName` 和 `shapeLabel` 必须说同一句话。
+       ⚠ 它们住在两个 module 里（一个是判读层的 five-kind、一个是对象层的四类），
+         今天它们一致是**巧合还是设计**必须由这条断言回答 —— 不一致的表现是
+         "提示语说圆、按钮上写椭圆"，而两边各自看都对。 */
+    eq(shapeName({ k: 'ellipse', cx: 0, cy: 0, rx: 40, ry: 40 }), shapeLabel('circle'), '(i) 正圆：对象层说"圆"，判读层也说"圆"')
+    eq(shapeName({ k: 'ellipse', cx: 0, cy: 0, rx: 40, ry: 20 }), shapeLabel('ellipse'), '  …椭圆同理')
+    eq(shapeName({ k: 'rect', cx: 0, cy: 0, w: 40, h: 20 }), shapeLabel('rect'), '  …矩形')
+    eq(shapeName({ k: 'triangle', t: [[0, 0], [40, 0], [20, 30]] }), shapeLabel('triangle'), '  …三角形')
+    eq(shapeName({ k: 'line', x1: 0, y1: 0, x2: 40, y2: 30 }), shapeLabel('line'), '  …直线')
+  }
+
+  /* ── ⑩ 图形的**存取往返**：存进文件、读回来、手柄还在 ────────────────────────
+   *
+   * 用户 2026-09-19 选的第三条是「存：笔迹上记一个字段」。这一节就是那条选择的对手盘。
+   * ★ 两条判据缺一不可：
+   *   · 存→读→**再存**，字节一致（不然每次开板都在 Git 里留一条假 diff）；
+   *   · **没规整过的板一个字节都不多**（老文件不许因为加了新字段就变脏）。
+   */
+  console.log('\n  [6x-3] 图形落盘：重开还在，而没规整过的板一个字节都不多')
+  {
+    const shapeStroke = regularizeStrokes([mkStroke(circle(400, 400, 80), { id: 'sh1' })]).strokes[0]
+    eq(!!shapeStroke.shape, true, '⑩ 规整过的笔上带着 `shape` 字段（重开之后手柄靠它回来）')
+    const bd = makeBoard()
+    bd.strokes = [shapeStroke]
+    /* ⚠ `serializeBoardDocument` 返回的是**字符串**（JSON 文本），不是对象 ——
+       这一行第一版写成 `doc.strokes[0]`，于是拿 `undefined` 去读属性。
+       要对象就读回来一份（`parseBoardDocument` 本来就是它的对手盘）。 */
+    const docText = serializeBoardDocument(bd)
+    const doc = parseBoardDocument(docText)
+    eq(!!doc.strokes[0].shape, true, '  ★ 写进了文件')
+    eq(doc.strokes[0].shape.k, 'ellipse', '  …而且是短字段版（k/cx/cy/rx/ry）')
+
+    /* ★ 读回来：点必须**从 shape 重烤**（那是唯一的真相，见 board.js 的 normalizeStroke）。 */
+    const bs = doc.strokes.find((s) => s.id === 'sh1')
+    eq(!!bs && !!bs.shape, true, '  ★ 读回来图形身份还在')
+    eq(bs.points.length, shapeStroke.points.length, '  …点数一致')
+    /* ★★ 再存一次必须**一个字节都不差** —— 不然"打开→什么都不改→存回去"就变脏了
+       （README 的"每天一条假 diff"那一族）。 */
+    const docText2 = serializeBoardDocument(doc)
+    eq(docText2 === docText, true, '★ ★ 存→读→再存 **逐字节一致**（不然每次开板都在 Git 里留一条假 diff）')
+    /* ★ 手柄要的那几样东西：包围盒、中心、四个角 + 旋转柄。
+       `shapeTarget` 就是从 `shapeAABB(points)` 现算的（Board.jsx），所以这里验它算得出来。 */
+    const box = shapeAABB(bs.points)
+    const handles = shapeHandlePoints(box)
+    eq(handles.length, 5, '  ★ 四个角柄 + 一个旋转柄')
+    eq(handles.map((h) => h.id).join(','), 'nw,ne,se,sw,rot', '  …顺序固定（自检和界面都按它取）')
+    eq(Math.abs(box.w - 160) < 2 && Math.abs(box.h - 160) < 2, true, '  ★ 包围盒就是那个圆（半径 80 → 160 见方）')
+    for (const h of handles.slice(0, 4)) {
+      const op = oppositeCorner(box, h.id)
+      eq(Math.abs(op.x - h.x) > 1 && Math.abs(op.y - h.y) > 1, true, `  …${h.id} 的锚点在对面（拖它时那一点不动）`)
+    }
+
+    /* ★ 反证：**没规整过的板**多一个字段都没有。判据是"文件里根本没有 shape 这个键"，
+       而不是"它的值是 undefined"（后者 JSON 里根本写不出来，是一条永远绿的断言）。
+       ⚠ 判据要落在**文件文本**上（`'"shape"' in docText`），不是落在解析后的对象上 ——
+         `JSON.parse` 之后"没有这个键"和"值是 undefined"分不开。 */
+    const plain = makeBoard()
+    plain.strokes = [mkStroke(circle(400, 400, 80), { id: 'raw1' })]
+    const plainText = serializeBoardDocument(plain)
+    eq(plainText.includes('"shape"'), false, '★ 手画的（没规整过的）那一笔**文件里连 shape 这个键都没有** —— 老板一个字节都不多')
+    eq(plainText.includes('"lock'), false, '  …顺便：没锁过的板也没有 locked（同一条纪律的邻居）')
+
+    /* ★ 坏数据：`shape` 是垃圾时**丢掉字段**，不是把整笔丢掉（那一笔的字还在！）。 */
+    const junkDoc = parseBoardDocument(docText.replace('"k": "ellipse"', '"k": "star"'))
+    eq(junkDoc.strokes.length, 1, '★ 手改文件把一个图形写成 `star` → **笔迹还在**（只是不再是图形）')
+    eq('shape' in junkDoc.strokes[0], false, '  …那个字段被丢掉了（而不是让烤点烤出一堆 NaN）')
+    eq(junkDoc.strokes[0].points.length > 0, true, '  …点原样留着（宁可退化成普通笔迹，也不丢用户的东西）')
+    eq(serializeBoardDocument(junkDoc).includes('"shape"'), false, '  …再存出去时它也不会被写回来')
+
+    /* ★★ 剪贴板：图形搬走时**参数必须跟着搬**（Board.jsx 的 shiftStroke / clipboard 两条路）。
+       漏了它的症状是"复制一个圆、贴在别处，它弹回原位置" —— 因为读盘按 shape 重烤。
+       这里直接验那个 module 的话（shiftStroke 是组件内部的，量不到），
+       所以验的是**它依赖的那句话**：translateShape 之后再烤，点确实挪了。 */
+    const moved = bakeShapePoints(translateShape(bs.shape, 250, -130))
+    const movedBox = shapeAABB(moved)
+    eq(Math.abs(movedBox.cx - (box.cx + 250)) < 0.5, true, '★ ★ 图形平移之后**烤出来的点也跟着挪**（只搬 points 不搬 shape = 贴出来弹回原处）')
+    eq(Math.abs(movedBox.cy - (box.cy - 130)) < 0.5, true, '  …另一个轴同理')
+  }
+}
+
 
 // ═════════════════════ 7. 装进视口 ═════════════════════
 console.log('\n[7] 打开时把所有内容装进屏幕')

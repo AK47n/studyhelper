@@ -107,7 +107,7 @@ const layers = await ev(`(() => {
     vw: window.innerWidth, vh: window.innerHeight,
     stagewrap: pick('.bd-stagewrap'), stage: pick('.bd-stage'),
     ink: pick('canvas.bd-ink'), hit: pick('.bd-hit'),
-    panel: pick('.bd-cpanel'), tools: pick('.bd-tools'),
+    tools: pick('.bd-tools'),
     cards: document.querySelectorAll('.bd-card').length,
     // 中间那片"应该能画"的位置，从上往下数三层是谁
     stack: (() => {
@@ -120,7 +120,7 @@ const layers = await ev(`(() => {
   }
 })()`)
 console.log('\n  层级：')
-for (const k of ['stagewrap', 'stage', 'ink', 'hit', 'panel', 'tools']) {
+for (const k of ['stagewrap', 'stage', 'ink', 'hit', 'tools']) {
   const v = layers[k]
   console.log('    ' + k.padEnd(10) + (v ? `rect=${JSON.stringify(v.rect)} z=${v.z} pe=${v.pe} pos=${v.pos} cursor=${v.cursor}` : '(没有)'))
 }

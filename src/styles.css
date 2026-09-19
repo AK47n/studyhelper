@@ -84,20 +84,111 @@ code, kbd { font-family: var(--mono); }
 .btag { font-size: var(--fs-meta); color: var(--dim2); margin-top: -2px; }
 
 .side-sec { padding: 11px 11px 4px; min-height: 0; display: flex; flex-direction: column; }
+.side-sec:nth-of-type(1) { flex: 1 1 auto; min-height: 0; }
 .side-sec:nth-of-type(2) { flex: 1; overflow: auto; }
 .side-title {
   font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.6px;
   padding: 4px 6px;
   display: flex; align-items: center; justify-content: space-between;
   gap: 6px;
+  border: 1px solid transparent; border-radius: 8px;
+  /* 标题那几个字不许折行 —— 折在中间（"我的一课一 / 页"）比挤一点难看多了。
+     挤不下的时候让**按钮换行**（下面那两行），不是把标题劈成两半。 */
+  flex-wrap: wrap;
 }
+.title-label { white-space: nowrap; }
+/* 顶部这一行 = **根目录**的放置目标（拖回根上），所以它也要有"被拖到"的样子 */
+.side-title.drop { background: #24304a; border-color: var(--acc); }
+.title-acts { display: flex; gap: 4px; flex: none; margin-left: auto; white-space: nowrap; }
 .filelist { display: flex; flex-direction: column; gap: 2px; overflow: auto; }
-.filerow {
+
+/* 左栏那棵树：一行就是一行（单行、横排），靠 padding-left 表层次。
+   ⚠ 缩进由 TreeRows 算（`6 + depth * 12`），这里**不要**再写 padding-left ——
+     两处都算的话深层会缩成一个字都放不下。 */
+.filerow, .folderrow {
   background: transparent; border: 1px solid transparent; border-radius: 9px;
-  padding: 8px 10px; text-align: left; display: flex; flex-direction: column; gap: 1px;
+  padding: 5px 8px; text-align: left;
+  display: flex; align-items: center; gap: 6px;
+  font-size: var(--fs-ui); color: var(--text); cursor: pointer; min-height: 1.7em;
 }
-.filerow:hover { background: var(--panel2); }
+.filerow:hover, .folderrow:hover { background: var(--panel2); }
 .filerow.on { background: #1d2536; border-color: var(--line2); }
+.filerow .fname, .folderrow .fname { flex: 1; min-width: 0; }
+.filerow .fmeta, .folderrow .fmeta { flex: none; }
+.caret { width: 0.9em; flex: none; color: var(--dim2); font-size: var(--fs-meta); }
+.folderrow .fname { color: var(--dim); }
+/* 行上的几个小动作（＋ 在这一层新建 / 导出 / 改名）：文件行划过才出现，
+   目录行（`[data-where="here"]`）常显 —— 一行里塞满图标就没法一眼看清这是个树了。
+   ★ 目录行常显的理由没变：那颗「＋」是分层里唯一那个说得清"建到哪一层"的入口，
+   而"哪一层"正是最容易点错、也最需要被看见的一件 —— 藏起来等于用户不知道能往那儿建。
+   （2026-09-18 用户说："现在的分层不是很人性化我还要自己输入上层的名字才能生成"。
+     那颗「＋」其实早就在，只是**要鼠标划过去才出现**，于是它看起来像"没有这个功能"。）
+   ★ 文件行这边，动作区里现在装着**改名唯一的那颗按钮**（2026-09-21：名字那一格改成
+     "打开"了，见 App.jsx 的 NameCell）。所以它不能退回"藏起来"：鼠标停在这一行上时
+     它就得在（`.filerow:hover .rowacts`），否则等于"改名的路得先猜到" ——
+     和上面那颗「＋」是同一个坑。键盘也 Tab 得到（它本来就是个 `<button>`）。
+   ★ 判据挂在 `data-where` 这个属性上，**不是**"第几行"那种位置判据 ——
+     位置判据会在树长深之后悄悄失效。 */
+.rowacts { display: none; gap: 2px; flex: none; }
+.filerow:hover .rowacts { display: flex; }
+.folderrow[data-where="here"] .rowacts { display: flex; }
+/* ★ 刚建出来的那一层闪一下（2026-09-21，见 App.jsx 的 settleNewLayer）：
+   光刷新列表不够 —— 新层可能长在折起来的、或者滚动条下面的地方，
+   点完看不到任何变化时，用户只会以为"没建成"。 */
+@keyframes justmade {
+  from { background: #2b5a3a; box-shadow: inset 3px 0 0 #57c07c; }
+  to { background: transparent; box-shadow: inset 3px 0 0 transparent; }
+}
+.folderrow.justmade { animation: justmade 2s ease-out; }
+/* 目录行的动作区常显之后就占了地方，名字那一格仍然要能省略号收尾 */
+.folderrow[data-where="here"] .fname { flex: 1; min-width: 0; }
+.rowbtn {
+  border: none; background: transparent; color: var(--dim2); cursor: pointer;
+  font-size: var(--fs-meta); padding: 1px 4px; border-radius: 5px; line-height: 1.2;
+}
+.rowbtn:hover { background: #24304a; color: var(--text); }
+/* ★ 「＋」和「▣」常显（目录行里）—— 它们是"点出来的分层"那两个入口。
+   ⚠ 别退回 `.filerow:hover .rowbtn.plus` 那种"划过才亮"：文件行那颗「＋」只在
+     目录里出现（根上不出现），它的位置由**所在层**决定，和目录行那颗是两件事。
+   目录行那颗给一点蓝：它是"这一行能往里建东西"的**唯一提示**，
+   而 `--dim2`（#667084）在深色底上小到几乎看不见。 */
+.rowbtn.plus { flex: none; color: var(--dim); padding: 0 4px; }
+.filerow:hover .rowbtn.plus { color: var(--text); }
+.folderrow .rowbtn.plus { color: var(--acc); }
+.folderrow .rowbtn.plus:hover { background: #24304a; color: #cfe6ff; }
+/* ★ 「＋分层」和「改名」**飘**在「＋白板」左边，鼠标上来才出现（2026-09-21）。
+   为什么不干脆都常显：实测三个词常显会把目录名挤成省略号
+   （"热力学与统计物理" → "热力学与统计…"，一眼看不出那是哪一层）。
+   为什么不直接 `display:none → flex`：那会让「＋白板」**在 hover 的那一刻往左跳一格**
+   （动作区变宽、名字被压缩），手正瞄着它、它自己跑了 —— 点下去落到隔壁那颗上。
+   ⇒ 绝对定位、锚在「＋白板」的**左边缘**（`right: 100%`，不写死像素）
+      + 一块底色（不然字压在名字上看不清）。这样既不挤名字、也不动别的按钮。
+   ⚠ 它**盖住名字的尾巴**是有意的：鼠标在这一行上时，用户要的是那两颗按钮；
+     名字在鼠标离开后就完整回来了。 */
+.folderrow .rare {
+  display: none; position: absolute; right: 100%; margin-right: 2px; top: 50%;
+  transform: translateY(-50%); white-space: nowrap;
+  background: var(--panel2); border-radius: 8px; padding: 0 4px;
+}
+.folderrow:hover .rare { display: block; }
+.folderrow .rare .rowbtn { display: inline-block; }
+.rowacts { position: relative; }
+/* 「导出」是个**词**而不是一个符号（不像 ＋ / ⤳ 那样一眼认得），
+   所以给它一点颜色，让它在两个符号中间看得出来是件独立的事。
+   比 ⤳ 宽不少 —— 一行的动作区会跟着变宽，但只在鼠标上来时才显示。 */
+.rowbtn.exp { color: #7ba7dc; padding: 1px 6px; }
+.rowbtn.exp:hover { background: #24304a; color: #cfe6ff; }
+/* 就地改名的输入框：**占 fname 那一格**（flex: 1，和它替换掉的那个 span 同一个位置），
+   所以点下去那一行除了"名字变成可编辑的"以外什么都不动 —— 树不会跳。 */
+.renameinput {
+  flex: 1; min-width: 0;
+  background: #0e1420; color: var(--text);
+  border: 1px solid var(--acc); border-radius: 6px;
+  padding: 1px 6px; font-size: var(--fs-ui); font-family: inherit;
+}
+.renameinput:focus { outline: none; }
+/* 拖拽时"会落到哪一层"——必须看得见，不然拖完不知道它会去哪 */
+.folderrow.drop { background: #24304a; border-color: var(--acc); }
 .fname { font-size: var(--fs-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fmeta { font-size: var(--fs-meta); color: var(--dim2); }
 
@@ -132,6 +223,18 @@ code, kbd { font-family: var(--mono); }
   min-width: 46px; text-align: center;
 }
 .side-zoom-val:hover { color: var(--text); background: #24304a; }
+/* 左栏底部那一条：导出目录在哪（能点的）。
+   2026-09-18 加的 —— 用户问"我在哪里找到存放导出的文件夹"，这就是答案。
+   做得比别的次要按钮显眼一点（它是**唯一**能找到那些文件的入口）。 */
+.side-export {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: #16202e; border: 1px solid #2b3d55; border-radius: 8px;
+  padding: 7px 10px; font-size: var(--fs-meta); color: #9fc0e8; text-align: left;
+}
+.side-export:hover { background: #1d2a3c; color: #cfe6ff; border-color: #3c567c; }
+.side-export .se-ico { flex: none; color: var(--acc); font-size: var(--fs-ui); line-height: 1; }
+.side-export .se-txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-export code { font-size: var(--fs-meta); color: #cfe6ff; }
 
 /* ---- 字号调节 ---- */
 .zoom {
@@ -699,6 +802,119 @@ kbd {
 .toast.ok { border-color: #1d4a36; color: #bdf0d7; }
 .toast.warn { border-color: #453316; color: #ffe0b0; }
 .toast.err { border-color: #5a2a24; color: #ffc9c0; }
+/* ---- 带动作的提示 ----
+   2026-09-18 加的：导出成功之后要给一条**能点的**路径（用户明确要求
+   "你得告诉我我在哪里找到存放导出的文件夹"）。带动作的提示不自动消失，
+   所以还得给一颗 ✕ —— 不然它就一直挂在那儿。 */
+.toast { display: flex; align-items: center; gap: 12px; }
+.toast-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-act {
+  flex: none; background: #24304a; border: 1px solid var(--line2); border-radius: 7px;
+  font-size: var(--fs-meta); padding: 5px 12px; color: #cfe6ff; white-space: nowrap;
+}
+.toast-act:hover { background: #2f3f60; color: #fff; }
+.toast-x {
+  flex: none; background: transparent; border: none; color: var(--dim2);
+  font-size: var(--fs-meta); padding: 2px 4px; line-height: 1;
+}
+.toast-x:hover { color: var(--text); }
+
+/* ---------- 询问框（从前是浏览器的 prompt/confirm）----------
+   遮罩刻意**很淡**：这里问的几乎都是"放进哪一层"，回答的时候**需要看得见左栏那棵树**。
+   原来那个原生弹窗是一块不透明的白板，把界面整个盖住 —— 那就把要看着的东西挡住了。
+   （白板那边的 `.wp-back` 是 0.55，因为它的弹层自己就是内容。） */
+.askwrap {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(8, 11, 16, 0.32);
+  display: grid; place-items: center; padding: 20px;
+}
+/* ★ `.ask` 上**别写 margin: 0**（2026-09-17 踩的，症状极具迷惑性）：
+   一个 `<dialog>`（非 modal，`open` 那个）的定位方式是
+   `position: absolute; inset-inline: 0; inset-block: 0; margin: auto` ——
+   **居中完全是靠那个 auto margin 撑出来的**，它不吃父容器的 place-items。
+   把 margin 归零 = 把这个 absolute 盒子钉死在遮罩的左上角：
+   量出来的矩形就是 `left: 0, top: 250, w: 460`（看着挺正常，所以没人怀疑）。
+   真正暴露它的不是外观，是**命中测试**：CDP 的合成点击严格按 rect 判命中，
+   于是"点「确定」"那一点落在框**外面** —— 落进遮罩的取消区，框当场关掉、
+   什么都没建，而页面上一点报错都没有。
+   （同一件事在浏览器里点没事，是因为 460px 宽的框在右下角那块区域
+   人和 rect 恰好重合 —— 一旦宽度或视口变一点就会现原形。）
+   所以：宽度后面**只留注释**，`margin: auto` 交给 UA 那条规矩去管。 */
+.ask {
+  width: min(460px, 94vw); padding: 0;
+  background: #161a22; border: 1px solid #2e3646; border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  color: #dde3ee; font-size: var(--fs-ui);
+  animation: askin 0.14s ease-out;
+}
+@keyframes askin { from { opacity: 0; transform: translateY(6px) scale(0.99); } }
+.ask form { padding: 16px 18px 14px; display: flex; flex-direction: column; gap: 9px; }
+.ask-title { font-size: calc(var(--fs-ui) * 1.15); font-weight: 600; color: #eef2f9; }
+/* 灰字那一行是**说明**，不是装饰：它说清"打斜杠会怎样"。所以它不许折成两团。 */
+.ask-hint { font-size: var(--fs-meta); color: #8b95a8; line-height: 1.65; }
+/* "建到哪一层"（2026-09-18 加的）。★ 它**必须显眼**，而且必须比 hint 靠上：
+   点出来的那条路上，"我点的是哪一行"就是这次新建的全部位置信息 ——
+   不写出来，用户的下一个问题就是"它建到哪儿去了？"（比让他多打一段名字更糟）。
+   做成一块**有左边框的条**而不是一行灰字：那是"位置"，不是"说明"。 */
+.ask-where {
+  font-size: var(--fs-meta); color: #cfe0ff;
+  background: #131c2b; border-left: 2px solid var(--acc); border-radius: 0 7px 7px 0;
+  padding: 6px 10px; line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.ask-where b { font-family: var(--mono); font-weight: 600; color: #eaf2ff; }
+.ask-where .aw-why { color: #7c869a; margin-left: 6px; }
+/* ── 「建到哪一层」那一排**能点的**层（2026-09-21）────────────────────────
+ * 用户原话：「优化新增白板，新增分层体验，你自己看看现在太垃圾了」。
+ * 改之前："建到哪一层"要么是**一句只读的话**（点出来的那条路），
+ * 要么干脆**没有**、路径预填在名字框里（顶栏那两颗）—— 于是想把板放到别处，
+ * 只能把打好的路径删掉重打（还要自己记住父层叫什么）。
+ * 现在它是一排小按钮：点一下就换一层，最左边那颗永远是「根目录」。
+ * ⚠ 换行 + 限高 + 自己滚：层可能有十几二十个（一门课一学期就分层了），
+ *   不能让它把对话框撑到屏幕外面（`.ask` 是固定宽度的浮层）。
+ * ⚠ 选中态用**实心**（`.on`）：这一排里"我现在选的是哪一层"必须一眼看得出来 ——
+ *   它是这个框里唯一一个"会改变结果"的选择。 */
+.ask-where .aw-label { color: #8b95a8; margin-right: 8px; flex: none; }
+.ask-layers {
+  display: inline-flex; flex-wrap: wrap; gap: 5px; margin-top: 6px;
+  max-height: 96px; overflow-y: auto; width: 100%;
+}
+.ask-layer {
+  border: 1px solid #33405a; background: #0e1116; color: #aab4c8;
+  border-radius: 999px; padding: 3px 10px; cursor: pointer;
+  font-size: var(--fs-meta); font-family: inherit; line-height: 1.5;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ask-layer:hover { background: #1b2536; color: #e7ecf5; }
+.ask-layer.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; font-weight: 600; }
+.ask-label { font-size: var(--fs-meta); color: #aab4c8; margin-top: 3px; }
+.ask-field { display: flex; align-items: center; gap: 0; }
+/* 钉住的前缀（比如当前所在的层）和输入框是**同一个盒子**：前缀不进输入框 ——
+   进去了就得靠"删到哪儿算完"来判断，那件事没有正确答案。 */
+.ask-prefix {
+  flex: none; padding: 8px 0 8px 10px; color: #7c869a;
+  background: #0e1116; border: 1px solid #2e3646; border-right: 0;
+  border-radius: 8px 0 0 8px; font-family: var(--mono); font-size: var(--fs-ui);
+  max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ask-input, .ask-textarea {
+  flex: 1; min-width: 0; width: 100%; box-sizing: border-box;
+  background: #0e1116; border: 1px solid #2e3646; border-radius: 8px;
+  color: #e7ecf5; font-family: inherit; font-size: var(--fs-ui);
+  padding: 8px 10px;
+}
+.ask-prefix + .ask-input { border-radius: 0 8px 8px 0; }
+.ask-textarea { resize: vertical; line-height: 1.6; }
+.ask-input:focus, .ask-textarea:focus { outline: none; border-color: #4b87e0; }
+.ask-input::placeholder, .ask-textarea::placeholder { color: #5d6779; }
+.ask-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; }
+.ask .btn { background: #232b3a; border: 1px solid #3a4457; color: #dde3ee; }
+.ask .btn:hover:not(:disabled) { background: #2c3648; }
+.ask .btn.primary { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+/* 破坏性的那个（"丢掉改动"）：红底，别和"确定"长得一样 */
+.ask .btn.primary.danger { background: #a33a30; border-color: #c9503f; }
+.ask .btn.primary.danger:hover:not(:disabled) { background: #b8453a; }
+.ask .btn:disabled { opacity: 0.45; cursor: default; }
 
 /* 滚动条 */
 ::-webkit-scrollbar { width: 12px; height: 12px; }
@@ -731,7 +947,7 @@ kbd {
 
 /* ==================== 画布全屏 ====================
    目标：OneNote 那种"满屏只剩一张纸"。
-   两件事一起做：① 把页面里的两侧栏、顶栏、关系面板全收掉（就是下面这些）；
+   两件事一起做：① 把页面里的两侧栏、顶栏全收掉（就是下面这些）；
                 ② 同时请求浏览器全屏（在 App.jsx 里）—— 不然地址栏、标签栏还在，
                    "彻底"两个字就无从谈起。
    Esc 或 F11 退出也认：App 那边监听 fullscreenchange 把状态跟上。 */
@@ -742,17 +958,9 @@ kbd {
 .app.fs.board-mode > .bd-shell { grid-column: 1; }
 .app.fs .bd-topline { display: none; }
 
-/* 关系面板：三种摆法各有各的容器，全收 */
-.bd-fs .bd-cpanel,
-.bd-fs .bd-drawer,
-.bd-fs .bd-drawer-toggle,
-.bd-fs .bd-csplit { display: none; }
-
-/* 摆法 C 的关系面板是"左边一整列"，它收掉之后画布得铺回去 */
-.bd.variant-C.bd-fs .bd-stagewrap { margin-left: 0; }
-.bd.variant-C.bd-fs .bd-cbar { left: 12px; }
-.bd.variant-C.bd-fs .bd-proto,
-.bd.variant-C.bd-fs .bd-proto-mini { left: 14px; }
+/* ⚠ 这里原来还有一段"全屏时把关系面板收起来"（`.bd-fs .bd-cpanel / .bd-drawer /
+   .bd-drawer-toggle / .bd-csplit { display: none }`）—— 面板 2026-09-19 整块删掉了，
+   那段规则跟着一起走。 */
 
 /* 工具条自动淡出：鼠标扫到屏幕底部才浮出来。
    留一点点痕迹（0.14）而不是彻底透明 —— 不然第一次用会以为工具条没了，
@@ -760,8 +968,6 @@ kbd {
 .bd-fs .bd-cbar { opacity: 0.14; transition: opacity 0.22s; }
 .bd-fs .bd-cbar:hover,
 .bd-fs .bd-cbar:focus-within { opacity: 1; }
-.bd-fs .bd-proto-mini { opacity: 0.14; }
-.bd-fs .bd-proto-mini:hover { opacity: 1; }
 
 /* 白板顶上那条：只放"现在开的是哪张板"。
    白板自己有一套工具条，所以这里刻意做得很薄 —— 一行就够。 */
@@ -931,8 +1137,40 @@ kbd {
      卡片自己的 z-index 是 auto，而**正 z-index 的定位元素排在所有 z-index:auto
      的定位元素后面**（更上面），所以只要卡片没有被包在一个更高 z-index 的祖先里，
      .bd-hit 就把它整个盖住 —— 看上去卡片在，一按就变成在板上画墨，
-     卡片里的输入框永远点不进去。宽高都是 0：卡片各自绝对定位，不让这一层撑出滚动条。 */
-.bd-world { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 6; }
+     卡片里的输入框永远点不进去。宽高都是 0：卡片各自绝对定位，不让这一层撑出滚动条。
+
+   ★ 上面那句"不要再加 transform"**现在有个例外，而且是唯一的一个**：
+     手势进行中，Board.jsx 会往这一层写一条**补正**变换
+     （`syncWorldCorrection` / view.js 的 viewCorrection，2026-09-18）。
+     它不是"又做一遍平移"，是**"React 还没追上"的那部分差**：
+       · 墨迹（canvas）在一个 effect 里直接重绘，一帧到位；
+       · 卡片（DOM）的 left/top 要等 setState → render → commit → layout，
+         落后一两帧 —— 那就是用户报的"卡片相对于字滑动"。
+     补上这个差之后两者同帧；React 追上后差是 0，那条 transform 就被移除，
+     回到"位置完全由 left/top 决定"。所以它是**过渡量，不是长期偏移**。
+     ⚠ transform-origin 必须是 `0 0`：那条公式（p × k + tx'）是以原点推的。
+     ⚠ 别把它改成"直接把 tx/ty 写上去" —— 那才会真的偏两遍。
+     ★★ 2026-09-18 第二版（补上第一版的漏洞）：补正**不只是卡片层的**。
+       第一版只贴了 `.bd-world`，于是两边还是差一步 —— 只是把"卡片快一帧"
+       换成了"墨迹慢一帧"，肉眼看照样滑动。现在**两组东西贴同一条补正**：
+       这一层（卡片 + 板框）+ 下面那个 `[data-view-follow]`（墨迹两层 canvas、
+       连线两层 SVG）。基准也换成了"**已经画出来了**的那一版视图"（`drawnViewRef`）——
+       拿"已经提交的"当基准会多算一步，补正就变成"把同一次平移做两遍"。 */
+.bd-world {
+  position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 6;
+  transform-origin: 0 0;
+}
+
+/* ★ 「跟着视野走」的那几层（两层 canvas + 两层 SVG）—— 补正也贴在它们身上。
+   属性由 BoardCanvas 自己声明（`data-view-follow`），Board.jsx 按它一次找齐：
+   这样"漏掉哪一层"不靠人记得，改成"谁跟视野走谁自己声明"。
+   ⚠ `transform-origin: 0 0` 和 `.bd-world` 同一个理由（那条公式以原点推的）：
+     少了它，缩放那一档会绕中心转，差就补歪了。
+   ⚠ 这两层 canvas 是**位图**：补正期间先被拉伸一下（缩放时略糊），下一帧重画
+     就恢复 —— 那一帧本来就是过渡帧。
+   ⚠ 用笔写字时不许挂着它：`paintLive` 按屏幕坐标反算世界坐标，非单位变换会把
+     落点算歪。所以**按下笔的那一刻先清掉**（Board.jsx 的 clearViewCorrection）。 */
+[data-view-follow] { transform-origin: 0 0; }
 .bd-card {
   position: absolute;
   background: #fff;
@@ -1161,21 +1399,115 @@ kbd {
   position: absolute; z-index: 12; transform: translateY(-100%);
   display: flex; align-items: flex-end; gap: 6px; white-space: nowrap;
 }
-.bd-inkdel, .bd-inkfmt, .bd-inkformula, .bd-inkgroup {
+.bd-inkdel, .bd-inkfmt, .bd-inkformula, .bd-inkcopy, .bd-inkgroup {
   border: 0; color: #fff; border-radius: 8px;
   padding: 5px 10px; cursor: pointer; white-space: nowrap;
   font-size: calc(12px * var(--s)); line-height: 1.2;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
-}
-.bd-inkdel { background: #2f6fd0; }
+}.bd-inkdel { background: #2f6fd0; }
 .bd-inkdel:hover { background: #3b7fe0; }
 .bd-inkfmt { background: #1f9d55; }
 .bd-inkfmt:hover { background: #24b463; }
 .bd-inkformula { background: #7048e8; }
 .bd-inkformula:hover { background: #7f5cf0; }
+/* 复制：青色，和「美化」的绿、「公式」的紫、「删除」的蓝都分得开 ——
+   它是"把这一块带走"，不是"改造这一块"，颜色也该是另一族。
+   ★ 故意比删除**浅**一点：两颗按钮挨着，误按复制只是白复制一次，
+     误按删除要把东西找回来（Ctrl+Z 或者没了）。视觉重量该跟着代价走。 */
+.bd-inkcopy { background: #0e7490; }
+.bd-inkcopy:hover { background: #1189a8; }
 /* 固定/拆开一块：中性的灰蓝 —— 它不是"把手写变成卡"，是"这一坨算多大"那条线。 */
 .bd-inkgroup { background: #3a4457; }
 .bd-inkgroup:hover { background: #4a566d; }
+
+/* ★ 规整形状（见 lib/shapes.js）——**描边、不填色**，是这一排里唯一这样的。
+   两个理由，都是有意的：
+     ① 它不产生新东西。左边那三颗（∑ 公式 / ✨ 美化 / ▣ 留下板框）都会让板上
+        "多一样东西"，所以它们是实心的；规整只是把你原来画的那一笔弄直、弄圆，
+        数量一个不差 —— 描边说的才是实话。
+     ② 它是**条件出现**的（框里认不出形状时这颗根本不在）。描边比实心"轻"，
+        浮出来又收回去时对眼睛的打扰小。
+   颜色用琥珀（和 --warn 同族）而不是蓝色系：蓝色那一族在下面（选中/删除），
+   而它是"改一改"不是"动结构"。 */
+.bd-inkshape {
+  border: 1.5px solid rgba(255, 180, 84, 0.85) !important;
+  background: rgba(40, 32, 20, 0.92); color: var(--warn);
+  border-radius: 8px; padding: 4px 10px; cursor: pointer; white-space: nowrap;
+  font-size: calc(12px * var(--s)); line-height: 1.2;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.bd-inkshape:hover { background: #4a3a20; color: #ffc978; }
+
+/* ---------- 选区手柄（框住一撮东西之后的四角 + 旋转，见 lib/selection.js）----------
+ *
+ * 用户 2026-09-19：「你可以对图形放大缩小修正真正形状」→ 那时它只服务**规整过的图形**；
+ * 用户 2026-09-21：「框选中任意的字迹——卡片都应该能够放大，旋转，这点类似 onenote」
+ * → 现在**任意选区**都有手柄（几笔字、一坨乱涂、框进来的卡片）。类名跟着从
+ *   `bd-shapehandle*` 改成 `bd-pickhandle*`（"shape" 那个名字已经不再成立了）。
+ *   ⚠ 改名时自检的钩子（`data-pick-handle`）和这里必须一起改 ——
+ *     样式和钩子对不上号的表现是"手柄看得见、抓不住"，而那正是这一族踩过三次的坑。
+ *
+ * ★ 尺寸是**屏幕像素**、不跟 `--s` 走（和卡片四角那几颗手柄同一个规矩）：
+ *   跟缩放走的话，缩到 33% 时手柄只剩 6px，抓不住。
+ *   （ADR-0002 那条"往上面再加任何量之前先问它跟不跟缩放走"——手柄属于"不跟"那一类。）
+ * ★ 这一层**整体收指针事件**（和 `.bd-inkacts` 一样），因为它只在"选中一块东西"时出现，
+ *   而且它自己不占地方（宽高 0 + 每颗柄绝对定位）—— 空白处照样能落笔。
+ *   ⚠ 每颗柄**必须显式写 pointer-events: auto**：父层是 none 时子元素不会自动恢复
+ *     （README 坑 #19 那条 📌 就是这个坑，漏了的表现是"手柄看得见、抓不住"）。
+ * ★ z-index 13：比 `.bd-inkacts`（12）高一层，因为手柄钉在选区**四周**、
+ *   而那一排按钮浮在选区**上方** —— 选区很小的时候两者会挨上，手柄必须压在上面
+ *   （它是"贴着选区"的那个，按钮躲开更容易）。
+ * ⚠ 但都还是低于底部工具条（20）和关系面板（20）：屏幕右缘/下缘的选区，
+ *   手柄会被那两层盖住 —— 这是**已知且接受**的（先把东西拖开再拉）。
+ *   自检里那条 `elementFromPoint` 断言就是为了让这件事**看得见**，不是假装它不存在。 */
+.bd-pickhandles { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 13; }
+.bd-pickhandle {
+  position: absolute; pointer-events: auto;
+  width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px;
+  padding: 0; border: 1.5px solid #fff; border-radius: 3px;
+  background: #2f6fd0; cursor: nwse-resize;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+.bd-pickhandle:hover { background: #3b7fe0; }
+/* 旋转柄：圆的、比角柄大一点、摆在框**右边中点**。
+   ★★ 为什么不在顶边中点（那样更像 OneNote，但这里不行 —— 这是量出来的）：
+     选中时 `.bd-inkacts`（那排「∑ 公式 / ✨ 美化 / ◯ 规整 / ⧉ 复制 / ✕ 删除」）
+     是 `translateY(-100%)` **钉在包围框正上方**的，实测高约 26 屏幕像素 ——
+     而顶边中点离框只有 26px，于是两者**正好压在同一个位置**：
+     `elementFromPoint` 量出来旋转柄中心命中的是那排按钮（看得见、抓不住）。
+     右边中点那一带上下都是空的（角柄在四个**角**上，竖直方向差半个框高）。
+   ⚠ 所以 **`margin-top` 是 `-8px`（竖直居中），`margin-left` 是 `+10px`（往框外挪一点）**——
+     这两个数各管一件事，别再把竖直那个改成"往上挪"（那正是撞上那排按钮的原因）。 */
+.bd-pickhandle.rot {
+  width: 16px; height: 16px; margin: -8px 0 0 10px;
+  border-radius: 50%; background: #7048e8; cursor: grab;
+}
+.bd-pickhandle.rot:hover { background: #7f5cf0; }
+.bd-pickhandle.rot:active { cursor: grabbing; }
+
+/* ---------- 缩放 / 旋转中的卡片：让合成器去动它（2026-09-21）----------
+ *
+ * 用户报的原话：**「大字体旋转时卡顿」**。
+ *
+ * 病根：卡片的 `transform` 每变一次，浏览器就要**把整张卡重新光栅化一遍**
+ * （除非它是一个自己的合成层）。而"大字体"的公式卡正是最贵的那一种：
+ *   · 面积大（scale 到 2~4 倍 → 屏幕上上千像素宽）；
+ *   · 内容复杂（KaTeX 那一大坨内联 span、每个字都是独立的字形绘制）；
+ *   · 还带一圈 14px 模糊的 `box-shadow`（模糊是最贵的绘制之一）。
+ * 于是拖着那颗旋转柄时，每一帧都在重画这张卡 —— 手就一顿一顿的。
+ *
+ * 修法：**只在手势进行中**给卡片一个合成器提示（`.bd.xforming` 由 Board.jsx 挂）：
+ *   · `will-change: transform` —— 把它提成自己的图层，转身这一下变成
+ *     "合成器拿着已经画好的那张位图转"（微秒级），松手之后再画一次清晰的；
+ *   · `transition: none` —— 顺带把 hover 那圈阴影的过渡停掉：卡片本来就在动，
+ *     没人看得出阴影在"过渡"，而那是一条**每帧重画整张卡**的路。
+ *
+ * ⚠ 为什么**不常挂**：每一层合成层都要一份显存（大卡片的位图就是几 MB），
+ *   一页几十张卡常挂上去，内存和首帧都吃亏 —— 提示只该在"正要动"的时候给。
+ * ⚠ 代价如实写下来：转动**过程中**文字是"被合成器采样出来的位图"，
+ *   会有一点点软（Chrome 的常规行为）；松手的那一帧它重新光栅化，立刻变回清晰。
+ *   这是 60fps 与"每一帧都锐利"之间的取舍 —— 选前者。 */
+.bd.xforming .bd-card { will-change: transform; transition: none; }
 
 /* ---------- 板框（你亲手留下的一个整体，见 ADR-0001）----------
    框线是**算出来的**（成员包围盒 + 内边距），所以它的宽高由 JS 算好写进 style，
@@ -1222,19 +1554,6 @@ kbd {
   font-size: calc(11.5px * var(--s)); line-height: 1.7; font-family: inherit;
   outline: none; pointer-events: auto;
 }
-
-/* 面板里的「板框（N 个）」那一节：一行一个框（名字 + 成员数 + 连着几条）。
-   形状和「你画过的那一条」那一族对齐（都是面板里可点的一行）。 */
-.bd-frames-list { margin-top: 8px; }
-.bd-frame-row {
-  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
-  background: none; border: 0; border-left: 3px solid rgba(90, 106, 138, 0.45);
-  color: var(--fg); font: inherit; font-size: var(--fs-ui);
-  padding: 3px 6px; cursor: pointer; border-radius: 4px;
-}
-.bd-frame-row:hover { background: rgba(90, 106, 138, 0.1); }
-.bd-frame-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bd-frame-links { color: var(--dim); font-size: calc(var(--fs-ui) * 0.9); }
 
 /* ---------- 画出来的连接（关系）----------
    用户 2026-09-16：「更便捷的显示出两者之间的主次、因果、并列」
@@ -1292,53 +1611,6 @@ kbd {
 .bd-inklink { display: flex; align-items: center; gap: 4px; }
 .bd-inklink .bd-linkchip { background: rgba(22, 26, 34, 0.92); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3); }
 .bd-inklink .bd-linkchip:hover { background: #232b3a; }
-
-/* 关系面板里"你画过的"那一节 */
-.bd-links-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
-/* 条件（写在线中点旁边那几个字）：不算词，是"附着在这条线上的内容" —— 淡一点、小一点 */
-.bd-cond { margin-left: 6px; color: #8b95a8; font-size: calc(11px * var(--s)); }
-/* 「这个条件不算」：那句话本身 + 那颗 ✕ / 回头路 ↺。
-   ★ 那句"你说过条件不算"**不能复用 .bd-cond** —— 它不是条件，是"这句话作废"的痕迹；
-     共用类名会让"面板上显示的条件"这类查询把它一起数进去（自检里当场撞过一次）。 */
-.bd-cond-note { margin-left: 6px; color: #d9a06a; font-size: calc(11px * var(--s)); }
-/* ★ ✕ / ↺ 是**行内按钮**（那一行本身是个 button，里面不能再套一个真的 button），
-     所以自己画成一颗小按钮的样子：可点区域给足（18px 见方），hover 才亮 ——
-     平时不显眼，但 `elementFromPoint` 命中的必须是它自己（自检就从它的中心按下去，
-     见 check:link [12]）。 */
-.bd-cond-no {
-  flex: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 18px; height: 18px; border-radius: 5px; cursor: pointer;
-  color: #8b95a8; border: 1px solid transparent; font-size: calc(11px * var(--s));
-}
-.bd-cond-no:hover { background: #2b3444; color: #dde3ee; border-color: #3a4457; }
-.bd-cond-no.back { color: #7fb2e5; }
-.bd-cond-no.arm { color: #9aa7bd; font-weight: 600; }
-.bd-cond-no.arm:hover { color: #cfe3fa; }
-.bd-cond-no.arm.on { background: #2b3444; border-color: #7fb2e5; color: #cfe3fa; }
-/* 「∈ 条件」武装着的时候：整块板换成十字光标（"这一下是**指**，不是画"）。
-   不这么做的话，用户会以为自己在画线。 */
-.bd.condarm .bd-stagewrap, .bd.condarm .bd-hit { cursor: crosshair; }
-/* 推导链：A →(条件) B →(缺条件) C */
-.bd-chain-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
-.bd-chain { margin: 6px 0 10px 2px; }
-.bd-chain-node {
-  font-size: calc(12px * var(--s)); color: #dde3ee;
-  padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.bd-chain-step { margin-left: 6px; border-left: 1px solid #3a4457; padding-left: 8px; }
-.bd-chain-cond { color: #8b95a8; font-size: calc(11px * var(--s)); padding: 1px 0; }
-/* 缺条件那一步要跳出来：这是这一节存在的理由（"补条件"就是在线旁边写几个字） */
-.bd-chain-cond.miss { color: #f0a020; }
-.bd-link-row {
-  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
-  background: transparent; border: 1px solid transparent; border-radius: 7px;
-  padding: 3px 4px; cursor: pointer; font-size: calc(12px * var(--s)); color: #dde3ee;
-}
-.bd-link-row:hover { background: #232b3a; }
-.bd-link-kind {
-  flex: none; font-size: calc(10.5px * var(--s)); padding: 0 5px; border-radius: 4px;
-  border: 1px solid currentColor; font-weight: 500;
-}
 
 /* 文字卡的字体选择（卡片编辑态里那一排，以及美化面板里那一排）。
    每个按钮用它自己的字体显示自己的名字 —— 选字体这件事，看到的就得是那个样子。
@@ -1451,52 +1723,11 @@ kbd {
    不写清楚的话，两个 −/+ 摆在同一根工具条上必然让人懵。 */
 .bd-zoomlabel { font-size: calc(11px * var(--s)); color: #667084; padding: 0 2px 0 6px; }
 
-/* ---------- 关系面板 ---------- */
-.bd-cpanel {
-  position: absolute; right: 14px; top: 14px; bottom: 78px; width: 320px; z-index: 20;
-}
-.bd-rel {
-  height: 100%; overflow: auto;
-  background: rgba(22, 26, 34, 0.94); backdrop-filter: blur(10px);
-  border: 1px solid #2e3646; border-radius: 12px; padding: 12px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-  font-size: calc(13px * var(--s));
-}
-.bd-rel-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
-.bd-rel-sub { color: #8b95a8; font-size: calc(11.5px * var(--s)); margin: 10px 0 5px; }
-.bd-tree { display: flex; flex-direction: column; gap: 2px; }
-.bd-node-row {
-  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
-  background: transparent; border: 1px solid transparent; border-radius: 7px;
-  color: #cfd6e4; padding: 4px 6px; cursor: pointer; font-size: inherit;
-}
-.bd-node-row:hover { background: #232b3a; color: #fff; }
-.bd-node-row.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
-.bd-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
-.bd-dot.formula { background: #ffd43b; }
-.bd-dot.note { background: #6aa8ff; }
-.bd-islands { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
-.bd-islands-head { color: #ffb454; margin-bottom: 3px; }
-.bd-orphan {
-  display: block; width: 100%; text-align: left; margin-top: 4px;
-  background: #232b3a; border: 1px solid #3a4457; border-radius: 7px;
-  color: #cfd6e4; padding: 4px 7px; cursor: pointer; font-size: calc(12px * var(--s));
-}
-.bd-orphan:hover { background: #2c3648; color: #fff; }
-.bd-edges-list { margin-top: 12px; border-top: 1px solid #2e3646; padding-top: 10px; }
-.bd-edge-row {
-  display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 6px;
-  font-size: calc(12px * var(--s)); color: #b6bfd0;
-}
-.bd-edge-row:hover { background: #232b3a; }
-.bd-edge-row.inked { color: #dde3ee; }
-.bd-kind {
-  flex: none; font-size: calc(10.5px * var(--s)); padding: 1px 5px; border-radius: 4px;
-  border: 1px solid #3a4457; color: #8b95a8;
-}
-.bd-kind.k-contain { color: #bdf0d7; border-color: #1d4a36; }
-.bd-kind.k-overlap { color: #ffe0b0; border-color: #453316; }
-.bd-er { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ---------- 关系面板：整块删掉了（2026-09-19）----------
+   那块 320px 的右侧浮层（.bd-cpanel / .bd-rel / 卡片树 / 板框列表 / 连接两节 /
+   推导链 / 谁靠着谁）连同它的样式一起走，原因写在 Board.jsx 同名的那段注释里。
+   ⚠ 它删掉之后画布是**整个宽度**，所以 .bd-inkacts 的夹取不用再扣 320+14
+     （见 BoardCanvas 顶部 INKACTS_GAP 那段）。 */
 
 /* ---------- 空板提示 ---------- */
 .bd-hint {
@@ -1512,25 +1743,12 @@ kbd {
 .bd-hint .btn:hover { background: #f2f5fa; }
 .bd-hint .btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
 
-/* ---------- 变体 B：全屏画布 ---------- */
-.bd.variant-B .bd-floatbar { position: absolute; left: 14px; right: 14px; bottom: 14px; z-index: 20; }
-.bd.variant-B .bd-drawer {
-  position: absolute; right: 14px; top: 14px; bottom: 86px; width: 330px; z-index: 20;
-}
-.bd-drawer-toggle {
-  position: absolute; right: 14px; top: 14px; z-index: 21;
-  background: rgba(22, 26, 34, 0.92); border: 1px solid #2e3646; color: #cfd6e4;
-  border-radius: 9px; padding: 6px 11px; cursor: pointer; font-size: calc(12.5px * var(--s));
-}
-.bd-drawer-toggle:hover { background: #232b3a; color: #fff; }
-
-/* ---------- 变体 C：关系占左边一整列 ---------- */
-.bd.variant-C .bd-stagewrap { margin-left: 300px; }
-.bd-csplit { position: absolute; left: 0; top: 0; bottom: 0; width: 300px; z-index: 20; display: flex; flex-direction: column; }
-.bd-clist { flex: 1; min-height: 0; }
-.bd-clist .bd-rel { border-radius: 0; border-left: 0; border-top: 0; border-bottom: 0; }
+/* ---------- 工具条：贴着画布底边的一条 ----------
+   三种摆法（A 右栏 / B 全屏浮层 / C 左列）2026-09-19 一起删掉了 ——
+   它们存在的唯一理由是给关系面板找地方。白板只剩这一种样子：
+   画布占满（`.bd-stagewrap` 不再有 margin-left），工具条贴底。
+   ⚠ `.bd-cbar` 是工具条的容器，别跟着那些变体规则一起删掉。 */
 .bd-cbar { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 22; }
-.bd.variant-C .bd-cbar { left: 312px; }
 
 /* ---------- 手写公式：写字板 + 设置 ----------
    这两块是弹层，风格跟白板工具条一致（深色玻璃），因为它们浮在浅色纸上。 */
@@ -1632,44 +1850,4 @@ kbd {
 .wp-prov input { margin-top: 3px; }
 .wp-prov > span { display: flex; flex-direction: column; gap: 2px; }
 
-/* ---------- 原型变体切换器 ----------
-   它是"给你挑摆法"用的，不属于设计本身：做成高对比的小药丸，
-   一眼就知道这不是白板的一部分。挑完连它带落选的摆法一起删掉。 */
-/* 布局变体切换器。
-   原来贴在屏幕底部正中（fixed + translateX），正好压在底部工具条上
-   —— 实测重叠 39.5px。底部那一条已经被工具条占满了，左右各只剩十几像素，
-   根本塞不下，所以只能换地方。
-   现在挪到画布左上角，而且**默认收成一个小圆点**：平时它就是个角标，
-   不挡任何 UI、也不怎么挡画布；要翻着看摆法的时候点一下再展开。 */
-.bd-proto-mini {
-  position: absolute; left: 14px; top: 14px; z-index: 300;
-  width: 26px; height: 26px; padding: 0; border-radius: 50%;
-  display: grid; place-items: center;
-  background: rgba(17, 21, 29, 0.8); border: 1px solid #3a4457;
-  color: #8b95a8; font-size: calc(11.5px * var(--s)); line-height: 1;
-  cursor: pointer; opacity: 0.45;
-  transition: opacity .15s, color .15s, background .15s;
-}
-.bd-proto-mini:hover { opacity: 1; color: #fff; background: #11151d; }
 
-/* 变体 C 的关系面板占左边一整列，得让开它 */
-.bd.variant-C .bd-proto,
-.bd.variant-C .bd-proto-mini { left: 314px; }
-
-.bd-proto {
-  position: absolute; left: 14px; top: 14px; z-index: 300;
-  display: flex; align-items: center; gap: 8px;
-  background: #11151d; border: 1px solid #3a4457; border-radius: 999px;
-  padding: 6px 10px; box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
-  color: #cfd6e4; font-size: calc(12px * var(--s));
-}
-.bd-proto button {
-  background: transparent; border: 0; color: #8b95a8; cursor: pointer;
-  font-size: calc(16px * var(--s)); line-height: 1; padding: 2px 8px; border-radius: 8px;
-}
-.bd-proto button:hover { background: #232b3a; color: #fff; }
-.bd-proto-t { white-space: nowrap; }
-.bd-proto-t b { color: #6aa8ff; }
-/* 收起按钮：比左右箭头小一号、暗一点，免得被当成"又一个切换" */
-.bd-proto .bd-proto-x { font-size: calc(13px * var(--s)); padding: 2px 6px; color: #667084; }
-.bd-proto .bd-proto-x:hover { color: #fff; }

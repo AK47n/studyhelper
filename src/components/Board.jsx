@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import BoardCanvas from './BoardCanvas.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
 import InkToCard from './InkToCard.jsx'
@@ -15,30 +15,31 @@ import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
 import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
-import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, strokeHitsRect, toFlat, toPoints } from '../lib/geometry.js'
+import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'
-/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。
-   `linkKey` = 一条连接在界面上的身份（你画的看那一笔、你连的看那条记录）。 */
-import {
-  createLinkReader, deriveChains, linkKey,
-} from '../lib/links.js'
+/* 连接读法（reader / 墨迹块 / 形状判据 / 各种阈值）搬去了 links.js。 */
+import { createLinkReader } from '../lib/links.js'
 /* 选中这一族（框住的笔意味着什么 + 你对它说的那几句话）搬去了 selection.js：
-   改词 / 反向 / 「不算连接」/ 回头路 / 留下板框 的规矩都在那儿，纯函数、有断言。 */
+   改词 / 反向 / 留下板框 / **整块缩放旋转** 的规矩都在那儿，
+   纯函数、有断言（`transformPick` 是"把框住的这一撮东西当一个整体动一下"的唯一入口）。
+   ⚠ 「这个条件不算 / 条件就是它」那三个写入口（`vetoCond` / `specCond` / `clearCond`）
+     还躺在那个 module 里，但**界面入口已经没有了** —— 它们唯一的脸就是关系面板，
+     而那块面板删掉了（见文件末尾「关系面板删掉了」那段）。 */
 import {
-  applyStrokeLink, clearCond, freezeFrameSelection, readSelection, removeStrokes, specCond, vetoCond,
+  applyStrokeLink, freezeFrameSelection, readSelection, removePick, transformPick,
 } from '../lib/selection.js'
 /* 板框 / 连接这两个概念的**动作**（留下 / 加进来 / 改标题 / 拆开 / 整体挪 / 删掉连接 /
    吸附到最近的卡片或板框）在 frames.js —— 和 selection.js 一个路子：纯函数、有断言。见 ADR-0001。 */
 import { declareLink, dissolveFrame, removeLink, setFrameTitle, setLinkKind, snapNode, translateFrame } from '../lib/frames.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
-import { ARROW_LINK, LINK_DELETE, LINK_KINDS, condCard, condInk, linkKind } from '../lib/link-kinds.js'
+import { ARROW_LINK, LINK_DELETE, LINK_KINDS, linkKind } from '../lib/link-kinds.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
    滚动/捏合/平移/居中全走这里。 */
-import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, screenLenToWorld, screenToWorld, worldLenToScreen, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
+import { applyViewTo, clampViewScale, combinedScale, panBy, screenLenToWorld, screenToWorld, viewCorrection, worldLenToScreen, worldToScreen, zoomAt, zoomBetween } from '../lib/view.js'
 /* 撤销账本（一次手势 = 一步撤销）在 history.js —— 四条手势从前各自手记一次账、
    "算不算动过"四个判据（架构 review 候选 3）。现在只说 begin / during / end。 */
 import { createHistory } from '../lib/history.js'
@@ -50,8 +51,27 @@ import { chipPlacement } from '../lib/chip-placement.js'
    从前它是四个 useState + 二十处 ad hoc 的互斥 if + 一串按键 if（候选 7）。 */
 import {
   FOCUS_NONE, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit, escapeIntent,
-  focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkIds, isTextField,
+  focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkCards, focusInkIds, isTextField,
 } from '../lib/focus.js'
+/* 复制 / 粘贴（框住一块 → 装进剪贴板 → 落到**任何一块板**上）在 clipboard.js：
+   "只装内容不装关系"、"落点用相对偏移"、"粘贴出来一律是新 id" 三条规矩都在那儿，纯函数、有断言。 */
+import { copySelection, isPayload, pastePayload, payloadCount } from '../lib/clipboard.js'
+/* 常用形状规整（画个圆 → 变成真正的圆）在 shapes.js —— 纯几何，不碰界面。
+   ★ 它和 ADR-0001 砍掉的"形状判读"是什么关系，写在那个文件的**第一段注释**里，
+     动手改之前先看那一段（那里也写着这条功能的铁律：宁可认不出来，也不许认错）。 */
+import { recognizeStrokes, regularizeStrokes } from '../lib/shapes.js'
+/* 图形对象那一族（"认出来之后怎么缩放/旋转/重开还在"）——
+   和上面 `shapes.js` 是两件事，见那个 module 的文件头。
+   ★ 2026-09-21 之后这里只剩**问句**：`shapeName`（形状的人话名字）、
+     `oppositeCorner`（拖一个角时不动的是哪一个点）、`translateShape`（整体平移一笔）。
+     "怎么变"（`scaleShape` / `rotateShape` / `retargetStroke`）整个搬进了
+     selection.js 的 `transformPick` —— 因为现在**任意一撮笔迹和卡片**都能变，
+     而变换的规矩只该有一份（两份的话，图形那一份迟早和这一份对不上）。 */
+import { oppositeCorner, shapeName, translateShape } from '../lib/shape-object.js'
+
+/* 剪贴板在 localStorage 里的键名。**跨窗口靠的就是它** ——
+   改这个名字等于"另一个开着的白板页读不到你刚复制的东西"，所以要改就连文档一起改。 */
+const CLIP_KEY = 'studyhelper.clip.v1'
 
 /* 白板：打开就能画的那一屏。没有文件名要起、没有格式要学。
  *
@@ -60,7 +80,8 @@ import {
  * ① **笔是主角，键盘是配角。** 默认工具永远是笔。输入框只在你要写公式/文字时出现，
  *    出现即聚焦、Enter 收、Esc 走。
  * ② **关系不用你填。** 你画的位置就是关系（见 lib/board.js 的 buildRelations）。
- *    面板会明说是"推断的"，并告诉你怎样让它变成确定的：在两张卡之间画一条线。
+ *    想让它是确定的，就在两张卡之间画一条线 —— 位置猜出来的只是猜测，那条线是你说的话。
+ *    （从前有一块右侧面板把这些逐条列出来，2026-09-19 整块删掉了。）
  * ③ **一切都是纯文本。** 一张板 = 一个 JSON 文本文件，随时能读、能 Git、能救。
  *
  * ── 状态怎么管（这部分是踩过坑的）──
@@ -81,6 +102,12 @@ import {
 const SAVE_DEBOUNCE_MS = 700
 /* 写盘失败之后隔多久再试（见 flushSave）：宁可重试，也不能让「已存」撒谎。 */
 const SAVE_RETRY_MS = 3000
+/* 「板安静多久才算安静」——给**那颗「◯ 规整」按钮的判读**用的（不是量尺寸那一条：
+   量尺寸的安静判据在 `card-fit.js` 的 `FIT_IDLE_MS`）。
+   为什么单有一个数：形状判读是 O(框住的笔数 × 每笔拟合)，而它在拖动中每一帧都会
+   白跑一遍（见下面 `shapeHits` 那一段）。240ms 的取法：比"手停下来的感觉"略短，
+   又明显长于两次 pointermove 的间隔（60fps 是 16.7ms），所以拖动中它永远不会触发。 */
+const SHAPE_SETTLE_MS = 240
 /* "板安静多久才算安静"（公式卡重新量尺寸那个防抖）跟着那条政策搬去了
    `src/lib/card-fit.js` 的 `FIT_IDLE_MS`（2026-09-17 架构 review 候选 6）——
    这个文件里不再留一份。 */
@@ -103,7 +130,6 @@ const COLORS = [
   { id: 'purple', v: '#7048e8', name: '紫' },
 ]
 const WIDTHS = [1.6, 2.6, 4.2]
-const VARIANTS = ['A', 'B', 'C']
 
 /* ── 纸面：几种背景，用户自己挑 ──
  * 2026-09-16 用户：「现在白板背景是十字格子纸，可以改成纯白纸，或者说有几种类型的
@@ -195,11 +221,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }, [focus])
   const [dirty, setDirty] = useState(false)
   const [hist, setHist] = useState({ undo: 0, redo: 0 })
-  const [variant, setVariant] = useState(readVariant)
   const [paper, setPaper] = useState(readPaper)
-  const [panelOpen, setPanelOpen] = useState(true)
   const [eraserAt, setEraserAt] = useState(null)
-  const [hoverEdge, setHoverEdge] = useState(null)
   /* 用笔写字时把鼠标光标收掉 —— 笔尖底下一直跟着一个十字，写字时很碍眼。
      但**不能简单粗暴地 cursor:none**：那样鼠标也会一起没光标，画布上就没法定位了。
      所以记着"最近一次是谁在操作"：笔 → 藏，鼠标 → 显示。
@@ -207,6 +230,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [penMode, setPenMode] = useState(false)
   const penModeRef = useRef(false)
   const [lasso, setLasso] = useState(null) // 正在拖的那个框（世界坐标，已经规范化成 x0<x1 / y0<y1）
+  /* ★ 正在"整体缩放 / 旋转"（手指按在选区手柄上）。它只影响**怎么画**，不影响数据：
+     给卡片挂一个合成器提示（`.bd.xforming .bd-card`，见 styles.css 那一段）——
+     卡片不带提示时，`transform` 每变一次都要**重新光栅化整张卡**，
+     而大字号公式卡（KaTeX 一大坨 span + 一圈模糊阴影）面积大、画起来贵，
+     转起来就是一顿一顿的。见 README 第 53 条。 */
+  const [xforming, setXforming] = useState(false)
   const lassoRef = useRef(null)
   const inkMoveRef = useRef(null)
   /* 刚画完一条连接线时浮出来的那排词（见 applyLink / LinkChips）。
@@ -223,8 +252,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      mode='text' 认文字（文字卡 + 字体）、mode='formula' 认公式（公式卡）。
      和写字板是两条路：那条是"另开一块小板先写再认"（见 InkToCard.jsx 顶部）。 */
   const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
-  /* 「∈ 条件」武装着的那条连接（null = 没武装）。一次性：点完目标就收（见 armCond）。 */
-  const [condArm, setCondArm] = useState(null)
 
   const wrapRef = useRef(null)
   const sceneRef = useRef(null)
@@ -238,14 +265,48 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const saveTimer = useRef(null)
   const dirtyRef = useRef(false)
   const dragStartRef = useRef(null)
-  /* 框选刚结束的那个框（世界坐标）。"留下板框"要用它找卡片成员 ——
-     选中笔迹的包围盒不一样：你顺手圈进来、却没在上面写字的卡片会被漏掉（见 keepFrame）。 */
-  const lastLassoRef = useRef(null)
+  /* ⚠ 这里原来有一个 `lastLassoRef`（"框选刚结束的那个框"）——
+     「留下板框」和「复制」靠它现算"这次框选圈到了哪几张卡"。
+     2026-09-21 删掉了：卡片现在**自己就进选区**（`sel.cardIds`，见 focus.js 的
+     `focusInk(ids, cards)`），所以"框住了什么"只有一份答案，不用再拿一个矩形回头去猜。
+     它当年还踩过一个真 bug（README 第 48 条 / 自检抓到的那条）：
+     那个 ref 写下去之后**没有任何地方清它**，于是"框住 → Esc → Ctrl+C"
+     会复制出上一次框住的那张卡。现在 Esc 一按，卡片跟着选区一起没了。 */
   /* 板框整体拖动的起点：{ id, before }（before = 按下那一刻的板，松手时进撤销栈）。 */
   const frameDragRef = useRef(null)
+  /* 剪贴板的内存镜像（跨窗口那份在 localStorage，见 CLIP_KEY）。
+     为什么两处都放：localStorage 可能被禁用 / 配额满（隐私模式），
+     那种时候**本次会话内**复制粘贴还得能用 —— 这里就是那个兜底。 */
+  const clipboardRef = useRef(null)
   /* 箭头工具那一次划动：{ from: 世界点, to: 世界点 }。
      它是**一次性的手势**（画完就回笔、纸上不留墨）—— 见 ADR-0001。 */
   const arrowRef = useRef(null)
+  /* ★ 手势里"最新算出来"的视图（2026-09-18，修用户报的"卡片相对滑动"）。
+     为什么不能只用 React 的 `view`：那个值是**上一次渲染时**的，而手势每一帧
+     都算出了更新的。
+     有了它，`syncViewCorrection()` 就能在手势回调里**同步**把差值补上去。
+     一致性：每次 setView 都跟着更新它（见 `setView`）。 */
+  const liveViewRef = useRef(null)
+  /* ★★ 补正的**基准** = "两层**已经画出来**的那一版视图"（2026-09-18 第二版）。
+     屏幕上真正被画出来的那一帧里，墨迹用的是哪个视图？**最近一次 canvas 重绘用的那个**
+     （`BoardCanvas` 画完之后把它写在这里）。补正表达的就是"从这一版到 live 还差多少"，
+     所以基准必须是它，不能是别的两个候选 —— 三个值各差一步，用错就是把偏差翻倍：
+       · `liveViewRef`   —— 手指刚算出来的（最新，还没画）
+       · `drawnViewRef`  —— **画出来了的**（基准，正确）
+       · `boardRef.current.view` —— 提交了但**还没重渲染**的（第一版用的就是它：
+         算出来的差多算了整整一步 pointermove，而 React 紧接着用新视图重渲染卡片，
+         于是那一份差在屏幕上被**做了两遍** ⇒ 卡片冲出 2 倍的距离，下一帧才收回去。
+         取证：`node scripts/diag-pan.js` —— 判据是**绝对位置**；
+         `check:pan` 原来那条"两点间距"对平移不敏感，所以看不见这个错。）
+       · `board.view`     —— React 这一趟渲染用的（和 drawnViewRef 只差"画没画完"）
+     它在 `BoardCanvas` 把墨迹画完之后、由那个 layout effect 更新（**绘制之前**），
+     所以"补正 + 新位置"叠在一起的那一帧一次都不会被画出来。 */
+  const drawnViewRef = useRef(null)
+  /* 上一次写进 DOM 的那条补正串（含 `null` = 没有补正）。
+     为什么记它：`syncViewCorrection` 每次提交都被叫一次，而绝大多数提交
+     （选中、改内容、量尺寸……）跟视图无关 —— 没有这道闸的话，每一趟都要
+     querySelector + 又写又删 transform，白制造样式重算（平移时每帧都跑）。 */
+  const corrRef = useRef(null)
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -343,8 +404,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       state: 'ok',
       card: cur,
       s: boardRef.current.view.s,
-      domW: cardEl.getBoundingClientRect().width,
-      bodyH: el.getBoundingClientRect().height,
+      /* ★★ 量的是**布局尺寸**（offsetWidth/offsetHeight），不是 `getBoundingClientRect()`。
+         2026-09-21 卡片能旋转之后这一条变成硬要求：`getBoundingClientRect()` 返回的是
+         **变换之后**的外接框 —— 一张转过 30° 的卡，量出来的宽高是它斜着那个大框，
+         于是 fitPass 会拿这个虚高的数去改 `w`/`h`（卡片会越转越胖，而且**存进文件**）。
+         `offsetWidth/offsetHeight` 是布局值，和 transform 无关（四舍五入到整数，
+         而 fitPass 的门槛是 1.5 屏幕像素，够用）。 */
+      domW: cardEl.offsetWidth,
+      bodyH: el.offsetHeight,
       padX,
       padY,
     }
@@ -353,7 +420,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          读完立刻还原 —— 同一帧里读回，屏幕上看不出来。 */
       const prev = el.style.width
       el.style.width = 'max-content'
-      snap.naturalW = el.getBoundingClientRect().width
+      snap.naturalW = el.offsetWidth
       el.style.width = prev
       /* 还要把"已经溢出的那部分"算进去：字体没就绪时 max-content 可能偏小，
          而溢出量（scrollWidth − clientWidth）任何情况下都准。两个取大的那个当需求。 */
@@ -364,10 +431,187 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     return snap
   }
 
-  /* 撤销 / 重做：账本的事（空栈时它自己返回 false，不抛、不改板）。 */
-  const undo = useCallback(() => ledger.undo(), [ledger])
+  /* ── 撤销 / 重做：账本的事（空栈时它自己返回 false，不抛、不改板）。 ─────────
+   *
+   * ★★ 撤销外面**多包了一层**，只有一件事要做：让"收笔自动规整"记住
+   *    "这一步是你退掉的，别再自动做一遍"（见下面 `runAutoShape` 那段的长注释）。
+   *    ⚠ 判据必须在**退掉的那一刻**读，不能在渲染之后读：
+   *      退掉之后 `boardRef` 立刻是旧版，而 React 的重渲染晚一步；
+   *      等到 effect 里再比，"哪一笔是被退掉的"就看不出来了
+   *      （板已经变回旧版，和"用户自己画成那样"长得一模一样）。
+   *    ★ 只记**形状消失/变了**的那些笔：判据是"退之前有 shape、退之后没有了"。
+   *      按住 Ctrl+Z 连退好几步时，每一步都各自记自己的 —— 不需要"撤销了几步"这个数
+   *      （那个数在这里没有意义，而且账本也不报）。 */
+  const suppressAutoRef = useRef(new Set())
+  const snapshotShapes = () => {
+    const m = new Map()
+    for (const s of boardRef.current.strokes) if (s.shape) m.set(s.id, s.shape)
+    return m
+  }
+  const noteUnshaped = (before) => {
+    for (const [id, shape] of before) {
+      const cur = boardRef.current.strokes.find((s) => s.id === id)
+      if (!cur || !cur.shape) {
+        suppressAutoRef.current.add(id)
+        continue
+      }
+      /* 形状还在、但**参数变了**也记一笔：那是"用户把某一步退掉了"的另一种样子
+         （比如规整之后又拖动/缩放过，退一步回的是上一个尺寸）。 */
+      if (cur.shape !== shape) suppressAutoRef.current.add(id)
+    }
+  }
+  const undo = useCallback(() => {
+    const before = snapshotShapes()
+    const r = ledger.undo()
+    noteUnshaped(before)
+    return r
+  }, [ledger])
 
-  const redo = useCallback(() => ledger.redo(), [ledger])
+  const redo = useCallback(() => {
+    /* 重做**不用**记：重做回来的是"你之前接受过的那一版"，
+       而它身上带着 shape（账本存的是整个板对象）—— 恢复原样正好是对的。 */
+    return ledger.redo()
+  }, [ledger])
+
+  /* 改视野。注意 pin 参数：
+     - pin=true  你亲手平移/缩放了 → 记下来，下次打开照用（"我看到哪了"是你的意图）
+     - pin=false 是程序自己适配的（打开时装进屏幕）→ 不记，下次重新算
+     这样容器一变（换摆法、改字号、改窗口大小），自动适配的视野会自己跟过去，
+     而你亲手定的那条只在你真的定过之后才生效。 */
+  /* ★ 把"还差多少"同步补上去（2026-09-18，修"卡片和板框相对于字滑动"）。
+   *
+   * ── 屏幕上为什么会有"差" ──────────────────────────────────────────────
+   * 同一个视野，板上有**两组**东西各自去够它，到达时间不一样：
+   *   · 墨迹 / 连线（canvas + SVG `<g>`）：`ctx.setTransform` / `transform` 属性，
+   *     **上一次 effect 那一趟**画的；
+   *   · 卡片 / 板框（DOM）：`left/top` 由 React 的 style prop 给，要等
+   *     setState → render → commit → style recalc + layout，**再晚一步**。
+   * 手势每动一下，两组各差一步 —— 那就是用户看到的相对滑动。
+   *
+   * ── 补的是什么 ────────────────────────────────────────────────────────
+   * 一个 CSS 变换，把**还没画出来**的那部分差（`live` 相对 `drawn`）贴在
+   * **两组东西共同的那些层**上：`.bd-world`（卡片 + 板框）、两层 canvas（墨迹）、
+   * 两层 SVG（连线 / 词 / 尖）。于是这一帧里所有东西都落在 `live` 上，
+   * 等 React 和 canvas 各自追上来，差变成 0、属性被移除。
+   *
+   * ★★ 为什么**墨迹也要贴**（第一版只贴了 `.bd-world`，那是半截修法）：
+   *   只补卡片那一半的话，两边还是差一步 —— 只是把"卡片快一帧"换成了"墨迹慢一帧"，
+   *   肉眼看还是滑动。**把 `drawn` 当基准、两组一起补，它们才真的同帧。**
+   *   （这也是为什么基准不能是 `boardRef.current.view`：那个值是 commit 里同步改的，
+   *    比"画出来了的"多走一步，拿它当基准等于把差算成两步 —— 卡片冲出 2 倍距离。
+   *    详见 `drawnViewRef` 那段和 `node scripts/diag-pan.js`。）
+   *
+   * 为什么必须在这里同步写、不能放进 useEffect：
+   *   effect 是在 commit **之后**跑的，那时如果 canvas 已经重画完、差就是 0 了 ——
+   *   补正什么都补不到。要补就得在"新值已经算出来、屏幕上还是旧的"这一刻补，
+   *   也就是**手势回调里**。收尾那一半在 `BoardCanvas` 画完之后（它调 `onViewDrawn`）。
+   *
+   * 谁来收尾：canvas 用新视野重画完（同一个 commit 里，绘制之前），差自然变成 0，
+   *   那时会把这条 transform 清掉（不写 'none'，直接移除，少留一个合成层）。
+   *   所以它是**过渡量**，不是一个长期偏移。
+   *   ⚠ 别把它改成"直接把 live 的 tx/ty 写上去" —— 那才是老注释警告的
+   *     "把同一次平移做两遍"，东西会整体偏掉。这里表达的是**两者的差**。
+   *
+   * ⚠ 贴在这些层上的是**位置**，不是"它们自己声明的变换"：canvas 内部那份
+   *   `setTransform` 归 `applyViewTo` 管，两边互不干扰（外层的 CSS 变换是给
+   *   "还没重画的那一版位图"补位）。缩放时它会把位图拉伸一下 —— 那一帧本来就是
+   *   过渡帧，下一帧就重画好了。 */
+  const worldRef = useRef(null)
+
+  /* 把补正那个**纯函数**挂到 window 上（诊断 / 自检用，和 `canvas.dataset.xform`
+     同一族）。为什么需要：补正是个过渡量，修好之后寿命常常不到一帧，
+     按固定节奏采样**采不到**它 —— 于是"补多少才对"这件事在浏览器里没法断言，
+     而它正是出过 bug 的地方（基准取错 ⇒ 差算成两步 ⇒ 卡片冲出 2 倍距离）。
+     自检拿它直接验公式：`corrFor(50, 60)` 必须是 `translate(10px, 0px) scale(1)`。 */
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.__viewCorrection = viewCorrection
+    return () => {
+      delete window.__viewCorrection
+    }
+  }, [])
+
+  /* 把这几个"跟着视野走"的层收成一份：`.bd-world`（卡片 + 板框）用 ref，
+     其余（两层 canvas + 两层 SVG）用 `data-view-follow` 找 —— 它们在
+     BoardCanvas 里声明自己，这里不用再维护一张平行的 ref 清单
+     （清单一定会漏，而漏掉的那一层就是继续滑动的那一层）。 */
+  const viewFollowNodes = useCallback(() => {
+    const out = []
+    if (worldRef.current) out.push(worldRef.current)
+    const stage = wrapRef.current
+    if (stage) out.push(...stage.querySelectorAll('[data-view-follow]'))
+    return out
+  }, [])
+
+  /* ★★ 补正唯一的入口：**算多少、写到哪儿**。
+     · 基准（drawn）= 屏幕上**已经画出来了**的那一版视图（见 `drawnViewRef`）；
+     · 目标（live） = 手指刚算出来的那一版；
+     · 差写成一条 CSS 变换，贴到**所有跟着视野走的层**上（`viewFollowNodes`）。
+     两个调用时机：
+       · 手势回调里（`setView`）—— 在"新值算出来了、屏幕上还是旧的"这一刻同步补上；
+       · canvas 按新视野重画完之后（`onViewDrawn`）—— 差变成 0，属性被撤掉。
+     ⚠ 定义顺序要紧：下面 `setView` / `onViewDrawn` / `clearViewCorrection`
+       都引用它，而 `const` 在初始化之前是 **TDZ** —— 提前引用会在挂载时当场
+       `ReferenceError: Cannot access '…' before initialization`，整个白板白屏
+       （2026-09-18 真踩了一次）。这一族的先后必须是：本函数 → onViewDrawn →
+       clearViewCorrection → setView。 */
+  const syncViewCorrection = useCallback(() => {
+    const live = liveViewRef.current
+    /* 基准 = 已经画出来的那一版。没画过（首帧）就退回"已提交的那一版"，
+        那只是为了别算出 null 来 —— 首帧上两者本来就是同一个数。 */
+    const drawn = drawnViewRef.current || boardRef.current.view
+    const tf = live && drawn ? viewCorrection(drawn, live) : null
+    /* ★ 把这两个数写在 DOM 上（诊断用，和 `canvas.dataset.xform` 同一族）。
+       为什么值得占两行：补正是个**过渡量**（寿命常常不到一帧），
+       自检按固定节奏去采样多半采到"没有补正"，于是"补正对不对"这件事
+       根本断言不到 —— 而它正是用户报的那条 bug。
+       有 `data-drawn-tx` 就能**反过来验**：屏幕上摆着的那一版（drawn）
+       必须等于当前视图（live）；两者不等就说明补正该在而没在。
+       2026-09-18：这一族数字是"把补正做成可观测"的唯一办法，别删。 */
+    const w = worldRef.current
+    if (w) {
+      w.dataset.liveTx = String(live ? live.tx : '')
+      w.dataset.liveS = String(live ? live.s : '')
+      w.dataset.drawnTx = String(drawn ? drawn.tx : '')
+      w.dataset.drawnS = String(drawn ? drawn.s : '')
+    }
+    /* 只在**真的变了**的时候动 DOM（见 corrRef 的说明）。 */
+    if (corrRef.current === tf) return
+    corrRef.current = tf
+    for (const el of viewFollowNodes()) {
+      if (tf) el.style.transform = tf
+      else el.style.removeProperty('transform')
+    }
+  }, [viewFollowNodes])
+
+  /* ★★ 补正的收尾：`BoardCanvas` 把墨迹按新视野画完之后叫这一下
+     （它在自己的 layout effect 里画，**浏览器绘制之前**）。
+     此刻"画出来了的"就是这一版，差变成 0 → 所有层上的属性被移除，
+     一切回到"位置完全由 left/top 和 canvas 变换决定"的常态。
+
+     ⚠ `liveViewRef` 也要跟着落到这一版：不然下次手势里 `syncViewCorrection`
+       会拿"上一轮的目标"当基准重算一遍，白补一次。
+     ⚠ 必须由 canvas 那一趟来叫，**不能**在 Board 自己的 effect 里猜"React 已经
+       提交了所以卡片到位了" —— 卡片确实到位了，可墨迹还是旧的，两边照样差一步。 */
+  const onViewDrawn = useCallback(
+    (view) => {
+      drawnViewRef.current = view
+      liveViewRef.current = view
+      syncViewCorrection()
+    },
+    [syncViewCorrection]
+  )
+
+  /* 把补正**清掉**，并把基准认到当前这一版。
+     ★ 为什么用笔之前必须清：`paintLive` 是按**屏幕坐标**反算世界坐标再画的，
+       而那一层 canvas 上正挂着一条非单位的 CSS 变换 —— 笔迹会整体画歪一个
+       "还差的量"。写字和"看板子怎么动"是两件事，写字这条路宁可不要补正。
+     ★ 为什么清得掉：按下笔的那一刻 `boardRef.current.view` **就是**屏幕上
+       已经画出来的那一版（手势刚结束、或者本来就没在动），所以差是 0。
+       清完之后两层 canvas 的变换都是单位阵，和 `paintLive` 的假设一致。 */
+  const clearViewCorrection = useCallback(() => {
+    onViewDrawn(boardRef.current.view)
+  }, [onViewDrawn])
 
   /* 改视野。注意 pin 参数：
      - pin=true  你亲手平移/缩放了 → 记下来，下次打开照用（"我看到哪了"是你的意图）
@@ -376,12 +620,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      而你亲手定的那条只在你真的定过之后才生效。 */
   const setView = useCallback(
     (v, pin = true) => {
+      const next = typeof v === 'function' ? v(boardRef.current.view) : v
+      /* 先记下"要去的视图"再提交：`commit` 内部是函数式更新，等它跑的时候
+         已经不好拿到这个值了。补正用的就是这个和**已经画出来的那一版**的差。 */
+      liveViewRef.current = next
+      syncViewCorrection()
       commit(
         (cur) => ({ ...cur, viewPinned: pin ? true : cur.viewPinned, view: typeof v === 'function' ? v(cur.view) : v }),
         false
       )
     },
-    [commit]
+    [commit, syncViewCorrection]
   )
 
   /* ── 换文件 / 点「重载」：整块重来。白板是"一节课一页"，不混着开 ──
@@ -554,11 +803,50 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   )
   /* ── 框住的那些笔意味着什么 ───────────────────────────────────────────────
      `sel.link`（框里正好一条连接线 → 改词那排）、`sel.frame`（框住的正好是一个板框的笔 →
-     拆开）、`sel.box`（那个虚线框）、`sel.strokes`（选中的笔迹对象）——
+     拆开）、`sel.box`（那个虚线框 —— 现在把框进来的卡片也圈住）、`sel.strokes` / `sel.cards`（选中的那些东西）——
      这几件事从前是这里一堆 useMemo，现在收成 `readSelection` 一次读
      （规矩和来历见 src/lib/selection.js 的文件头）。
      判据都在那个 module 里：集合完全相等才算"这个框"、正好一条才算"这条线"。 */
-  const sel = useMemo(() => readSelection(board, inkSel, links), [board, inkSel, links])
+  const inkCards = useMemo(() => focusInkCards(focus), [focus])
+  const sel = useMemo(() => readSelection(board, inkSel, links, inkCards), [board, inkSel, links, inkCards])
+  /* 框住的卡片（一个 Set，给"整体拖动"那条路用）。和 `inkSel` 一个形状，
+     所以下面"整组拖着走"那一段两半写起来是对称的。 */
+  const cardSel = useMemo(() => new Set(sel.cardIds), [sel.cardIds])
+  /* ── 框住的笔里，有哪些是"能规整的形状" ────────────────────────────────────
+   * 用户 2026-09-18：「加入常用形状优化方式，比如我画个圆他给我优化成真正的圆形，
+   * 直线也是还有常用的矩形，三角形都能自动优化」。
+   *
+   * ★ 它算的是"这一撮笔里能不能认出一个形状"，**不是**"替用户决定这一撮是什么" ——
+   *   判读规则（顺序、阈值、什么时候宁可认不出来）整个在 shapes.js。
+   *   这里只做一件事：把结果递给界面，让「◯ 规整」那颗按钮**有结果才出现**。
+   *
+   * ★★ 2026-09-21：**它不再跟着每一帧重算了**（用户报「大字体旋转时卡顿」时查出来的）。
+   *   为什么原来会每帧重算：判读的依赖写的是 `sel.strokes`，而那个数组**每一帧都是新的**
+   *   （`readSelection` 每次 filter 一遍）—— 拖动、缩放、旋转、平移、擦除……
+   *   只要板变了它就重跑一遍。代价是 O(框住的笔数 × 每笔拟合)：
+   *   实测（用户那张 1451 笔的板、框住 171 笔）光 `pointSegDist` 就是 **0.6ms/帧**，
+   *   整页框住时是好几毫秒 —— 而**这一帧算出来的东西没有一个人看得见**
+   *   （手在拖，不在点那颗按钮）。
+   *   ⇒ 改成两个触发点：
+   *     · **选区换了**（`sel.ids` 变了）→ 立刻算一次 —— 框住一个圆，按钮马上出来；
+   *     · **板安静下来**（`SETTLE_MS` 里没有新的改动）→ 再算一次 —— 覆盖"拖动改了几何、
+   *       缩放把一个形状拉得认得出/认不出"这些情况。
+   *   ⚠ 用"多久没有新改动"而不是"手势开始/结束"标记：抬手、平移、擦除、撤销、缩放卡片……
+   *     入口一双手数不完，而"安静"是它们**共同的性质**（`card-fit.js` 的
+   *     `board-changed` 那条政策也是这么判的，只是那边还管着量尺寸）。
+   *   ⚠ `selRef` 是**必须**的：定时器回调里要拿"那一刻的选区"，而闭包里的 `sel`
+   *     是排这一次定时器时的那个（早过期了）。 */
+  const [shapeHits, setShapeHits] = useState([])
+  const selRef = useRef(sel)
+  selRef.current = sel
+  const selKey = sel.ids.join('|')
+  useEffect(() => {
+    setShapeHits(recognizeStrokes(selRef.current.strokes))
+  }, [selKey])
+  useEffect(() => {
+    const t = setTimeout(() => setShapeHits(recognizeStrokes(selRef.current.strokes)), SHAPE_SETTLE_MS)
+    return () => clearTimeout(t)
+  }, [board])
   const focusIds = useMemo(() => {
     if (!selectedId) return null
     const set = descendantsOf(relations, selectedId)
@@ -596,23 +884,474 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     }
   }, [])
 
-  /* 把框选中的那组墨迹删掉。一次删除 = 一步撤销（commit 默认记历史）。
+  /* 把框选中的那些东西删掉（笔迹 + 顺带框进来的卡片）。一次删除 = 一步撤销。
+     ★ 2026-09-21：卡片也归它删 —— 分成两处的话，"框住 3 笔 + 1 张卡按 Delete"
+       会只删一半，而屏幕上看起来就是"删除做了一半"（卡片还杵在原地）。
      ⚠ 必须定义在下面那个键盘 useEffect **之前**：它的依赖数组里引用了这里。
        const 是有暂时性死区的，写在后面的话组件一渲染就
        "Cannot access 'xx' before initialization"，整页白屏、什么都不显示。
        （踩过一次：构建完全正常、vite 也不报错，只有浏览器控制台里能看到。） */
   const deleteInkSel = useCallback(() => {
-    if (!inkSel || !inkSel.size) return
-    const ids = inkSel
-    commit((cur) => removeStrokes(cur, ids))
+    const ids = inkSel ? new Set(inkSel) : new Set()
+    const cards = new Set(sel.cardIds)
+    if (!ids.size && !cards.size) return
+    commit((cur) => removePick(cur, ids, cards))
     setFocus(FOCUS_NONE)
-  }, [inkSel, commit])
+  }, [inkSel, sel.cardIds, commit])
+
+  /* ── 规整形状：把框住的那些笔里**认得出来的**换成规整的一笔 ─────────────────
+   *
+   * ★★ 两条要点，都是这一族设计里最要紧的：
+   *
+   * ① **认不出来的原样留着，不是整块失败。**
+   *    框里常常是"一个圆 + 旁边两笔小注释"。用户点「◯ 规整」的意思是
+   *    "把这儿画的形状弄整齐"，不是"我认为这三笔全是形状"。
+   *    所以只有认出来的那几笔被换掉，其余一个字节都不动。
+   *    （这一点和 ADR-0001 砍掉的那一族**正好相反** —— 那一族要么整个写进文件、
+   *      要么整个不写；这里每一笔各判各的、各换各的。）
+   *
+   * ② **一次点击 = 一步撤销。**
+   *    `commit` 默认记历史，而规整是"把 N 笔的 points 一起换掉"这样一个数据替换 ——
+   *    撤销的时候 N 笔一起回退，不是撤 N 次。用户按一下 Ctrl+Z 就回到手写的样子。
+   *
+   * ★ 沿用 id（见 shapes.js 的 regularizeStrokes）：板框成员、挂在笔上的
+   *   link / cond 都跟着走，不会因为"规整一下"就被踢出框、丢掉连接。
+   * ★ 认不出来时**不报错、不弹提示**，只是把话说清楚（"这几笔没看出形状"）——
+   *   用户画的是字，那他本来就点错了按钮，告诉他一句就够了。 */
+  const regularizeInkSel = useCallback(() => {
+    const b = boardRef.current
+    const ids = inkSel ? new Set(inkSel) : new Set()
+    if (!ids.size) {
+      flash('先框住要规整的图形（笔杆侧键拖一圈，或者工具条上的「⬚ 框选」）', 'warn')
+      return
+    }
+    const { strokes, changed } = regularizeStrokes(b.strokes.filter((s) => ids.has(s.id)))
+    if (!changed.length) {
+      flash('框住的这几笔没看出形状 —— 圆、直线、矩形、三角形才认（认不出来就不动它）', 'warn')
+      return
+    }
+    /* 只换那几笔：其余笔迹**连引用都不变**（下面这个 map 里没碰到的直接返回原对象）。 */
+    const byId = new Map()
+    for (const s of strokes) byId.set(s.id, s)
+    commit((cur) => ({ ...cur, strokes: cur.strokes.map((s) => byId.get(s.id) || s) }))
+    /* 规整完**焦点留着**：你可能想接着再规整同一块里的另一笔，
+       也可能想马上 Ctrl+Z 看看对不对 —— 两种都要求这一撮还选着。
+       （对比「留下板框」：那个动作之后焦点要清，因为它把这一坨变成了别的东西。） */
+    const names = [...new Set(changed.map((c) => c.label))]
+    flash(`规整了 ${changed.length} 笔：${names.join('、')}（Ctrl+Z 能退回手写的样子）`, 'ok')
+  }, [inkSel, commit, flash])
+
+/* ══════════════════ 收笔之后**停顿一下就自动规整**（OneNote 那个手感）══════════════════
+   *
+   * 用户 2026-09-19：「我希望做到的图形修正是类似 onenote 的那种**略微停顿后**会给你
+   * 把画的图形修正成规整的图形，然后你可以对图形放大缩小修正真正形状，
+   * 但现在并不是这样子的」。上一版只有"框住 → 点「◯ 规整」"那条手动路
+   * （README 第 49 条），而文档里写的是"收笔时它自己认" —— **文档和代码不一致**，
+   * 这一段就是把缺的那一半补上。
+   *
+   * ── 三条设计要点，每条都是拿这个仓库自己的教训换的 ────────────────────────
+   *
+   * ★① **停顿 0.55 秒**（`AUTO_SHAPE_MS`），不是"收笔立刻变"。
+   *    OneNote 也是这个手感，而它在这里**还有第二个理由**：`shapes.js` 的判读
+   *    是"宁可认不出来，也不许认错"，它吃的点已经是抽稀过的（真板中位 6 点）。
+   *    停顿让我们可以**把这一笔留给你看完再动** —— 写连笔字时笔是不停的，
+   *    每一笔收笔都紧跟着下一笔的落笔，于是"停顿"自然而然地只发生在
+   *    **你确实画完了一个图形、正在看它**的那一刻。
+   *
+   * ★② **只有一笔会被自动规整：最后收的那一笔。**
+   *    第 ① 条那个"写字时笔不停"的假设不是百分之百成立（写完一个字会停一下
+   *    想事情），所以再加一道**结构**上的闸：定时器只有**一个**，
+   *    下一笔一落下就把上一个撤掉（见 `cancelAutoShape`，挂在 pointerdown 上）。
+   *    于是"停笔想事情"永远不会攒出一批待办 —— 最多只有**刚刚那一笔**在等。
+   *    这一条比任何阈值都管用：**误判的暴露面被压到"你正在看的那一笔"**。
+   *
+   * ★③ **误判的回头路是一步 Ctrl+Z**，而且**退掉之后不再自动重来**
+   *    （`suppressAutoRef`，见 `undo` 上面那段）。这一条是"自动"这件事能成立的
+   *    前提：`shapes.js` 开头写得很清楚 —— 形状判读和 ADR-0001 砍掉的那一族
+   *    唯一的区别就是**错了看得出来**、而且**一步能退**。自动之后"看得出来"这一条
+   *    更要紧（屏幕上多一句会消失的提示语），"一步能退"由这一条钉住。
+   *    ⚠ 少了"退掉之后不再重来"，Ctrl+Z 就变成**假的**：退回去、0.55 秒后又变回来。
+   *      那比不自动更糟 —— 用户会以为撤销坏了。
+   *
+   * ⚠ **不碰正在编辑的东西、也不碰别人的笔**：判读只吃刚收的那一笔（`recognizeShape`
+   *   内部还有五道闸）。框选、拖卡片、切工具、关页面都不受影响 ——
+   *   它们各自会把那个定时器撤掉（`cancelAutoShape` 挂在 pointerdown 上）。
+   * ⚠ **`AUTO_SHAPE_MIN_DIAG` 不是多余的**：`recognizeShape` 自己有一道
+   *   `MIN_DIAG = 26`，但那是在**抽稀之后**算的。这里先按抽稀前的点粗算一遍，
+   *   是为了让"一个笔画短横"在**调度**那一层就被挡掉，连定时器都不排
+   *   （一秒里画十笔，就少排十次判读）。
+   *   ★ 它和 `shapes.js` 的 `MIN_DIAG` **必须一样**（自检里有一条对着比）：
+   *     不一样的话，会出现"排了定时器、判读又把它挡掉"这种白跑的中间地带 ——
+   *     不报错，只是白白多跑一趟，而且调参的人会以为自己改的是同一道闸。
+   */
+  const AUTO_SHAPE_MS = 550
+  const AUTO_SHAPE_MIN_DIAG = 26
+
+  /* 唯一那个待办：{ id, timer }。 */
+  const autoShapeRef = useRef(null)
+
+  const cancelAutoShape = useCallback(() => {
+    const cur = autoShapeRef.current
+    if (cur && cur.timer) clearTimeout(cur.timer)
+    autoShapeRef.current = null
+  }, [])
+
+  const runAutoShape = useCallback(
+    (id) => {
+      autoShapeRef.current = null
+      const stroke = boardRef.current.strokes.find((s) => s.id === id)
+      /* 这一笔没了（被你擦掉 / 撤销掉了）→ 什么都不做。 */
+      if (!stroke) return
+      /* 它已经是个图形了（比如你手点过「◯ 规整」）→ 不重复劳动。 */
+      if (stroke.shape) return
+      /* ★ 你正在就地改一张卡（双击进去了）→ 不许在背后动板。
+         ⚠ 这一条挡的是一个真的会很难受的场景：写完一个圈 → 550ms 内双击进卡片改字 →
+         定时器到点、`commit` 换掉板 → React 重渲染那一层 → **输入框失焦**，
+         而你正在打字。窗口只有半秒，但"打着字突然跳出去"是最容易让人以为程序坏了的那种。
+         （判据用**焦点那个值**，不是"DOM 里有没有 input" —— 焦点是唯一那个值，见 focus.js。） */
+      if (focus && focus.editing) return
+      /* 你刚刚亲手退掉过这一笔的自动规整 → 听你的，不再来一次。 */
+      if (suppressAutoRef.current.has(id)) return
+      const { strokes, shapeObjects } = regularizeStrokes([stroke])
+      const hit = shapeObjects.find((o) => o.id === id)
+      const next = strokes.find((s) => s.id === id)
+      /* 认不出来 → **什么都不做**（`shapes.js` 那条铁律：宁可认不出来，也不许认错）。
+         注意这里**连提示语都不给**：写字的时候每一笔都弹一句"这不是形状"是骚扰。 */
+      if (!hit || !next || !next.shape) return
+      /* 只换这一笔，其余笔迹**连引用都不变**。一次自动规整 = 一步撤销（commit 默认记）。 */
+      commit((cur) => ({ ...cur, strokes: cur.strokes.map((s) => (s.id === id ? next : s)) }))
+      flash(`认出来了：${shapeName(hit.shape)} —— 拖角放大缩小、顶上那颗转它（Ctrl+Z 退回手写）`, 'ok')
+    },
+    [commit, flash, focus]
+  )
+
+  /* 收笔之后叫它。⚠ 判据要**保守**：只排给"够大、不是荧光笔"的一笔。 */
+  const scheduleAutoShape = useCallback(
+    (stroke) => {
+      cancelAutoShape()
+      if (!stroke) return
+      if (stroke.tool === 'highlighter') return
+      /* 抽稀前的粗筛（见上面那段）：世界像素的对角线够大才值得判读。 */
+      const flat = stroke.points || []
+      let x0 = Infinity
+      let y0 = Infinity
+      let x1 = -Infinity
+      let y1 = -Infinity
+      for (let i = 0; i + 2 < flat.length; i += 3) {
+        if (flat[i] < x0) x0 = flat[i]
+        if (flat[i] > x1) x1 = flat[i]
+        if (flat[i + 1] < y0) y0 = flat[i + 1]
+        if (flat[i + 1] > y1) y1 = flat[i + 1]
+      }
+      if (!(Math.hypot(x1 - x0, y1 - y0) >= AUTO_SHAPE_MIN_DIAG)) return
+      const timer = setTimeout(() => runAutoShape(stroke.id), AUTO_SHAPE_MS)
+      autoShapeRef.current = { id: stroke.id, timer }
+    },
+    [AUTO_SHAPE_MS, cancelAutoShape, runAutoShape]
+  )
+
+  /* 组件卸载（切板 / 关页面）时把定时器收掉 —— 不然它会在一个已经没了的组件里
+     去动一张已经换掉的板。`clearTimeout` 是幂等的，多叫一次没有代价。 */
+  useEffect(() => cancelAutoShape, [cancelAutoShape])
+
+  /* ── 选区手柄：缩放 / 旋转（`selection.js` 的 `transformPick` 那一族的界面这一半）──
+   *
+   * 用户 2026-09-19：「你可以对图形放大缩小修正真正形状」→ 那时手柄**只在"框住的
+   * 正好是一个规整过的图形"**时出现（`stroke.shape`，见 shape-object.js）。
+   * 用户 2026-09-21：「框选中任意的字迹——卡片都应该能够放大，旋转，这点类似 onenote」
+   * → 手柄对**任意选区**都出现：几笔字、一坨乱涂、以及**框进来的卡片**，都算"一个东西"。
+   *
+   * ★★ 两个手势都走 `transformPick` 这**唯一**一个入口，而且**每一帧都从"按下那一刻的板"
+   *    重算**（`start` 那个快照）。两条理由，都是这一族的老账：
+   *    · 累加那条路没有自愈能力（一帧算成 0，加多少次还是 0），而且会把浮点误差和
+   *      1/10 像素的量化误差一帧一帧攒起来 —— 拖十下图形就糊了；
+   *    · 谁都别自己改 points：那会在"点"和"shape"之间造出第二份真相，
+   *      而下一帧的渲染和包围盒读的都是 points —— 一旦不同步，手柄会从一个地方
+   *      跳到另一个地方（静默的，没有报错）。
+   *
+   * ★ 拖角缩放：**锚点是那个角的对角**（拖右下角 → 左上角不动，和拖卡片缩放同一个手感）。
+   *   分轴算倍率（横一根、竖一根）—— 这正是"圆拉成椭圆 / 手写字被拉宽"的来源，是**要的**
+   *   （OneNote 也是这样；卡片只能等比，理由见 selection.js 那段）。
+   * ⚠ 倍率的分母必须是**按下那一刻**框的跨度，不是每帧重算的框：
+   *   每帧重算会变成"倍率的倍率"，拖两下手感就炸了。
+   *
+   * ★ 转：绕**选区包围框的中心**。角度取"第一次 move 的角度 → 现在的角度"的**绝对差**，
+   *   不是一帧一帧的增量（同一条"没有自愈能力"的账）。单个图形在手时，绕包围盒中心转
+   *   和绕它自己的几何中心转是同一个点吗？—— 矩形/椭圆是（它对称），
+   *   三角形不是（重心 ≠ 包围盒中心），代价是"框住一个三角形转它"的转轴比从前偏一点点。
+   *   取包围盒中心是有意的：**选区的转轴必须是那个虚线框的中心**，
+   *   不然"转一下"的时候框会绕着别处跑（多个东西一起选时尤其明显）。
+   */
+  const pickTarget = useMemo(() => {
+    const box = sel.box
+    if (!box) return null
+    const cx = (box.x0 + box.x1) / 2
+    const cy = (box.y0 + box.y1) / 2
+    /* `ids` / `cardIds` 一起带出去：手势每一帧要把它们原样交给 `transformPick`。 */
+    return { ids: sel.ids, cardIds: sel.cardIds, box: { ...box, cx, cy } }
+  }, [sel.box, sel.ids, sel.cardIds])
+
+  function startPickScale(corner) {
+    const t = pickTarget
+    if (!t) return
+    /* ★ 按下那一刻的那一份板 —— 手势每一帧都从它重算（见上面那段）。 */
+    const start = boardRef.current
+    const pick = { ids: t.ids, cardIds: t.cardIds }
+    const box = t.box
+    const anchor = oppositeCorner(box, corner)
+    /* ★★ 分母是**框的两个跨度**，不是"从锚点到 box.x1/y1 的距离"。
+       为什么写这一条（2026-09-21，新自检 [12g] 当场抓到的**老 bug**）：
+       原来写的是 `Math.abs(box.x1 - anchor.x)` / `Math.abs(box.y1 - anchor.y)` ——
+       那两行只在拖 **se**（锚点 = nw）时等于框的宽高。换一颗柄就崩：
+         · ne（锚点 = 左下角）：`|box.y1 − anchor.y|` = **0** → 被 `Math.max(1, …)`
+           兜成 1 → 倍率 = "指针离锚点的**世界像素数**"，拖 30px 就是 30 倍；
+         · nw（锚点 = 右下角）：两轴都是 0 → 两轴都成了"像素数"；
+         · sw：只有横轴那一半崩。
+       为什么从前没人发现：`check:shape` 的 [12c] **只拖过 se** 那一颗
+       （夹具是"拖右下角放大 1.5 倍"），而屏幕上"拖右上角它会暴涨"看起来像
+       "我手抖了" —— 静默、且只在四分之三的角上发生。
+       几何上正确的写法：倍率 = 指针现在离锚点多远 ÷ **被拖的那颗柄**离锚点多远，
+       而"那颗柄离锚点"在横轴/竖轴上**恒等于框的宽/高**（对角关系）。 */
+    const w0 = Math.max(1, Math.abs(box.x1 - box.x0))
+    const h0 = Math.max(1, Math.abs(box.y1 - box.y0))
+    const g = ledger.begin()
+    setXforming(true)
+    const onMove = (e) => {
+      const rect = wrapRef.current.getBoundingClientRect()
+      const wp = screenToWorld(e.clientX - rect.left, e.clientY - rect.top, boardRef.current.view)
+      /* 倍率 = 指针现在离锚点多远 / 按下那一刻多远。**取绝对值** ——
+         指针拖过锚点另一边不该让选中的东西翻面（见 selection.js 的 clampPickFactor）。 */
+      const fx = Math.abs(wp.x - anchor.x) / w0
+      const fy = Math.abs(wp.y - anchor.y) / h0
+      g.during(() => transformPick(start, pick, { scale: { fx, fy, anchor } }))
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove, true)
+      window.removeEventListener('pointerup', onUp, true)
+      window.removeEventListener('pointercancel', onUp, true)
+      setXforming(false)
+      g.end()
+    }
+    window.addEventListener('pointermove', onMove, true)
+    window.addEventListener('pointerup', onUp, true)
+    window.addEventListener('pointercancel', onUp, true)
+  }
+
+  /* ── 转一整个选区 ───────────────────────────────────────────────────────
+   * ★★ 结构和上面那个缩放**一模一样**，这不是巧合：拖角缩放是验过的
+   *   （`check:shape` [12c] 实测倍率 1.50×1.50），所以旋转沿用它的每一处口径 ——
+   *   同一个 `wrapRef` 取 rect、同一个 `screenToWorld`、同一个 `ledger.begin/during/end`、
+   *   同样把 move/up 挂在 window 上、同样每帧从**按下那一刻的板**重算。
+   *   **同一个组件里两段手势用两套口径，一定会有一套是错的**
+   *   （"同一句话两份实现"的账这个仓库记了十几条）。
+   *
+   * ★ 角度用"**第一次 move 的角** → 现在的角"的**绝对差**，不是一帧一帧的增量：
+   *   增量那条路没有自愈能力（一帧算成 0，0 加多少次还是 0），
+   *   而绝对差每帧都从**起始形状**重算，一帧算错不影响下一帧。
+   *
+   * ⚠ 起手的角度基准取"**第一次 move**"而不是"pointerdown"：
+   *   按下那一刻指针就贴在手柄上（离中心只有十几像素），那个角度的**杠杆太短** ——
+   *   位置差一个像素、角度就差好几度，而那个误差会原样留在整段旋转里。
+   *   第一次 move 时指针已经离开手柄、离中心更远，量出来的基准稳得多。
+   *   代价是"按下不动、直接松手"不会转（指针没动，本来也没有可转的角度）。
+   *
+   * ⚠⚠ 转轴 = **选区包围框的中心**（`pickTarget.box` 的 cx/cy），不是"选中那样东西自己的
+   *   几何中心"：选多个东西（或者一个字迹块 + 一张卡）时，转轴只能是那一个框的中心 ——
+   *   绕其中某一个的中心转，屏幕上就是"框绕着别处甩"。
+   *   单个图形在手时的行为变化（三角形那一种，重心 ≠ 框中心）是**故意**的，
+   *   理由同上：用户看到的是那个虚线框。
+   * ⚠ `check:shape` 的 [12d] 从前**没能端到端验住这一段**（rot 只变了 0.003 弧度）；
+   *   2026-09-21 起 [12i]/[12j] 拿"任意一撮字迹"和"卡片"分别验它 ——
+   *   动这一段之前先看那两条里记的读数（`data-last-grab` / `data-rot-steps`）。 */
+  function startPickRotate() {
+    const t = pickTarget
+    if (!t) return
+    const start = boardRef.current
+    const pick = { ids: t.ids, cardIds: t.cardIds }
+    const center = { x: t.box.cx, y: t.box.cy }
+    const rect = wrapRef.current.getBoundingClientRect()
+    const angleAt = (e) => {
+      const wp = screenToWorld(e.clientX - rect.left, e.clientY - rect.top, boardRef.current.view)
+      return Math.atan2(wp.y - center.y, wp.x - center.x)
+    }
+    const g = ledger.begin()
+    setXforming(true)
+    let a0 = null
+    const onMove = (e) => {
+      const a = angleAt(e)
+      if (a0 == null) {
+        a0 = a
+        return
+      }
+      const d = a - a0
+      if (Math.abs(d) < 1e-4) return
+      g.during(() => transformPick(start, pick, { rotate: { d, center } }))
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove, true)
+      window.removeEventListener('pointerup', onUp, true)
+      window.removeEventListener('pointercancel', onUp, true)
+      setXforming(false)
+      g.end()
+    }
+    window.addEventListener('pointermove', onMove, true)
+    window.addEventListener('pointerup', onUp, true)
+    window.addEventListener('pointercancel', onUp, true)
+  }
+
+  /* ── 整组拖动（"框住的那一坨东西"一起挪）──────────────────────────────────
+   *
+   * 三个入口都走这里，**一件事只有一份实现**：
+   *   · 按在选区的空白处（`.bd-hit` 的 pointerdown）；
+   *   · 按在**选区里的那张卡片**上（卡片自己收指针事件 —— 见下面 `inPick`）。
+   * 后一条是 2026-09-21 补的：不接它的话，"框住字 + 卡，按着卡拖"只有卡动，
+   * 屏幕上就是**拖散了**（和"只搬笔迹不搬卡片"是同一个错，只是换了个入口）。
+   *
+   * ★ 每一帧都从"按下那一刻的原样"算偏移，**不是**累加每一帧的增量 ——
+   *   累加会把浮点误差和 1/10 像素的量化误差一路攒起来，来回拖几次位置就飘了。
+   * ★ 中途每一帧只改板、不记账；"这一下算不算一步"收尾时由账本判一次。 */
+  const beginPickMove = useCallback(
+    (wp) => {
+      const origin = new Map()
+      for (const s of boardRef.current.strokes) if (inkSel.has(s.id)) origin.set(s.id, s)
+      /* ★ 卡片也要一起搬：框住的是"这一坨东西"，只搬笔迹 = 屏幕上"拖散了"。 */
+      const originCards = new Map()
+      for (const c of boardRef.current.cards) if (cardSel.has(c.id)) originCards.set(c.id, c)
+      inkMoveRef.current = { from: wp, origin, originCards, g: ledger.begin() }
+    },
+    [inkSel, cardSel, ledger]
+  )
+
+  const movePickTo = useCallback((wp) => {
+    const mv = inkMoveRef.current
+    if (!mv) return
+    const dx = wp.x - mv.from.x
+    const dy = wp.y - mv.from.y
+    mv.g.during((cur) => ({
+      ...cur,
+      strokes: cur.strokes.map((s) => (mv.origin.has(s.id) ? shiftStroke(mv.origin.get(s.id), dx, dy) : s)),
+      cards: mv.originCards.size
+        ? cur.cards.map((c) => (mv.originCards.has(c.id) ? shiftCard(mv.originCards.get(c.id), dx, dy) : c))
+        : cur.cards,
+    }))
+  }, [])
+
+  const endPickMove = useCallback(() => {
+    const mv = inkMoveRef.current
+    if (!mv) return
+    inkMoveRef.current = null
+    mv.g.end()
+  }, [])
+
+  /* 卡片那条路送进来的是**事件**（它拿不到"相对画布容器"的坐标，那是 Board 的账）——
+     这里统一换算成世界坐标，再交给同一个 `movePickTo`。 */
+  const pickMoveFromCard = useCallback(
+    (e, phase) => {
+      if (phase === 'end') {
+        endPickMove()
+        return
+      }
+      const lp = localPoint(e)
+      const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
+      if (phase === 'start') beginPickMove(wp)
+      else movePickTo(wp)
+    },
+    [localPoint, beginPickMove, movePickTo, endPickMove]
+  )
+
+  /* ── 复制 / 粘贴（见 lib/clipboard.js 的三条规矩）────────────────────────────
+   *
+   * ★ **剪贴板是一份模块级的内存 + localStorage 的镜像**，不是 `navigator.clipboard`。
+   *   为什么不用系统剪贴板：`navigator.clipboard.write` 要 HTTPS + 用户手势，
+   *   而这个应用跑在 `http://127.0.0.1:5177`（本机 HTTP）—— 写会直接被拒。
+   *   而这里要复制的是**这个应用自己的东西**（笔迹的点、卡片的框），
+   *   本来也不是"粘到别的软件里"用的，所以自己存一份更合适。
+   *   存 localStorage 是为了**跨窗口**：用户开两个白板页（或者复制完关了再打开）
+   *   照样能粘 —— 那正是"贴到别的板上"最常见的走法。
+   *   ⚠ 键名一起改动要连带改掉：它是"另一个窗口也能读到"的唯一凭据。 */
+  function readClipboard() {
+    try {
+      const raw = localStorage.getItem(CLIP_KEY)
+      if (!raw) return null
+      const p = JSON.parse(raw)
+      return isPayload(p) ? p : null
+    } catch {
+      return null // 存储被禁用 / 内容坏了 —— 当"没有剪贴板"，别让整页崩
+    }
+  }
+
+  /* 复制：框住的笔 + 框进来的卡片。
+     ★ 2026-09-21：这两样现在都是**焦点自带的**（`inkSel` + `sel.cardIds`），
+       不再靠"最后一次框选那个矩形"去找卡片 ——
+       那条路（`lastLassoRef`）踩过一个真 bug（2026-09-18 自检抓到的）：
+       它只在框选成功那一下被写下，之后**没有任何地方清它**，
+       于是"框住一块 → 按 Esc 取消选中 → 再按 Ctrl+C"会拿**上一次的矩形**
+       去找卡片，复制出"0 笔 + 那一张卡"（用户明明已经取消了）。
+       现在"框住了什么"只有一份答案（焦点），Esc 一按它连同卡片一起没了。 */
+  const copySel = useCallback(() => {
+    const b = boardRef.current
+    const ids = inkSel ? new Set(inkSel) : new Set()
+    const cards = sel.cardIds
+    const payload = copySelection(b, ids, { cards, frame: sel.frame })
+    if (!payload) {
+      flash('先框住要复制的东西（笔杆侧键拖一圈，或者工具条上的「⬚ 框选」）', 'warn')
+      return
+    }
+    try {
+      localStorage.setItem(CLIP_KEY, JSON.stringify(payload))
+    } catch {
+      /* 存不进去（隐私模式 / 配额满了）也不该失败：本次会话里还能粘
+         —— 下面那份内存里的就是给这种情况兜底的。 */
+    }
+    clipboardRef.current = payload
+    const n = payloadCount(payload)
+    flash(`复制了 ${n.strokes} 笔${n.cards ? ` + ${n.cards} 张卡` : ''}${n.frames ? `（含 ${n.frames} 个板框）` : ''} —— 切到别的板按 Ctrl+V 贴上`, 'ok')
+  }, [inkSel, sel.cardIds, sel.frame])
+
+  /* 粘贴：落点默认是**视野中心**（"贴在我正看着的地方"）。
+     为什么不是鼠标位置：键盘触发的那一下没有鼠标位置，
+     而"看着哪儿就贴哪儿"这两种触发方式下都成立 —— 鼠标用户挪一下地图也一样。 */
+  const pasteSel = useCallback(() => {
+    const payload = clipboardRef.current || readClipboard()
+    if (!payload) {
+      flash('剪贴板里什么都没有 —— 先框住一块东西按 Ctrl+C', 'warn')
+      return
+    }
+    const el = wrapRef.current
+    /* 视野中心的世界坐标：屏幕中心 → 世界（走 view.js 那一处，别自己反算）。 */
+    const cx = el ? el.clientWidth / 2 : 0
+    const cy = el ? el.clientHeight / 2 : 0
+    const w = screenToWorld(cx, cy, boardRef.current.view)
+    const res = pastePayload(boardRef.current, payload, { world: w })
+    if (!res) {
+      flash('剪贴板里的东西读不出来（可能是别的版本留下的）—— 重新复制一次', 'warn')
+      return
+    }
+    commit(res.board)
+    /* 贴完把焦点放在**新贴出来的这些东西**上（笔迹 + 卡片）：
+       ① 用户能立刻拖走 / 再删掉 / 再缩放旋转，不用重新框一遍；
+       ② 而且"再按一次 Ctrl+C"复制的就是刚贴的这份（符合直觉：
+          我贴了两次之后想再贴一次，复制的那一份不该变）。
+       ★ 2026-09-21：卡片也一起选中 —— 焦点那一种 kind 现在装得下两样
+         （见 focus.js 的 `focusInk(ids, cards)`）。 */
+    setFocus(focusInk(res.ids, res.cards))
+    const n = payloadCount(payload)
+    flash(`粘贴了 ${n.strokes} 笔${n.cards ? ` + ${n.cards} 张卡` : ''}${payload.from ? `（从《${payload.from}》复制）` : ''}`, 'ok')
+  }, [commit])
 
   const onPointerDown = useCallback(
     (e) => {
       const el = wrapRef.current
       if (!el) return
       trackPointerKind(e)
+      /* ★★ 纸面上**任何**一次按下都作废"收笔自动规整"那个待办（见 scheduleAutoShape）。
+         为什么挂在这里而不是"挂在新的一笔收笔时"：
+           · 你下一笔落在哪儿都算 —— 画、擦、框选、拖卡片、按那颗按钮，全都是一次"我在动了"；
+           · 它把"停笔想事情"和"我正在画"分开：停笔时那一笔在等（等你看它一眼），
+             手一落下去就不等了。
+         ⚠ 放在 `useCallback` 的最前面：下面每一条分支都有 `return`，
+           写在中间就会被某些分支跳过 —— 那种漏是静默的（定时器照旧在跑）。 */
+      cancelAutoShape()
       /* ★ 指针捕获必须设在**收到事件的那个元素自己**身上（这里是 .bd-hit）。
          第一版设在最外层的 .bd-stagewrap 上：于是 pointermove / pointerup 被
          重定向到那个 div，而监听器挂在 .bd-hit 上 —— 结果就是
@@ -636,23 +1375,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
 
       const lp = localPoint(e)
+      /* ★ 落点要按**屏幕上的实际位置**算，所以先把补正清掉（2026-09-18）：
+         平移刚结束时那几层可能正挂着一条过渡变换，而 `localPoint` / `paintLive`
+         的口径是"没有变换的舞台" —— 带着变换落笔，第一笔会整体歪一个"还差的量"。
+         清掉之后差是 0（屏幕上本来就已经对齐了），两层 canvas 的变换都是单位阵。
+         ⚠ 这一句必须在下面**所有**用 `wp` 的分支之前：擦、框选、箭头、画都吃这个落点。 */
+      clearViewCorrection()
       const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
-
-      /* ⓪ 「∈ 条件」武装着 → 这一下不是画、不是选，是**指**：
-         点到哪撮字就把"条件就是它"写在那条连接上（点到卡片那条路走 Card 的 onSelect，
-         因为卡片自己收指针事件 —— 见下面 Card 的 onSelect）。
-         没点到东西就说一句、**保持武装**（指着指着点偏了很正常，不用重新按一次）。
-         ⚠ 这一步必须在"平移/框选/画/擦"之前 —— 武装着的时候不该落墨。 */
-      if (condArm) {
-        const R = 12 / (boardRef.current.view.s || 1) // 12 屏幕像素换算成世界像素
-        const hit = [...boardRef.current.strokes].reverse().find((s) => strokeHitsCircle(s, wp.x, wp.y, R))
-        if (hit) {
-          pickCond(condArm, { strokeId: hit.id })
-        } else {
-          flash('这一点上没东西 —— 点一下那撮字，或者点一张卡（Esc 取消）', 'warn')
-        }
-        return
-      }
 
       /* ★ 箭头工具（一次性的，见 ADR-0001）：这一下不是画墨，是"拉一条关系"。
          起点先记下来、拖动时画一条预览线（两端吸到谁就把谁圈一下），松手才写进 `links`。
@@ -681,19 +1410,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
-      /* ② 已经选着一组墨迹、又正好按在它的框里 → 整组拖着走。 */
+      /* ② 已经选着一组东西、又正好按在它的框里 → 整组拖着走（笔迹**和卡片**一起）。 */
       if (
         sel.box &&
         tool !== 'eraser' &&
         wp.x >= sel.box.x0 && wp.x <= sel.box.x1 &&
         wp.y >= sel.box.y0 && wp.y <= sel.box.y1
       ) {
-        // 把"选中那几条按下时的原样"存下来，拖动时拿它算偏移（不累加，见 onPointerMove）
-        const origin = new Map()
-        for (const s of boardRef.current.strokes) if (inkSel.has(s.id)) origin.set(s.id, s)
         /* 一次拖动 = 一步撤销：起点交给账本记（`moved` 那个手写标记没了 ——
            "动没动过"由 `end()` 按 `sameWithin` 判一次，见 history.js）。 */
-        inkMoveRef.current = { from: wp, origin, g: ledger.begin() }
+        beginPickMove(wp)
         return
       }
 
@@ -729,7 +1455,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         paintLive(liveRef, stroke, boardRef.current.view)
       }
     },
-    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, inkSel, selectedId, condArm, selectedFrameId, ledger]
+    [tool, color, width, localPoint, eraseAt, trackPointerKind, sel.box, cardSel, inkSel, selectedId, selectedFrameId, ledger, clearViewCorrection]
   )
   const onPointerMove = useCallback(
     (e) => {
@@ -761,20 +1487,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
-      /* 拖着选中的那组墨迹走。
-         ★ 每次都从"按下那一刻的原样"重新算偏移，**不是**累加每一帧的增量 ——
-           累加会攒浮点误差，来回拖几次位置就飘了。 */
+      /* 拖着选中的那组东西走（笔迹 + 卡片）—— 换算和那三件事都在 `movePickTo` 里，
+         两个入口（按空白 / 按选区里的卡片）共用同一份实现。 */
       if (inkMoveRef.current) {
         const lp = localPoint(e)
-        const wp = screenToWorld(lp.x, lp.y, boardRef.current.view)
-        const mv = inkMoveRef.current
-        const dx = wp.x - mv.from.x
-        const dy = wp.y - mv.from.y
-        /* 中途每一帧只改板、不记账（"这一下算不算一步"收尾时由账本判一次）。 */
-        mv.g.during((cur) => ({
-          ...cur,
-          strokes: cur.strokes.map((s) => (mv.origin.has(s.id) ? shiftStroke(mv.origin.get(s.id), dx, dy) : s)),
-        }))
+        movePickTo(screenToWorld(lp.x, lp.y, boardRef.current.view))
         return
       }
 
@@ -852,7 +1569,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         if (added) paintLive(liveRef, d.stroke, boardRef.current.view)
       }
     },
-    [tool, localPoint, setView, eraseAt, trackPointerKind, commit, ledger]
+    [tool, localPoint, setView, eraseAt, trackPointerKind, commit, ledger, cancelAutoShape]
   )
 
   const onPointerUp = useCallback(
@@ -871,16 +1588,28 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         return
       }
 
-      /* 框选松手：把圈到的墨迹选上。
+      /* 框选松手：把圈到的东西选上 —— **笔迹 + 中心落在框里的卡片**。
          用 lassoRef 里的 box 而不是 lasso 这个 state —— 两者在同一帧里可能差一步，
-         松手这一刻要的是"最后画出来那个框"。 */
+         松手这一刻要的是"最后画出来那个框"。
+         ★ 卡片的判据走 geometry.js 的 `membersInBox`（和「留下板框」「复制」同一句
+           话：卡片**中心**落在框里才算）—— 三处各判各的话，
+           "我圈住了什么"在三个功能里会给出三个答案。
+         ★ 2026-09-21 起卡片也进选区（用户要的「框选中任意的字迹——卡片都应该能够放大，
+           旋转」）—— 所以 `lastLassoRef` 那道"卡片靠最后一次框选的矩形找"的补丁
+           跟着退休了：选区和那一次框选现在是同一份东西。 */
       if (lassoRef.current) {
         const box = lassoRef.current.box
         lassoRef.current = null
         setLasso(null)
-        /* 记下这个框：「留下板框」要拿它找卡片成员（见 keepFrame 的说明）。 */
-        lastLassoRef.current = box
-        let ids = boardRef.current.strokes.filter((s) => strokeHitsRect(s, box)).map((s) => s.id)
+        const hit = membersInBox(boardRef.current, box)
+        let ids = hit.ids
+        /* ★ 固定（📌）住的卡片**框不进来** —— 那是它的全部意思：「别动我」。
+           README 第 19 条那句"锁上之后选不中"说的就是这一条：
+           卡片的 pointer-events:none 挡住了鼠标，但框选是**另一条**入口
+           （它按坐标算，不问卡片收不收事件）。漏了这一句的后果很实在：
+           框一大片按 Delete 会把钉住的卡一起删掉。 */
+        const locked = new Set(boardRef.current.cards.filter((c) => c.locked === true).map((c) => c.id))
+        const cards = hit.cards.filter((id) => !locked.has(id))
         /* ★ 点一下那条线 = 选中它（"点线即选中"，2026-09-16 加）。
            以前改一个词得先**框住**那条线 —— 一条线本来就是一个点得中的东西，
            多一个框的手势是白费的。判据三条，都是为了让"点"不误伤：
@@ -893,27 +1622,30 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
              原来写的是"4 世界像素"，放大到 6 倍时 4 世界像素 = 24 屏幕像素 ——
              轻轻拖一下就成了"点"，行为跟手上的动作对不上（审查挑出来的）。 */
         const vs = boardRef.current.view.s
-        if (!ids.length && worldLenToScreen(box.x1 - box.x0, vs) <= 4 && worldLenToScreen(box.y1 - box.y0, vs) <= 4) {
+        if (
+          !ids.length &&
+          !cards.length &&
+          worldLenToScreen(box.x1 - box.x0, vs) <= 4 &&
+          worldLenToScreen(box.y1 - box.y0, vs) <= 4
+        ) {
           const cx = (box.x0 + box.x1) / 2
           const cy = (box.y0 + box.y1) / 2
           const r = screenLenToWorld(10, boardRef.current.view.s)
-          const hit = boardRef.current.strokes.find((s) => linkByStroke.has(s.id) && strokeHitsCircle(s, cx, cy, r))
-          if (hit) ids = [hit.id]
+          const one = boardRef.current.strokes.find((s) => linkByStroke.has(s.id) && strokeHitsCircle(s, cx, cy, r))
+          if (one) ids = [one.id]
         }
-        /* 框住了 → 焦点变成"这一撮笔"；框空了 → 只取消墨迹那一种（卡片 / 板框的选中留着，
-           和从前一样：从前这里也只清 inkSel）。 */
-        setFocus((f) => (ids.length ? focusInk(ids) : clearInkFocus(f)))
+        /* 框住了 → 焦点变成"这一撮东西"（笔迹 + 卡片）；框空了 → 只取消墨迹那一种
+           （板框的选中留着，和从前一样）。 */
+        setFocus((f) => (ids.length || cards.length ? focusInk(ids, cards) : clearInkFocus(f)))
         /* 空框说一句人话。静默什么都不发生是最让人迷惑的 ——
            用户会以为"框选坏了"，而其实只是框小了/框到空白上了。 */
-        if (!ids.length) flash('框里没有笔迹 —— 框大一点，或者框到字上', 'warn')
+        if (!ids.length && !cards.length) flash('框里没有笔迹 —— 框大一点，或者框到字上', 'warn')
         return
       }
 
       /* 拖完松手：整次拖动记成一步撤销（中途那些帧都不记）。 */
       if (inkMoveRef.current) {
-        const mv = inkMoveRef.current
-        inkMoveRef.current = null
-        mv.g.end()
+        endPickMove()
         return
       }
 
@@ -932,6 +1664,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         const simple = simplifyPoints(pts, 0.6)
         const stroke = { ...d.stroke, points: toFlat(simple) }
         commit((cur) => ({ ...cur, strokes: [...cur.strokes, stroke] }))
+        /* ★★ 收笔之后**停顿一下就自动规整**（OneNote 那个手感）——
+           排在 commit 后面：定时器回调要能在 boardRef 里找到这一笔。
+           它自己会撤掉上一个待办（只有最后一笔在等，见 scheduleAutoShape 那段）。 */
+        scheduleAutoShape(stroke)
         /* ★ 这一笔要是正好连上了两个东西，就在旁边浮出那排词。
            顺序要紧：先 commit（boardRef 里已经有这一笔了），再 offerLink ——
            offerLink 是拿**最新的板**去算连接的，早了就找不到自己这一笔。 */
@@ -942,7 +1678,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         setEraserAt(null)
       }
     },
-    [commit, tool, flash]
+    [commit, tool, flash, scheduleAutoShape]
   )
 
   // ── 滚轮：缩放 / 横向平移 ──
@@ -990,6 +1726,37 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         redo()
         return
       }
+      /* ★ 复制 / 粘贴（2026-09-18）。放在 `mod` 那一串里、**在"面板/输入框"那道闸之后** ——
+         `inField` 已经在上面 return 掉了，所以卡片里正在编辑的那段文字
+         走的是**浏览器自己的**复制粘贴（那才是用户要的），我们绝不抢。
+         ⚠ 不判 `onPaper`：复制粘贴是**全局**的（不像 Delete 那样"面板上的不算"）——
+           用户点了一下关系面板里的名字，一样该能复制板上框住的东西。 */
+      if (mod && (e.key === 'c' || e.key === 'C')) {
+        /* 有真的选中文字时让浏览器自己来（比如用户拖亮了一段名字想复制）——
+           抢过来会让他"复制了别的东西"，而屏幕上一点提示都没有。 */
+        const picked = typeof window.getSelection === 'function' ? window.getSelection() : null
+        if (picked && String(picked).length) return
+        e.preventDefault()
+        copySel()
+        return
+      }
+      if (mod && (e.key === 'v' || e.key === 'V')) {
+        e.preventDefault()
+        pasteSel()
+        return
+      }
+      /* ★ 规整形状（2026-09-18）：Ctrl+Shift+S。
+         为什么是它：「S」已经单独给了框选工具（见下面那行），
+         加 Shift 得到一个"和框选是一路、但不是同一件事"的键 ——
+         规整的前提本来就是"先框住"，脑子里那条线接得上。
+         ⚠ 必须排在下面 `if (e.key === 's')` **之前**，而且必须带 mod 判据：
+           不然 Shift+S 会被下面那句吃掉，变成"切到框选工具"（什么都不会发生，
+           而用户以为规整过了 —— 这种"静默地什么都没做"最难查）。 */
+      if (mod && e.shiftKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        regularizeInkSel()
+        return
+      }
       if (mod && e.key === '0') {
         e.preventDefault()
         const el = wrapRef.current
@@ -1016,25 +1783,21 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
       if (e.key === 'Escape') {
         /* ★「一次只收一层」这个顺序住在 `focus.js` 的 `escapeIntent` 里（候选 7）：
-           浮着的那排词 → 武装着的「∈ 条件」→ 板框改名 → 取消焦点。
-           （Esc 是**全局**的：在面板上按 Esc 也该收掉武装 —— 只有删除那一族要分纸面/面板。） */
-        const it = escapeIntent({ focus, linkPick, condArm })
+           浮着的那排词 → 板框改名 → 取消焦点。
+           （Esc 是**全局**的：在浮层按钮上按 Esc 也该收走 —— 只有删除那一族要分纸面/浮层。） */
+        const it = escapeIntent({ focus, linkPick })
         if (it.kind === 'none') return
         e.preventDefault()
         if (it.kind === 'dismiss-link') return setLinkPick(null)
-        if (it.kind === 'disarm-cond') {
-          setCondArm(null)
-          flash('不收条件了', 'ok')
-          return
-        }
         if (it.kind === 'end-frame-edit') return setFocus(endEdit)
         setFocus(FOCUS_NONE)
         return
       }
       /* ★ 删除 / 拆开："该谁管、管什么"整个在 `focus.js` 的 `deleteIntent` 里 ——
          焦点是一个值，所以"先看谁"写在**类型**里（从前是三个分支各查一个子集，
-         而且不区分纸面和面板：点一下关系面板里那一行再按 Backspace 会把板框拆开，
-         `preventDefault` 还顺手吞掉浏览器的后退 —— review 当场走到的那个 bug）。 */
+         而且不区分纸面和浮层：点一下浮层里那一行再按 Backspace 会把板框拆开，
+         `preventDefault` 还顺手吞掉浏览器的后退 —— review 当场走到的那个 bug。
+         当年最常踩的就是关系面板那一行，它现在已经整块删掉了）。 */
       const del = deleteIntent(focus, e.key, e.target)
       if (del.kind === 'dissolve-frame') {
         e.preventDefault()
@@ -1054,8 +1817,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       if (del.kind === 'delete-card') {
         e.preventDefault()
         /* ★ 固定的卡片不给删。它是"锁住"的语义，而 Delete 是最容易误按的一个键。
-           （它平时选不中，所以正常路径下也走不到这儿；但关系面板里点一下名字
-           是会选中的 —— 那条路得挡住。）想删就先点 📌 解开。 */
+           （它平时选不中，所以正常路径下也走不到这儿 —— 留这道闸是因为"选不中"
+           是 CSS 的 pointer-events 保证的，不是类型保证的。）想删就先点 📌 解开。 */
         const card0 = boardRef.current.cards.find((c) => c.id === del.id)
         if (card0 && card0.locked === true) {
           flash('这张卡固定着，先点它左下角的 📌 解开再删', 'warn')
@@ -1081,10 +1844,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         setPadOpen((v) => !v)
         return
       }
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-        const d = e.key === 'ArrowRight' ? 1 : -1
-        setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + d + 3) % 3], setVariant)
-      }
     }
     const onUp = (e) => {
       if (e.code === 'Space') spaceRef.current = false
@@ -1096,8 +1855,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       window.removeEventListener('keyup', onUp)
     }
   /* 依赖里那个 `focus` 就是这一刀的收成：从前这里是 selectedId / inkSel / frameEditId /
-     selectedFrameId 四个 —— 四个里漏一个，"按键读到的是旧的焦点"（删错东西）。 */
-  }, [undo, redo, setView, focus, commit, variant, deleteInkSel, linkPick, linkByStroke, condArm])
+     selectedFrameId 四个 —— 四个里漏一个，"按键读到的是旧的焦点"（删错东西）。
+     `copySel` / `pasteSel` 也必须进来：它们闭包住 `inkSel` / `sel`，
+     漏了就会"框住了新的一撮、Ctrl+C 复制的还是上一撮"。 */
+  }, [undo, redo, setView, focus, commit, deleteInkSel, linkPick, linkByStroke, copySel, pasteSel, regularizeInkSel])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -1248,7 +2009,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        返回 null = 那个词不认识 —— 什么都不做，也不弹提示。 */
     if (kind === LINK_DELETE) {
       const ids = new Set(link.ids && link.ids.length ? link.ids : [link.strokeId])
-      commit((cur) => removeStrokes(cur, ids))
+      commit((cur) => removePick(cur, ids))
       setLinkPick(null)
       setFocus(clearInkFocus)
       flash('删掉这条线了 —— 关系跟着那一笔一起没了（Ctrl+Z 能退回）', 'ok')
@@ -1265,63 +2026,40 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      它存在的理由是"形状判读会猜错"，而形状判读整族已经删掉（ADR-0001）。
      现在"这条连错了"只有一句：删掉这条连接（那排词里 `0` 那颗）。 */
 
-  /* ── 「这个条件不算」/「条件就是它」 ────────────────────────────────────────
-   * 条件本来是**位置送的**：写在那条线弧长中点旁边的字/卡自动成为它的条件。
-   * 位置两头都不灵的时候就得有说法：
-   *   · 读错了 → `noCond`（`cond:'none'`，否决权优先，不再往位置里读）；
-   *   · 读不到（条件写在别处）→ `armCond` 武装一下、再点一下目标（卡片或那撮字），
-   *     写 `cond:'card:<id>'` / `'ink:<笔 id>'`。
-   * ★ 两个口子都要有回头路（`condBack`）：一句话说出口、重开之后就没路了，那还是单向门 ——
-   *   和「不算连接」的「又算回连接」是同一个道理。
-   * ⚠ 只说"那个不是条件"/"就是它"，不是"这一步不需要条件" —— 否决之后面板照实回到
-   *   "缺条件"，补的办法还是老规矩：在中点旁边把该写的写上（或者指一个）。 */
-  function noCond(link) {
-    if (!link) return
-    commit((cur) => vetoCond(cur, link))
-    flash('这个条件不算了 —— 那撮字照旧留在板上（想改回来点 ↺）', 'ok')
-  }
-
-  function condBack(link) {
-    if (!link) return
-    commit((cur) => clearCond(cur, link))
-    flash('又按位置读了（那条线中点旁边写什么就是什么）', 'ok')
-  }
-
-  /* 武装：「∈ 条件」按下之后，下一下点在哪张卡/哪撮字上，它就成了这条线的条件。
-     一次性（点完就收）—— 不做成常驻模式，免得下次画东西时它还开着。 */
-  function armCond(link) {
-    if (!link) return
-    setCondArm(link)
-    flash('点一下要当条件的那张卡、或者那撮字（Esc 取消）', 'warn')
-  }
-
-  /* 真去说那句"条件就是它"。kind 由"点到了什么"决定（卡片 / 笔迹）。 */
-  function pickCond(link, target) {
-    const value = target && target.cardId ? condCard(target.cardId) : condInk(target && target.strokeId)
-    if (!value) return false
-    commit((cur) => specCond(cur, link, value))
-    setCondArm(null)
-    flash(target.cardId ? '这张卡就是它的条件了（点 ↺ 回到按位置读）' : '这撮字就是它的条件了（点 ↺ 回到按位置读）', 'ok')
-    return true
-  }
+  /* ── 「这个条件不算」/「条件就是它」：界面入口没有了（2026-09-19）─────────────
+   * 条件本来是**位置送的**：写在那条线弧长中点旁边的字/卡自动成为它的条件
+   * （读法在 `links.js` 的 `linkCondition` —— **纯数据那一半一个字没动**）。
+   * 位置两头都不灵的时候从前有说法：读错了按 ✕（写 `cond:'none'`）、读不到按 ∈
+   * 再点一下目标（写 `cond:'card:<id>'` / `'ink:<笔 id>'`），外加一颗 ↺ 当回头路。
+   * ★ 这三个写入口唯一的家是**关系面板**，而那块面板整块删掉了（用户：「不需要右侧
+   *   关系栏，可以删掉了」，栏里独有的操作一起不要）—— 于是 `selection.js` 的
+   *   `vetoCond` / `specCond` / `clearCond` 现在**没有界面入口**了。
+   *   数据层留着：老文件里已经写下的 `stroke.cond` 照旧读得出来，只是没有地方显示、
+   *   也没有地方写。`readBoard` / `deriveChains` 这类读法一个字节没改。
+   * ⚠ 要把它们请回来，别只把面板那段 JSX 抄回来 —— 那三颗按钮得先有个新家
+   *   （框住那条线时 `.bd-inkacts` 那排动作是现成的口子），而且**必须配回头路**
+   *   （一句话说出口、重开之后就没路，那是单向门）。
+   */
 
   /* ── 板框：留下 / 拆开 / 改标题 / 整体挪（见 ADR-0001、lib/frames.js）──────────
    * 从前这里叫"固定成一块"（`groups`）：**不可见**、只能装笔迹。现在它是**板框** ——
    * 有框线、有标题、成员可以是笔迹和卡片，还能整体拖动。
    * ★ 归属只在**你按「留下板框」的那一刻**判定：以后再往框里画一笔，它不会自己变成成员
    *   （那又变回"位置猜"，而这次的整个教训就是别猜）。想加就明说（frames.js 的 addToFrame）。
-   * ★ 卡片成员靠**最后一次框选的矩形**找（卡片中心落在框里才算）——
-   *   不能用"选中笔迹的包围盒"：你顺手圈进来的那张卡会被漏掉，
-   *   而"板框里的东西形成一个整体"正是你要的那句话。 */
+   * ★ 卡片成员就是**框住那些卡片**（`sel.cardIds`）—— 2026-09-21 之前它靠"最后一次
+   *   框选的矩形"现算（`lastLassoRef` + `membersInBox`），因为卡片那时不进选区。
+   *   现在两者是同一份东西：一次框选框住了什么，复制 / 留下板框 / 缩放旋转
+   *   说的是同一句话（各判各的话，三个功能会给出三个答案）。
+   *   ⚠ 判据仍然是"卡片**中心**落在框里"（`membersInBox` 那句话），
+   *     只是它现在发生在**框选那一刻**，不再是回头再算一遍。 */
   function keepFrame() {
     const b = boardRef.current
     const ids = inkSel ? [...inkSel] : []
-    if (!ids.length) {
-      flash('先框住要归到一块的笔迹（笔杆侧键拖一圈，或者工具条上的「⬚ 框选」）', 'warn')
+    const cards = sel.cardIds
+    if (!ids.length && !cards.length) {
+      flash('先框住要归到一块的东西（笔杆侧键拖一圈，或者工具条上的「⬚ 框选」）', 'warn')
       return
     }
-    const box = lastLassoRef.current || sel.box
-    const cards = membersInBox(b, box).cards
     const { board: next, movedFrom } = freezeFrameSelection(b, ids, cards)
     commit(next)
     setFocus(clearInkFocus)
@@ -1523,8 +2261,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* stageProps 里那些东西要一起传给画布：卡片层作为 children（同一个世界原点）。 */
   const stageProps = {
     sceneRef, liveRef, view: board.view, size,
+    /* 卡片/板框那一层的容器 ref。给它写"补正"（见 syncViewCorrection）——
+       手势里 React 还没把新的 left/top 提交上去时，先靠它把卡片贴到正确位置。 */
+    worldRef,
+    /* ★ 墨迹画完之后由它回报"画出来了的是哪一版视图"——补正以那个为基准。
+       ⚠ 不能省：省了补正就没有基准（`drawnViewRef` 永远是 null），
+         而那**不会报错**，只会退回"整块不补" —— 屏幕上看就是滑动照旧。 */
+    onViewDrawn,
     strokes: board.strokes, relations, cardById,
-    cardsForInk: inkPairs, hoverEdge, eraserAt,
+    cardsForInk: inkPairs, eraserAt,
     links, selLink: sel.link, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
     inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
     /* 板框那一族（见 frames.js）：渲染要的是"框 + 框线矩形"，交互只有把手那三件事。 */
@@ -1542,7 +2287,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       linkLeftRef.current = inside
     },
     onPointerDown, onPointerMove, onPointerUp,
-    lasso, inkBox: sel.box, onDeleteInk: deleteInkSel,
+    lasso, inkBox: sel.box, inkHasStrokes: sel.ids.length > 0, onDeleteInk: deleteInkSel, onCopyInk: copySel,
+    /* 「◯ 规整」：`shapeHits` 是**有没有结果**（有才出现那颗按钮），
+       `onRegularizeInk` 是点下去真做的事。两个一起递进去 ——
+       按钮该不该出现这件事的价值判断在 shapes.js，画布那边只管显示。 */
+    shapeHits, onRegularizeInk: regularizeInkSel,
+    /* 选区手柄（见 lib/selection.js 的 `transformPick`）：`pickTarget` 对**任意选区**
+       都非空（几笔字、一坨乱涂、框进来的卡片都算），两个回调是"拖角缩放"和"转"。 */
+    pickTarget, onPickScale: startPickScale, onPickRotate: startPickRotate,
     onFormulaInk: () => openInkPanel('formula'),
     onBeautifyInk: () => openInkPanel('text'),
     /* 卡片层作为 children 传进画布组件 —— 它必须和两层 canvas 待在**同一个**
@@ -1557,18 +2309,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             key={c.id}
             card={c}
             selected={c.id === selectedId}
+            /* ★ 这张卡**在框住的那一块里**吗 —— 在的话，拖它 = 拖整块（见 Card 的 onPointerDown）。
+               判据就是当前选区里的卡片集合（`cardSel`），和"框选收了谁"是同一份。 */
+            inPick={cardSel.has(c.id)}
+            onPickMove={pickMoveFromCard}
             dimmed={focusIds ? !focusIds.has(c.id) : false}
             editing={c.id === editingId}
             view={board.view}
-            /* ★ 武装着「∈ 条件」时，点一张卡 = **指着它**（"这张卡就是那条线的条件"），
-               而不是选中它 —— 卡片自己收指针事件，所以这条只能在这儿拦
-               （笔迹那边是 onPointerDown 拦的，见上面 ⓪）。 */
-            onSelect={() => {
-              if (condArm) pickCond(condArm, { cardId: c.id })
-              /* 选中一张卡 = 焦点是它（板框自然不再是"当前这个" —— 互斥在类型里，
-                 不用再手写一句 setSelectedFrameId(null)，见 focus.js）。 */
-              else setFocus(focusCard(c.id))
-            }}
+            /* 选中一张卡 = 焦点是它（板框自然不再是"当前这个" —— 互斥在类型里，
+               不用再手写一句 setSelectedFrameId(null)，见 focus.js）。 */
+            onSelect={() => setFocus(focusCard(c.id))}
             onStartDrag={() => {
               const c0 = boardRef.current.cards.find((x) => x.id === c.id)
               /* 一次拖动 = 一步撤销：起点交给账本（"点了一下没拖"由 `end()` 判）。 */
@@ -1619,50 +2369,6 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     ),
   }
 
-  const panel = (
-    <RelationPanel      board={board}
-      relations={relations}
-      inkPairs={inkPairs}
-      links={links}
-      selectedId={selectedId}
-      onSelect={(id) => setFocus(focusCard(id))}
-      onHoverEdge={setHoverEdge}
-      /* 「这个条件不算」那颗 ✕ / 回头路 ↺ —— 面板是另一个组件，得把动作递进去
-         （见 RelationPanel 的说明：它是纯展示，改板一律回到 Board 这边做）。 */
-      onNoCond={noCond}
-      onCondBack={condBack}
-      /* 「∈ 条件」的入口放在**这一行**（不是框选浮层）：板上几条线走同一条走廊时
-         "只框住其中一条"很不好框，而"缺条件"这件事本来就显示在那一行上 ——
-         入口就在它旁边。`condArmId` 是正武装着的那条，用来把按钮点亮。 */
-      onArmCond={armCond}
-      condArmId={condArm ? linkKey(condArm) : null}
-      /* 板框那一行（见 ADR-0001）：点一下 = 选中它 + 视野居到它身上。 */
-      onFrameSelect={(id) => setFocus(focusFrame(id))}
-      onFocusFrame={(id) => {
-        const f = (boardRef.current.frames || []).find((x) => x.id === id)
-        const el = wrapRef.current
-        if (!f || !el) return
-        const box = frameBounds(boardRef.current, f)
-        if (!box) return
-        setView(centerOn(boardRef.current.view, { x: box.x + box.w / 2, y: box.y + box.h / 2 }, el.clientWidth, el.clientHeight))
-      }}
-      onFocus={(id) => {
-        const el = wrapRef.current
-        if (!el) return
-        const c = cardById.get(id)
-        /* 端点是墨迹块（不是卡片）时没有卡可居中 —— 退回到"这条连接的中点"，
-           不然点了面板那一行什么都不动，看起来像坏了。 */
-        const center = c
-          ? { x: c.x + c.w / 2, y: c.y + c.h / 2 }
-          : (links.find((l) => l.a === id || l.b === id) || {}).mid
-        if (!center) return
-        /* 缩放不变，只把这个世界点摆到容器正中 —— 就是 screenToWorld 的逆运算，
-           收在 view.js 的 `centerOn` 里（原来这里是手写的一行）。 */
-        setView(centerOn(boardRef.current.view, center, el.clientWidth, el.clientHeight))
-      }}
-    />
-  )
-
   const toolbar = (
     <Toolbar
       tool={tool} setTool={setTool}
@@ -1705,7 +2411,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      写字板那块小板也要跟着换纸，而它是 .bd 的兄弟分支，不是 stagewrap 的孩子。
      挂在根上，一条 `.paper-grid .bd-stagewrap, .paper-grid .wp-padwrap` 就都管得住。 */
   return (
-    <div className={'bd variant-' + variant + ' paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '') + (condArm ? ' condarm' : '')}>
+    <div className={'bd paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '') + (xforming ? ' xforming' : '')}>
       {/* ★ 指针种类在**捕获阶段**就记下来（挂在最外层，卡片上的事件也会先经过这里）。
           为什么不能只在 .bd-hit 上记：笔悬停到**卡片**上时，事件被卡片接走了，
           .bd-hit 上的监听收不到 —— 于是"上一次是笔"要等按下才知道，
@@ -1729,27 +2435,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         {board.cards.length === 0 && board.strokes.length === 0 && <Hint />}
       </div>
 
-      {variant === 'B' ? (
-        <>
-          <div className="bd-floatbar">{toolbar}</div>
-          {panelOpen && <div className="bd-drawer">{panel}</div>}
-          <button className="bd-drawer-toggle" onClick={() => setPanelOpen((v) => !v)}>
-            {panelOpen ? '收起关系 ›' : '‹ 关系'}
-          </button>
-        </>
-      ) : variant === 'C' ? (
-        <div className="bd-csplit">
-          <div className="bd-clist">{panel}</div>
-          <div className="bd-cbar">{toolbar}</div>
-        </div>
-      ) : (
-        <>
-          <div className="bd-cbar">{toolbar}</div>
-          <div className="bd-cpanel">{panel}</div>
-        </>
-      )}
-
-      <VariantSwitcher variant={variant} setVariant={setVariant} />
+      {/* 工具条贴在画布底部。**不再有右侧那一栏**（见文件末尾「关系面板删掉了」）——
+          画布从左边栏一直铺到窗口右缘。 */}
+      <div className="bd-cbar">{toolbar}</div>
 
       {padOpen && (
         <WritingPad
@@ -1776,7 +2464,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
 
 // ────────────────────────────── 卡片 ──────────────────────────────
 
-function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, onStartDrag, onCommit, onCloseEdit, onDrag, onDragEnd, onDelete, onStartResize, onToggleLock }) {
+function Card({ card, selected, dimmed, editing, view, inPick, onSelect, onStartEdit, onStartDrag, onCommit, onCloseEdit, onDrag, onDragEnd, onDelete, onStartResize, onToggleLock, onPickMove }) {
   const dragRef = useRef(null)
   const taRef = useRef(null)
   const [draft, setDraft] = useState('')
@@ -1959,6 +2647,16 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
            边框一加粗就会压到字上。4px 是"看着贴、但不顶边"的那个数。 */
         padding: `${worldLenToScreen(4, f)}px ${worldLenToScreen(8, f)}px`,
         borderRadius: Math.max(3, worldLenToScreen(10, f)),
+        /* ★ 旋转（2026-09-21，用户要的「卡片都应该能够放大，旋转，这点类似 oneNote」）。
+           绕**卡片自己的中心**转 —— `transform-origin` 显式写出来，不靠 CSS 默认值：
+           `.bd-card` 哪天有人给它设了别的 origin（比如为了那个补正），
+           旋转的轴就会悄悄跑到角上去（卡片会绕着角甩，而且看起来"像是我拖歪了"）。
+           ⚠ 这条 transform **只管旋转**，绝不参与定位：位置还是上面那两行
+             `left/top` 按"屏幕 = 世界 × s + t"算的（README 第 3 条：
+             同一个位移两处各表达一遍，就一定有一处会多加一次）。
+           ⚠ 没转过（`rot` 为 0/没有）时**一个字节的 style 都不写** ——
+             和文件里那个字段同一条纪律（老卡片的 DOM 也纹丝不动）。 */
+        ...(card.rot ? { transform: `rotate(${card.rot}rad)`, transformOrigin: '50% 50%' } : {}),
       }}
       onPointerDown={(e) => {
         /* ★ 固定住的卡片**什么都不接**：不选中、不拖动。
@@ -1972,6 +2670,19 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
            编辑器占的只是卡片中间那一块，四周的边留给人拖。 */
         if (editing && e.target.closest('textarea, button, input, .bd-snips')) return
         e.stopPropagation()
+        /* ★★ 这张卡**在框住的那一块里** → 拖它 = 拖**整块**（2026-09-21）。
+           为什么必须有这一条：卡片自己收指针事件（它比 .bd-hit 高一层），
+           所以"按在卡片上"根本到不了 Board 里那个整组拖动的分支 ——
+           不接这一条的话，症状是"框住字 + 卡，按着卡拖，只有卡动了"，
+           屏幕上就是**拖散了**（和"只搬笔迹不搬卡片"是同一个错，换了个入口）。
+           ⚠ 这里**不调用 onSelect()**：那会把焦点换成这张卡、整块选区当场散掉 ——
+             而用户的意思明明是"动这一整块"。想单独动它就先点一下空白（取消选中）。 */
+        if (inPick) {
+          dragRef.current = { pick: true }
+          e.currentTarget.setPointerCapture?.(e.pointerId)
+          onPickMove?.(e, 'start')
+          return
+        }
         onSelect()
         onStartDrag?.()
         dragRef.current = { x: e.clientX, y: e.clientY, moved: false }
@@ -1980,6 +2691,11 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
       onPointerMove={(e) => {
         const d = dragRef.current
         if (!d || editing || locked) return
+        /* 整块拖动那一条：坐标换算在 Board 那边（它才知道画布容器的原点）。 */
+        if (d.pick) {
+          onPickMove?.(e, 'move')
+          return
+        }
         /* 这里只报**屏幕位移**，换算成世界坐标由 Board 按当前缩放做 ——
            在这个闭包里读 view.s 会读到"按下那一刻"的缩放，
            缩放过一次之后拖动就会跑得比手指快/慢。 */
@@ -1992,7 +2708,10 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
         onDrag(dx, dy)
       }}
       onPointerUp={() => {
-        if (dragRef.current) onDragEnd()
+        if (!dragRef.current) return
+        /* 整块拖动那条路收尾：一次拖动 = 一步撤销（判"动没动过"由账本做）。 */
+        if (dragRef.current.pick) onPickMove?.(null, 'end')
+        else onDragEnd()
         dragRef.current = null
       }}
       onDoubleClick={(e) => {
@@ -2060,7 +2779,10 @@ function Card({ card, selected, dimmed, editing, view, onSelect, onStartEdit, on
               e.stopPropagation()
               e.preventDefault()
               const host = e.currentTarget.closest('.bd-card')
-              const rectW = host ? host.getBoundingClientRect().width : worldLenToScreen(card.w, f)
+              /* ⚠ `offsetWidth`（布局宽）而不是 `getBoundingClientRect().width`：
+                 卡片转过之后后者是**斜着的外接框**，拖缩放柄的手感会跟着歪
+                 （倍率算成"外接框 / 布局框"那个虚高的数）。见 sampleCardForFit 那段。 */
+              const rectW = host ? host.offsetWidth : worldLenToScreen(card.w, f)
               onStartResize?.(rectW, e.clientX)
             }}
           >
@@ -2207,297 +2929,25 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
   )
 }
 
-// ────────────────────────────── 关系面板 ──────────────────────────────
-
-function RelationPanel({ board, relations, links, inkPairs, selectedId, onSelect, onHoverEdge, onFocus, onNoCond, onCondBack, onArmCond, condArmId, onFrameSelect, onFocusFrame }) {
-  const byId = new Map(board.cards.map((c) => [c.id, c]))
-  const label = (c) => {
-    if (!c) return '(没了)'
-    /* 公式卡显示**渲染后的式子**（displayTex），不是手打的源码。
-       理由：卡片上是好看的式子，列表里却是 "oint(B) dl = mu0 I_in"，
-       同一张卡两个样子，你得在脑子里做一次映射才对得上。 */
-    if (c.kind === 'formula') {
-      const t = displayTex(c)
-      return t ? t.slice(0, 30) : '(空公式)'
-    }
-    return (c.text || '(空便签)').slice(0, 24).replace(/\s+/g, ' ')
-  }
-  const roots = board.cards.filter((c) => !relations.parentOf.has(c.id))
-  /* 两族连接（见 ADR-0001）：**你连的**（宣告的，`declared`）和**你画过的**（画出来的那一条线）。
-     分开列而不是混在一起：前者删它 = 删一条记录，后者删它 = 擦掉那一笔 ——
-     两句话不是一回事，混着说用户会以为"删了线关系还在"。 */
-  const declared = links.filter((l) => l.declared)
-  const drawn = links.filter((l) => !l.declared)
-  /* 连接的两端可能是卡片、**墨迹块**（没成卡的字迹、手画的图）或者**板框**。
-     后两种的名字都挂在链接对象上（aLabel/bLabel），不能去卡片表里找 —— 找不到就是"(没了)"。 */
-  const endName = (l, k) => (l[k + 'Kind'] === 'card' ? label(byId.get(l[k])) : l[k + 'Label'] || (l[k + 'Kind'] === 'frame' ? '板框' : '墨迹块'))
-  /* 链里的人名：端点可能是卡片，也可能是墨迹块 / 板框（名字在链接对象上）。 */
-  const nameOf = (id, link) => {
-    if (link && id === link.a && link.aKind !== 'card') return link.aLabel || (link.aKind === 'frame' ? '板框' : '墨迹块')
-    if (link && id === link.b && link.bKind !== 'card') return link.bLabel || (link.bKind === 'frame' ? '板框' : '墨迹块')
-    return label(byId.get(id))
-  }
-  const condName = (cond) => (cond.kind === 'ink' ? cond.label || '墨迹块' : label(byId.get(cond.id)))
-  /* 条件那一族的几颗按钮（✕ / ↺ / ∈）—— **你画的和你的连的共用这一份**。
-     从前只有"你画过的"那一行有它们：三个写入口只看 `link.strokeId`，而宣告的连接
-     那个字段恒为 null —— 于是"∈ 条件"在那一节里根本不存在，你连的那条**永远指不了条件**
-     （架构 review 候选 4；现在写入口按 `link.declared` 自己决定住哪，见 selection.js）。
-     ✕ 是"位置读错了"那个口子，只对**画出来**的连接有意义（宣告的那种条件只能是你亲口说的），
-     所以它在那一节里自然不会出现（`condManual` 只在你说过话时为真）。 */
-  const condChips = (l) => (
-    <>
-      {l.cond && (
-        <span
-          className="bd-cond"
-          title={l.condSpec ? '你亲手指的那个条件（点右边的 ↺ 回到按位置读）' : '写在这条线中点旁边的字（或那张卡）—— 位置决定它是不是条件'}
-        >
-          条件 {condName(l.cond)}
-          {l.condSpec ? '（你指的）' : ''}
-        </span>
-      )}
-      {l.condManual && !l.cond && (
-        <span className="bd-cond-note" title="你说过：这个条件不算（位置读出来的那个作废）；点右边的 ↺ 改回来">
-          条件不算
-        </span>
-      )}
-      {(l.cond || l.condManual) && (
-        <span
-          className={'bd-cond-no' + (l.condManual ? ' back' : '')}
-          role="button"
-          data-cond-btn={l.condManual ? 'back' : 'no'}
-          title={l.condManual ? '改回来：还是按位置读' : '这个条件不是给这条线的（位置读错了）'}
-          onClick={(e) => {
-            e.stopPropagation()
-            if (l.condManual) onCondBack && onCondBack(l)
-            else onNoCond && onNoCond(l)
-          }}
-        >
-          {l.condManual ? '↺' : '✕'}
-        </span>
-      )}
-      {/* 「∈ 条件」：这一行现在**没有条件显示**时给的口子（读不到、或者你刚否掉）——
-          按一下它，再点一下要当条件的那张卡/那撮字。两种连接都有这条口子。 */}
-      {!l.cond && (
-        <span
-          className={'bd-cond-no arm' + (condArmId === linkKey(l) ? ' on' : '')}
-          role="button"
-          data-arm-cond={linkKey(l)}
-          title="指定条件：按一下，再点要当条件的那张卡或那撮字（Esc 取消）"
-          onClick={(e) => {
-            e.stopPropagation()
-            onArmCond && onArmCond(l)
-          }}
-        >
-          ∈
-        </span>
-      )}
-    </>
-  )
-  /* 「推导链」（见 lib/board.js 的 deriveChains）：由推导连接串起来的 A→B→C，
-     并标出**哪一步缺条件** —— 条件就是写在线中点旁边那几个字，不用你声明。 */
-  const chains = deriveChains(links)
-
-  return (
-    <div className="bd-rel">
-      <div className="bd-rel-head">
-        <b>关系</b>
-        <span className="dim small">按位置读出来的</span>
-      </div>
-
-      {board.cards.length === 0 && <div className="dim pad">这张板上还没有卡片。</div>}
-
-      <div className="bd-tree">
-        {roots.map((r) => (
-          <TreeNode key={r.id} node={r} depth={0} relations={relations} byId={byId} label={label} selectedId={selectedId} onSelect={onSelect} onFocus={onFocus} />
-        ))}
-      </div>
-
-      {/* ★ 板框：你亲手留下的那些整体（见 ADR-0001）。
-          面板里也给一节的理由：板框常常把**离得很远**的东西收在一起，
-          屏幕上不一定同时看得见，而"这一节跟哪几节连着"正是要对着看的东西。
-          点一行 = 选中它（屏幕上那个框亮起来）+ 视野居中到它身上。 */}
-      {(board.frames || []).length > 0 && (
-        <div className="bd-frames-list">
-          <div className="bd-rel-sub">板框（{board.frames.length} 个）</div>
-          {board.frames.map((f) => {
-            const mine = links.filter((l) => l.a === f.id || l.b === f.id)
-            const nCard = (f.cards || []).length
-            return (
-              <button
-                key={f.id}
-                className="bd-frame-row"
-                data-frame-row={f.id}
-                onClick={() => {
-                  onFrameSelect && onFrameSelect(f.id)
-                  onFocusFrame && onFocusFrame(f.id)
-                }}
-                title="点一下：选中这个框（能整体拖、能起名）；在板上拖框上的名字也行"
-              >
-                <span className="bd-frame-name">▣ {f.title || '未命名'}</span>
-                <span className="dim small">
-                  {(f.ids || []).length} 笔{nCard ? ` · ${nCard} 卡` : ''}
-                </span>
-                {mine.length > 0 && <span className="bd-frame-links">{mine.length} 条连接</span>}
-              </button>
-            )
-          })}
-        </div>
-      )}
-
-      {/* ★ 你亲手画出来的那些连接 —— 和上面的"按位置读出来的"分开列。
-          为什么要单独一节：连线的两张卡常常离得很远（位置推断根本不会把它俩凑一对），
-          而"我画过线"恰恰是最确定的一句话，它不该因为离得远就从面板上消失。 */}
-      {links.length > 0 && (
-        <div className="bd-links-list">
-          {/* 你**连**的（宣告的）：那一笔没有留在板上，屏幕上那条箭头是应用画的。 */}
-          {declared.length > 0 && (
-            <>
-              <div className="bd-rel-sub">你连的（{declared.length} 条）</div>
-              {declared.map((l) => (
-                <button
-                  key={l.id}
-                  className={'bd-link-row' + (l.dir ? ' dir' : '')}
-                  data-link-declared={l.id}
-                  onClick={() => onFocus(l.a)}
-                  title={'你连的：' + l.name + '（点线上那颗词能改词 / 删掉这条连接 / ∈ 指一个条件）'}
-                >
-                  <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
-                    {l.name}
-                    {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
-                  </span>
-                  <span className="bd-er">{endName(l, 'a')}</span>
-                  <span className="dim">{l.dir ? '→' : '—'}</span>
-                  <span className="bd-er">{endName(l, 'b')}</span>
-                  {/* 你连的这条也能说条件 —— 只是它没有"位置读法"，所以只有 ∈ / ↺ 两种。 */}
-                  {condChips(l)}
-                </button>
-              ))}
-            </>
-          )}
-          {drawn.length > 0 && (
-            <>
-              <div className="bd-rel-sub">你画过的（{drawn.length} 条）</div>
-              {drawn.map((l) => (
-                <button
-                  key={l.strokeId}
-                  className={'bd-link-row' + (l.dir ? ' dir' : '')}
-                  onClick={() => onFocus(l.a)}
-                  title={l.manual ? '你点过词的：' + l.name : '你画的一条线，默认按「相关」读：' + l.name}
-                >
-                  <span className="bd-link-kind" style={{ color: l.color, borderColor: l.color }}>
-                    {l.name}
-                    {l.dir ? (l.kind === 'cause' ? ' →' : ' ⇒') : ''}
-                  </span>
-                  <span className="bd-er">{endName(l, 'a')}</span>
-                  <span className="dim">{l.dir ? '→' : '—'}</span>
-                  <span className="bd-er">{endName(l, 'b')}</span>
-              {/* 「条件是位置送的」：线中点旁边那几个字 / 那张卡（见 lib/board.js 的 linkCondition）。
-                  ★ 位置两头都不灵的时候有说法：
-                     · 读错了 → 那颗 ✕ 是「这个条件不算」（`cond:'none'`）；
-                     · 读不到（条件写在别处）→ 框住那条线，浮层上按「∈ 条件」再点一下目标
-                       （`cond:'card:<id>'` / `'ink:<笔 id>'`）—— 那一行会写「（你指的）」。
-                     · 旁边的 ↺ 是这两种说法的**回头路**（回到按位置读）。 */}
-              {condChips(l)}
-            </button>
-          ))}
-            </>
-          )}
-          <div className="dim small pad">
-            你**连**的那些（上面一节）都写在文件里（`links`）；你**画**的那条线没点过词时
-            按「相关」读、**不写文件** —— 点过词的那几条才记住。
-          </div>
-        </div>
-      )}
-
-      {/* ★ 推导链：把「推导」那几条串起来读成 A→B→C，并标出**哪一步缺条件**。
-          条件不需要你声明 —— 写在那条线**中点旁边**的几个字就算
-          （见 lib/board.js 的 linkCondition），所以"补条件"这件事就是
-          "在线旁边把那句话写上"，写完这一节自己就更新了。 */}
-      {chains.length > 0 && (
-        <div className="bd-chain-list">
-          <div className="bd-rel-sub">推导链（{chains.length} 条）</div>
-          {chains.map((c, ci) => (
-            <div key={'chain' + ci} className="bd-chain">
-              <div className="bd-chain-node">{nameOf(c.start, c.steps[0].link)}</div>
-              {c.steps.map((s, k) => (
-                <div key={'st' + k} className="bd-chain-step">
-                  <div className={'bd-chain-cond' + (s.missing ? ' miss' : '')}>
-                    {s.missing ? '↓ 缺条件（在线中点旁边写几个字就行）' : '↓ 条件：' + condName(s.cond)}
-                  </div>
-                  <div className="bd-chain-node">{nameOf(s.to, s.link)}</div>
-                </div>
-              ))}
-            </div>
-          ))}
-          <div className="dim small pad">
-            「条件」= 写在那条连接线**中点旁边**的字（或那张卡）—— 位置说了算，不用你标。
-          </div>
-        </div>
-      )}
-
-      {relations.orphans.length > 0 && (
-        <div className="bd-islands">
-          <div className="bd-islands-head">
-            有 <b>{relations.orphans.length}</b> 张还没跟谁连上
-          </div>
-          <div className="dim small">不一定错 —— 可能正是你还没想清楚"它属于哪一节"的地方。</div>
-          {relations.orphans.map((id) => (
-            <button key={id} className="bd-orphan" onClick={() => onFocus(id)}>
-              {label(byId.get(id))}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <div className="bd-edges-list">
-        <div className="bd-rel-sub">谁靠着谁（{relations.edges.length} 条）</div>
-        {relations.edges.slice(0, 40).map((e) => {
-          const inked = inkPairs.has(e.a + '|' + e.b) || inkPairs.has(e.b + '|' + e.a)
-          return (
-            <div
-              key={e.a + e.b}
-              className={'bd-edge-row' + (inked ? ' inked' : '')}
-              onMouseEnter={() => onHoverEdge([e.a, e.b])}
-              onMouseLeave={() => onHoverEdge(null)}
-            >
-              <span className={'bd-kind k-' + e.kind}>{e.kind === 'contain' ? '包含' : e.kind === 'overlap' ? '重叠' : '挨着'}</span>
-              <span className="bd-er">{label(byId.get(e.a))}</span>
-              <span className="dim">→</span>
-              <span className="bd-er">{label(byId.get(e.b))}</span>
-            </div>
-          )
-        })}
-        {relations.edges.length === 0 && <div className="dim small pad">还没有靠在一起的卡片。</div>}
-      </div>
-
-      <div className="dim small pad">
-        「包含 / 重叠 / 挨着」都是**按位置推断**的，不是你说过的。
-        想让它确定下来，就用笔在两张卡之间画一条线。
-      </div>
-    </div>
-  )
-}
-
-function TreeNode({ node, depth, relations, byId, label, selectedId, onSelect, onFocus }) {
-  if (!node) return null
-  const kids = relations.children.get(node.id) || []
-  return (
-    <div className="bd-node" style={{ marginLeft: depth * 12 }}>
-      <button
-        className={'bd-node-row' + (node.id === selectedId ? ' on' : '')}
-        onClick={() => onSelect(node.id)}
-        onDoubleClick={() => onFocus(node.id)}
-        title="点一下选中 · 双击把它挪到屏幕中间"
-      >
-        <span className={'bd-dot ' + node.kind} />
-        {label(node)}
-      </button>
-      {kids.map((k) => (
-        <TreeNode key={k} node={byId.get(k)} depth={depth + 1} relations={relations} byId={byId} label={label} selectedId={selectedId} onSelect={onSelect} onFocus={onFocus} />
-      ))}
-    </div>
-  )
-}
+// ─────────────── 关系面板：整块删掉了（2026-09-19，用户说不要右边那一栏）───────────────
+/*
+ * 用户：「白板页面我觉得不需要右侧关系栏，可以删掉了」—— 连栏里独有的那几个操作一起不要。
+ * 删掉的是**界面**：卡片树 / 板框列表 / 「你连的」「你画过的」两节 / 推导链 / 谁靠着谁，
+ * 以及只有它一个入口的三件事（条件否决 ✕、回头路 ↺、「∈ 指一个条件」）。
+ *
+ * 留下来的是**读法**：`relations`（buildRelations）还在 —— 画布上"谁靠着谁"那层浅色线
+ * （BoardCanvas 里的 `relations.edges`）用它，不是只有面板在用。
+ * `links` / `deriveChains` / `linkCondition` 也一个字没改，只是没有地方显示了。
+ *
+ * ⚠ 要把面板请回来，先想清楚三件事：
+ *   ① 它是**浮层**（旧的 `.bd-cpanel`：宽 320、right:14、z-index 20），压在画布上 ——
+ *      选区那排动作 `.bd-inkacts` 的夹取要扣掉它，落点也要躲开屏幕右缘那 320px，
+ *      不然合成点击会打到面板上（README 第 13/38 条）。删了之后画布是整个宽度，
+ *      那两条夹取公式反而变简单了。
+ *   ② 「条件不算 / 条件就是它」那几颗按钮**必须配回头路**（↺）—— 单向门比没有更坏。
+ *   ③ 那些按钮的命中测试要单独验（行本身是 button、按钮是行内的 span）——
+ *      旧自检 check-link 的 [12]/[13] 就是这么写的，删掉之前它一直是绿的。
+ */
 
 // ────────────────────────────── 空板提示 ──────────────────────────────
 
@@ -2520,52 +2970,12 @@ function Hint() {
   )
 }
 
-// ────────────────────────────── 变体切换 ──────────────────────────────
-
-/* 三种摆法，`?variant=A/B/C` 或左右方向键切。
-   A：工具条在顶、关系面板在右（默认）
-   B：全屏画布，工具条和面板都做成浮层
-   C：关系面板占左边一整列（表格式，适合复习时顺着念）
-   这不是最终形态，是给你翻着挑的 —— 挑完我把落选的两套删掉。 */
-function VariantSwitcher({ variant, setVariant }) {
-  const names = { A: '工具条在顶 · 关系在右', B: '全屏画布 · 都做成浮层', C: '关系在左一整列' }
-  // 默认收起。这东西是"翻着挑摆法"用的，摆法定了之后平时根本用不到，
-  // 之前一直摊在屏幕底下、还压着工具条 —— 收成一个角标，要用再点开。
-  const [open, setOpen] = useState(false)
-  const prev = () => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 2) % 3], setVariant)
-  const next = () => setVariantAndUrl(VARIANTS[(VARIANTS.indexOf(variant) + 1) % 3], setVariant)
-
-  if (!open) {
-    return (
-      <button
-        className="bd-proto-mini"
-        onClick={() => setOpen(true)}
-        title={`布局摆法：${variant} — ${names[variant]}（点一下展开）`}
-      >
-        {variant}
-      </button>
-    )
-  }
-
-  return (
-    <div className="bd-proto">
-      <button onClick={prev} title="上一个摆法（←）">‹</button>
-      <span className="bd-proto-t">
-        <b>{variant}</b> — {names[variant]}
-      </span>
-      <button onClick={next} title="下一个摆法（→）">›</button>
-      <button className="bd-proto-x" onClick={() => setOpen(false)} title="收起">⌄</button>
-    </div>
-  )
-}
+// ─────────────── 变体切换：也删了（三种摆法本来就是"翻着挑"的临时形态）───────────────
+/* A / B / C 三套摆法存在的唯一理由是**给关系面板找地方**（右栏 / 抽屉 / 左列）。
+   面板没了，它们就没有意义了 —— 用户说"删掉"，所以连 `?variant=` 和左右方向键都收走，
+   白板只剩一种样子：画布占满，工具条贴底。 */
 
 // ────────────────────────────── 小工具 ──────────────────────────────
-
-function readVariant() {
-  if (typeof window === 'undefined') return 'A'
-  const m = /[?&]variant=([ABC])/i.exec(window.location.search)
-  return m ? m[1].toUpperCase() : 'A'
-}
 
 /* 打开时用哪种纸：**地址栏 > 上次选的 > 默认纯白**。
    地址栏放在最前面是有用的：`?paper=grid` 能一次把纸定死，
@@ -2587,17 +2997,6 @@ function readPaper() {
     /* 隐私模式下读不了，用默认 */
   }
   return DEFAULT_PAPER
-}
-
-function setVariantAndUrl(v, setVariant) {
-  setVariant(v)
-  try {
-    const u = new URL(window.location.href)
-    u.searchParams.set('variant', v)
-    window.history.replaceState(null, '', u.toString())
-  } catch {
-    /* 地址栏改不了就算了，变体本身已经切了 */
-  }
 }
 
 function load(text, file) {
@@ -2642,7 +3041,12 @@ function isPenBarrel(e) {
 
 /* 整笔平移。★ points 必须保持那个**扁平**数组格式（x, y, 压力 三连），
    这是这个项目的铁律 —— 见 lib/board.js 顶部的说明，
-   内存里一旦换成对象数组，画布就会把一笔 10 个点读成 3 个。 */
+   内存里一旦换成对象数组，画布就会把一笔 10 个点读成 3 个。
+   ★ 图形那一笔（`shape`）的参数**必须一起搬**，而且要用同一个 module 的那句话：
+     读盘时点会被 `shape` **重烤一遍**（board.js 的 normalizeStroke 里那条不变量），
+     所以"只搬点、不搬 shape"的结果是**这一块自己弹回原处**。
+     症状和剪贴板那条一模一样（复制/粘贴、整组拖动都会中）——
+     而笔迹的点、包围盒、状态栏全都是对的，又是一条静默故障。 */
 function shiftStroke(stroke, dx, dy) {
   const pts = stroke.points
   const out = new Array(pts.length)
@@ -2651,7 +3055,20 @@ function shiftStroke(stroke, dx, dy) {
     out[i + 1] = pts[i + 1] + dy
     out[i + 2] = pts[i + 2]
   }
-  return { ...stroke, points: out }
+  const next = { ...stroke, points: out }
+  if (stroke.shape) {
+    const sh = translateShape(stroke.shape, dx, dy)
+    if (sh) next.shape = sh
+    else delete next.shape
+  }
+  return next
+}
+
+/* 整张卡平移（框住一坨东西整体拖走时要跟着走）。
+ * ★ 只改 `x/y` —— 倍率和旋转都是"这张卡自己长什么样"，平移一个像素都不该碰它们
+ *   （`rot` 还是那个 `rot`，卡片照样是斜的，只是挪了个地方）。 */
+function shiftCard(card, dx, dy) {
+  return { ...card, x: card.x + dx, y: card.y + dy }
 }
 
 function clearLive(liveRef) {

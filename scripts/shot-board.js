@@ -1,14 +1,15 @@
-/* 切换白板摆法并截一张图。
+/* 白板截一张图（"自己看一眼"用）。
  *
- * 跑：node scripts/shot-board.js [A|B|C] [输出路径]
+ * 跑：node scripts/shot-board.js [输出路径]
  * 为什么单独做一个小工具：在浏览器里改完东西、想"自己看一眼"的时候，
- * 每次都手搓一段 CDP 脚本太慢，而且容易漏掉"切回默认摆法"这一步 ——
- * 我就是漏了，结果截出来一张变体 C 的错位图，白吓了一跳。
+ * 每次都手搓一段 CDP 脚本太慢 —— 而这个应用有一半的毛病（错位、被浮层压住、
+ * 白得像没画上）**只有看一眼才知道**。
+ * ⚠ 2026-09-19：这里原来还带"先切到某个摆法"——那块关系面板和 A/B/C 三套摆法
+ *   一起删掉了（白板只剩一种样子），所以现在只有"滚回顶部、量一下、截一张"。
  */
 const CDP = process.env.CDP_URL || 'http://127.0.0.1:9222'
 const APP = process.env.APP_URL || 'http://127.0.0.1:5177/'
-const want = (process.argv[2] || 'A').toUpperCase()
-const outPath = process.argv[3] || '.cache/board-shot.png'
+const outPath = process.argv[2] || '.cache/board-shot.png'
 
 import fs from 'node:fs'
 
@@ -38,18 +39,6 @@ const send = (method, params = {}) =>
 const ev = (expr) => send('Runtime.evaluate', { expression: expr, returnByValue: true }).then((r) => r.result && r.result.value)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// 切摆法：点切换器按钮，直到 class 对上。
-// ⚠ 必须先点开那个角标 —— 切换器默认收起成 .bd-proto-mini，
-//   展开后才有 .bd-proto 和里面的按钮。漏了这一下就永远切不动
-//   （循环空转 5 次，class 一直是 variant-A）。
-await ev(`(() => { const m = document.querySelector('.bd-proto-mini'); if (m) m.click(); return 1 })()`)
-await sleep(300)
-for (let i = 0; i < 5; i++) {
-  const cls = await ev(`document.querySelector('.bd').className`)
-  if (cls && cls.includes('variant-' + want)) break
-  await ev(`(() => { const b = document.querySelectorAll('.bd-proto button')[1]; if (b) b.click(); return 1 })()`)
-  await sleep(320)
-}
 await sleep(400)
 // 先滚回顶部再量/截图：上一轮测试如果滚过页面，量到的是"视口外的位置"，
 // 截出来会是一张黑图，看着像白板崩了 —— 我就是这么被自己吓过一次。
@@ -72,6 +61,6 @@ console.log('  ' + JSON.stringify(info))
 const shot = await send('Page.captureScreenshot', { format: 'png' })
 fs.mkdirSync('.cache', { recursive: true })
 fs.writeFileSync(outPath, Buffer.from(shot.data, 'base64'))
-console.log(`  截图：${outPath}（摆法 ${want}）`)
+console.log(`  截图：${outPath}`)
 ws.close()
 process.exit(0)

@@ -33,7 +33,7 @@
 
 import { cardBounds, rectCenter, toFlat, toPoints } from './geometry.js'
 import { linkId } from './board.js'
-import { CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById } from './nodes.js'
+import { CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from './nodes.js'
 import {
   ARROW_LINK, DEFAULT_LINK, LINK_KINDS, isLinkKind, linkKind, parseCond,
 } from './link-kinds.js'
@@ -544,6 +544,13 @@ function buildLinks(board, inkInput) {
   const boxes = ((board && board.cards) || []).map((c) => ({ id: c.id, r: cardBounds(c) }))
   const byId = new Map(all.map((s) => [s.id, s]))
   const ink = inkInput || createInkIndex(all, (board && board.frames) || [])
+  /* ★ 端点清单**算一次**（2026-09-18 修"一放板框就巨卡"）——
+     下面那个循环每一笔都要问两次"这一点落在谁身上"，而
+     `nodeAt` 默认每次自己 `nodeList(board)` → 每个板框都重跑一遍 `frameBounds`
+     （= 把框里几百笔逐点扫一遍求包围盒）。实测 1451 笔 + 777 笔的框 = **549ms**，
+     而它在拖动板框时**每一帧**都要跑一次（那时 strokes 换新引用 → 整个 reader 重来）
+     → 用户看到的"巨卡"。算一次之后这一趟是 O(笔数)，不再是 O(笔数 × 框成员数)。 */
+  const nodes = nodeList(board)
   const out = []
   /* 成了连接的那些笔：条件那一趟要把它们排除掉 ——
      别的连接线不是"内容"，不该被当成某条关系的条件（实测：两条卡间连线交叉时，
@@ -557,8 +564,8 @@ function buildLinks(board, inkInput) {
     const last = pts[pts.length - 1]
     /* 免费路：两头各落在**一张卡片**里（宽容 CARD_HIT_PAD）——
        判据住在 nodes.js（"这一点落在谁身上"那一层），这里不再自己写一份 pointInRect。 */
-    const ca = nodeAt(board, first, { kinds: ['card'], pad: CARD_HIT_PAD })
-    const cb = nodeAt(board, last, { kinds: ['card'], pad: CARD_HIT_PAD })
+    const ca = nodeAt(board, first, { kinds: ['card'], pad: CARD_HIT_PAD, nodes })
+    const cb = nodeAt(board, last, { kinds: ['card'], pad: CARD_HIT_PAD, nodes })
     if (!ca || !cb || ca.id === cb.id) continue
     /* 手动标过的词：你点过那排词就有（`stroke.link`），否则「相关」。 */
     const manualStroke = isLinkKind(s.link) ? s : null
@@ -694,8 +701,10 @@ export function readDeclaredLinks(board, ink) {
      `ReferenceError: cards is not defined`，整块白板当场白屏。
      自检里那条"指一个条件 → 写在 links[i].cond 上，再读回来"就是照它的。 */
   const cards = (board && board.cards) || []
-  /* 两端按 id 取节点：判据（卡片 / 板框、框的成员全没了就不画）住在 nodes.js 一处 */
-  const nodeFor = (id) => nodeById(board, id)
+  /* 两端按 id 取节点：判据（卡片 / 板框、框的成员全没了就不画）住在 nodes.js 一处。
+     ★ 端点清单算一次再进循环（同上：不然每条连接都重建一遍全板的 `frameBounds`）。 */
+  const nodes = nodeList(board)
+  const nodeFor = (id) => nodeById(board, id, nodes)
   const out = []
   for (const rec of (board && board.links) || []) {
     const na = nodeFor(rec.from)
@@ -703,8 +712,11 @@ export function readDeclaredLinks(board, ink) {
     if (!na || !nb) continue
     const p0 = rectCenter(na.box)
     const p1 = rectCenter(nb.box)
-    const from = edgePointOf(na.box, p1)
-    const rawTo = edgePointOf(nb.box, p0)
+    /* ★ 边点用 `rect`（**没转的那个**可视矩形）—— 卡片转过之后拿外接框求边点，
+       尖会停在离卡片还有一段的空中（见 nodes.js 的 `edgePointOf`）。
+       板框没有 `rect`（它的框线本来就是轴对齐的），回退到 `box`。 */
+    const from = edgePointOf(na.rect || na.box, p1)
+    const rawTo = edgePointOf(nb.rect || nb.box, p0)
     const u0 = unit(from, rawTo)
     /* 尖停在框边上再让开一点点（LINK_GAP）：贴死看着像"插进卡片里"。 */
     const to = u0 ? { x: rawTo.x - u0.x * LINK_GAP, y: rawTo.y - u0.y * LINK_GAP } : rawTo

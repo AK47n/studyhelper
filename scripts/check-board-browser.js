@@ -6,7 +6,7 @@
  *  ⑤ 双击公式卡能编辑，写 dS/dt 就排成分式
  *  ⑥ ★ 墨迹和卡片对齐（这一条只有真浏览器能测，今天栽了三次）
  *  ⑦ 截图，自己也看一眼
- *  ⑧ 三种摆法都能切，切完还能画
+ *  ⑧ 白板**只有一种布局**（画布占满 + 贴底工具条），而且照样画得出来、存得下去
  *
  * 为什么非要在真浏览器里跑：jsdom 没有真实尺寸、没有 canvas、没有指针事件 ——
  * 白板恰恰全靠这三样。单元测试（check-board.js）能保证"算得对"，
@@ -110,9 +110,12 @@ console.log('\n[1] 打开就是白板')
       cards: q('.bd-card'),
       edges: q('.bd-edge'),
       tools: q('.bd-tools .bd-t'),
-      /* 摆法切换器默认是**收起**的，收起时只有角标 .bd-proto-mini，
-         展开后才是 .bd-proto（见 Board.jsx 的 VariantSwitcher）。两个都算"在"。 */
-      proto: !!document.querySelector('.bd-proto') || !!document.querySelector('.bd-proto-mini'),
+      /* ★ 2026-09-19：右侧那块关系面板（.bd-cpanel）和三套摆法切换器（.bd-proto*）
+         整块删掉了 —— 白板只剩一种样子。这里**反过来钉**：它们一个都不许再出现。
+         （删掉一块压在画布上的浮层之后，最容易的失误就是某个角落还留着一份，
+         而它照样点得到、照样挡住画布 —— 那正是当年 check-link [10] 抓过的病。） */
+      panel: q('.bd-cpanel') + q('.bd-rel') + q('.bd-drawer') + q('.bd-clist') + q('.bd-csplit'),
+      proto: q('.bd-proto') + q('.bd-proto-mini'),
       file: (document.querySelector('.bd-file') || {}).textContent || '(空)',
       stageH: (document.querySelector('.bd-stagewrap') || {}).clientHeight || 0,
     }
@@ -133,8 +136,10 @@ console.log('\n[1] 打开就是白板')
   else bad(`连线只有 ${info.edges} 条，期望 ≥3（2 包含 + 1 挨着）`)
   if (info.tools >= 8) ok(`工具条按钮 ${info.tools} 个`)
   else bad(`工具条只有 ${info.tools} 个按钮`)
-  if (info.proto) ok('摆法切换器在（给你挑完就该删掉的那个）')
-  else bad('没有摆法切换器 —— 那三套摆法就挑不了了')
+  if (info.panel === 0) ok('右侧那块关系面板真的不在了（.bd-cpanel / .bd-rel / .bd-drawer / .bd-clist / .bd-csplit 一个都没有）')
+  else bad(`画布上还压着 ${info.panel} 个关系面板的容器 —— 它删不干净，而它照样挡画布`)
+  if (info.proto === 0) ok('摆法切换器也没了（A/B/C 三套跟着面板一起删）')
+  else bad(`摆法切换器还在（${info.proto} 个）—— 面板没了，它已经切不动任何东西`)
   console.log('      当前文件：' + info.file)
 }
 
@@ -512,43 +517,53 @@ console.log('\n[7] 截图（自己也看一眼）')
   ok(`截图存到 ${SHOT}（${Math.round(fs.statSync(SHOT).size / 1024)} KB）`)
 }
 
-console.log('\n[8] 三种摆法都能切（点切换器按钮，走的是真路径）')
+console.log('\n[8] 白板只剩一种布局：画布占满容器 + 工具条贴底，而且照样画得出来、存得下去')
 {
-  /* 先点开切换器。它默认收起成角标 .bd-proto-mini，展开后才渲染 .bd-proto，
-     里面的按钮才存在。这里曾经漏了这一下：自检一直找不到 .bd-proto button，
-     于是 B / C 永远切不过去，报"切到 B 失败"—— 错在自检不知道它默认收起，
-     不在白板。空转 4 次也切不动的那个 for 循环就是证据。 */
-  await s.eval(`(() => { const m = document.querySelector('.bd-proto-mini'); if (m) m.click(); return 1 })()`)
-  await s.sleep(300)
-
-  for (const v of ['A', 'B', 'C']) {
-    // 点"下一个"直到到位 —— 比直接改 URL 更接近用户真会做的事
-    for (let i = 0; i < 4; i++) {
-      const cls = await s.eval(`document.querySelector('.bd').className`)
-      if (cls.includes('variant-' + v)) break
-      await s.eval(`(() => { const b = document.querySelectorAll('.bd-proto button')[1]; if (b) b.click(); return 1 })()`)
-      await s.sleep(330)
-    }
-    const state = await s.eval(`(() => ({
+  /* 2026-09-19 用户：「白板页面我觉得不需要右侧关系栏，可以删掉了」。
+     面板删掉之后 A/B/C 三套摆法也就没有意义了（它们存在的唯一理由就是给面板找地方：
+     右栏 / 抽屉 / 左列），于是 `?variant=` 和左右方向键一起收走。
+     ★ 这一节因此改成钉两件事：
+       · 「删干净了」的判据**不只是面板不在**（[1] 已经钉过）—— 当年那三套摆法是靠
+         给 `.bd-stagewrap` 加 `margin-left` / 把工具条右移来让位的，**那些让位必须一起回来**，
+         否则画布会莫名其妙窄 300px 而没有人抱怨（[1] 查不出这种事）。
+         所以这里比的是**画布宽度 ≈ 容器宽度**。
+       · 布局变了之后照样能画、能存（最容易坏的就是这个）。 */
+  const layout = await s.eval(`(() => {
+    const shell = document.querySelector('.bd-shell')
+    const stage = document.querySelector('.bd-stagewrap')
+    return {
       cls: document.querySelector('.bd').className,
       url: location.search,
+      shellW: shell ? Math.round(shell.getBoundingClientRect().width) : 0,
+      stageW: stage ? Math.round(stage.getBoundingClientRect().width) : 0,
+      stageH: stage ? stage.clientHeight : 0,
+      bar: !!document.querySelector('.bd-cbar'),
       canvas: document.querySelectorAll('canvas').length,
       hit: !!document.querySelector('.bd-hit'),
       tools: document.querySelectorAll('.bd-tools').length,
-      stageH: (document.querySelector('.bd-stagewrap') || {}).clientHeight || 0,
-    }))()`)
-    if (state.cls.includes('variant-' + v)) ok(`摆法 ${v} 切过去了（url「${state.url}」）`)
-    else bad(`切到 ${v} 失败，现在的 class 是「${state.cls}」`)
-    if (state.canvas === 2 && state.hit && state.tools === 1 && state.stageH > 300) {
-      ok(`摆法 ${v} 下画布 / 收事件层 / 工具条都在（画布高 ${state.stageH}px）`)
-    } else {
-      bad(`摆法 ${v} 下白板缺件：${JSON.stringify(state)}`)
     }
+  })()`)
+  if (!/variant-/.test(layout.cls)) ok(`白板根节点上没有 variant- 了（「${layout.cls}」）`)
+  else bad(`还有 variant- 的类：${layout.cls}`)
+  if (!/variant=/.test(layout.url)) ok(`地址栏里也没有 ?variant= 了（「${layout.url || '(空)'}」）`)
+  else bad(`地址栏还挂着 variant —— 那条路已经不存在了：${layout.url}`)
+  if (layout.stageH > 300) ok(`画布有高度（${layout.stageH}px）`)
+  else bad(`画布高度只有 ${layout.stageH}px —— 容器塌了`)
+  if (layout.stageW >= layout.shellW - 2) {
+    ok(`画布占满了容器（画布 ${layout.stageW}px / 容器 ${layout.shellW}px）—— 没有哪一段还让给面栏`)
+  } else {
+    bad(`画布只有 ${layout.stageW}px，容器有 ${layout.shellW}px —— 右边/左边还空着一段（摆法那套让位没清干净？）`)
   }
-  // 切完摆法还能不能画 —— 这是最容易"切一下就画不出来"的地方
+  if (layout.canvas === 2 && layout.hit && layout.tools === 1 && layout.bar) {
+    ok('画布 / 收事件层 / 工具条都在')
+  } else {
+    bad(`白板缺件：${JSON.stringify(layout)}`)
+  }
+
+  // 改了布局之后还能不能画 —— 这是最容易"动一下就画不出来"的地方
   const empty2 = await findEmptyRun({ need: 140 })
   if (!empty2) {
-    bad('切过摆法之后画布区里找不到空白处可以画')
+    bad('画布区里找不到空白处可以画')
   } else {
     const point = { x: empty2.x0 + 20, y: empty2.y }
     await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1 })
@@ -560,8 +575,8 @@ console.log('\n[8] 三种摆法都能切（点切换器按钮，走的是真路�
   // 存盘是 700ms 防抖 + 写盘；等待给宽一点，否则偶发卡在边界上报「正在存…」
   await s.sleep(2400)
   const saved = await s.eval(`(() => { const e = document.querySelector('.bd-save'); return e ? e.textContent : null })()`)
-  if (saved === '已存') ok('切过摆法之后照样能画、能存')
-  else bad(`切过摆法之后画不出来了（状态「${saved}」）`)
+  if (saved === '已存') ok('画完之后照样能存')
+  else bad(`画完之后存不下去（状态「${saved}」）`)
 }
 
 console.log('\n[9] ★ 页面上不许有报错')

@@ -96,8 +96,41 @@ export function strokeBounds(stroke) {
   return { x: minX - pad, y: minY - pad, w: maxX - minX + w, h: maxY - minY + w }
 }
 
+/* 一张卡片**画在纸上的样子**：布局尺寸 × 倍率，再绕自己的中心转 `rot`。
+ *
+ * ★ 为什么单开这一个函数（2026-09-21）：卡片现在有**两个**尺寸概念（`w/h` 是布局尺寸、
+ *   `scale` 是倍率）和一个姿态（`rot`）。它们各自在三个地方被乘一遍的话，
+ *   总有一处会漏乘（README 第 15/16 条那一族的账：同一个矩形两处各算一遍，
+ *   就一定有一处忘了乘别的东西）。所以"肉眼看到的那个矩形"只有这一份：
+ *     `{ x, y, w, h, cx, cy, rot }` —— x/y/w/h 是**没转的**那个矩形（中心在 cx,cy）。
+ *   ⚠ 它和 `strokeBounds` 一样是**世界坐标**；屏幕那一半在 view.js。
+ * ⚠ `scale` 在这里只做兜底（`normalizeCard` 已经把它夹在 0.5~4 了）。
+ *   **不能 import board.js 的 clampCardScale** —— board.js 要 import 这里的 toFlat，
+ *   反过来就是环（这个仓库为这件事专门写过一条注释，见文件头）。 */
+export function cardVisualRect(c) {
+  const k = Number(c && c.scale) > 0 ? Number(c.scale) : 1
+  const w = (Number(c && c.w) || 0) * k
+  const h = (Number(c && c.h) || 0) * k
+  const x = Number(c && c.x) || 0
+  const y = Number(c && c.y) || 0
+  return { x, y, w, h, cx: x + w / 2, cy: y + h / 2, rot: Number(c && c.rot) || 0 }
+}
+
+/* 卡片的**外接矩形**（轴对齐，世界坐标 {x,y,w,h}）。
+ * ★ 含倍率和旋转 —— 关系（包含/重叠/挨着）、板框的框线、"装回屏幕"都吃这一个：
+ *   一张转过 30° 的卡，肉眼看到的范围就是它的外接框；拿没转的那个矩形去判关系，
+ *   会出现"明明叠在一起却说挨着"。
+ * ⚠ 代价说清楚：轴对齐的外接框对**斜着的**卡略微偏大（四角那一圈）。
+ *   这是已知且接受的近似 —— 真按旋转矩形判交，收益是几个像素、代价是这一族
+ *   所有判据都要重写一遍；而且"包含"那条本来就有 CONTAIN_RATIO 的余量。 */
 export function cardBounds(c) {
-  return { x: c.x, y: c.y, w: c.w, h: c.h }
+  const r = cardVisualRect(c)
+  if (!r.rot) return { x: r.x, y: r.y, w: r.w, h: r.h }
+  const co = Math.abs(Math.cos(r.rot))
+  const si = Math.abs(Math.sin(r.rot))
+  const w = r.w * co + r.h * si
+  const h = r.w * si + r.h * co
+  return { x: r.cx - w / 2, y: r.cy - h / 2, w, h }
 }
 
 /* 一组笔迹的包围盒（世界坐标，**不带线宽**）。
@@ -317,7 +350,13 @@ function dedupePoints(points) {
  */
 export function buildRelations(board) {
   const cards = (board && board.cards) || []
-  const boxes = cards.map((c) => ({ id: c.id, r: cardBounds(c), area: c.w * c.h, seq: cards.indexOf(c) }))
+  /* ★ 面积按**外接框**算，不按 `c.w * c.h`（2026-09-21）：判重叠用的是 `r`，
+     判"大框包住小框"却用另一个数的话，两张各自都是同一个倍率的卡会比出不同的结论 ——
+     "包含"那条就会时而成立时而不成立（同一个矩形两份算法，这个仓库记了十几条账）。 */
+  const boxes = cards.map((c) => {
+    const r = cardBounds(c)
+    return { id: c.id, r, area: r.w * r.h, seq: cards.indexOf(c) }
+  })
   const edges = []
   const parentOf = new Map()
   const children = new Map()
