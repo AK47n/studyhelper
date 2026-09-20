@@ -21,7 +21,8 @@ import { extractFilePart, extractTextPart, buildMultipart } from '../src/lib/mul
 import { httpRequest } from '../src/lib/http.js'
 import { cleanText, interpretOcrResponse } from '../src/lib/ocr.js'
 import {
-  DEFAULT_CONFIG, PROVIDERS, TEXT_PROMPT, authHeaders, callDeepSeek, callProvider, callSimpleTex, cleanLatex,
+  BOARD_PROMPT, BOARD_LINES_PROMPT, DEFAULT_CONFIG, DOC_PROMPT, PROVIDERS, STRUCT_PROMPT, TEXT_PROMPT, authHeaders, boardLinesPrompt,
+  callDeepSeek, callProvider, callSimpleTex, cleanLatex,
   cleanModelOutput, cleanTextOutput, configFile, endpointOf, hasKey, loadConfig, normalizeConfig, parseProviderResponse,
   publicStatus, saveConfig, testProvider, tinyWhitePng,
 } from '../server-ocr.js'
@@ -487,6 +488,8 @@ console.log('\n[8] mode=text：认普通文字')
     const t = Array.isArray(c) ? c.find((x) => x.type === 'text') : null
     return (t && t.text) || ''
   }
+  /* content 块本身（`[文字]` 还是 `[文字, 图]`）—— 结构整理那一趟必须**没有图**。 */
+  const msgContent = (req) => req && req.json && req.json.messages && req.json.messages[0] && req.json.messages[0].content
   const pText = promptOf(seen[0])
   if (pText === TEXT_PROMPT) ok('发出去的是认文字那段提示词（原样，没被改过）')
   else bad('提示词不对：' + pText.slice(0, 80))
@@ -501,6 +504,48 @@ console.log('\n[8] mode=text：认普通文字')
   eq(rf.latex, 'B=\\frac{a}{b}', '不传 mode（老调用方）→ 还是走公式那条路')
   if (promptOf(seen[1]) !== TEXT_PROMPT) ok('公式模式发的仍是公式提示词（两条路没有串）')
   else bad('公式模式也发成了文字提示词 —— 老功能会认出一堆解释')
+  /* 板框脚手架（2026-09-19 晚）：图里会画进浅灰虚线框，提示词必须说清"它只是记号"，
+     不然模型把框线当内容抄，草稿里就长出一堆"□"。 */
+  if (/虚线框/.test(BOARD_PROMPT) && /分区记号/.test(BOARD_PROMPT) && /照常转录/.test(BOARD_PROMPT)) {
+    ok('整板转录的提示词说清了虚线框只是分区记号（板框脚手架那刀）')
+  } else bad('BOARD_PROMPT 缺"虚线框是分区记号、框内照常转录"那句 —— 模型会把框线当内容抄')
+
+  /* ── 第 4 步：两趟分开（按行抄 / 结构整理）──────────────────────────────
+     ① 带行清单时换成 BOARD_LINES_PROMPT，而且清单是**拼进去**的；
+     ② 不带清单时退回老 BOARD_PROMPT（行为可预测，老调用方一个字不用改）；
+     ③ 结构整理那一趟**一张图都不发**（content 里只有文字）。 */
+  seen.length = 0
+  reply = { code: 200, body: { choices: [{ message: { content: 'L1|甲\nL2-3|$\\frac{a}{b}$' } }] } }
+  const rl = await callProvider(ds, png, { mode: 'board', lines: '行清单（这一块从上到下共 3 行）：\nL1 位于 0% 高度，居中' })
+  eq(rl.ok, true, '带行清单的整板转录照旧成功')
+  eq(promptOf(seen[0]).includes('L1 位于 0% 高度'), true, '★ 行清单被拼进了提示词（模型得先知道有几个行号）')
+  eq(/\{\{LINES\}\}/.test(promptOf(seen[0])), false, '占位符被替换掉了（没漏出去）')
+  eq(/L<行号>\|/.test(promptOf(seen[0])), true, '提示词里写明了 `L<行号>|` 这个契约')
+  eq(/L5-6\|/.test(promptOf(seen[0])), true, '★ 也写明了"几行其实是一整块东西"时的范围写法（分数/矩阵）')
+  eq(rl.text, 'L1|甲\nL2-3|$\\frac{a}{b}$', '认回来的原文一个字不改（行号是契约的一部分，不能剥）')
+  seen.length = 0
+  const rl2 = await callProvider(ds, png, { mode: 'board' })
+  eq(promptOf(seen[0]) === BOARD_PROMPT, true, '★ 没有行清单 → 退回老 BOARD_PROMPT（老调用方行为不变）')
+  eq(rl2.ok, true, '退回老路也照样成功')
+
+  seen.length = 0
+  reply = { code: 200, body: { choices: [{ message: { content: '{"sections":[],"relations":[]}' } }] } }
+  const rs = await callProvider(ds, null, { mode: 'structure', input: 'L1：安培环路定理\nL2：只对稳恒电流成立' })
+  eq(rs.ok, true, '结构整理那一趟成功')
+  eq(rs.text, '{"sections":[],"relations":[]}', '回的就是那段 JSON（服务端**不解析**它 —— 落行校验在纯函数那边）')
+  eq(promptOf(seen[0]).includes('L1：安培环路定理'), true, '输入那段文字跟着提示词一起发了过去')
+  eq(/一个字都不要写/.test(promptOf(seen[0])), true, '★ 提示词里的铁律在：行的文字一个字都不许它写')
+  /* ★ 2026-09-20 放行的那一处（`say`）：铁律要**收窄**，不能还写成"整趟一个字都不许写" ——
+     那样模型会连 `say` 也不写，这一趟又退回"只有骨架"（用户报的正是那个）。 */
+  eq(/除了 `say`/.test(promptOf(seen[0])), true, '★ 铁律收窄成"除了 say 那一段"（不然 say 永远不会出现）')
+  eq(/唯一一处你可以自己写字的地方/.test(promptOf(seen[0])), true, '说清 `say` 是唯一可写处')
+  eq(/不许引入这些行里没有的量、数字、结论/.test(promptOf(seen[0])), true, '★ 三个不许在（放行 ≠ 放开编造）')
+  eq(/看不出这一节在讲什么，就写 null/.test(promptOf(seen[0])), true, '★ 看不出来就写 null（空的比硬凑的好）')
+  eq(/推导/.test(promptOf(seen[0])) && /等价/.test(promptOf(seen[0])), true, '五个关系词都列了（不让它自由发挥）')
+  eq(Array.isArray(msgContent(seen[0])) && msgContent(seen[0]).length === 1 && msgContent(seen[0])[0].type === 'text', true,
+    '★ 结构整理**一张图都不发**（content 里只有文字块）')
+  eq(/结构整理来自/.test(rs.note || ''), true, 'note 里报得出这一趟用的是什么（哪儿来的字要看得见）')
+
 
   srv.close()
 }

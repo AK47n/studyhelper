@@ -41,6 +41,8 @@
     "check:zoom": "node scripts/check-zoom.js",
     "check:highlighter": "node scripts/check-highlighter.js",
     "check:loaded": "node scripts/check-loaded.js",
+    "check:gather": "node scripts/check-gather.js",
+    "regather": "node scripts/regather.js",
     "diag:board": "node scripts/diag-board.js",
     "diag:pan": "node scripts/diag-pan-frame.js",
     "diag:interact": "node scripts/diag-interact.js",

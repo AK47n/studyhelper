@@ -198,7 +198,7 @@ function paperGeometry(view, paperId) {
   }
 }
 
-export default function Board({ file, initialText, reloadToken, onSave, flash, scale, onScale, onScaleReset, fullscreen, onToggleFullscreen }) {
+export default function Board({ file, initialText, reloadToken, onSave, flash, scale, onScale, onScaleReset, fullscreen, onToggleFullscreen, onGatherNote }) {
   const [board, setBoard] = useState(() => load(initialText, file))
   const [tool, setTool] = useState('pen')
   const [color, setColor] = useState(COLORS[0].v)
@@ -2379,6 +2379,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       paper={paper} onPaper={pickPaper}
       onWriteFormula={() => setPadOpen(true)}
       onBeautify={() => openInkPanel('text')}
+      /* 收拢成笔记：把**当前这块活板**（boardRef，不是打开时的那份原文 ——
+         上面刚认出来的一张卡也要算数）递给 App，草稿和建文件都在那边。 */
+      onGather={() => onGatherNote && onGatherNote(boardRef.current)}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
       onFit={() => {
@@ -2869,6 +2872,17 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
             ★ 框住之后浮层上还会多一个「∑ 公式」——已经写在板上的式子不用重抄一遍。 */}
         <button className="bd-t" onClick={onBeautify} title="美化手写：先框住你写的字（点「⬚ 框选」拖一个框，或按住笔杆键拖），再点这里">
           ✨ 美化手写
+        </button>
+        {/* 收拢成笔记：白板是过程，笔记是结论。卡片/板框/连接拣成草稿；
+            裸手写不再丢下 —— 整板画成一张图发给识别服务抄成 Markdown（要几十秒）。
+            ★ 没配识别密钥时转录会失败，但**不拦路**：照样收卡片，提示说清原因。 */}
+        <button
+          className="bd-t"
+          data-tool="gather"
+          onClick={onGather}
+          title="收拢成笔记：卡片/板框/连接拣成草稿 + 整板手写由机器转录成文字（有手写时要几十秒；没配识别密钥就只收卡片）"
+        >
+          ▤ 收成笔记
         </button>
       </div>
 

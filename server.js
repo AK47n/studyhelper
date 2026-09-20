@@ -598,6 +598,42 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, r)
   }
 
+  /* 结构整理（2026-09-19，ADR-0004 第 4 步）：**不看图的第二次调用**。
+     收一段纯文本（行清单 + 每行的字 + 你自己的词），回一个 JSON 骨架。
+     ★ 和 /api/ocr 分开是**故意的**：那个口的契约是"一张图 → 一段字"，
+       这里一张图都没有 —— 混在一起会让人以为"结构也是从图上认出来的"。
+     ⚠ 这一层**不解析、不校验**它回的 JSON：落行校验是纯函数
+       （src/lib/board-structure.js），在自检里断言得住；在这儿再解析一遍
+       等于把同一份规矩写两处（这个仓库为"同一句话两份实现"栽过两次）。 */
+  if (p === '/api/structure' && req.method === 'POST') {
+    const cfg = await loadConfig(__dirname)
+    if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
+    const body = await readBody(req)
+    let input = ''
+    try {
+      input = String(JSON.parse(body || '{}').input || '')
+    } catch {
+      return sendJson(res, 400, { ok: false, kind: 'bad', error: '结构整理的请求不是合法 JSON' })
+    }
+    if (!input.trim()) return sendJson(res, 200, { ok: false, kind: 'bad', error: '结构整理的输入是空的' })
+    /* 上限：这个口是给本机页面用的，但"顺手当代理"不该发生（行清单撑死几 KB）。 */
+    if (input.length > 200000) return sendJson(res, 200, { ok: false, kind: 'bad', error: '结构整理的输入太大了' })
+
+    const r = await callProvider(cfg, null, { mode: 'structure', input, timeoutMs: 60000 })
+    if (!r.ok) {
+      console.log(`  [结构整理] 失败（${r.kind}）：${r.error}`)
+      return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
+    }
+    console.log(`  [结构整理] 回了 ${String(r.text).length} 个字的骨架（输入 ${input.length} 字）`)
+    return sendJson(res, 200, {
+      ok: true,
+      mode: 'structure',
+      text: r.text,
+      note: r.note || '',
+      debug: { chars: input.length, endpoint: cfg.provider === 'simpletex' ? 'simpletex' : cfg.dsBase },
+    })
+  }
+
   if (p === '/api/ocr' && req.method === 'POST') {
     const cfg = await loadConfig(__dirname)
     if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
@@ -625,13 +661,23 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, { ok: false, kind: 'bad', error: '收到的不是 PNG/JPEG 图片' })
     }
 
-    const r = await callProvider(cfg, img, { mode })
+    /* 整板转录的图大（一整块板）、模型要读的东西多，30 秒常不够 —— 给它 120 秒。
+       课件整理也是一页图、输出还长（一页几条知识点 + LaTeX），给 90 秒。
+       `lines`（2026-09-19，第 4 步）：第一趟"按行抄"要把**行清单**拼进提示词。
+       它是一条文字字段，和 mode 一样从 multipart 里读；没有它就走老的 BOARD_PROMPT。
+       `page`（2026-09-22）：课件整理要**页码** —— 它落在提示词里（"这一页是第 N 页"），
+       模型据此把每条知识点挂到页上。别的一律不读这个字段。 */
+    const linesRaw = extractTextPart(raw, req.headers['content-type'] || '', 'lines')
+    const pageRaw = Number(extractTextPart(raw, req.headers['content-type'] || '', 'page')) || 0
+    const timeoutMs = mode === 'board' ? 120000 : mode === 'doc' ? 90000 : 30000
+    const r = await callProvider(cfg, img, { mode, timeoutMs, lines: linesRaw || '', page: pageRaw })
     if (!r.ok) {
       console.log(`  [手写识别] 失败（${r.kind}）：${r.error}`)
       return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
     }
-    if (mode === 'text') {
-      console.log(`  [手写美化] 认出文字：${String(r.text).slice(0, 70).replace(/\n/g, ' ⏎ ')}`)
+    if (mode === 'text' || mode === 'board' || mode === 'doc') {
+      const who = mode === 'board' ? '整板转录' : mode === 'doc' ? '课件整理' : '手写美化'
+      console.log(`  [${who}]${mode === 'doc' ? `（第 ${pageRaw} 页）` : ''} 回了：${String(r.text).slice(0, 70).replace(/\n/g, ' ⏎ ')}`)
       return sendJson(res, 200, {
         ok: true,
         mode,

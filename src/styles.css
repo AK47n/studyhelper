@@ -1878,4 +1878,71 @@ kbd {
 .wp-prov input { margin-top: 3px; }
 .wp-prov > span { display: flex; flex-direction: column; gap: 2px; }
 
+/* ────────────────────────── 转录校对（.trv，2026-09-19 晚）──────────────────────────
+   整板转录认完后、落笔前的人机接手点：左边原板图、右边机器认的稿，并排改。
+   骨架样式（弹层卡片、头部、按钮）蹭 .wp 那一套 —— 组件上同时挂了 wp 类，
+   这里只写差异和它自己的东西。 */
+.trv-back {
+  position: fixed; inset: 0; z-index: 420; /* > busy 遮罩(100)，校对时不让人点到板 */
+  background: rgba(8, 11, 16, 0.62);
+  display: grid; place-items: center; padding: 20px;
+}
+/* .wp 是 min(760px,94vw)，这个界面的对照要更宽 */
+.trv { width: min(1180px, 96vw); }
+.trv-warn {
+  margin: 10px 18px 0; padding: 8px 11px;
+  border: 1px dashed #e0d3a6; border-radius: 8px; background: #fffbe9; color: #5c4a12;
+  font-size: calc(12.5px * var(--s));
+}
+.trv-body { overflow: auto; padding: 12px 18px; display: flex; flex-direction: column; gap: 16px; }
+.trv-band {
+  display: grid; grid-template-columns: minmax(200px, 1fr) minmax(200px, 1fr);
+  gap: 12px; align-items: stretch;
+}
+/* 块名：一块 = 你圈的一个板框（2026-09-19 第 2 步）。横跨两栏摆在最上面 ——
+   校对的人得先知道"我在改哪一节"，而这个名字最后就是草稿里那一节的名字。 */
+.trv-name {
+  grid-column: 1 / -1;
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: calc(13px * var(--s)); color: #e6ebf4;
+  padding-bottom: 2px; border-bottom: 1px solid #232a37;
+}
+.trv-name b { font-weight: 600; }
+/* 「正在识别…」/「上次认的」：块名那一行右侧的两颗小标（第 3 步）。
+   为什么值得有：一是等待期间看得见"还在认哪一块"，二是"这次没花钱"这件事
+   应该一眼看得出来（缓存命中 = 没发请求）。 */
+.trv-tag {
+  margin-left: auto; padding: 1px 7px; border-radius: 999px;
+  font-size: calc(11px * var(--s));
+  background: #2b3342; color: #cfd7e6; border: 1px solid #39435a;
+}
+.trv-tag.ok { background: #16351f; color: #b6e6c4; border-color: #24512f; }
+/* 重新认这一块（只重发这一块）。它跟着块名那一行走，所以标签用 margin-left:auto 推右边时
+   得让它在标签之后 —— 靠 flex 的排列顺序即可。 */
+.trv-retry { font-size: calc(11.5px * var(--s)); padding: 2px 8px; }
+/* 还在认的那一块：整块压暗一点，读得出"还没轮到它" */
+.trv-band.on .trv-edit { opacity: 0.55; }
+.trv-band.on .trv-img { opacity: 0.75; }
+/* 这一块认得怎么样（第 4 步）：几行认到了、漏了哪几行、"没按行回话"。
+   ⚠ 它挨着块名摆、不抢眼 —— 校对的人扫一眼就知道该盯哪一块。 */
+.trv-cov { font-size: calc(11px * var(--s)); color: #93a1b5; }
+/* "读结构"那一趟怎么处理你自己的词：看得见、**关得掉**（这是唯一会把笔记里的字发出去的地方） */
+.trv-vocab { display: inline-flex; align-items: center; gap: 5px; margin-right: 10px; color: #cfd7e6; }
+.trv-vocab input { margin: 0; }
+.trv-warn.ok { border-color: #2f6b46; background: #10281c; color: #b7e3c6; }
+/* 原板图：发给识别的就是白底黑字，这里也白底 —— 和模型看到的完全一致 */
+.trv-img {
+  background: #fbfbf9; border: 1px solid #2e3646; border-radius: 8px;
+  overflow: auto; display: grid; place-items: center; padding: 8px; max-height: 46vh;
+}
+.trv-img img { max-width: 100%; height: auto; display: block; }
+.trv-edit {
+  width: 100%; min-height: 180px; resize: vertical;
+  background: #1c212b; color: #dde3ee; border: 1px solid #2e3646; border-radius: 8px;
+  padding: 9px 11px; font: inherit; line-height: 1.7;
+}
+.trv-edit:focus { outline: 1px solid #4b87e0; }
+.trv-acts { padding: 10px 18px; border-top: 1px solid #232a37; }
+
+
 

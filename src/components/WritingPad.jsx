@@ -303,6 +303,7 @@ export function OcrSettings({ onClose, onSaved, flash }) {
   const [base, setBase] = useState('')
   const [dsBase, setDsBase] = useState('')
   const [model, setModel] = useState('')
+  const [boardModel, setBoardModel] = useState('')
   const [advanced, setAdvanced] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState(null)
@@ -316,6 +317,7 @@ export function OcrSettings({ onClose, onSaved, flash }) {
       setBase(s.base || '')
       setDsBase(s.dsBase || '')
       setModel(typeof s.model === 'string' ? s.model : '')
+      setBoardModel(typeof s.boardModel === 'string' ? s.boardModel : '')
     })
   }, [])
 
@@ -326,6 +328,8 @@ export function OcrSettings({ onClose, onSaved, flash }) {
     if (base.trim()) patch.base = base.trim().replace(/_turbo$/, '')
     if (dsBase.trim()) patch.dsBase = dsBase.trim()
     if (model.trim()) patch.model = model.trim()
+    // boardModel **总是**带上（它不是密钥，写空 = 清掉专用档、回落到普通模型）
+    patch.boardModel = boardModel.trim()
     const r = await ocrSaveConfig(patch)
     if (!r || !r.ok) {
       flash((r && r.error) || '保存失败', 'err')
@@ -335,7 +339,7 @@ export function OcrSettings({ onClose, onSaved, flash }) {
     setToken('')
     onSaved?.(r)
     flash('存好了')
-  }, [token, provider, turbo, base, dsBase, model, flash, onSaved])
+  }, [token, provider, turbo, base, dsBase, model, boardModel, flash, onSaved])
 
   const doTest = useCallback(async () => {
     setTesting(true)
@@ -411,6 +415,20 @@ export function OcrSettings({ onClose, onSaved, flash }) {
                 <div className="dim small">
                   官方把模型名改过（旧的 <code>deepseek-v4-flash-vision-exp</code> 已下线）。
                   名字变了在这儿改，不用等改代码。
+                </div>
+              </div>
+              <div className="wp-field">
+                <label>整板转录专用模型（留空 = 和上面一样）</label>
+                <input
+                  className="wp-edit"
+                  value={boardModel}
+                  spellCheck={false}
+                  placeholder="比如更强的一档模型名"
+                  onChange={(e) => setBoardModel(e.target.value)}
+                />
+                <div className="dim small">
+                  「▤ 收成笔记」的整板转录是这条链路里最难的活（整页手写 + 要出结构），
+                  想给它配更强的一档就填这儿；美化手写、认公式照样用上面的普通档。
                 </div>
               </div>
               <div className="wp-field">

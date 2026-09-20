@@ -54,6 +54,22 @@ import { applyViewTo, centerOn, clampViewScale, combinedScale, panBy, scaledRect
    四条手势从前各自记一次账、判据四个 —— 这里用假 adapter 断言整族（见 [6s]）。 */
 import { MOVE_EPS, createHistory, sameWithin } from '../src/lib/history.js'
 import { readFileSync } from 'node:fs'
+/* 整板转录的两个纯函数（按留白切块 / 板框脚手架）在 board-note.js（2026-09-19 晚）。
+   [11] 起还管"收拢草稿"这一整条（ADR-0004 第 1 步）：转录必须落成**合法笔记行**。 */
+import { draftNoteFromBoard, frameRectsForBand, noteLines, splitByBands, splitByBlocks, unreadableLines } from '../src/lib/board-note.js'
+/* 识别图的尺寸规矩（放大倍数只在那儿一处）—— [13] 断言那一族。 */
+import { OCR_MAX_DIM, ocrScaleFor } from '../src/lib/ocr.js'
+/* 转录结果的本地缓存（第 3 步）：键怎么算、坏存储怎么办 —— [14]。 */
+import { OCR_CACHE_MAX, blockKey, makeOcrCache } from '../src/lib/ocr-cache.js'
+/* 行清单（第 4 步的坐标系）：一行怎么切、每一笔归哪一行 —— [15]。 */
+import { LINE_GAP, buildLines, groupByLines } from '../src/lib/ink-lines.js'
+/* 结构整理（第 4 步唯一会猜的一步）：行清单怎么读、模型的话怎么落行 —— [16]。 */
+import {
+  MACHINE_SAY_MARK, SAY_MAX, buildStructureInput, cleanSay, coverageNote, flatSection, manifestText, parseLineOutput,
+  parseStructureOutput, plainText, relines, renderStructuredNote,
+} from '../src/lib/board-structure.js'
+/* 词表（第 4 步"结合我的笔记"）：取你自己的词 —— [17]。 */
+import { isSameLayer, pickVocab, termsFromNote } from '../src/lib/note-vocab.js'
 import { ARROW_SNAP, CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from '../src/lib/nodes.js'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 /* "那颗词摆哪"（浮层锚点夹进可用区域）是一条屏幕像素的政策，单开一个文件
@@ -4224,6 +4240,672 @@ console.log('\n[9] 样板板：三张卡的关系必须和注释里说的一致'
     if (t && t.trim()) ok(`样板公式「${c.src.slice(0, 24)}」有可渲染的式子`)
     else bad(`样板公式「${c.src}」渲染不出来`)
   }
+}
+
+// ═════════════════════ 10. 板框脚手架 ═════════════════════
+/* frameRectsForBand：整板转录时"哪些框画进哪一块的识别图"（2026-09-19 晚，第②刀）。
+   不变量：① 只给和这一块笔迹相交的框；② 只有卡的框、笔迹被擦了的框不给
+   （图上那块是空的，画框=让模型对空白分节）；③ 没笔迹/没框/没板都老实回空。 */
+console.log('\n[10] frameRectsForBand：板框画进哪一块的识别图')
+{
+  const b = newBoard('脚手架')
+  b.strokes = [
+    { ...newStroke('pen', toFlat([{ x: 0, y: 0 }, { x: 100, y: 50 }]), { width: 2 }), id: 's1' },
+    { ...newStroke('pen', toFlat([{ x: 0, y: 600 }, { x: 100, y: 650 }]), { width: 2 }), id: 's2' },
+  ]
+  b.cards = [{ ...newCard('note', 200, 600, { w: 80, h: 40 }), id: 'k1', x: 200, y: 600, text: '卡' }]
+  b.frames = [
+    { id: 'f1', title: '上块', ids: ['s1'], cards: [] },
+    { id: 'f2', title: '下块', ids: ['s2'], cards: ['k1'] },
+    { id: 'f3', title: '只有一张别处的卡', ids: [], cards: ['k-nope'] },
+  ]
+
+  const up = frameRectsForBand([b.strokes[0]], b)
+  eq(up.length, 1, '上块只拿到自己的框（下块隔着 90px+ 的大留白，不相交就不给）')
+  if (up[0]) {
+    /* ⚠ 这两条原来写的是 `ok(条件, '说明')` —— 而 `ok()` 只收一个参数（它只报"✓ 这一条"），
+       条件被**静默丢掉**，两条断言恒绿。这正是 README 第 25 条那类"自检全绿 ≠ 功能真能用"，
+       所以判据一律走 `eq(条件, true, 说明)`（它会把实际值打出来）。 */
+    eq(up[0].w > 100 && up[0].h > 50, true, '框矩形比成员包围盒大一圈（FRAME_PAD 在里面）')
+    eq(up[0].x <= 0 && up[0].y <= 0, true, '框从成员包围盒往外扩（x/y 不会缩到内容里头去）')
+  }
+  const down = frameRectsForBand([b.strokes[1]], b)
+  eq(down.length, 1, '下块也只拿到自己的框')
+  eq(frameRectsForBand([b.strokes[0], b.strokes[1]], b).length, 2,
+    '一整块板做一块认时，两个框都给（跨块的框就该在每块里都出现）')
+  const before = serializeBoardDocument(b)
+  frameRectsForBand([b.strokes[0], b.strokes[1]], b)
+  frameRectsForBand([b.strokes[0]], null)
+  eq(serializeBoardDocument(b), before, '★ 板一个字节没动（纯函数）')
+  eq(frameRectsForBand([], b).length, 0, '这一块没有笔迹 → 空数组（没有图就不用分节）')
+  eq(frameRectsForBand([b.strokes[0]], { frames: [] }).length, 0, '板上没有框 → 空数组')
+  eq(frameRectsForBand([b.strokes[0]], null).length, 0, '板传 null 不崩')
+  eq(frameRectsForBand(null, b).length, 0, '笔迹传 null 不崩')
+}
+
+// ═════════════════════ 11. 收拢草稿：转录落成合法笔记行 ═════════════════════
+/* ADR-0004 第 1 步。判据只有一条，但它是硬判据：**草稿里"读不到的行"必须是 0**。
+   为什么值得单开一节：笔记格式是"每行一个节点、行首 `- `"（parse.js 的 LEADING），
+   读不到的行**在阅读页签和导出里是不存在的**。2026-09-19 拿真草稿量过：
+   `data/大物/电磁感应/8.2 · 笔记.md` 67 行里 **34 行读不到**，而那 34 行正是转录的正文 ——
+   屏幕上一点异常都没有（原始编辑框里字都在，所以没人会发现）。 */
+console.log('\n[11] 收拢草稿：转录必须落成合法笔记行（ADR-0004 第 1 步）')
+{
+  /* ① noteLines：模型回的是自由 Markdown，倒进笔记之前逐行变成节点。 */
+  const src = [
+    '# 环流定理',
+    '为什么？什么力 ∵ $V≠0$',
+    '- 它自带的项目符号',
+    'A | B 这一行有竖线',
+    '$$E = mc^2$$',
+    '---',
+    '',
+  ].join('\n')
+  const ls = noteLines(src)
+  eq(ls.length, 5, 'noteLines：标题 + 四行内容（纯分隔线和空行丢掉）')
+  eq(ls[0], '# 环流定理', '模型自己分的小节原样留着（笔记语法也认 `#`）')
+  eq(ls[1], '- 为什么？什么力 ∵ $V≠0$', '散文行 → 一条')
+  eq(ls[2], '- 它自带的项目符号', '模型自带的 `- ` 不会套成 `- - `')
+  eq(ls[3], '- A ｜ B 这一行有竖线', '行内 ` | ` 转全角（留着它这一行会被笔记切成"标题 | 正文"）')
+  eq(ls[4], '- $E = mc^2$', '独占一行的 `$$…$$` 归一成 `$…$`')
+
+  /* ② 草稿级：转录进草稿 + 关系补全（**你画的那条线**和条件都要在）。 */
+  const b = newBoard('收拢')
+  b.cards = [
+    { ...newCard('note', 0, 0, { w: 100, h: 50 }), id: 'k1', x: 0, y: 0, text: '第一张卡' },
+    { ...newCard('note', 400, 0, { w: 100, h: 50 }), id: 'k2', x: 400, y: 0, text: '第二张卡' },
+    { ...newCard('note', 900, 0, { w: 100, h: 50 }), id: 'k3', x: 900, y: 0, text: '只对稳恒电流' },
+  ]
+  /* 你**画**的那条线（两头各落在一张卡里）：零字节的关系 —— 它不写 `links`，
+     只活在笔迹里，所以从前草稿里看不见它。 */
+  b.strokes = [{ ...newStroke('pen', toFlat([{ x: 50, y: 25 }, { x: 450, y: 25 }]), { width: 2 }), id: 's1' }]
+  /* 你**宣告**的箭头 + 你亲手指的条件（条件就是第三张卡）。 */
+  b.links = [{ from: 'k1', to: 'k2', kind: 'derive', cond: condCard('k3') }]
+
+  const before = serializeBoardDocument(b)
+  const draft = draftNoteFromBoard(b, { when: '2026-09-19', transcription: src })
+  eq(serializeBoardDocument(b), before, '★ 收拢是纯函数：板一个字节没动')
+  eq(draft.unreadable, 0, '★ **读不到的行 = 0**（ADR-0004 第 1 步的判据）')
+  eq(unreadableLines(draft.md).length, 0, 'unreadableLines 和返回值报的是同一个数')
+  eq(draft.md.includes('- 为什么？什么力 ∵ $V≠0$'), true, '转录的散文行进了草稿（而且是 `- ` 开头）')
+  eq(draft.md.includes('- 相关 | 第一张卡 ↔ 第二张卡'), true,
+    '你**画出来**的那条线也进草稿了（从前只读 board.links，它是隐形的）')
+  eq(draft.md.includes('- 推导 | 第一张卡 → 第二张卡（条件：只对稳恒电流）'), true,
+    '宣告的箭头带上了条件，条件卡用卡片自己的字')
+  eq(draft.md.includes('手写转录（机器认的，还没校对'), true, '机器认的那一段明写着"还没校对"')
+
+  /* ③ 空板仍然不生成空草稿（老行为不许被这一刀改掉）。 */
+  const empty = draftNoteFromBoard(newBoard('空'), { transcription: '' })
+  eq(empty.md, '', '板上什么都没有 → 不生成空草稿（调用方去提示"先美化再收拢"）')
+  eq(empty.unreadable, 0, '空草稿报 0 行读不到')
+}
+
+// ═════════════════════ 12. 分块：板框优先，留白兜底 ═════════════════════
+/* ADR-0004 第 2 步。四条判据：
+   ① **框里有笔迹 → 一块就是那个框**（带名字、带 frameId），框外的绝不混进来；
+   ② 不在任何框里的，才按留白切（和 `splitByBands` 逐字一致）；③ 从上到下排；
+   ④ 纯函数，板一个字节不动。
+   草稿那一头：**框名成为小节名**，框里的手写落在这个小节底下。 */
+console.log('\n[12] splitByBlocks：板框优先、留白兜底（ADR-0004 第 2 步）')
+{
+  const b = newBoard('分块')
+  const mk = (id, x, y, w = 200) => ({ ...newStroke('pen', toFlat([{ x, y }, { x: x + w, y }]), { width: 2 }), id })
+  /* 上：一个框（两笔）｜中：框外单独一笔（离框 400px）｜下：框外挨着的两笔。
+     框外那三笔之间隔着 370px（> minGap 90）→ 会切成两块。 */
+  b.strokes = [mk('s1', 0, 0), mk('s2', 0, 30), mk('s3', 0, 400), mk('s4', 0, 800), mk('s5', 0, 830)]
+  b.frames = [{ id: 'fr1', title: '环流定理', ids: ['s1', 's2'] }]
+
+  const blks = splitByBlocks(b.strokes, b, { maxBands: 4 })
+  eq(blks.length, 3, '三块：那个框 + 框外两片（中间隔着大留白）')
+  eq(blks[0].frameId, 'fr1', '第一块就是你圈的那个框（而且它排在最上面）')
+  eq(blks[0].name, '环流定理', '★ 块名 = 框名')
+  eq(blks[0].ids, ['s1', 's2'], '框里那两笔就是这一块')
+  eq(blks[1].frameId, null, '框外那一片没有框（frameId 是空的）')
+  eq(blks[1].ids, ['s3'], '框外单独那一笔自成一块')
+  eq(blks[2].ids, ['s4', 's5'], '框外挨着那两笔是一块')
+  /* ★ 一笔只能出现在一块里 —— "框里的别混进框外"这条的硬判据。 */
+  const all = blks.flatMap((x) => x.ids).sort()
+  eq(all, ['s1', 's2', 's3', 's4', 's5'], '★ 五笔各出现一次（框内框外没有重复、也没有漏）')
+  /* ⚠ 别断言 `top` 的**具体数值**（`strokeBounds` 会把线宽算进去：y=0 的一横量出来是 -1）；
+     要钉的是**顺序**。 */
+  eq(blks[0].top < blks[1].top && blks[1].top < blks[2].top, true, '块按上沿从上到下排（阅读顺序）')
+
+  /* 没有框的板：行为必须和原来**逐字一样**（这一刀不许顺手改掉老路）。 */
+  eq(
+    splitByBlocks(b.strokes, { frames: [] }).map((x) => x.ids),
+    splitByBands(b.strokes).map((band) => band.map((s) => s.id)),
+    '没有板框时 == splitByBands（老路一个字没改）'
+  )
+  /* 太短的笔 / 不是笔迹的东西不进块（调用方已经滤过荧光笔，这里再兜一道）。 */
+  eq(splitByBlocks([{ id: 'x', tool: 'pen', points: [0, 0, 0.5] }], b).length, 0, '一个点的"笔"不成块')
+  eq(splitByBlocks([], b).length, 0, '空笔迹 → 空数组')
+  const before = serializeBoardDocument(b)
+  splitByBlocks(b.strokes, b)
+  eq(serializeBoardDocument(b), before, '★ 分块是纯函数：板一个字节没动')
+
+  /* ── 草稿那一头：框名成小节名，框里的手写落在这一节底下 ── */
+  const blocks = [
+    { name: '环流定理', frameId: 'fr1', text: '为什么？什么力 ∵ $V≠0$\n静电场 $\\oint E·dl=0$' },
+    { name: '', frameId: null, text: '框外那一笔的字' },
+  ]
+  const d = draftNoteFromBoard(b, { when: '2026-09-19', blocks })
+  eq(d.unreadable, 0, '★ 带块收拢：读不到的行还是 0')
+  eq(d.md.includes('## 1、环流定理'), true, '★ 框名成了笔记的小节名')
+  eq(d.md.includes('> 下面这一段是机器认的手写（还没校对）：'), true, '机器认的那一段明写着"还没校对"')
+  eq(d.md.includes('- 为什么？什么力 ∵ $V≠0$'), true, '框里的手写落在这一节底下')
+  eq(d.md.includes('## 2、手写转录（机器认的，还没校对）'), true, '框外那一片还是文末那一段')
+  eq(d.md.includes('- 框外那一笔的字'), true, '框外的字也在草稿里')
+  eq(d.md.indexOf('、环流定理') < d.md.indexOf('、手写转录'), true, '框那一节排在框外那一段前面（阅读顺序）')
+
+  /* 认不出来的块：**那一节留着**（框是你圈的，不该悄悄消失），并写明为什么。 */
+  const dErr = draftNoteFromBoard(b, { blocks: [{ name: '环流定理', frameId: 'fr1', text: '', error: '额度用完' }] })
+  eq(dErr.md.includes('## 1、环流定理'), true, '没认出来也留着那一节')
+  eq(dErr.md.includes('额度用完'), true, '而且写明为什么没认出来')
+  eq(dErr.unreadable, 0, '带失败的块时读不到的行也是 0')
+
+  /* frameId 指不到任何框（框被拆了）→ 退回文末那一段，不凭空造一节。 */
+  const dGhost = draftNoteFromBoard(b, { blocks: [{ name: 'x', frameId: 'fr-没了', text: '孤儿块' }] })
+  eq(dGhost.md.includes('## 1、手写转录（机器认的，还没校对）'), true, 'frameId 指不到框 → 退回文末那一段')
+  eq(dGhost.md.includes('孤儿块'), true, '内容一个字都没丢')
+
+  /* 老形状（一整段字符串）继续认 —— 别的调用方和旧自检还在用。 */
+  const dOld = draftNoteFromBoard(b, { when: 'x', transcription: '老形状的一行' })
+  eq(dOld.md.includes('- 老形状的一行'), true, '老的 transcription（一整段字符串）照样收得进来')
+}
+
+// ═════════════════════ 13. 识别图多大：宽扁的要有上限 ═════════════════════
+/* 2026-09-19 第 2 步（板框优先分块）**顺带量出来的一个真问题**：`scale` 原来只由高度定，
+   于是"又宽又扁"的一块会被放大成巨图 —— 真板 `board-熵增加.md` 上实测 1893×447 的一条
+   变成了 **7797×2011**（1600 万像素）。判据：**单边不许超过 OCR_MAX_DIM**，
+   而长条板/整页板那些正常的输入一个像素都不许变。 */
+console.log('\n[13] ocrScaleFor：识别图的放大倍数（高度 + 单边上限）')
+{
+  const PAD = 56 // 图四周各 28 世界像素的留白，乘上 scale 之后就是 56×scale
+  const dim = (w, h, o) => {
+    const s = ocrScaleFor(w, h, o)
+    return [Math.round((w + PAD) * s), Math.round((h + PAD) * s)]
+  }
+  const boardOpts = { targetH: 2000, minScale: 0.8, maxScale: 4 }
+
+  /* ① 老行为不许变：整板那几个真实尺寸算出来要和以前一模一样。 */
+  eq(ocrScaleFor(1665, 1176, boardOpts).toFixed(2), '1.70', '整页板（复变函数那种）倍率照旧 1.70')
+  eq(dim(1665, 1176, boardOpts), [2927, 2095], '★ 它的图一个像素都没变（上限只咬宽扁的）')
+  eq(ocrScaleFor(1637, 3286, boardOpts), 0.8, '长条板（8.4 那种）还是压到下限 0.8')
+  eq(dim(1637, 3286, boardOpts), [1354, 2674], '★ 它的图也没变')
+  /* ② 小选区（认一个公式/一行字）走的是另一套参数：下限 2、上限 6，一个字没动。 */
+  eq(ocrScaleFor(200, 40, {}), 4, '一个公式那么小的选区：按 targetH 放到 4 倍')
+  eq(ocrScaleFor(200, 20, {}), 6, '再扁一点的选区顶到上限 6 倍')
+  eq(ocrScaleFor(300, 300, {}), 2, '小选区放大不到 targetH 时退回下限 2 倍')
+  /* ③ 就是它：宽扁的一块。 */
+  eq(dim(1893, 447, boardOpts)[0], OCR_MAX_DIM, '★ 1893×447 的一块被压到上限宽（实测过 7797）')
+  eq(dim(1893, 447, boardOpts)[1] <= OCR_MAX_DIM, true, '而且另一条边也在上限之内')
+  const wide = dim(6000, 300, boardOpts)
+  eq(wide[0] <= OCR_MAX_DIM && wide[1] <= OCR_MAX_DIM, true, '再宽再扁也只到上限（6000×300 的极端输入）')
+  /* ④ 上限管的是"图"，不是"世界"：算出 0 或者负数都不行。 */
+  eq(ocrScaleFor(100000, 100000, boardOpts) > 0, true, '巨大输入也算得出一个正的倍率（不崩）')
+}
+
+// ═════════════════════ 14. 转录缓存：同一块没改过就别再花一次钱 ═════════════════════
+/* ADR-0004 第 3 步。四条判据：
+   ① 键是**内容**（点/笔宽/工具/flavor），**不含 id** —— 复制粘贴换了 id 也该命中；
+   ② 改一个字（挪一个点超过 0.1）就换键；0.04 那种浮点噪声**不**换；
+   ③ 空文本不进缓存（一次失败不该被记成"这块就是空的"）；
+   ④ 有上限、坏了/存不下就**静默降级**（缓存不是正确性的一部分）。 */
+console.log('\n[14] 转录缓存 blockKey / makeOcrCache')
+{
+  const fake = () => {
+    const m = new Map()
+    return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), _m: m }
+  }
+  const st = (id, y, x1 = 200) => ({ ...newStroke('pen', toFlat([{ x: 0, y }, { x: x1, y }]), { width: 2 }), id })
+
+  const a = [st('s1', 0), st('s2', 40)]
+  const sameButOtherIds = [st('zz1', 0), st('zz2', 40)]
+  eq(blockKey(a), blockKey(sameButOtherIds), '★ 键不含 id：内容一样、id 全换了照样命中')
+  eq(blockKey(a, { flavor: 'board' }) === blockKey(a, { flavor: 'text' }), false, 'flavor 不一样 → 键不一样（换了模式/模型就该重认）')
+
+  const moved = [st('s1', 0.04), st('s2', 40)]
+  eq(blockKey(a) === blockKey(moved), true, '★ 0.04 的浮点噪声不换键（那不是"你改了字"）')
+  const edited = [st('s1', 3), st('s2', 40)]
+  eq(blockKey(a) === blockKey(edited), false, '★ 真挪了 3 个像素 → 换键（要重认）')
+  const wider = [{ ...st('s1', 0), width: 5 }, st('s2', 40)]
+  eq(blockKey(a) === blockKey(wider), false, '笔宽变了也换键')
+  eq(blockKey([]) === blockKey([]), true, '空块也是稳定的键（虽然不会有人去认它）')
+
+  const cache = makeOcrCache(fake())
+  eq(cache.get('nope'), null, '没存过 → null')
+  cache.set(blockKey(a), '第一块认回来的字')
+  eq(cache.get(blockKey(a)).text, '第一块认回来的字', '存了就能取回来')
+  cache.set(blockKey(a), '重新认过的字')
+  eq(cache.get(blockKey(a)).text, '重新认过的字', '同一个键再存一次 = 覆盖（不是存两条）')
+  eq(cache.size(), 1, '只留一条')
+  cache.set('kempty', '   ')
+  eq(cache.get('kempty'), null, '★ 空/空白文本不进缓存（一次失败不该被记成"这块就是空的"）')
+
+  /* 上限：写满之后**最老的被剔掉**，而且总数不超过上限。 */
+  const c2 = makeOcrCache(fake())
+  for (let i = 0; i < OCR_CACHE_MAX + 5; i++) c2.set('k' + i, '第 ' + i + ' 块')
+  eq(c2.size(), OCR_CACHE_MAX, `上限就是 ${OCR_CACHE_MAX} 条（写多了旧的被剔）`)
+  eq(c2.get('k0'), null, '最老的已经被剔了')
+  eq(c2.get('k' + (OCR_CACHE_MAX + 4)).text, `第 ${OCR_CACHE_MAX + 4} 块`, '最新的一定在')
+
+  /* 坏存储 / 坏 JSON：一律当"没有缓存"，绝不抛。 */
+  const broken = { getItem: () => '{ 这不是 JSON', setItem: () => {} }
+  eq(makeOcrCache(broken).get('k'), null, '★ 存储里是坏 JSON → 当没有缓存（不抛）')
+  const throwing = { getItem: () => { throw new Error('配额满') }, setItem: () => { throw new Error('配额满') } }
+  const c3 = makeOcrCache(throwing)
+  eq(c3.get('k'), null, '★ 取的时候抛（隐私模式/配额满）→ 静默当没有')
+  let threw = false
+  try {
+    c3.set('k', '字')
+  } catch {
+    threw = true
+  }
+  eq(threw, false, '★ 存的时候抛也不往外冒')
+  eq(makeOcrCache(null).get('k'), null, '压根没给 storage 也不崩')
+}
+
+// ═════════════════════ 15. 行清单：板上有哪几行 ═════════════════════
+/* ADR-0004 第 4 步的坐标系。判据：
+   ① 相邻笔中心差 > LINE_GAP 才换行（阈值是量的：真板 96.8% 的空隙 ≤15px）；
+   ② **每一笔恰好属于一行**（不重不漏）—— 这是"不编造"的地基；
+   ③ 行按 y 排、行内按 x 排；④ 纯函数（不改输入、不改板）。 */
+console.log('\n[15] 行清单 buildLines（ADR-0004 第 4 步）')
+{
+  const st = (id, x, y, w = 60, h = 20) => ({ ...newStroke('pen', toFlat([{ x, y }, { x: x + w, y: y + h }]), { width: 2 }), id })
+  const input = [st('a', 0, 0), st('b', 90, 4), st('c', 180, 8), st('d', 0, 200), st('e', 90, 204), st('f', 700, 1200)]
+  const before = JSON.stringify(input)
+  const lines = buildLines(input)
+  eq(lines.map((l) => l.id), ['L1', 'L2', 'L3'], '三行：上面一行、中间一行、下面孤零零一笔一行')
+  eq(lines[0].ids, ['a', 'b', 'c'], '同一行里的笔按 x 从左到右')
+  eq(lines[1].ids, ['d', 'e'], '第二行是它自己那两笔')
+  eq(lines[2].ids, ['f'], '隔得很远的一笔自成一行')
+  const all = lines.flatMap((l) => l.ids).sort()
+  eq(all, ['a', 'b', 'c', 'd', 'e', 'f'], '★ 每一笔恰好属于一行（不重不漏）')
+  eq(JSON.stringify(input), before, '★ 纯函数：输入数组一个字节没动（内部排的是副本）')
+
+  /* 阈值两侧：差 24 算同一行、差 26 算换行（LINE_GAP=25）。 */
+  eq(buildLines([st('p', 0, 0), st('q', 0, 24)]).length, 1, '中心差 24 < 25 → 同一行')
+  eq(buildLines([st('p', 0, 0), st('q', 0, 26)]).length, 2, '中心差 26 > 25 → 换行')
+  eq(LINE_GAP, 25, '阈值就是量出来的那个 25（改它之前先看 ink-lines.js 文件头那张直方图）')
+
+  /* 左边缘：只给**事实**（相对中位左边缘多少像素），不给"缩进层级" ——
+     真板上左边缘是连续铺开的，量化成层级会大面积误判（见 ink-lines.js 文件头）。 */
+  const ind = buildLines([st('p', 0, 0), st('q', 80, 200), st('r', 300, 400), st('s', 900, 600)])
+  eq(ind.map((l) => l.x0Rel), [-190, -110, 110, 710], 'x0Rel = 这一行比**中位**左边缘靠右多少（可以是负的）')
+  eq(ind.some((l) => 'indent' in l), false, '★ 不给"缩进层级"（本地层只给事实，判断留给第二趟）')
+  eq(buildLines([st('p', 0, 0), st('q', 0, 200)]).map((l) => l.x0Rel), [0, 0], '两行一样靠左 → 都是 0')
+
+  /* 空 / 太短的输入：老实回空，不崩。 */
+  eq(buildLines([]), [], '空笔迹 → 空清单')
+  eq(buildLines(null), [], 'null 不崩')
+  eq(buildLines([{ id: 'x', points: [0, 0, 0.5] }]), [], '一个点的"笔"不成行')
+
+  /* groupByLines：识别那一趟要"这一行是哪几笔"。 */
+  const g = groupByLines(input, lines)
+  eq([...g.keys()], ['L1', 'L2', 'L3'], '按行分组，顺序跟行清单走')
+  eq(g.get('L2').map((s) => s.id), ['d', 'e'], '行 → 那几笔（拿得到原对象）')
+  eq(groupByLines(input, [{ id: 'L9', ids: ['nope', 'a'] }]).get('L9').map((s) => s.id), ['a'], '行里混进死 id → 跳过，不崩')
+}
+
+// ═════════════════════ 16. 结构整理：只许引用行 id ═════════════════════
+/* ADR-0004 第 4 步的**唯一会猜的一步**，四条规矩在这儿断言：
+   ① 行清单 → 提示词那段文字；② 认字回来的 `L<k>|文字` 怎么校验；
+   ③ 结构 JSON 怎么落行（引不出来就丢 + 报数）；④ 渲染出来的必须是**合法笔记**。 */
+console.log('\n[16] 结构整理 board-structure（只许引用行号）')
+{
+  /* ── ① 行清单 → 给识别那一趟的文字 ── */
+  const lines = [
+    { id: 'L1', n: 1, y: 0, h: 20, x0: 100, x1: 300, x0Rel: 0 },
+    { id: 'L2', n: 2, y: 100, h: 20, x0: 100, x1: 340, x0Rel: 0 },
+    { id: 'L3', n: 3, y: 200, h: 20, x0: 420, x1: 520, x0Rel: 320 },
+    { id: 'L4', n: 4, y: 300, h: 20, x0: 40, x1: 200, x0Rel: -60 },
+  ]
+  const mt = manifestText(lines)
+  eq(mt.split('\n').length, 5, '行清单文字 = 一行说明 + 每行一条')
+  eq(/共 4 行/.test(mt), true, '说明里写着这一块共几行（模型得先知道有几个行号）')
+  eq(mt.includes('L1 位于 0% 高度'), true, '每行带着"在图里多高"（百分比，给它位置感）')
+  eq(mt.includes('居中'), true, 'x0Rel=0 → 居中')
+  eq(mt.includes('靠右 320'), true, 'x0Rel>0 → 靠右多少（是个事实，不是"第几层"）')
+  eq(mt.includes('靠左 60'), true, 'x0Rel<0 → 靠左多少（真板上确实有比大多数行还靠左的）')
+  eq(manifestText([]), '', '没有行 → 空字符串（调用方据此走老路）')
+
+  /* ── ② 认字回来的 "L<k>|文字" ── */
+  const p1 = parseLineOutput('L1|为什么？什么力 洛伦兹力不做功\nL2|静电场 ∮E·dl=0', 2)
+  eq(p1.followed, true, '按契约回来的：格式跟上了')
+  eq(p1.items.map((x) => [x.from, x.text]), [[1, '为什么？什么力 洛伦兹力不做功'], [2, '静电场 ∮E·dl=0']], '一行一条，顺序按行号')
+  eq(p1.missing, [], '每行都提到了')
+  const p2 = parseLineOutput('L1-2|$\\frac{a}{b}$', 2)
+  eq(p2.items.map((x) => [x.from, x.to]), [[1, 2]], '★ `L1-2|` = 这两行其实是一整块东西（分数的分子分母）→ 合成一条')
+  const p3 = parseLineOutput('L1|甲', 3)
+  eq(p3.missing, [2, 3], '漏掉的行号报出来')
+  eq(p3.followed, true, '★ 漏认**不是**"格式没跟上"（漏的那行由人在校对界面补，别的照用）')
+  const p4 = parseLineOutput('为什么？什么力\nL2|乙', 2)
+  eq(p4.loose.length, 1, '没按格式回的那一行进 loose')
+  eq(p4.followed, false, '★ 有 loose → 格式没跟上 → 整段退回按原文抄')
+  const p5 = parseLineOutput('L9|越界\nL1|甲\nL1|又一条', 2)
+  eq(p5.bad.outOfRange, 1, '越界的行号丢掉、记账')
+  eq(p5.bad.dup, 1, '同一行回了两条 → 第二条丢掉、记账')
+  eq(p5.items.map((x) => x.text), ['甲'], '留下的只有第一条')
+  const p6 = parseLineOutput('L3-1|范围写反了', 3)
+  eq(p6.items.map((x) => [x.from, x.to]), [[1, 3]], '范围写反了也认（1~3），并且记账')
+  eq(p6.bad.flipped, 1, '写反记一笔（不影响结果，但要看得见）')
+  eq(parseLineOutput('l 2 ｜ 乙', 2).items.map((x) => [x.from, x.text]), [[2, '乙']], '小写 l / 全角竖线 / 中间有空格都认')
+  eq(parseLineOutput('L1|', 1).items.map((x) => x.text), [''], '空的文字也是一条（认了个空的）')
+  eq(parseLineOutput('', 2).followed, false, '什么都没回 → 没跟上')
+
+  /* ── ③ 拼给结构整理那一趟的输入 ── */
+  const input = buildStructureInput({
+    title: '8.2',
+    blocks: [
+      {
+        name: '感生电场',
+        frameId: 'fr1',
+        lines: lines.slice(0, 2),
+        items: [{ from: 1, to: 1, text: '为什么？什么力' }, { from: 2, to: 2, text: '静电场 ∮E·dl=0' }],
+      },
+      {
+        name: '',
+        frameId: null,
+        lines: lines.slice(2),
+        /* 第 2 段只认到"块内第 1 行"，第 2 行一行都没认到 → 也要占一个号 */
+        items: [{ from: 1, to: 1, text: '与r有关 非保守场' }],
+      },
+    ],
+    vocab: ['安培环路定理', '洛伦兹力'],
+    links: [{ from: '感生电场', to: '题1', kind: '推导' }],
+  })
+  eq(input.rows.map((r) => r.id), ['L1', 'L2', 'L3', 'L4'], '★ 整板唯一的坐标系：按段、按条连起来数')
+  eq(input.rows.length, 4, '两条 + 一条 + **一行都没认到的那一行也占一个号** = 4')
+  eq(input.rows[2].text, '与r有关 非保守场', '第 3 条的字')
+  eq(input.rows[3].text, '', '第 4 条是"没认到的那一行"（空文字，但号在）')
+  eq(input.rows[1].blockName, '感生电场', '每一条记得自己属于哪个板框（框名当小节名靠它）')
+  eq(input.rows[2].blockName, '', '框外的手写没有名字')
+  eq(input.text.includes('L4：（这一行没认出来）'), true, '输入里明写"这一行没认出来"（模型别去猜它）')
+  eq(input.text.includes('L3（比大多数行靠右 320）：与r有关 非保守场'), true, '偏得多的一条带着位置提示')
+  eq(input.text.includes('L1：为什么？什么力'), true, '大多数条（没偏多少）不带位置提示 —— 真板上 p75 只有 44px，每条都标是纯噪声')
+  eq(input.text.includes('安培环路定理'), true, '你的词表跟着一起发过去')
+  eq(input.text.includes('感生电场 → 题1'), true, '板上连过的关系也带上（只作参考）')
+  eq(input.text.includes('── 第 2 段（框外的手写） ──'), true, '段号从 1 数、也写清是框外还是框里')
+  eq(buildStructureInput({}).rows, [], '什么都不给 → 空（不崩）')
+
+  /* ── ④ 结构 JSON → 校验过的结构（落行校验）── */
+  const rows = input.rows
+  const good = parseStructureOutput(
+    JSON.stringify({
+      sections: [
+        { title: 1, rows: [{ line: 2, indent: 0 }, { line: 3, indent: 1 }] },
+        { title: null, rows: [{ line: 4, indent: 0 }] },
+      ],
+      relations: [{ kind: '推导', from: 2, to: 4, cond: 3 }],
+    }),
+    rows
+  )
+  eq(good.ok, true, '规矩的 JSON → 收下')
+  eq(good.sections.length, 2, '两节')
+  eq(good.sections[0].title, 'L1', '标题是**行号**（文字由那一行自己提供，模型没机会写）')
+  eq(good.sections[0].rows.map((r) => [r.id, r.indent]), [['L2', 0], ['L3', 1]], '行 + 缩进')
+  eq(good.relations.map((r) => [r.kind, r.from, r.to, r.cond]), [['derive', 'L2', 'L4', 'L3']], '关系：中文词认，条件落在行号上')
+  eq(good.unplaced, [], '每一行都被摆进去了')
+  eq(good.dropped.length, 0, '没有丢掉的东西')
+
+  const fenced = parseStructureOutput('```json\n{"sections":[{"title":1,"rows":[{"line":2}]}]}\n```', rows)
+  eq(fenced.ok && fenced.sections[0].rows[0].id, 'L2', '包在 ```json 里也认（模型老这么干）')
+  const chatty = parseStructureOutput('好的，这是结果：{"sections":[{"title":1,"rows":[{"line":2}]}]} 希望有用', rows)
+  eq(chatty.ok, true, '前后多说了两句也认（抠第一个 { 到最后一个 }）')
+  const garbage = parseStructureOutput('我看不出这些行之间有什么关系。', rows)
+  eq(garbage.ok, false, '★ 整段不是 JSON → 老实说没读出来（"看不出来就说看不出来"是合法结果）')
+  eq(garbage.unplaced.length, 4, '读不出来的时候，**所有行都算没摆**（渲染那一趟不许丢东西）')
+
+  const badRef = parseStructureOutput(
+    JSON.stringify({ sections: [{ title: 99, rows: [{ line: 2 }, { line: 42 }] }], relations: [{ kind: '因果', from: 2, to: 77 }] }),
+    rows
+  )
+  eq(badRef.sections[0].rows.map((r) => r.id), ['L2'], '★ 引用了没有的行号 → 那一条丢掉')
+  eq(badRef.dropped.filter((d) => /没有的?那一行/.test(d.why)).length, 2, '丢掉的都记着（标题那条 + 行那条）')
+  eq(badRef.relations.length, 0, '关系两头有一头不存在 → 整条丢掉')
+  eq(badRef.unplaced.sort(), ['L1', 'L3', 'L4'], '没被摆的行照实报出来（调用方得把它们摆进草稿）')
+
+  const dupIndent = parseStructureOutput(
+    JSON.stringify({ sections: [{ rows: [{ line: 2 }, { line: 2, indent: 9 }, { line: 3, indent: -5 }] }] }),
+    rows
+  )
+  eq(dupIndent.sections[0].rows.map((r) => [r.id, r.indent]), [['L2', 0], ['L3', 0]], '★ 同一行摆两次 → 第二次丢掉；缩进越界夹回 0~3')
+  eq(dupIndent.dropped.filter((d) => /两次/.test(d.why)).length, 1, '重复那条记一笔')
+
+  const badKind = parseStructureOutput(
+    JSON.stringify({ sections: [{ rows: [{ line: 2 }] }], relations: [{ kind: '因为所以', from: 2, to: 3 }, { kind: 'derive', from: 2, to: 3 }, { kind: 'derive', from: 2, to: 3 }] }),
+    rows
+  )
+  eq(badKind.relations.length, 1, '词表外的关系丢掉；同一条说两遍只留一条')
+  eq(badKind.dropped.filter((d) => /词表/.test(d.why)).length, 1, '词表外那条记一笔')
+  const badCond = parseStructureOutput(JSON.stringify({ sections: [{ rows: [{ line: 2 }] }], relations: [{ kind: 'derive', from: 2, to: 3, cond: 404 }] }), rows)
+  eq(badCond.relations[0].cond, null, '条件的行号不存在 → 条件不要了，关系留着')
+  eq(badCond.dropped.filter((d) => /条件/.test(d.why)).length, 1, '条件那条也记一笔')
+
+  /* ── ⑤ 校验过的结构 → **笔记的小节**（交给草稿去编号）── */
+  const rendered = renderStructuredNote(good, rows)
+  eq(rendered.sections.length, 2, '两节（`## 小节头` 由草稿自己写 —— 节号是连着的，这一层不替它决定）')
+  eq(rendered.sections[0].title, '为什么？什么力', '小节名 = 标题那一行的文字')
+  eq(rendered.sections[0].lines[0], '- 静电场 ∮E·dl=0', '第一行是一条节点')
+  eq(rendered.sections[0].lines[1], '  - 推导 | → 〔这一行没认出来〕（条件：与r有关 非保守场）', '★ 关系紧跟在它的出发行底下（带方向和条件）')
+  eq(rendered.sections[0].lines[2], '  - 与r有关 非保守场', '缩进的行也照实摆着')
+  eq(rendered.leftover, [], '每一行都有去处')
+
+  /* ★ 板框名也能当小节名（第 2 步挣来的不能在这一步丢掉）：`"frame": 1` = 第 1 段那个框 */
+  const framed = parseStructureOutput(JSON.stringify({ sections: [{ frame: 1, rows: [{ line: 1 }, { line: 2 }] }] }), rows)
+  eq(framed.sections[0].frame, 0, '`frame` 说的是**第几段**（从 1 数），内部换算成 0 基')
+  eq(renderStructuredNote(framed, rows).sections[0].title, '感生电场', '★ 小节名就成了你圈的框名')
+  const badFrame = parseStructureOutput(JSON.stringify({ sections: [{ frame: 9, rows: [{ line: 1 }] }] }), rows)
+  eq(badFrame.sections[0].frame, null, '第 9 段不存在 → 那个说法丢掉（小节照样留着）')
+  eq(badFrame.dropped.filter((d) => /第几段/.test(d.why)).length, 1, '丢掉的那条记一笔')
+
+  /* 没被摆进任何一节的行：**照样要出现在草稿里**（宁可丑，不可丢）。 */
+  const partial = parseStructureOutput(JSON.stringify({ sections: [{ title: 1, rows: [{ line: 2 }] }] }), rows)
+  const rendered2 = renderStructuredNote(partial, rows)
+  eq(rendered2.leftover, ['L3', 'L4'], '没摆的行照实交出来（由草稿摆进最后一节）')
+  const flat = flatSection(rows.filter((r) => rendered2.leftover.includes(r.id)), '没归进哪一块的行')
+  eq(flat.lines.length, 2, '★ 退路：按行平铺成一节（一个字都不丢）')
+  eq(flat.lines[0], '- 与r有关 非保守场', '平铺就是把每一条写成一行')
+  const allLines = [...rendered2.sections[0].lines, ...flat.lines].join('\n')
+  eq(unreadableLines(allLines).length, 0, '★ 拼起来也全是合法笔记行（第 1 步的判据）')
+  eq(allLines.includes('- 与r有关 非保守场'), true, '没摆的那一行也在')
+
+  /* ── 校对界面那条路：拆成纯文字给人改，改完**挂回行号** ── */
+  const items = [{ from: 1, to: 1, text: '安培环路定理' }, { from: 2, to: 3, text: '$\\frac{a}{b}$' }]
+  eq(plainText(items), '安培环路定理\n$\\frac{a}{b}$', '文本框里看到的是纯文字（不该让人盯着 `L7|` 改字）')
+  eq(relines('安培环路定理\n$\\frac{a}{b}$', items).map((x) => [x.from, x.to]), [[1, 1], [2, 3]], '改完挂回原来的行号')
+  eq(relines('安培环路定理改了\n$\\frac{a}{b}$', items)[0].text, '安培环路定理改了', '改过的字跟着走')
+  eq(relines('只有一行了', items), null, '★ 行数对不上（加了一行/删了一行）→ 回 null = 这一块退化成整段，不硬挂')
+  eq(relines('', []), [], '空块不崩')
+
+  /* 关系里的 ` | `——和 board-note 同一条规矩：转全角，免得被笔记切成"标题 | 正文"。 */
+  const pipeRows = [{ id: 'L1', text: 'A | B 这一行有竖线', block: 0, blockName: '' }]
+  const pipeNote = renderStructuredNote({ ok: true, sections: [{ title: null, frame: null, rows: [{ id: 'L1', indent: 0 }] }], relations: [], unplaced: [] }, pipeRows)
+  eq(pipeNote.sections[0].lines[0], '- A ｜ B 这一行有竖线', '行内的 ` | ` 转成全角')
+
+  /* ── ⑤-b `say`：**唯一放行"机器自己写字"的那一处**（2026-09-20）──────────────
+     由来是用户那句"完全没有体现出来 LLM 对与我的笔记的理解与整合，象是纯粹的识别"：
+     只许重排的话，它读出来的东西一个字都没地方放。护栏四条，这一节把每一条都钉住。 */
+  const withSay = parseStructureOutput(
+    JSON.stringify({ sections: [{ title: 1, say: '感生电场是变化磁场在空间里激出来的。', rows: [{ line: 2 }, { line: 3 }] }] }),
+    rows
+  )
+  eq(withSay.sections[0].say, '感生电场是变化磁场在空间里激出来的。', '`say` 收下（这一处是放行的）')
+  const sayOut = renderStructuredNote(withSay, rows)
+  eq(sayOut.sections[0].lines[0], '- ' + MACHINE_SAY_MARK + '感生电场是变化磁场在空间里激出来的。',
+    '★ 排在这一节**最前面**，而且标记是**我们加的**（不靠模型自觉）')
+  eq(unreadableLines(sayOut.sections[0].lines.join('\n')).length, 0,
+    '★ 它是一条**真节点**（阅读页签和导出里都看得见），不是 `>` 那种只在编辑框里存在的说明')
+  eq(sayOut.sections[0].lines[1], '- 静电场 ∮E·dl=0', '你写的那几行照旧跟在后面（一个字不删）')
+
+  /* 脏输入：模型爱写标记、爱分点、爱换行、爱带竖线 —— 一条都不许穿透到笔记里。 */
+  const dirtySay = parseStructureOutput(
+    JSON.stringify({ sections: [{ rows: [{ line: 2 }], say: '〔机器整理〕第一句。\n- 第二句 | 带个竖线\n\n# 顺手加个小节头' }] }),
+    rows
+  )
+  eq(dirtySay.sections[0].say, '第一句。 第二句 ｜ 带个竖线',
+    '★ 标记不重复、多行压成一行、` | ` 转全角（留着它这一行会被笔记悄悄切成"标题 | 正文"）、小节头不带进来')
+  eq(cleanSay('').text, null, '空 say → 不写')
+  eq(cleanSay(null).text, null, 'null say → 不写（不崩）')
+  eq(parseStructureOutput(JSON.stringify({ sections: [{ rows: [{ line: 2 }] }] }), rows).sections[0].say, null,
+    '模型没给 say → 这一节跟从前一字不差（不硬凑）')
+  const longSay = parseStructureOutput(JSON.stringify({ sections: [{ rows: [{ line: 2 }], say: '字'.repeat(SAY_MAX + 60) }] }), rows)
+  eq(longSay.sections[0].say.length <= SAY_MAX + 1, true, '太长的整理稿截断（草稿里不许盖过你写的行）')
+  eq(longSay.dropped.some((d) => /整理稿太长/.test(d.why)), true, '★ 截断记一笔 —— 丢了一点东西就必须报出来')
+  /* 只有 say、没有 title 也没有行的节：留着（否则那段话没地方去）。 */
+  eq(renderStructuredNote(parseStructureOutput(JSON.stringify({ sections: [{ say: '只有一句话' }] }), rows), rows).sections.length, 1,
+    '只有 say 的节也算一节')
+
+  /* ── ⑤-c 同一节里重复的关系行：只写一遍（2026-09-20）──────────────────────
+     真板上实测：同一条 `推导 | → 那一大坨公式` 挂在 4 个出发行底下，那 5 行 LaTeX
+     在同一节里出现 4 遍（6850 字的草稿里一半是重复）。去重**只去关系行**，
+     而且**按节算**、**按整行文字算**；你自己的行一条都不动。 */
+  const dupRows = [
+    { id: 'L1', text: 'A', block: 0, blockName: '' },
+    { id: 'L2', text: 'B', block: 0, blockName: '' },
+    { id: 'L3', text: 'C', block: 1, blockName: '' },
+  ]
+  const dupStruct = {
+    ok: true,
+    sections: [
+      { title: null, frame: null, say: null, rows: [{ id: 'L1', indent: 0 }, { id: 'L2', indent: 0 }] },
+      { title: null, frame: null, say: null, rows: [{ id: 'L3', indent: 0 }] },
+    ],
+    /* 两条一模一样的（都在第 1 节）+ 一条换成另一节（那是另一个话题，各写各的） */
+    relations: [
+      { kind: 'derive', from: 'L1', to: 'L1', cond: null },
+      { kind: 'derive', from: 'L2', to: 'L1', cond: null },
+      { kind: 'derive', from: 'L3', to: 'L1', cond: null },
+    ],
+    unplaced: [],
+  }
+  const dedup = renderStructuredNote(dupStruct, dupRows)
+  eq(dedup.sections[0].lines.filter((l) => /推导/.test(l)).length, 1, '★ 同一节里一模一样的关系行只写一遍')
+  eq(dedup.dupRel, 1, '★ 去掉几条**报数**（不静默）')
+  eq(dedup.sections[0].lines.filter((l) => /^- [ABC]$/.test(l)).length, 2, '你自己的行一条没动（照样两行）')
+  eq(dedup.sections[1].lines.filter((l) => /推导/.test(l)).length, 1, '换一节照样写（去重按节算，不是按整份草稿）')
+  eq(renderStructuredNote({ ok: true, sections: dupStruct.sections, relations: [], unplaced: [] }, dupRows).dupRel, 0, '没有重复 → 报 0')
+
+  /* ── ⑥ 认得怎么样：**报数** ── */
+  eq(coverageNote(p3, 3).includes('1/3 行认到了'), true, '覆盖率报出来')
+  eq(coverageNote(p3, 3).includes('第 2、3 行没认出来'), true, '哪几行没认出来也报出来')
+  eq(coverageNote(p4, 2).includes('没按格式回'), true, '没按格式回的也报出来')
+  eq(coverageNote(p5, 2).includes('已丢'), true, '丢掉的行号问题也报出来')
+}
+
+// ═════════════════════ 17. 词表：从你自己的笔记取词 ═════════════════════
+/* ADR-0004 第 4 步的"结合我的笔记"。取词只看**你亲手写下的名字**
+   （`[[…]]` 和节点标题），同层优先 —— 它是提示，不是判据。 */
+console.log('\n[17] 词表 note-vocab（从你自己的笔记取词）')
+{
+  const note = [
+    '# 大物 · 电磁学',
+    '',
+    '- 安培环路定理',
+    '  - 公式 | $\\oint_L \\vec{B}\\cdot d\\vec{l} = \\mu_0 I$',
+    '  - 用到的量 | [[B]] [[mu0]] [[I]]',
+    '  - 易错 | 只对稳恒电流成立',
+    '- 螺绕环 | 磁场集中在环内',
+    '- [[感生电场]] | 涡旋电场，无源有旋',
+    '- 123 | 纯数字的名字不算词',
+  ].join('\n')
+  const terms = termsFromNote(note).map((x) => x.term)
+  eq(terms.includes('B') && terms.includes('mu0'), true, '`[[…]]` 里的词收进来（单字也收 —— 那多半是"量"）')
+  eq(terms.includes('感生电场'), true, '`[[感生电场]]` 这种收进来')
+  eq(terms.includes('安培环路定理') && terms.includes('螺绕环'), true, '节点标题也收（你亲手起的名字）')
+  eq(terms.includes('公式') || terms.includes('易错') || terms.includes('用到的量'), false, '★ 字段名不是词（那是格式，不是内容）')
+  eq(terms.includes('只对稳恒电流成立'), false, '★ 正文里的句子不进词表（只看名字，不是"猜关键词"）')
+  eq(terms.includes('$\\oint_L \\vec{B}\\cdot d\\vec{l} = \\mu_0 I$'), false, '公式不是词')
+  eq(terms.includes('123'), false, '纯数字不是词')
+  eq(termsFromNote(''), [], '空文本 → 空（不崩）')
+
+  const voc = pickVocab([
+    { path: 'data/大物/电磁感应/8.2 · 笔记.md', text: '- 安培环路定理\n- [[B]]', near: true },
+    { path: 'data/大物/8.1.md', text: '- 安培环路定理\n- [[B]]\n- [[感生电场]]\n- [[洛伦兹力]]', near: false },
+  ])
+  eq(voc[0], '安培环路定理', '出现次数多的排前面')
+  eq(voc.includes('B'), true, '两边都出现的量也在')
+  eq(voc.includes('感生电场') && voc.includes('洛伦兹力'), true, '只在不远处出现过的词照样收（是同一门课的词）')
+  const nearFirst = pickVocab([
+    { path: 'x', text: '- [[只在同层出现过一次]]', near: true },
+    { path: 'y', text: '- [[别层的热词]]\n- [[别层的热词]]\n- [[别层的热词]]', near: false },
+  ])
+  eq(nearFirst[0], '只在同层出现过一次', '★ 同层的词排前面（哪怕出现得少 —— 这一课的词才是这一课会写到的）')
+  eq(pickVocab([{ text: '- [[a]]' }], { limit: 1 }).length, 1, 'limit 管用')
+  eq(pickVocab([]), [], '没有笔记 → 空（整条链路照跑，词表只是提示）')
+  eq(isSameLayer('data/大物/电磁感应/board-8.2.md', 'data/大物/电磁感应/8.2 · 笔记.md'), true, '同一个目录 = 同层')
+  eq(isSameLayer('data/大物/电磁感应/board-8.2.md', 'data/大物/8.1.md'), false, '上一层不是同层')
+}
+
+// ═════════════════════ 18. 结构小节进草稿 ═════════════════════
+/* 第 4 步的收口：`structured` 一进来，手写就从"按块平铺"变成"按模型读出的小节摆"，
+   而**板框那一节里不再重复贴同一段字**。没有它 → 一字不差地走第 2/3 步那条路。 */
+console.log('\n[18] 草稿：结构小节（第 4 步的收口）')
+{
+  const b = newBoard('收口')
+  b.cards = [{ ...newCard('note', 0, 900, { w: 220, h: 40 }), id: 'k1', x: 0, y: 900, text: '牛顿第二定律' }]
+  const ln = (id, y) => ({ ...newStroke('pen', toFlat([{ x: 0, y }, { x: 240, y }]), { width: 2 }), id })
+  b.strokes = [ln('s1', 0), ln('s2', 40), ln('s3', 700)]
+  b.frames = [{ id: 'fr1', title: '环流定理', ids: ['s1', 's2'] }]
+
+  const blocks = [
+    { name: '环流定理', frameId: 'fr1', text: '安培环路定理\n只对稳恒电流成立' },
+    { name: '', frameId: null, text: '与r有关 非保守场' },
+  ]
+  const rows = [
+    { id: 'L1', text: '安培环路定理', block: 0, blockName: '环流定理' },
+    { id: 'L2', text: '只对稳恒电流成立', block: 0, blockName: '环流定理' },
+    { id: 'L3', text: '与r有关 非保守场', block: 1, blockName: '' },
+  ]
+  const structured = {
+    sections: [
+      { title: '安培环路定理', lines: ['- 只对稳恒电流成立'] },
+      { title: '这一块', lines: ['- 与r有关 非保守场'] },
+    ],
+    leftover: [],
+  }
+
+  const plain = draftNoteFromBoard(b, { when: 'x', blocks })
+  eq(plain.md.includes('## 1、环流定理') && plain.md.includes('- 安培环路定理'), true, '没有 structured → 老路（按块平铺，第 2 步原样）')
+
+  const st = draftNoteFromBoard(b, { when: 'x', blocks, structured })
+  eq(st.unreadable, 0, '★ 结构小节进来之后，读不到的行还是 0')
+  eq(/## \d+、安培环路定理/.test(st.md), true, '★ 模型读出的小节成了笔记的小节')
+  eq(/## \d+、这一块/.test(st.md), true, '第二节也是')
+  eq(st.md.includes('> 下面这几节是机器认的手写'), true, '机器认的那一段明写着（两种可信度分得开）')
+  eq(/\n- 安培环路定理\n/.test(st.md), false, '★ **板框那一节里不再重复贴同一段字**（否则同一句话出现两次）')
+  eq(st.md.includes('- 牛顿第二定律'), true, '卡片照旧收进来')
+  const i1 = st.md.search(/## \d+、安培环路定理/)
+  const i2 = st.md.indexOf('\n## ', i1 + 1)
+  const sec1 = st.md.slice(i1, i2 < 0 ? undefined : i2)
+  eq(sec1.includes('- 只对稳恒电流成立'), true, '小节里就是那一节的几行')
+
+  const withLeft = draftNoteFromBoard(b, {
+    when: 'x',
+    blocks,
+    structured: { sections: [{ title: '只有这一节', lines: ['- 安培环路定理'] }], leftover: [{ id: 'L2', lines: ['- 只对稳恒电流成立'] }, { id: 'L3', lines: ['- 与r有关 非保守场'] }] },
+  })
+  eq(withLeft.md.includes('没归进哪一块的行'), true, '★ 没被摆进小节的行收在最后一节（宁可丑，不可丢）')
+  eq(withLeft.md.includes('- 与r有关 非保守场'), true, '它们的字一个都没丢')
+  eq(withLeft.unreadable, 0, '这一份也全是合法笔记行')
+
+  /* 空的 structured（第二趟没读出来）→ 一个字不差地退回老路 */
+  const empty = draftNoteFromBoard(b, { when: 'x', blocks, structured: { sections: [], leftover: [] } })
+  eq(empty.md === plain.md, true, '★ 结构整理没读出来 → 退化成"按块平铺"，和没有它时一字不差')
+
+  /* ★ 去重那条要在**草稿那一层**也看得见（报数那句写在草稿里）。 */
+  const dedupDraft = draftNoteFromBoard(b, {
+    when: 'x',
+    blocks,
+    structured: {
+      sections: [{ title: null, lines: ['- 推导 | → 同一个东西', '- 推导 | → 同一个东西', '- 只对稳恒电流成立'] }],
+      leftover: [],
+      dupRel: 1,
+    },
+  })
+  eq(dedupDraft.md.includes('省掉 1 条重复'), true, '★ 草稿里报得出"省掉了几条重复"')
+  eq(dedupDraft.unreadable, 0, '报数那句也是合法行（`>` 开头，不当节点）')
 }
 
 // ═════════════════════ 结果 ═════════════════════

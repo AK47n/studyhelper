@@ -26,11 +26,25 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { withBoard, ROOT } from './lib/board-check.js'
+/* 第 [11] 节要自己造一张夹具板（比手画快、也更准），所以用应用自己的那几个构造函数。 */
+import { newBoard, newCard, newStroke, serializeBoardDocument } from '../src/lib/board.js'
+import { toFlat } from '../src/lib/geometry.js'
+import { unreadableLines } from '../src/lib/board-note.js'
+import { OCR_MAX_DIM } from '../src/lib/ocr.js'
 
 const APP_PORT = Number(process.env.OCR_TEST_APP_PORT || 5179)
 const MOCK_PORT = Number(process.env.OCR_TEST_MOCK_PORT || 5198)
 const CDP_PORT = Number(process.env.OCR_TEST_CDP_PORT || 9223)
 const TEST_TOKEN = 'test-uat-token-abcdefgh'
+
+/* 行清单在提示词里的样子（board-structure.js 的 `manifestText` 写的那一句）：
+   `行清单（这一块从上到下共 N 行，行号就用下面这些）：`
+   ⚠ 别把结尾那个 `）` 写进正则 —— 它和 `行` 之间还夹着"，行号就用下面这些"，
+     写上去会**永远匹配不上**（第一版就是这么写的，于是"清单在不在"这条判据
+     变成了一个恒假的断言：修好了也报失败，白跑一趟）。
+   假服务拿它当**分流**：有 → 照行回话；没有 → 自由发挥（真模型的行为）。
+   自检里也拿它当判据："认字那一趟到底带没带行清单"。 */
+const MANIFEST_RE = /行清单（这一块从上到下共 \d+ 行/
 
 // ═════════════ 1. 假的识别服务（DeepSeek 形状）═════════════
 /* default provider 现在是 deepseek，所以这个假服务回 OpenAI 兼容的形状：
@@ -54,6 +68,7 @@ const mock = http.createServer((req, res) => {
     const content = json && json.messages && json.messages[0] && json.messages[0].content
     const img = Array.isArray(content) ? content.find((c) => c.type === 'image_url') : null
     const b64 = img && img.image_url && img.image_url.url ? String(img.image_url.url).replace(/^data:image\/\w+;base64,/, '') : ''
+    const promptText = Array.isArray(content) && content[0] ? String(content[0].text || '') : ''
     seen.push({
       url: req.url,
       method: req.method,
@@ -62,12 +77,57 @@ const mock = http.createServer((req, res) => {
       model: json ? json.model : null,
       temperature: json ? json.temperature : null,
       blockTypes: Array.isArray(content) ? content.map((c) => c.type) : null,
-      promptText: Array.isArray(content) && content[0] ? String(content[0].text || '') : '',
+      promptText,
       imageBytes: b64 ? Buffer.from(b64, 'base64').length : 0,
       imageMagic: b64 ? Buffer.from(b64, 'base64').subarray(0, 4).toString('hex') : null,
+      /* PNG 的 IHDR 里就写着尺寸（宽在 16..19、高在 20..23，大端）。
+         为什么要它：识别图"多大"是有上限的（`OCR_MAX_DIM`）—— 而**只有真跑一遍**
+         才知道实际发出去的是多大（纯函数那边算得再对，画布也可能不听话）。 */
+      imageW: b64 && Buffer.from(b64, 'base64').length > 24 ? Buffer.from(b64, 'base64').readUInt32BE(16) : 0,
+      imageH: b64 && Buffer.from(b64, 'base64').length > 24 ? Buffer.from(b64, 'base64').readUInt32BE(20) : 0,
     })
     res.writeHead(mockReply.code, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(mockReply.body))
+    /* `byIndex`：第 N 次请求回第 N 段。**一条链路里发好几块**时（整板转录按块发），
+       只有"哪块回了什么"分得开，断言才分得清"这段话落在哪一节底下" ——
+       [11] 那两条"框里的字在框那一节、框外的字在文末那一段"靠的就是它。
+       `delayMs`：故意慢一点回 —— "弹层是不是**边认边填**"这件事只有在"还没认完"的
+       那一刻才看得出来（假服务秒回的话，等我们看到弹层时它早就填完了）。
+       ⚠ 被取消的那次请求：`setTimeout` 到点时客户端早走了 → 写到已关闭的 socket 上，
+         所以先看 `destroyed` 再写（不然假服务自己会抛一个 EPIPE）。 */
+    const replyBody = mockReply.byLines
+      ? {
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                /* ★ **照行清单回话，还是要自由发挥 —— 由提示词里有没有行清单决定。**
+                   真模型就是这么干的：没有清单（服务端退回 BOARD_PROMPT）时它会自己
+                   分行、一个 `L` 前缀都不写。假服务从前按"第几次请求"回话，于是
+                   **行清单根本没发出去**它也照样回 `L1|…`，[13] 一路全绿 —— 而真跑的时候
+                   第二趟（结构整理）压根没被叫上（2026-09-20 用户看到的"纯粹的识别"）。 */
+                content: MANIFEST_RE.test(promptText)
+                  ? String(mockReply.byLines[mockReply.n++ % mockReply.byLines.length])
+                  : String(mockReply.free || ''),
+              },
+            },
+          ],
+        }
+      : mockReply.byIndex
+        ? { choices: [{ message: { role: 'assistant', content: String(mockReply.byIndex[(mockReply.n++) % mockReply.byIndex.length]) } }] }
+        : mockReply.body
+    /* ★ **没有图的请求 = 结构整理那一趟**（第 4 步）：它是一段纯文本进去、
+       一个 JSON 出来。用"有没有图"分流，比让假服务去猜提示词稳。
+       默认回一个空骨架 —— 那是最合法的答案（"我看不出这些行之间有什么关系"）。 */
+    const noImage = !(img && img.image_url && img.image_url.url)
+    const structBody = mockReply.struct || { choices: [{ message: { role: 'assistant', content: '{"sections":[],"relations":[]}' } }] }
+    const send = () => {
+      try {
+        if (res.destroyed) return
+        res.end(JSON.stringify(noImage ? structBody : replyBody))
+      } catch {}
+    }
+    if (mockReply.delayMs) setTimeout(send, mockReply.delayMs)
+    else send()
   })
 })
 await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r))
@@ -148,7 +208,7 @@ const fails = await withBoard(
       STUDYHELPER_OCR_TOKEN: TEST_TOKEN,
     },
   },
-  async ({ s, ok, bad, open, read }) => {
+  async ({ s, ok, bad, board, open, read, until, after }) => {
 /* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
 
 const sleep = (ms) => s.sleep(ms)
@@ -1340,6 +1400,455 @@ console.log('\n[10] 框选 → 认公式；顺带量卡片的留白')
   fs.writeFileSync(path.join(ROOT, '.cache', 'formula-from-ink.png'), Buffer.from(shot.data, 'base64'))
   console.log('  （截图存到 .cache/formula-from-ink.png）')
   if (!s.errors().length) ok('整个流程跑下来，页面里没有任何 JS 报错')
+  else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
+}
+/* ═════════════════ 11. 收成笔记：一块 = 一节（ADR-0004 第 2 步）═════════════════
+ *
+ * 这一节测的是**整板转录这条链路**（「▤ 收成笔记」→ 分块发图 → 转录校对 → 落成笔记）。
+ * ⚠ 它在这之前**浏览器覆盖是 0**：这条链路要一个"能认字"的假服务，而假服务只长在
+ *   这一条自检里（用的还是同一份 mock + 同一份被挪开的真配置 —— 仍然完全离线、
+ *   一个字节都不出这台机器）。
+ *
+ * 要钉住的事（第 2 步的全部内容）：
+ *   ① 分块**优先按你圈的板框**（框里有笔迹 → 一块就是那个框），框外的才按留白切；
+ *   ② 块名 = 框名，而且**校对弹层里就看得见**（从前只有"第 N 块"）；
+ *   ③ 认回来的字落在草稿里**同名的那一节**底下（"只装手写的框等于不存在"治好了）；
+ *   ④ 还是"每行一条 `- `"（第 1 步的判据不许被这一刀弄回去）。 */
+console.log('\n[11] 收成笔记：你圈的板框成为笔记小节（一块 = 一节）')
+{
+  /* 换一张夹具：一个**只装手写**的板框（有标题）+ 框外挨着的两笔（算一片）+ 一张卡。
+     ⚠ 先把页面导航走、等应用把**旧的**夹具板补存完再写新内容 ——
+       应用"离开页面/切文件之前会补存一次"，写早了会被它盖回去。 */
+  const fx = newBoard('收成测试')
+  fx.cards = [{ ...newCard('note', 0, 1500, { w: 220, h: 40 }), id: 'k1', x: 0, y: 1500, text: '牛顿第二定律' }]
+  const ln = (id, y) => ({ ...newStroke('pen', toFlat([{ x: 0, y }, { x: 240, y }]), { width: 2 }), id })
+  fx.strokes = [ln('s1', 0), ln('s2', 40), ln('s3', 700), ln('s4', 740)]
+  fx.frames = [{ id: 'fr1', title: '环流定理', ids: ['s1', 's2'] }]
+
+  await s.send('Page.navigate', { url: 'about:blank' })
+  await sleep(700)
+  fs.writeFileSync(board.path, serializeBoardDocument(fx), 'utf8')
+  await open()
+
+  const back = await read()
+  if (back && (back.frames || []).length === 1 && (back.strokes || []).length === 4) {
+    ok('夹具换成了：一个只装手写的板框「环流定理」+ 框外两笔 + 一张卡')
+  } else {
+    bad('夹具没换成（八成被应用补存的旧内容盖回去了）：' +
+      JSON.stringify({ 笔: (back && back.strokes || []).length, 框: (back && back.frames || []).length }))
+  }
+
+  /* 假服务这次回"一整段手写笔记"，不是公式；而且**按块给不同的字** ——
+     两块拿同一段话的话，"框里的字落在哪一节"这条断言会被另一块的副本蒙混过去。
+     再故意**慢 1.5 秒**：弹层"边认边填"这件事只有在"还没认完"的那一刻才看得出来。 */
+  mockReply = {
+    code: 200,
+    n: 0,
+    delayMs: 1500,
+    byIndex: ['为什么？什么力 洛伦兹力不做功 ∵ $V≠0$', '静电场 ∮E·dl=0 ∴闭合回路无法提供能量'],
+  }
+  const n0 = seen.length
+
+  /* 点「▤ 收成笔记」（真鼠标 + elementFromPoint：浮出来的东西只有命中测试能证明点得到）。 */
+  const gb = await s.eval(`(() => {
+    const b = document.querySelector('[data-tool="gather"]')
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2)
+    const hit = document.elementFromPoint(x, y)
+    return { x, y, hitSelf: !!(hit && hit.closest('[data-tool="gather"]')) }
+  })()`)
+  if (gb && gb.hitSelf) ok('「▤ 收成笔记」点得到（elementFromPoint 命中它自己）')
+  else bad('「▤ 收成笔记」看不见或被盖住：' + JSON.stringify(gb))
+  await s.mouse(gb.x, gb.y)
+
+  const askw = await until(
+    () => s.eval(`(() => { const d = document.querySelector('.ask-input'); return d ? String(d.value || '') : null })()`),
+    { what: '「收拢成笔记」的询问框弹出来' }
+  )
+  if (askw.ok && askw.value === '收成测试 · 笔记') ok('名字预填成「收成测试 · 笔记」')
+  else bad('询问框没弹 / 名字不对：' + JSON.stringify(askw.value))
+  await s.key('Enter', 'Enter', 13)
+
+  /* 等转录校对弹层挂上。★ 它现在**当场就开**（图先画好、每块摆一个"正在识别…"），
+     所以这一刻它应该已经在，而且**两块都还没认完** —— 那正是"边认边填"。 */
+  const rvOpen = () => s.eval(`(() => {
+    const root = document.querySelector('.trv')
+    if (!root) return null
+    const bands = [...root.querySelectorAll('.trv-band')]
+    return {
+      count: bands.length,
+      names: bands.map((b) => { const n = b.querySelector('.trv-name b'); return n ? n.textContent.trim() : '' }),
+      pending: bands.filter((b) => b.getAttribute('data-pending') === '1').length,
+      stopBtn: !!([...root.querySelectorAll('button')].find((x) => /停止转写/.test(x.textContent))),
+    }
+  })()`)
+  const rv = await until(rvOpen, { timeout: 30000, what: '转录校对弹层挂上' })
+  if (rv.ok && rv.value.count === 2) ok('弹层里两块：你的板框一块 + 框外那一片')
+  else bad('弹层的块数不对（期望 2）：' + JSON.stringify(rv.value))
+  if (rv.value && rv.value.names[0] === '环流定理') ok('★ 第一块的标题就是你框的名字「环流定理」')
+  else bad('第一块没有框名：' + JSON.stringify(rv.value && rv.value.names))
+  if (rv.value && rv.value.names[1] === '第 2 块') ok('框外那一片没有名字（它本来就没有框）')
+  else bad('第二块的名字不对：' + JSON.stringify(rv.value && rv.value.names))
+  if (rv.value && rv.value.pending > 0 && rv.value.stopBtn) {
+    ok(`★ 弹层是**当场打开**的：这一刻还有 ${rv.value.pending}/2 块在认（而且「停止转写」在）`)
+  } else {
+    bad('弹层不是边认边填（打开时已经没有在认的块，或者没有停止按钮）：' + JSON.stringify(rv.value))
+  }
+
+  /* 等它认完（判据是页面事实：没有 pending 的块了，不是睡一个固定毫秒）。 */
+  const rvDone = await until(
+    async () => {
+      const v = await rvOpen()
+      return v && v.pending === 0 ? v : undefined
+    },
+    { timeout: 30000, what: '两块都认完' }
+  )
+  if (rvDone.ok) ok('两块都认完了（弹层里"正在识别…"全部消失）')
+  else bad('等不到两块认完')
+
+  const mine = seen.slice(n0)
+  if (mine.length === 2) ok('假识别服务收到 2 次请求（一块一次，没有把整板压成一张图）')
+  else bad(`假识别服务收到 ${mine.length} 次请求（期望 2）`)
+  if (mine.some((r) => /白板转录工具/.test(r.promptText))) ok('发出去的是**整板转录**那段提示词（mode=board 走通了）')
+  else bad('提示词不对（mode 没传到位？）：' + String(mine[0] && mine[0].promptText).slice(0, 60))
+  if (mine.length && mine.every((r) => r.imageBytes > 1000)) ok('两块都发了图，而且不是空图')
+  else bad('有块发出去的是空图/小图：' + JSON.stringify(mine.map((r) => r.imageBytes)))
+  if (mine.length && mine.every((r) => r.imageW > 0 && r.imageW <= OCR_MAX_DIM && r.imageH <= OCR_MAX_DIM)) {
+    ok(`★ 每张识别图都在尺寸上限之内（最大 ${Math.max(...mine.map((r) => r.imageW))}×${Math.max(...mine.map((r) => r.imageH))}，上限 ${OCR_MAX_DIM}）`)
+  } else {
+    bad('有块的识别图超了上限：' + JSON.stringify(mine.map((r) => [r.imageW, r.imageH])))
+  }
+
+  /* 校对完了 → 落笔。 */
+  const cb = await s.eval(`(() => {
+    const b = [...document.querySelectorAll('.trv .wp-acts button')].find((x) => /校对完了/.test(x.textContent))
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  if (cb) await s.mouse(cb.x, cb.y)
+  else bad('找不到「校对完了，收成笔记」那颗按钮')
+
+  const NOTE = '收成测试 · 笔记.md'
+  const notePath = path.join(ROOT, 'data', NOTE)
+  after(() => {
+    try {
+      fs.rmSync(notePath, { force: true })
+    } catch {}
+  })
+  const made = await until(
+    () => {
+      try {
+        const t = fs.readFileSync(notePath, 'utf8')
+        return t.length ? t : undefined
+      } catch {
+        return undefined
+      }
+    },
+    { timeout: 12000, what: '笔记草稿落盘（' + NOTE + '）' }
+  )
+  if (made.ok) ok('笔记落盘：' + NOTE)
+  else bad('点了「校对完了」之后盘上没长出那份笔记')
+
+  const md = made.value || ''
+  const iFrm = md.indexOf('## 1、环流定理')
+  const iNext = iFrm < 0 ? -1 : md.indexOf('\n## ', iFrm + 1)
+  const secFrm = iFrm < 0 ? '' : md.slice(iFrm, iNext < 0 ? undefined : iNext)
+  if (iFrm >= 0) ok('★ 草稿里那一节就叫「环流定理」—— 你圈的框成了笔记的小节')
+  else bad('草稿里没有「## 1、环流定理」那一节：' + md.split('\n').slice(0, 8).join(' / '))
+  if (secFrm.includes('- 为什么？什么力 洛伦兹力不做功')) ok('★ 框里认回来的手写**落在这一节里面**（不是文末那一段）')
+  else bad('框里的手写没落进「环流定理」那一节：' + secFrm.slice(0, 120))
+  const iLoose = md.indexOf('、手写转录（机器认的，还没校对）')
+  if (iLoose > 0 && md.indexOf('- 静电场 ∮E·dl=0', iLoose) > iLoose) ok('框外那一片落成了文末那一段')
+  else bad('框外那一片没落成"手写转录"那一段：' + md.split('\n').slice(-6).join(' / '))
+  if (md.includes('- 牛顿第二定律')) ok('板上的卡照旧收进来了')
+  else bad('卡没收进来')
+  const unread = unreadableLines(md)
+  if (!unread.length) ok('★ 草稿里没有"读不到的行"（第 1 步的判据没被这一刀弄回去）')
+  else bad(`草稿里有 ${unread.length} 行 parseDoc 读不到：` + JSON.stringify(unread.slice(0, 2)))
+
+  const inNote = await s.eval(`!!document.querySelector('textarea.raw')`)
+  if (inNote) ok('应用切到了笔记模式打开它')
+  else bad('收完之后没切到笔记模式')
+  if (!s.errors().length) ok('这一节跑下来，页面里没有任何 JS 报错')
+  else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
+  /* 落盘的那份删掉：[12] 要拿**同一张板**再收一次（缓存那一条必须能再写一次同名笔记）。 */
+  try {
+    fs.rmSync(notePath, { force: true })
+  } catch {}
+}
+
+/* ═════════════════ 12. 转录的手感：缓存 / 单块重认 / 停止（ADR-0004 第 3 步）═════════════════
+ *
+ * 三件事各有一条硬判据，而且都拿**假服务收到几次请求**当尺子（那才是钱）：
+ *   ① **缓存**：同一张板再收一次 → 0 次请求，字照样在（而且标着"上次认的"）；
+ *   ② **单块重认**：只发那**一块**（1 次请求），回来把那一块的字换掉；
+ *   ③ **停止**：认到一半按停 → 后面的块**一个请求都不发**，弹层留着让你收已经认好的。
+ * 顺带钉住"先不收 = 什么都没写"。 */
+console.log('\n[12] 转录的手感：内容缓存 / 单块重认 / 停止（第 3 步）')
+{
+  const NOTE = '收成测试 · 笔记.md'
+  const notePath = path.join(ROOT, 'data', NOTE)
+  const askAndGo = async () => {
+    const gb = await s.eval(`(() => {
+      const b = document.querySelector('[data-tool="gather"]')
+      if (!b) return null
+      const r = b.getBoundingClientRect()
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+    })()`)
+    if (!gb) return bad('找不到「▤ 收成笔记」')
+    await s.mouse(gb.x, gb.y)
+    const w = await until(
+      () => s.eval(`(() => { const d = document.querySelector('.ask-input'); return d ? String(d.value || '') : null })()`),
+      { what: '询问框弹出来' }
+    )
+    if (!w.ok) bad('询问框没弹出来')
+    await s.key('Enter', 'Enter', 13)
+  }
+  const bandState = () => s.eval(`(() => {
+    const root = document.querySelector('.trv')
+    if (!root) return null
+    const bands = [...root.querySelectorAll('.trv-band')]
+    return {
+      count: bands.length,
+      pending: bands.filter((b) => b.getAttribute('data-pending') === '1').length,
+      cachedTags: bands.filter((b) => b.querySelector('.trv-tag.ok')).length,
+      texts: bands.map((b) => { const t = b.querySelector('textarea'); return t ? t.value : '' }),
+      stopBtn: !!([...root.querySelectorAll('button')].find((x) => /停止转写/.test(x.textContent))),
+    }
+  })()`)
+  const waitDone = () => until(async () => { const v = await bandState(); return v && v.pending === 0 ? v : undefined }, { what: '两块都认完' })
+  const noReview = () => s.eval(`!document.querySelector('.trv')`)
+
+  /* ── ① 缓存：同一张板再收一次，一次请求都不该发 ── */
+  mockReply.delayMs = 0
+  await open()
+  const c0 = seen.length
+  await askAndGo()
+  const c1 = await waitDone()
+  const cReq = seen.length - c0
+  if (cReq === 0) ok('★ 同样的板再收一次：**0 次请求**（内容没变 → 缓存全命中）')
+  else bad(`缓存没生效：又发了 ${cReq} 次请求`)
+  if (c1.ok && c1.value.texts[0].includes('为什么？什么力') && c1.value.texts[1].includes('静电场')) {
+    ok('★ 两块的字照样在（一个是框里的、一个是框外的）')
+  } else bad('缓存命中的块里没有字：' + JSON.stringify(c1.value && c1.value.texts))
+  if (c1.ok && c1.value.cachedTags === 2) ok('两块都标着「上次认的」（这次没花钱，界面上看得出来）')
+  else bad(`"上次认的"标签数不对（期望 2，实际 ${c1.value && c1.value.cachedTags}）`)
+
+  /* ── ② 单块重认：只发那一块 ── */
+  mockReply = { code: 200, n: 0, byIndex: ['重新认回来的那一块的字'] }
+  const r0 = seen.length
+  const rb = await s.eval(`(() => {
+    const b = [...document.querySelectorAll('.trv-band')][0].querySelector('.trv-retry')
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  if (rb) await s.mouse(rb.x, rb.y)
+  else bad('第一块上没有「重新认这一块」那颗按钮')
+  const rd = await waitDone()
+  const rReq = seen.length - r0
+  if (rReq === 1) ok('★ 「重新认这一块」只发 1 次请求（不是把整板重发一遍）')
+  else bad(`单块重认发了 ${rReq} 次请求（期望 1）`)
+  if (rd.ok && rd.value.texts[0].includes('重新认回来的那一块的字') && !rd.value.texts[1].includes('重新认回来')) {
+    ok('★ 只有第一块的字被换掉，第二块（缓存那份）一个字没动')
+  } else bad('重认之后两块的字不对：' + JSON.stringify(rd.value && rd.value.texts))
+
+  /* ── ③ 先不收 = 什么都没写 ── */
+  const cancelBtn = await s.eval(`(() => {
+    const b = [...document.querySelectorAll('.trv .wp-acts button')].find((x) => /先不收/.test(x.textContent))
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  if (cancelBtn) await s.mouse(cancelBtn.x, cancelBtn.y)
+  const closed = await until(noReview, { timeout: 4000, what: '弹层关掉' })
+  if (closed.ok) ok('「先不收」把弹层关掉了')
+  else bad('「先不收」没关掉弹层')
+  if (!fs.existsSync(notePath)) ok('★ 先不收 = 盘上什么都没写')
+  else {
+    bad('说了"先不收"，盘上却多了一份笔记')
+    try {
+      fs.rmSync(notePath, { force: true })
+    } catch {}
+  }
+
+  /* ── ④ 停止：认到一半按停，后面的块一个请求都不发 ── */
+  /* 清掉缓存（不然两块都秒回，根本没有"认到一半"这回事），并让假服务慢一点。 */
+  await s.eval(`(() => { try { localStorage.removeItem('studyhelper.ocrCache') } catch {} return 1 })()`)
+  mockReply = { code: 200, n: 0, delayMs: 4000, byIndex: ['这一块会认很久'] }
+  await open()
+  const s0 = seen.length
+  await askAndGo()
+  const opened = await until(async () => { const v = await bandState(); return v && v.pending > 0 ? v : undefined }, { what: '弹层打开、第一块在认' })
+  if (opened.ok && opened.value.stopBtn) ok('认到一半，「停止转写」那颗在弹层上')
+  else bad('停止按钮不在：' + JSON.stringify(opened.value))
+  const sb = await s.eval(`(() => {
+    const b = [...document.querySelectorAll('.trv button')].find((x) => /停止转写/.test(x.textContent))
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  if (sb) await s.mouse(sb.x, sb.y)
+  const stopped = await until(async () => { const v = await bandState(); return v && v.pending === 0 && !v.stopBtn ? v : undefined }, { timeout: 8000, what: '停止生效（没有在认的块了）' })
+  if (stopped.ok) ok('★ 停止生效：不再有在认的块，停止按钮也收了')
+  else bad('按了停止但还在认：' + JSON.stringify(stopped.value))
+  if (seen.length - s0 === 1) ok('★ 停止之后**后面的块一个请求都没发**（只发了正在认的那一块）')
+  else bad(`停止之后又发了 ${seen.length - s0 - 1} 次请求（期望 0）`)
+  if (stopped.ok && (await noReview()) === false) ok('弹层留着（已经认好的还能收）—— 停止 ≠ 关掉')
+  else bad('停止把弹层也关掉了（那就没法收已经认好的了）')
+  /* 收尾：Esc 关掉，别让它影响后面的自检。 */
+  await s.key('Escape', 'Escape', 27)
+  await until(noReview, { timeout: 4000, what: 'Esc 关掉弹层' })
+  if (!s.errors().length) ok('这一节跑下来，页面里没有任何 JS 报错')
+  else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
+}
+
+/* ═════════════════ 13. 两趟：按行抄 + 读结构（ADR-0004 第 4 步）═════════════════
+ *
+ * 第 4 步的收口，全在真浏览器里跑一遍：
+ *   ① 认字那趟**按行回话**（`L1|…`），行号来自本地算的行清单；
+ *   ② 校对弹层上**报得出"几行认到了"**；
+ *   ③ 点「校对完了」之后再走一趟**没有图的**纯文本调用（假服务按"有没有图"分流）；
+ *   ④ 落下来的草稿是**结构小节**，而且每一行都合法（第 1 步的判据）。
+ * ⚠ [11]/[12] 用的假服务回的是**不带行号**的自由文字 —— 那正好覆盖了**退化**那条路
+ *   （格式没跟上 → 整段照原文抄、第二趟不参与）。这一节才是有行号的那条路。 */
+console.log('\n[13] 两趟：按行抄 + 读结构（第 4 步）')
+{
+  const NOTE = '收成测试 · 笔记.md'
+  const notePath = path.join(ROOT, 'data', NOTE)
+  /* 缓存里有 [12] 那几块（老格式的原文）→ 不清掉的话这一节根本不会发请求。 */
+  await s.eval(`(() => { try { localStorage.removeItem('studyhelper.ocrCache') } catch {} return 1 })()`)
+  mockReply = {
+    code: 200,
+    n: 0,
+    /* ★ 按行回话（`byLines`）：**前提是提示词里真有行清单** —— 假服务现在会自己看。
+       没有清单时回 `free` 那一段（自由发挥、不带行号），于是"行清单没发出去"
+       这条链子断了会在**下一个断言上**（2/2 行认到了）当场炸，而不是一路绿到底。 */
+    byLines: ['L1|安培环路定理\nL2|只对稳恒电流成立'],
+    free: '安培环路定理\n只对稳恒电流成立（这一次没有行清单，我按自己的分行走）',
+    struct: {
+      choices: [
+        {
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              sections: [
+                /* 第 1 段就是你圈的那个板框 → 用 `"frame": 1` 让**框名**当小节名 */
+                {
+                  frame: 1,
+                  say: '安培环路定理把磁场的环流和穿过它的电流连起来。',
+                  rows: [{ line: 1, indent: 0 }, { line: 2, indent: 1 }],
+                },
+                /* 第 2 段是框外的手写（没名字）→ 拿它第一行的字当标题 */
+                { title: 3, rows: [{ line: 3, indent: 0 }, { line: 4, indent: 1 }] },
+              ],
+              relations: [{ kind: '推导', from: 1, to: 3 }],
+            }),
+          },
+        },
+      ],
+    },
+  }
+  await open()
+  const n0 = seen.length
+  const gb = await s.eval(`(() => {
+    const b = document.querySelector('[data-tool="gather"]')
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  await s.mouse(gb.x, gb.y)
+  await until(() => s.eval(`(() => { const d = document.querySelector('.ask-input'); return d ? String(d.value || '') : null })()`), { what: '询问框' })
+  await s.key('Enter', 'Enter', 13)
+
+  const done = await until(
+    () => s.eval(`(() => {
+      const root = document.querySelector('.trv')
+      if (!root) return null
+      const bands = [...root.querySelectorAll('.trv-band')]
+      const pend = bands.filter((b) => b.getAttribute('data-pending') === '1').length
+      if (pend) return null
+      return { cov: bands.map((b) => { const c = b.querySelector('.trv-cov'); return c ? c.textContent.trim() : '' }), texts: bands.map((b) => b.querySelector('textarea').value) }
+    })()`),
+    { timeout: 30000, what: '两块都认完' }
+  )
+  if (done.ok && done.value.cov.every((c) => /2\/2 行认到了/.test(c))) ok('★ 校对弹层上报得出"2/2 行认到了"（按行回话走通了）')
+  else bad('覆盖率没报出来 / 行数不对：' + JSON.stringify(done.value && done.value.cov))
+  if (done.ok && !done.value.texts.join('').includes('L1|')) ok('★ 文本框里是**纯文字**（行号那一层不给改字的人看）')
+  else bad('文本框里还带着行号前缀：' + JSON.stringify(done.value && done.value.texts))
+
+  const cb = await s.eval(`(() => {
+    const b = [...document.querySelectorAll('.trv .wp-acts button')].find((x) => /校对完了/.test(x.textContent))
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+  })()`)
+  if (cb) await s.mouse(cb.x, cb.y)
+  const made = await until(
+    () => {
+      try {
+        const t = fs.readFileSync(notePath, 'utf8')
+        return t.length ? t : undefined
+      } catch {
+        return undefined
+      }
+    },
+    { timeout: 15000, what: '笔记落盘' }
+  )
+  const mine = seen.slice(n0)
+  const structReqs = mine.filter((r) => r.imageBytes === 0)
+  /* ★ 认字那一趟的提示词里**必须**带着行清单（ADR-0004 第 4 步的第一跳）。
+     它是"第二趟有没有被叫上"的唯一前提：模型见不到清单就只能自由分行、
+     一个 `L<行号>|` 都回不出来 → `parseLineOutput` 判 followed=false → `items` 是 null
+     → App.jsx 里那个闸不开 → 草稿退回"按块平铺"（＝纯粹的识别）。
+     ⚠ 2026-09-20 用户报的"碎片化、没有逻辑"就是这个：App.jsx 一路在传 `opts.lines`，
+       服务端一路在读 `lines` 字段，**中间 recognizeHandwriting 没把它 append 进去**。
+       当时这一节之所以全绿，是因为假服务按"第几次请求"回话、根本不看提示词。 */
+  const imgReqs = mine.filter((r) => r.imageBytes > 0)
+  if (imgReqs.length && imgReqs.every((r) => MANIFEST_RE.test(r.promptText))) {
+    ok('★ 认字那一趟的提示词里带着**行清单**（第 4 步的第一跳没断）')
+  } else {
+    bad(
+      `认字那一趟的提示词里没有行清单（发了 ${imgReqs.length} 张图，` +
+        `${imgReqs.filter((r) => !MANIFEST_RE.test(r.promptText)).length} 张没有）—— ` +
+        '模型只能自由分行，第二趟永远不会被叫上：' +
+        String(imgReqs[0] && imgReqs[0].promptText).slice(0, 80)
+    )
+  }
+  if (structReqs.length === 1) ok('★ 第二趟只发了一次，而且**没有图**（纯文本出去）')
+  else bad(`结构整理那一趟发了 ${structReqs.length} 次（期望 1）`)
+  if (structReqs.length && /一个字都不要写/.test(structReqs[0].promptText)) ok('★ 那一趟的提示词里带着铁律：行的文字一个字都不许它写')
+  else bad('结构整理的提示词不对：' + String(structReqs[0] && structReqs[0].promptText).slice(0, 60))
+  if (structReqs.length && /除了 `say`/.test(structReqs[0].promptText)) ok('★ 铁律收窄成"除了 `say`"——放行的那一处没被漏掉')
+  else bad('提示词里没写清 `say` 是唯一可写处（它会连 say 也不写，这一趟又只剩骨架）')
+  if (structReqs.length && /L1：安培环路定理/.test(structReqs[0].promptText)) ok('输入里是"行号：那一行的字"（坐标系跟着一起发）')
+  else bad('结构整理的输入里没有行清单')
+
+  const md = made.value || ''
+  if (/## \d+、环流定理/.test(md)) ok('★ 第一小节用**你圈的框名**当标题（`"frame": 1` 那条路）')
+  else bad('板框名那条路没走通：' + md.split('\n').filter((l) => /^## /.test(l)).join(' / '))
+  if (/## \d+、安培环路定理/.test(md)) ok('★ 第二小节拿它第一行的字当标题（`"title": 3` 那条路）')
+  else bad('草稿里没有结构小节：' + md.split('\n').slice(0, 10).join(' / '))
+  if (md.includes('  - 只对稳恒电流成立')) ok('★ 缩进也读出来了（挂在上一行底下）')
+  else bad('层级没落进草稿')
+  /* ★ 放行的那一段（`say`）：它得**真落进草稿**、带着我们加的标记、而且是一条合法节点。 */
+  if (md.includes('- 〔机器整理〕安培环路定理把磁场的环流和穿过它的电流连起来。')) {
+    ok('★ 机器写的那一段落进草稿了，而且带着〔机器整理〕标记（哪句是它写的，一眼看得见）')
+  } else {
+    bad('草稿里没有机器整理那一段：' + md.split('\n').filter((l) => /机器整理/.test(l)).join(' / '))
+  }
+  if (md.includes('带 `〔机器整理〕` 的那一条是**机器自己写的一段话**')) ok('★ 草稿开头明说了两种出处（机器写的 vs 你写的）')
+  else bad('草稿里没说清"哪一条是机器写的"')
+  if (/- 推导 \| → /.test(md)) ok('关系落在草稿里（长在它出发的那一行底下）')
+  else bad('关系没落进草稿')
+  if (md.includes('> 下面这几节是机器认的手写')) ok('机器认的那一段照样明写着"还没校对"')
+  else bad('草稿里没有"机器认的"那句提醒')
+  const unread = unreadableLines(md)
+  if (!unread.length) ok('★ 结构化之后的草稿里也没有"读不到的行"')
+  else bad(`草稿里有 ${unread.length} 行 parseDoc 读不到：` + JSON.stringify(unread.slice(0, 2)))
+  if (!s.errors().length) ok('这一节跑下来，页面里没有任何 JS 报错')
   else bad(`页面里有 JS 报错（${s.errors().length} 条）：` + s.errors().slice(0, 3).join(' ｜ '))
 }
 })

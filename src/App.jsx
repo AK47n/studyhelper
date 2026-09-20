@@ -5,6 +5,18 @@ import SourceEditor from './components/SourceEditor.jsx'
 import Board from './components/Board.jsx'
 import { isBoardName, newBoard, serializeBoardDocument } from './lib/board.js'
 import { parseDoc, renderTitle, cleanName } from './lib/parse.js'
+import { draftNoteFromBoard, frameRectsForBand, splitByBlocks } from './lib/board-note.js'
+/* 转录结果的本地缓存（第 3 步）：键按**内容**算，同一块没改过就不再花一次钱。 */
+import { blockKey, browserStore, makeOcrCache } from './lib/ocr-cache.js'
+/* 第 4 步：行清单（本地几何）+ 两趟之间的那套契约（只许引用行号）。 */
+import { buildLines } from './lib/ink-lines.js'
+import {
+  buildStructureInput, coverageNote, flatSection, manifestText, parseLineOutput, parseStructureOutput, plainText,
+  relines, renderStructuredNote,
+} from './lib/board-structure.js'
+import { isSameLayer, pickVocab } from './lib/note-vocab.js'
+import { recognizeHandwriting, structureReading, strokesToPngBlob } from './lib/ocr.js'
+import TranscribeReview from './components/TranscribeReview.jsx'
 import { normalizeMarkers, useFormulaEditing } from './lib/useFormulaEditing.js'
 import { SEED_NAME, SEED_TEXT } from './seed.js'
 import { buildSeedBoard } from './seed-board.js'
@@ -84,6 +96,16 @@ const ASK = {
     hint: '名字里带 / 可以一次往下开几层（比如 电磁学/第一周）。',
     label: '这条笔记叫什么',
     ok: '建好并打开',
+    where: true,
+    required: true,
+  },
+  /* 「收拢成笔记」（2026-09-19 晚，方向 B）：从白板生成草稿，这一条只问"叫什么、放哪层"。
+     层的初值 = 那张板所在的层（板和它的结论页待在一起最好找）。 */
+  'note-from-board': {
+    title: '收拢成笔记',
+    hint: '把白板上认出来的卡片/板框/连接拣成一份草稿。名字里带 / 可以换一层放。',
+    label: '这份笔记叫什么',
+    ok: '生成并打开',
     where: true,
     required: true,
   },
@@ -216,6 +238,23 @@ const SCALE_DEFAULT = 1.25
 const SCALE_KEY = 'studyhelper.scale'
 /* 左栏哪几层展开着。同样是"我怎么看"，存 localStorage，不进板文件。 */
 const TREE_KEY = 'studyhelper.tree'
+
+/* ── 整板转录那一条的参数（2026-09-19，第 3 步之后收在这里）──────────────
+ * 为什么提成模块常量：**缓存键要用 flavor，请求要用同一套参数** —— 两处各写一份
+ * 迟早漂移（"缓存命中了但发出去的参数不一样"是最难查的那种）。
+ * `targetH: 2000` 是"整板一条"的档：块里的字要够大，识别准确率才立得住
+ * （小选区认公式走的是另一套：targetH 160 / 2~6 倍）。 */
+const BAND_OPTS = { mode: 'board', targetH: 2000, minScale: 0.8, maxScale: 4 }
+/* `lines-N` = 按行抄那一套契约（第 4 步）：**换了契约就要换 flavor** ——
+   不然上一次按老格式认回来的缓存会被当成新格式读，行号全对不上。
+   ⚠ `lines-1` → `lines-2`（2026-09-20）：`lines-1` 那段时间里**行清单根本没发出去**
+   （见 lib/ocr.js 里那段说明），缓存里躺着的是"模型自由分行、一个 L 前缀都没有"的
+   老稿；不换 flavor 的话，修好之后再收一次会**原样命中那份老稿**，
+   屏幕上看起来跟没修一样（而且不会花一次钱去发现这件事）。 */
+const BAND_FLAVOR = 'board/lines-2/2000/0.8-4'
+/* 这几种失败**不是"这一块没认出来"，是整条链路没通** —— 一块一块地撞墙没有意义，
+   该停下来说清楚（"没配密钥 / 服务端是旧版 / 这家服务干不了这活"）。 */
+const FATAL_OCR_KINDS = new Set(['no-key', 'key', 'stale', 'provider'])
 
 const clampScale = (v) => Math.min(SCALE_MAX, Math.max(SCALE_MIN, Math.round(v * 100) / 100))
 
@@ -690,6 +729,16 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [toast, setToast] = useState(null)
   const [busy, setBusy] = useState(true)
+  /* 遮罩上那句话。整板转录要几十秒，"载入中…"三个字撑不住那么长的等待 ——
+     得说清"在干什么、要多久"，不然用户以为卡死了。 */
+  const [busyMsg, setBusyMsg] = useState('')
+  /* 转录校对（2026-09-19 晚）：整板转录完**先不落笔**，把"每块的原板图 + 机器认的稿"
+     摆进 TranscribeReview 让人改完再收。null = 没在校对。
+     放 App 这一层：转录发生在 gatherNote（这里），busy 遮罩也在这层。 */
+  const [transReview, setTransReview] = useState(null)
+  /* 停止转录用的把手（第 3 步）：弹层上那颗「停止」按它，它 abort 掉**还在等的那一次**，
+     并把"别再发下一块了"立刻生效。校对弹层关掉时清空（见 confirmTransReview / onCancel）。 */
+  const cancelRef = useRef(null)
   const [diskMtime, setDiskMtime] = useState(0)
   /* 「编辑 / 阅读」双视图：2026-09-19 晚一度砍掉，同日又请回来 —— 两度反转，把账记全：
      砍的时候它看着像"同一份内容两种摆法"；但「收成笔记」上线后草稿里全是公式，
@@ -1185,9 +1234,388 @@ export default function App() {
     flash((made.overwritten ? '覆盖了：' : '建好了：') + made.name)
   }
 
+  /* ── 收拢成笔记（2026-09-19 晚，方向 B：白板为主、笔记为辅）──────────
+   * 白板是"算"的地方，笔记是"算完留下的结论"。这一步把板上已经提纯的东西
+   * （认成卡片的公式/文字、亲手圈的板框、亲口连的箭头）拣成一份草稿，
+   * 人接手改成自己的话 —— 笔记从此不用从零打字。
+   *
+   * ★ 裸手写**不再被丢下**：有手写时先做一次**整板转录**（分成几块、每块单独发），
+   *   认完先进**转录校对**（原板图和转录稿并排），改完才落笔。
+   *
+   * ★ 2026-09-19 第 3 步（手感，ADR-0004 第 3 步）：
+   *   ① **弹层立刻打开**：图当场画好，每块先摆一个"等待识别"，认完一块填一块 ——
+   *      等待从"盯着遮罩几十秒"变成"可以一边看原图一边等"；
+   *   ② 认过的块按**内容哈希**缓存（lib/ocr-cache.js）：改一笔再收一次，
+   *      没动过的块**秒回、不再花钱**；
+   *   ③ 每块能**单独重认**（从前第一块失败会把整趟带走，后面全不认）；
+   *   ④ 随时能**停止**（中止后面的请求。⚠ 已经发出去的那一次拦不住 ——
+   *      服务端还在跑、钱也照花，这一条如实写在按钮上）。
+   *
+   * 草稿怎么拣：src/lib/board-note.js（一个纯函数，自检直接喂板文件文本）。 */
+  async function gatherNote(board) {
+    const strokes = (board && Array.isArray(board.strokes) ? board.strokes : []).filter(
+      (s) => s && s.points && s.points.length >= 3
+    )
+
+    /* 先问名字（快），确认了才花那几十秒去转录 —— 取消了就不该花钱。 */
+    const here = parentPath(current || '')
+    const def = ((board && board.title) || baseName(current || '')).trim() + ' · 笔记'
+    const raw = await ask('note-from-board', { value: def, where: here, layers: folders })
+    if (!raw) return
+
+    const ink = strokes.filter((s) => s.tool !== 'highlighter')
+    if (!ink.length) {
+      /* 没有裸手写：没有转录这回事，直接收卡片（老路，一个字没变）。 */
+      await writeDraft(board, raw, [], '')
+      return
+    }
+
+    /* 一块 = 一个板框（第 2 步）；框外的按竖直大留白切。
+       图**当场全部画好**：一是弹层立刻能开（左边那张图从第一秒就在，
+       人可以先照着图读），二是缓存键和发出去的图用的是同一份笔迹，不会两处漂移。 */
+    const blocks = splitByBlocks(ink, board, { maxBands: 4 })
+    /* **你自己的词**（第 4 步的"结合我的笔记"）：从同层的笔记里抽，只读本机的 .md。
+       它只喂**第二趟**（结构整理）—— 那一趟在弹层上看得见、关得掉；
+       喂第一趟（认字）要等设置里有一个"还没发出去就能关"的开关，记在 ADR 的"还没做"里。 */
+    const vocab = await sameLayerVocab(board)
+    /* ★ 第 4 步：本地先算好每一块的**行清单**，它同时喂给两趟 ——
+         认字那趟把它拼进提示词（模型按 `L<行号>|文字` 回话），
+         结构整理那趟拿它当坐标系（每条结论都必须引用行号）。
+       图也当场画好：一是弹层立刻能开，二是缓存键和发出去的图用同一份笔迹。 */
+    const plan = blocks.map((blk) => {
+      const lines = buildLines(blk.strokes)
+      const overlays = frameRectsForBand(blk.strokes, board)
+      const made = strokesToPngBlob(blk.strokes, { ...BAND_OPTS, overlays })
+      return {
+        name: blk.name,
+        frameId: blk.frameId,
+        strokes: blk.strokes,
+        overlays,
+        lines,
+        manifest: manifestText(lines),
+        img: made ? made.canvas.toDataURL('image/png') : '',
+      }
+    })
+    const parts = plan.map((b) => ({
+      name: b.name,
+      frameId: b.frameId,
+      strokes: b.strokes,
+      overlays: b.overlays,
+      lines: b.lines,
+      img: b.img,
+      text: '',
+      items: null, // 按行认回来时：每一段文字对应哪几行（改完的字靠它挂回去）
+      coverage: '',
+      error: '',
+      pending: true,
+      cached: false,
+      rev: 0,
+    }))
+    const cache = makeOcrCache(browserStore())
+    const ac = new AbortController()
+    cancelRef.current = () => ac.abort()
+    setTransReview({ board, raw, bands: parts, ocrFail: '', streaming: true, vocab, useVocab: !!vocab.length })
+
+    let ocrFail = ''
+    let anyText = false
+    try {
+      for (let i = 0; i < parts.length; i++) {
+        if (ac.signal.aborted) break
+        const key = blockKey(parts[i].strokes, { flavor: BAND_FLAVOR })
+        const hit = cache.get(key)
+        if (hit) {
+          /* 这一块没动过：直接用上次认的（**不再发请求、不再花钱**）。
+             缓存的原文带着 `L<行号>|` 前缀 —— 照样要过一遍解析，两趟的坐标才对得上。 */
+          patchBand(i, { ...readBack(hit.text, parts[i].lines.length), pending: false, error: '', cached: true })
+          anyText = true
+          continue
+        }
+        const r = await recognizeHandwriting(parts[i].strokes, {
+          ...BAND_OPTS,
+          overlays: parts[i].overlays,
+          lines: plan[i].manifest,
+          signal: ac.signal,
+        })
+        if (r.kind === 'cancel') break
+        if (r.ok && r.text) {
+          cache.set(key, r.text)
+          patchBand(i, { ...readBack(r.text, parts[i].lines.length), pending: false, error: '', cached: false })
+          anyText = true
+        } else {
+          ocrFail = r.error || '没认出内容'
+          /* 这几种不是"这一块没认出来"，是**整条链路没通**（没配密钥 / 服务端是旧版 /
+             这家服务干不了这活）。一块都还没认到的时候，别拿一屏空框子拦人 ——
+             关掉弹层，走"先收卡片"的老路，并把人话原样报出来。 */
+          if (FATAL_OCR_KINDS.has(r.kind) && !anyText) {
+            cancelRef.current = null
+            setTransReview(null)
+            await writeDraft(board, raw, [], ocrFail, null)
+            return
+          }
+          patchBand(i, { pending: false, error: ocrFail })
+          if (FATAL_OCR_KINDS.has(r.kind)) {
+            /* 链路不通，但已经有内容了：剩下的别再一块一块撞墙，直接全部标上原因。 */
+            for (let j = i + 1; j < parts.length; j++) patchBand(j, { pending: false, error: ocrFail })
+            break
+          }
+        }
+      }
+    } finally {
+      cancelRef.current = null
+      /* 收尾：**还在认的块要有个交代** —— 停止（或被打断）之后它们不该摆着一个
+         空框子装作"机器认了个空的"，所以给它们一句人话（缓存/认好的块一个字不动）。 */
+      setTransReview((rv) =>
+        rv
+          ? {
+              ...rv,
+              streaming: false,
+              ocrFail,
+              bands: rv.bands.map((b) => (b.pending ? { ...b, pending: false, error: b.error || ocrFail || '已停止' } : b)),
+            }
+          : rv
+      )
+    }
+  }
+
+  /* 识别回来的原文 → 给校对界面用的那一份。
+     `L<行号>|文字` 是**契约**（第二趟要靠行号），但不该让改字的人盯着它看：
+     格式跟上了 → 文本框里只放纯文字，行号单独存着（改完 `relines` 挂回去）；
+     没跟上 → 整段照原样摆出来（**退化成"照原文抄"**，不是编一个结构出来）。 */
+  function readBack(raw, lineCount) {
+    const parsed = parseLineOutput(raw, lineCount)
+    const note = coverageNote(parsed, lineCount)
+    if (!parsed.followed) {
+      return { text: String(raw || '').trim(), items: null, coverage: note + '（没按行回话，这一块退回整段抄）' }
+    }
+    return { text: plainText(parsed.items), items: parsed.items, coverage: note }
+  }
+
+  /* 弹层里改过的字：只覆盖**这一块**（别的地方你敲进去的东西一个字都不许动）。 */
+  const patchBand = useCallback((i, next) => {
+    setTransReview((rv) => {
+      if (!rv || !rv.bands[i]) return rv
+      return { ...rv, bands: rv.bands.map((b, j) => (j === i ? { ...b, ...next, rev: (b.rev || 0) + 1 } : b)) }
+    })
+  }, [])
+
+  /* 单块重认：只重发这一块，而且**绕开缓存** —— 这颗按钮的意思就是"上次那个我不信"。 */
+  async function retryBlock(i) {
+    const rv = transReview
+    if (!rv || !rv.bands[i]) return
+    const p = rv.bands[i]
+    if (p.pending || !p.strokes) return
+    const ac = new AbortController()
+    cancelRef.current = () => ac.abort()
+    patchBand(i, { pending: true, error: '' })
+    try {
+      const r = await recognizeHandwriting(p.strokes, {
+        ...BAND_OPTS,
+        overlays: p.overlays,
+        lines: manifestText(p.lines || []),
+        signal: ac.signal,
+      })
+      if (r.kind === 'cancel') {
+        patchBand(i, { pending: false })
+        return
+      }
+      if (r.ok && r.text) {
+        makeOcrCache(browserStore()).set(blockKey(p.strokes, { flavor: BAND_FLAVOR }), r.text)
+        patchBand(i, { ...readBack(r.text, (p.lines || []).length), pending: false, error: '', cached: false })
+      } else {
+        patchBand(i, { pending: false, error: r.error || '没认出内容' })
+      }
+    } finally {
+      cancelRef.current = null
+    }
+  }
+
+  /* 停止转录（弹层上那颗）。**中止的是"后面的请求"**：已经发出去的那一次拦不住，
+     服务端还在跑、钱也照花 —— 按钮上如实写着（见 TranscribeReview）。 */
+  function stopTranscribe() {
+    if (cancelRef.current) cancelRef.current()
+  }
+
+  /* 校对完（或放弃校对）之后真正落笔的那一步。
+     `blocks` 是**校对后的那块手写**，一块一条：`{ name, frameId, text, items, error }` ——
+     `frameId` 说得出它属于哪个板框，`items`（按行认回来时）让改过的字还能挂回原来的行号。
+     `structured` 是**结构整理那一趟**的产物（没有就是 null → 草稿走按块平铺的老路）。
+     `ocrFail` 原样带给提示语。 */
+  async function writeDraft(board, raw, blocks, ocrFail, structured = null) {
+    const list = (Array.isArray(blocks) ? blocks : []).filter((b) => b && (b.text || b.error))
+    const draft = draftNoteFromBoard(board, { when: new Date().toLocaleDateString('zh-CN'), blocks: list, structured })
+    if (!draft || !draft.md) {
+      flash('板上还没有收得动的东西：框选手写 → 「✨ 美化」成卡片，再来收拢', 'warn')
+      return
+    }
+    const { dir, title } = splitTitlePath(raw)
+    if (!title) return
+    const name = joinPath(dir, title + '.md')
+    /* 撞名就问一句（覆盖 / 换个名字 / 算了）—— 从白板收拢的草稿默认叫「<板名> · 笔记」，
+       撞名是常态，不是意外。
+       ★「换个名字」那条把**同一句问话再问一遍**，但预填的是**不撞名的那个**
+         （`suggestFreeName`）：于是这条路的成本是"回车一下"，不是"自己想一个名字"。 */
+    const made = await createNewFile(name, draft.md, {
+      onRename: async (taken) => {
+        const sug = suggestFreeName(taken) || taken
+        const again = await ask('note-from-board', { value: sug, where: parentPath(sug), layers: folders })
+        if (!again) return null
+        const parsed = splitTitlePath(again)
+        return parsed.title ? joinPath(parsed.dir, parsed.title + '.md') : null
+      },
+    })
+    if (made.cancelled) {
+      /* 「算了」也要有回音（"点了没反应"是这里最糟的结果）——顺带告诉他代价不大：
+         认过的块按内容缓存着，再点一次不会重新花一次钱。 */
+      flash('没收成笔记（认过的块有缓存，再点一次不用重新花钱）')
+      return
+    }
+    if (made.error) return flash(made.error, 'err')
     await refreshList()
-    await open(r.name, { force: true })
-    flash('建好了：' + r.name)
+    await open(made.name, { force: true })
+    const got = list.filter((b) => b.text).length
+    /* 「覆盖了原来那份」要看得见 —— 那是不可逆的一步，事后至少得知道你刚才做的是哪一件。 */
+    const over = made.overwritten ? '（覆盖了原来那份）' : ''
+    if (got) {
+      flash(
+        ocrFail
+          ? `转录只完成了一部分（${ocrFail}）；已认到的 ${got} 块都在草稿里${over}，记得校对`
+          : `收好了：${draft.cards} 张卡 + ${got} 块手写转录${draft.frames ? `（${draft.frames} 个板框成了小节）` : ''}${over}。转录是机器认的，记得对照原板校对`,
+        ocrFail ? 'warn' : 'ok'
+      )
+    } else if (ocrFail) {
+      flash(`手写转录没成（${ocrFail}）；先收了 ${draft.cards} 张卡${over}`, 'warn')
+    } else if (draft.strokesLeft > 0) {
+      flash(`收好了 ${draft.cards} 张卡${over}；还有 ${draft.strokesLeft} 笔手写没进来（想收的先美化成卡片）`)
+    } else {
+      flash(`收好了 ${draft.cards} 张卡`)
+    }
+    /* ★ "第二趟（结构整理）没被叫上"这件事**必须说出来**：它的症状是草稿看上去
+       "只有并列、没有逻辑"，而屏幕上一点异常都没有 —— 人只会以为"这机器不懂我的笔记"。
+       真因只有一个：认字那趟没按 `L<行号>|` 回话（`items` 是 null）→ 上面那个闸不开。
+       ⚠ 它排在"收好了：…"后面（顶掉那句是有意的：这一条更说明问题），
+         而**排在"读不到的行"前面** —— 那一条永远最重要，谁都不许盖它。 */
+    const gotText = list.filter((b) => b.text)
+    if (gotText.length && !list.some((b) => b.items && b.items.length)) {
+      flash('这一板手写没按行回话（模型没给行号）—— 结构整理没参与，草稿是照原文平铺的。再收一次，或者就在草稿里手动分节', 'warn')
+    }
+    /* ⚠ 读不到的行**必须永远是 0**（ADR-0004 第 1 步的判据）：那些行只活在原始编辑框里，
+       阅读页签和导出里**不存在**，而屏幕上一点异常都没有。它不该发生，
+       所以一旦发生就得报出来（上面那句 flash 被它顶掉是有意的：这条更重要）。 */
+    if (draft.unreadable > 0) {
+      flash(`⚠ 草稿里有 ${draft.unreadable} 行没落进笔记格式（阅读页签和导出会看不见它们）`, 'warn')
+    }
+  }
+
+  /* ── 结构整理那一趟（第 4 步）────────────────────────────────────────────
+   * 只在**真有按行认回来的块**时才跑：输入是整板的行清单 + 每行的字 +（可选的）你的词，
+   * 输出是一个只引用行号的 JSON 骨架。任何一步不成就回 null → 草稿退回"按块平铺"。
+   * ★ 这一趟**出网**（纯文本，比看图那趟便宜得多），所以弹层上要看得见、关得掉。 */
+  async function structureBlocks(board, blocks) {
+    const usable = (Array.isArray(blocks) ? blocks : []).filter(
+      (b) => Array.isArray(b.items) && b.items.length && Array.isArray(b.lines) && b.lines.length
+    )
+    if (!usable.length) return null
+    const { text, rows } = buildStructureInput({
+      title: (board && board.title) || '',
+      blocks: usable.map((b) => ({ name: b.name, frameId: b.frameId, lines: b.lines, items: b.items })),
+      vocab: transReview && transReview.useVocab ? transReview.vocab || [] : [],
+      links: declaredLinkHints(board),
+    })
+    const r = await structureReading(text)
+    if (!r.ok) return { error: r.error || '结构整理没成' }
+    const parsed = parseStructureOutput(r.text, rows)
+    if (!parsed.ok) return { error: parsed.error || '结构整理回的不是结构化内容' }
+    /* 没被摆进任何一节的行 → 平铺进最后一节（宁可丑，不可丢）。 */
+    const leftoverRows = (parsed.unplaced || []).map((id) => rows.find((x) => x.id === id)).filter(Boolean)
+    const rendered = renderStructuredNote(parsed, rows)
+    if (leftoverRows.length) rendered.leftover = [flatSection(leftoverRows)]
+    return { ...rendered, dropped: parsed.dropped, vocabUsed: (transReview && transReview.vocab || []).length }
+  }
+
+  /* 板上"你宣告过/画过"的连接，给结构整理当参考（只报名字，不给它当判据）。 */
+  function declaredLinkHints(board) {
+    try {
+      const cards = (board && board.cards) || []
+      const byId = new Map(cards.map((c) => [c.id, c]))
+      const frames = (board && board.frames) || []
+      const nameOf = (id) => {
+        const c = byId.get(id)
+        if (c) return String((c.kind === 'formula' ? c.src || c.tex : c.text) || '').replace(/\s+/g, ' ').trim().slice(0, 24) || '一张卡'
+        const f = frames.find((x) => x.id === id)
+        return (f && f.title) || '一块'
+      }
+      return ((board && board.links) || []).slice(0, 20).map((l) => ({ from: nameOf(l.from), to: nameOf(l.to), kind: linkKind(l.kind).name }))
+    } catch {
+      return []
+    }
+  }
+
+  /* 从**同层的笔记**里取你自己的词（第 4 步的"结合我的笔记"）。
+     只读本机上的 .md（不联网）；读不到就回空 —— 词表是提示，缺了整条链路照跑。 */
+  async function sameLayerVocab(board) {
+    try {
+      const lst = await api.list()
+      const files = (Array.isArray(lst && lst.files) ? lst.files : [])
+        .map((f) => (typeof f === 'string' ? f : f && (f.path || f.name)))
+        .filter(Boolean)
+      const here = current || ''
+      const names = files
+        .filter((f) => !/board-/.test(baseName(f)) && /\.md$/.test(f) && isSameLayer(here, f))
+        .slice(0, 8)
+      const notes = []
+      for (const f of names) {
+        const g = await api.get(f).catch(() => null)
+        if (g && typeof g.text === 'string' && !g.error) notes.push({ path: f, text: g.text, near: true })
+      }
+      return pickVocab(notes)
+    } catch {
+      return []
+    }
+  }
+
+  async function confirmTransReview(texts) {
+    const rv = transReview
+    if (!rv) return
+    stopTranscribe() // 还有块在认就先把后面的停掉（弹层已经收了，再填也没地方去）
+    cancelRef.current = null
+    /* 清空 = 不要那一块；空白块不进草稿（和"模型回 EMPTY"一个待遇）。
+       ★ 块的身份（`name` / `frameId`）跟着交下去 —— 草稿靠 frameId 把字放回
+         **同名的那一节**底下（第 2 步）。
+       ★ 改过的字用 `relines` **挂回原来的行号**（结构整理那一趟只认行号）。
+         行数对不上（你加了一行/删了一行）→ `items: null` = 这一块退化成整段。 */
+    const blocks = (Array.isArray(rv.bands) ? rv.bands : [])
+      .map((b, i) => {
+        const text = String((Array.isArray(texts) ? texts[i] : '') || '')
+        return {
+          name: (b && b.name) || '',
+          frameId: (b && b.frameId) || null,
+          lines: (b && b.lines) || [],
+          text: text.trim(),
+          items: b && b.items ? relines(text, b.items) : null,
+          error: (b && b.error) || '',
+        }
+      })
+      .filter((b) => b.text || b.error)
+
+    /* 第二趟：读结构。它要几秒、而且**弹层先别关**（不然屏幕上什么反馈都没有）。 */
+    let structured = null
+    let structErr = ''
+    if (blocks.some((b) => b.items && b.items.length)) {
+      setTransReview({ ...rv, bands: rv.bands, streaming: false, confirming: true })
+      try {
+        structured = await structureBlocks(rv.board, blocks)
+        if (structured && structured.error) {
+          structErr = structured.error
+          structured = null
+        }
+      } catch (e) {
+        structErr = (e && e.message) || '结构整理出错了'
+        structured = null
+      }
+    }
+    setTransReview(null)
+    await writeDraft(rv.board, rv.raw, blocks, rv.ocrFail, structured)
+    if (structErr) flash(`结构没读出来（${structErr}）—— 草稿照旧按块收着，一个字没丢`, 'warn')
   }
 
   /* 新建一"层"（目录）。★ 2026-09-21 之前它问的是**完整路径**（预填"当前那一层 + /"），
@@ -1657,6 +2085,10 @@ export default function App() {
             reloadToken={boardReload}
             onSave={saveBoardText}
             flash={flash}
+            /* 「收拢成笔记」：Board 手里才有活板（boardRef），App 手里只有文件原文。
+               点工具条那颗时 Board 把**当前板对象**递上来，草稿在 App 这边生成
+               （要弹询问框、要建文件、要切模式 —— 这些都是 App 的事）。 */
+            onGatherNote={gatherNote}
             /* 界面字号：白板模式顶栏不渲染，所以调字号的入口得进白板工具条，
                否则白板里就只能靠左栏那一个（而且那一个原来只会放大）。 */
             scale={scale}
@@ -1756,9 +2188,30 @@ export default function App() {
     </>
   )}
 
+      {busy && <div className="cover">{busyMsg || '载入中…'}</div>}
+      {/* 转录校对（TranscribeReview）：盖在一切上面（z 420 > busy 的 100），
+          传送门是 setTransReview —— gatherNote 转录完打开，confirmTransReview 收尾。 */}
+      {transReview && (
+        <TranscribeReview
+          bands={transReview.bands}
+          ocrFail={transReview.ocrFail}
+          streaming={!!transReview.streaming}
+          confirming={!!transReview.confirming}
+          vocab={transReview.vocab || []}
+          useVocab={!!transReview.useVocab}
+          onToggleVocab={(v) => setTransReview((rv) => (rv ? { ...rv, useVocab: !!v } : rv))}
+          onRetry={retryBlock}
+          onStop={stopTranscribe}
+          onConfirm={confirmTransReview}
+          onCancel={() => {
+            /* 「先不收」/ Esc / 点外面：**先把还在等的请求停掉**再关 ——
+               不然它认完之后还会回来改一个已经关掉的弹层的状态（白花钱还看不见）。 */
+            stopTranscribe()
+            cancelRef.current = null
+            setTransReview(null)
+          }}
+        />
       )}
-
-      {busy && <div className="cover">载入中…</div>}
       {/* 询问框（从前是浏览器的 prompt）：`ask()` 把它打开，它 resolve 回去再往下走。
           挂在最后 = 压在所有东西上面（它自带的一层遮罩也是这么来的）。 */}
       {askState && (
