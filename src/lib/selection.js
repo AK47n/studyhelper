@@ -26,7 +26,8 @@
  *   removePick(board, ids, cards) → board'   删掉这些笔**和这些卡**（顺手把板框里的死成员摘掉）
  *   transformPick(board, pick, xf) → board'  把框住的这一撮东西当成**一个整体**缩放 / 旋转
  *     xf 只有两种形状（一次拖动只有一种，见 Board.jsx 的两段手势）：
- *       { scale:  { fx, fy, anchor } }  —— 拖角；锚点是**对角**那一点
+ *       { scale:  { fx, fy, anchor } }  —— 拖角；锚点是**对角**那一点。
+ *         fx/fy 是**带符号**的倍率：负 = 翻面（把角拖过锚点另一边就是镜像，OneNote 手感）。
  *       { rotate: { d, center } }       —— 拖那颗圆的；绕选区中心
  *   freezeFrameSelection(board, ids, cards) → { board, movedFrom }   留下板框；movedFrom 是被挪过的别的框
  *   这些函数都是**纯的**：不动原对象、只返回新的 board（约定见 board.js 顶部）。
@@ -225,14 +226,19 @@ const clampMaxFactor = (f) => {
   return Math.min(PICK_MAX_FACTOR, v)
 }
 /** 把一根轴上的倍率夹到"这一轴还剩至少 PICK_MIN_SPAN"为止（见上面那段）。
+ *  ★ 2026-09-19 起**保符号**：负倍率 = 翻面（镜像）—— 用户明确要的：
+ *    「框选后拖动角……把右边的角拖到左边来」。从前这里取绝对值，
+ *    指针拖过锚点的瞬间缩放从"变小"翻回"变大"，右角看起来往反方向跑。
  *  ⚠ **0 也要夹、不能当成 1**：指针正好拖到锚点那一点上时倍率就是 0，
  *    当成 1 的话屏幕上就是"拖到底了它却一动不动"（而且包围盒还是原来那么大，
- *    下一次连"往哪拖"都看不出来）。shape-object.js 的 `clampFactor` 把 0 当 1
- *    是因为它那边的手势永远拿不到精确的 0（指针贴着锚点也差着几个像素）——
- *    这里不许照抄那一条。 */
+ *    下一次连"往哪拖"都看不出来）。shape-object.js 那边的 `clampFactor` 现在也保符号了，
+ *    两边口径一致：0 一律夹到最小倍率。 */
 function clampToSpan(f, span) {
   const lo = Number.isFinite(span) && span > 0 ? PICK_MIN_SPAN / span : 0.001
-  return Math.max(lo, clampMaxFactor(f))
+  const v = Number(f)
+  if (!Number.isFinite(v) || v === 0) return lo
+  const mag = Math.max(lo, clampMaxFactor(v))
+  return v > 0 ? mag : -mag
 }
 const q1 = (n) => Math.round(Number(n) * 10) / 10
 
@@ -354,8 +360,8 @@ export function transformPick(board, pick, xf) {
   const spanH = box ? Math.max(1, box.y1 - box.y0) : 1
   const fx = clampToSpan(sp.fx, spanW)
   const fy = clampToSpan(sp.fy, spanH)
-  /* 线宽按几何平均走（见文件上半段那条）。 */
-  const wk = Math.sqrt(fx * fy)
+  /* 线宽按几何平均走（见文件上半段那条）。**取绝对值**：翻面（负倍率）不改变笔的粗细。 */
+  const wk = Math.sqrt(Math.abs(fx * fy))
   return {
     ...board,
     strokes: S.size ? board.strokes.map((s) => (S.has(s.id) ? scaleStroke(s, fx, fy, anchor, wk) : s)) : board.strokes,

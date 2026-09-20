@@ -2034,6 +2034,29 @@ console.log('\n[6m] 选中这一族（`selection.js`）：框住的笔意味着�
       const span = pickBox(n3.strokes.filter((s) => s.id !== 'far'), [])
       eq(span.x1 - span.x0 > 0 && span.y1 - span.y0 > 0, true, '  ★ 倍率 0 也不会把选区压成一点（夹到还剩 PICK_MIN_SPAN，才拖得回来）')
       eq(p3[0] === 0 && p3[3] <= 2.0001, true, '  …那一轴真的只剩 PICK_MIN_SPAN 那么大')
+
+      /* (b2) 翻面：负倍率 = 镜像（2026-09-19 用户要的「把右边的角拖到左边来」）。
+         从前手势取绝对值，指针拖过锚点的瞬间缩放从"变小"翻回"变大"——
+         右角看起来往反方向跑。现在带符号：右角一路扫过锚点到左边去。 */
+      {
+        const b4 = mkPickBoard()
+        /* fx = −1：横向镜像（锚点 x=0 在左缘上，翻完两端对调）。 */
+        const n4 = transformPick(b4, { ids: ['a', 'b'], cardIds: ['k1'] }, { scale: { fx: -1, fy: 1, anchor: { x: 0, y: 0 } } })
+        const a4 = n4.strokes.find((s) => s.id === 'a')
+        eq([a4.points[0], a4.points[3]], [0, -100], '  ★ fx<0 = 翻面：笔迹的 x 整体镜像（100 → −100），不是"弹回去变大"')
+        eq(a4.width, 2, '  …线宽不变（翻面不改粗细）')
+        const k4 = n4.cards[0]
+        const kr4 = cardVisualRect(k4)
+        eq(Math.round(kr4.cx), -250, '  ★ 卡片中心也镜像（250 → −250）；文字本身不镜像（内容是等比的）')
+        /* 翻过去再翻回来 = 原样（浮点上允许 1/10 像素的量化差）。 */
+        const back4 = transformPick(n4, { ids: ['a', 'b'], cardIds: ['k1'] }, { scale: { fx: -1, fy: 1, anchor: { x: 0, y: 0 } } })
+        const aBack = back4.strokes.find((s) => s.id === 'a')
+        eq(Math.abs(aBack.points[3] - 100) < 0.2, true, '  ★ 再翻一次回原样（连续拖过锚点再拖回来，东西不糊）')
+        /* 负得很大也被 PICK_MAX_FACTOR 夹住（50 倍）。 */
+        const n5 = transformPick(b4, { ids: ['a', 'b'], cardIds: [] }, { scale: { fx: -99, fy: 1, anchor: { x: 0, y: 0 } } })
+        const a5 = n5.strokes.find((s) => s.id === 'a')
+        eq(Math.abs(a5.points[3]) <= 100 * 50 + 0.2, true, '  …翻面的倍率同样有 50 倍上限')
+      }
     }
 
     /* (c) 旋转：绕**选区包围盒中心**，笔迹和卡片一起转；没选中的不动 */
@@ -3854,8 +3877,16 @@ console.log('\n[6x] 常用形状规整（`shapes.js`）：画个圆 → 变成�
          于是"拖到最小再往回拖"会先卡住再猛地跳回一个大尺寸。 */
       const tiny = scaleShape(s0, 0, 0, { x: 50, y: 50 })
       eq(!!tiny, true, '★ 倍率 0 也不许返回 null（那会让图形**消失**，而且拖不回来）')
+      /* ★★ 负倍率 = 翻面（2026-09-19 起支持，用户要的「把右边的角拖到左边来」）：
+         椭圆没有"负半径"这种存储，所以**中心镜像、半径取绝对值** —— 翻过去的就是它自己。 */
       const neg = scaleShape(s0, -3, -3, { x: 50, y: 50 })
-      eq(neg.rx > 0 && neg.ry > 0, true, '  …负倍率取正（翻面不做，不然手柄会跑到对角去）')
+      eq(neg.rx > 0 && neg.ry > 0, true, '  …半径仍然是正数（存储里没有负尺寸）')
+      eq(Math.round(neg.cx), -100, '  ★ 中心镜像过去了（锚点 50、cx 100 → 50 − 50×3 = −100）')
+      eq(neg.rot === 0 || Object.is(neg.rot, 0), true, '  …翻面之后朝向也对（轴对称的形状翻完还是正的）')
+      /* 单轴翻面：横向镜像，竖直不动。 */
+      const negX = scaleShape(s0, -1, 1, { x: 50, y: 50 })
+      eq(Math.round(negX.cx), 0, '  ★ 单轴翻面：只有那一轴镜像（cx 100 → 0），另一轴纹丝不动')
+      eq(Math.round(negX.cy), 100, '  …cy 不动')
     }
 
     /* (e) 旋转：转的是**参数** `rot`，不是"把点转一遍"。

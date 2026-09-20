@@ -383,9 +383,18 @@ export function translateShape(shape, dx, dy) {
  *   ⇒ 正确做法：把倍率**夹在**"形状还剩 MIN_SPAN 这么大"的范围里。
  *     夹了之后倍率永远不会小到让图形消失，往回拖就是**连续地长回来**。
  *     代价是"拖到最小之后指针再走一段它不动" —— 那是对的，它已经到底了。
- * ⚠ 负倍率（把图形翻过去）：不许。`normalizeShape` 把尺寸取绝对值，
- *   于是翻过去和翻过来在屏幕上一样 —— 但**手柄会跑到对角**，看起来像功能坏了。
- *   所以倍率一律取正（`Math.abs`），"翻面"这件事这个版本不做。 */
+ *
+ * ★★ 2026-09-19 起**负倍率 = 翻面（镜像）**（用户明确要的：「把右边的角拖到左边来」——
+ *   从前取绝对值，指针拖过锚点的瞬间缩放从"变小"翻回"变大"，右角看起来往反方向跑）。
+ *   分三种情况：
+ *     · 直线 / 三角形：顶点直接按带符号的倍率走 —— 镜像自然成立，一个特例都没有；
+ *     · 矩形 / 椭圆：参数里**没有负尺寸**（normalizeShape 取绝对值），
+ *       所以"尺寸吃 |倍率|、**中心**吃带符号的倍率" —— 中心镜像过去了，形状就翻过去了；
+ *     · 矩形 / 椭圆带 `rot` 时，翻面还要把朝向跟着翻（水平镜像 θ → π−θ、竖直镜像 θ → −θ），
+ *       不然翻过去之后斜的角度不对。转出来的角按 π 折进 (−π/2, π/2]：
+ *       这两种形状转半圈和自己一样，折一下才不会把 `rot: π`（和 0 长得一样）写进文件。
+ *   ⚠ 带 rot + 非等比缩放本来就只是近似（先转后缩不交换，参数表示不了平行四边形）——
+ *     翻面沿用同一份近似，不让它更糟。 */
 const MIN_SPAN = 1
 export function scaleShape(shape, fx, fy, anchor) {
   const s = normalizeShape(shape)
@@ -404,7 +413,7 @@ export function scaleShape(shape, fx, fy, anchor) {
   if (s.k === 'triangle') {
     /* 三角形夹的是它的**两个跨度**（面积的平方根量级）：三角形退化之后
        `normalizeShape` 会按面积那道闸把它丢掉 —— 那一丢就是"图形消失"。
-       所以在算倍率之前先把跨度夹住。 */
+       所以在算倍率之前先把跨度夹住。顶点按带符号的倍率走 —— 翻面就是镜像。 */
     const bb = aabbOfPoints(s.t)
     const ggx = clampToSpan(gx, bb.w)
     const ggy = clampToSpan(gy, bb.h)
@@ -412,23 +421,30 @@ export function scaleShape(shape, fx, fy, anchor) {
     return normalizeShape({ k: 'triangle', t: s.t.map((p) => T(p[0], p[1])) })
   }
   const c = S(s.cx, s.cy)
+  /* 翻面时朝向跟着翻（见上面那段）：水平镜像 θ → π−θ、竖直镜像 θ → −θ；
+     两个都翻 = 转半圈。算完按 π 折进 (−π/2, π/2]（这族形状转半圈是自己）。 */
+  let rot = s.rot
+  if (gx < 0) rot = Math.PI - rot
+  if (gy < 0) rot = -rot
+  rot = normAngle(rot)
+  if (Math.abs(rot) > Math.PI / 2) rot = normAngle(rot - Math.PI)
   if (s.k === 'rect') {
     return normalizeShape({
       k: 'rect',
       cx: c[0],
       cy: c[1],
-      w: Math.max(MIN_SPAN, s.w * clampToSpan(gx, s.w)),
-      h: Math.max(MIN_SPAN, s.h * clampToSpan(gy, s.h)),
-      rot: s.rot,
+      w: Math.max(MIN_SPAN, s.w * Math.abs(clampToSpan(gx, s.w))),
+      h: Math.max(MIN_SPAN, s.h * Math.abs(clampToSpan(gy, s.h))),
+      rot,
     })
   }
   return normalizeShape({
     k: 'ellipse',
     cx: c[0],
     cy: c[1],
-    rx: Math.max(MIN_SPAN / 2, s.rx * clampToSpan(gx, s.rx * 2)),
-    ry: Math.max(MIN_SPAN / 2, s.ry * clampToSpan(gy, s.ry * 2)),
-    rot: s.rot,
+    rx: Math.max(MIN_SPAN / 2, s.rx * Math.abs(clampToSpan(gx, s.rx * 2))),
+    ry: Math.max(MIN_SPAN / 2, s.ry * Math.abs(clampToSpan(gy, s.ry * 2))),
+    rot,
   })
 }
 function aabbOfPoints(pts) {
@@ -436,17 +452,25 @@ function aabbOfPoints(pts) {
   const ys = pts.map((p) => p[1])
   return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) }
 }
-/** 倍率夹到"这一轴还剩至少 MIN_SPAN"为止（见上面那段"拖不回来"的账）。 */
+/** 倍率夹到"这一轴还剩至少 MIN_SPAN"为止（见上面那段"拖不回来"的账）。
+ *  ★ 保符号（负 = 翻面，见 scaleShape 那段）。 */
 function clampToSpan(f, span) {
   const lo = Number.isFinite(span) && span > 0 ? MIN_SPAN / span : 0.02
-  return Math.max(lo, Math.abs(num(f)) || lo)
+  const v = Number(f)
+  if (!Number.isFinite(v) || v === 0) return lo
+  const mag = Math.max(lo, Math.min(50, Math.abs(v)))
+  return v > 0 ? mag : -mag
 }
+/** 同上：夹大小、保符号。**0 / 非数退回 1（等于"这一帧不变"）** ——
+ *  这是给"直接调进来"的防御：手势那条路永远先过 selection.js 的 clampToSpan
+ *  （那边 0 夹到最小倍率），到不了这里。 */
 function clampFactor(f) {
-  const v = Math.abs(num(f))
+  const v = Number(f)
   if (!Number.isFinite(v) || v === 0) return 1
   /* 上限 50 倍：再大就是"屏幕外的一个巨型图形"（点云会到几万个点），
      而那既不是用户想做的事，也不好在文件里收拾。 */
-  return Math.min(50, Math.max(0.001, v))
+  const mag = Math.min(50, Math.max(0.001, Math.abs(v)))
+  return v > 0 ? mag : -mag
 }
 
 /* 旋转。`deltaRad` 是**增量**，绕 `center`（默认它自己的几何中心）。

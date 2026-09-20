@@ -1119,10 +1119,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const onMove = (e) => {
       const rect = wrapRef.current.getBoundingClientRect()
       const wp = screenToWorld(e.clientX - rect.left, e.clientY - rect.top, boardRef.current.view)
-      /* 倍率 = 指针现在离锚点多远 / 按下那一刻多远。**取绝对值** ——
-         指针拖过锚点另一边不该让选中的东西翻面（见 selection.js 的 clampPickFactor）。 */
-      const fx = Math.abs(wp.x - anchor.x) / w0
-      const fy = Math.abs(wp.y - anchor.y) / h0
+      /* 倍率 = 指针现在离锚点多远 / 按下那一刻多远。**带符号** ——
+         指针拖过锚点另一边 = 翻面（镜像），右角能一路拖到左边去（OneNote 手感，
+         用户 2026-09-19 明确要的；从前取绝对值，拖过锚点就"反方向弹回去"）。
+         夹取（保符号、剩 PICK_MIN_SPAN）在 selection.js 的 clampToSpan 里。 */
+      const fx = (wp.x - anchor.x) / w0
+      const fy = (wp.y - anchor.y) / h0
       g.during(() => transformPick(start, pick, { scale: { fx, fy, anchor } }))
     }
     const onUp = () => {
