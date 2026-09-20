@@ -3588,7 +3588,7 @@ function isPenBarrel(e) {
    两份实现摆在一起，改一处漏一处就是"框选和板框判得不一样"，而屏幕上很难看出来。
    现在框选也走 geometry.js 那一个入口（见文件头的 import）。 */
 
-/* 一组笔迹的包围盒搬去了 lib/board.js 的 `strokesBBox`（跟着"选中那一族"一起走的）。 */
+/* 一组笔迹的包围盒搬去了 lib/geometry.js 的 `strokesBBox`（跟着"选中那一族"一起走的）。 */
 
 /* 整笔平移。★ points 必须保持那个**扁平**数组格式（x, y, 压力 三连），
    这是这个项目的铁律 —— 见 lib/board.js 顶部的说明，

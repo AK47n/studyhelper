@@ -758,7 +758,7 @@ export default function App() {
     }
   })
   const [scale, setScale] = useState(readScale)
-  // 画布全屏：把左侧栏、顶栏、关系面板全收掉，只留一张纸。
+  // 画布全屏：把左侧栏、顶栏全收掉，只留一张纸。
   // 它和"浏览器全屏"是联动的 —— 所以点一下连地址栏那圈也一起收掉，
   // 这才是 OneNote 那种"满屏只剩页面"的感觉。
   const [boardFs, setBoardFs] = useState(false)
@@ -874,7 +874,7 @@ export default function App() {
   const bumpScale = useCallback((d) => setScale((s) => clampScale(s + d)), [])
 
   /* 画布全屏。两件事一起做：
-       ① 界面这边把左侧栏、顶栏、关系面板收掉（靠 .app.fs / .bd-fs 那几条样式）；
+       ① 界面这边把左侧栏、顶栏收掉（靠 .app.fs / .bd-fs 那几条样式）；
        ② 请求**真正的浏览器全屏** —— 不然地址栏、标签栏还在，"彻底"就无从谈起。
      为什么监听 fullscreenchange 而不自己记状态：用户按 Esc 或 F11 退出时，
      浏览器不会来通知这个按钮，只能靠这个事件把状态跟上，
