@@ -1688,21 +1688,28 @@ kbd {
   position: absolute; left: 14px; bottom: 14px; right: 14px; z-index: 20;
 }
 .bd-tools {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
   background: rgba(22, 26, 34, 0.92); backdrop-filter: blur(10px);
-  border: 1px solid #2e3646; border-radius: 12px; padding: 6px 9px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  border: 1px solid #2e3646; border-radius: 14px; padding: 6px 9px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2), 0 10px 30px rgba(0, 0, 0, 0.3);
   font-size: calc(12.5px * var(--s));
 }
 .bd-tools .right { margin-left: auto; }
 .bd-group { display: flex; align-items: center; gap: 3px; }
-.bd-group + .bd-group { border-left: 1px solid #2e3646; padding-left: 8px; }
+.bd-group + .bd-group { border-left: 1px solid #2e3646; padding-left: 6px; }
+/* ⚠ 这一条间距（gap 5 / 按钮左右 6）是**量出来的**，不是随手调的：
+   工具条会换行，而它每多一行就**从画布底下啃掉 44px** —— 2026-09-20 加「∑ 公式架」
+   那颗按钮时正好压过一条线：1440×900 下工具条从 2 行（90px）变成 3 行（134px），
+   于是"画布上找块地方写字"这件事在 `check:ocr-browser` 的 [8] 里当场红了
+   （它算出来的落笔点第二笔正好落到工具条上）。
+   收紧到 gap 5 + 左右 6px 之后，那颗按钮装得进原来那一行（1440 下仍是 2 行 87px），
+   画布高度一个像素没少。**再加按钮之前先量一遍这个**：`.cache/probe-gap.mjs` 那个做法。 */
 .bd-t {
   background: transparent; border: 1px solid transparent; border-radius: 8px;
-  color: #cfd6e4; padding: 4px 8px; cursor: pointer; font-size: inherit; white-space: nowrap;
+  color: #cfd6e4; padding: 4px 6px; cursor: pointer; font-size: inherit; white-space: nowrap;
 }
 .bd-t:hover { background: #232b3a; color: #fff; }
-.bd-t.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.bd-t.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; box-shadow: 0 1px 4px rgba(47, 111, 208, 0.4); }
 .bd-t.icon { min-width: 32px; text-align: center; font-size: calc(15px * var(--s)); }
 .bd-t:disabled { opacity: 0.35; cursor: default; }
 .bd-t:disabled:hover { background: transparent; }
@@ -1776,6 +1783,61 @@ kbd {
    画布占满（`.bd-stagewrap` 不再有 margin-left），工具条贴底。
    ⚠ `.bd-cbar` 是工具条的容器，别跟着那些变体规则一起删掉。 */
 .bd-cbar { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 22; }
+
+/* ---------- 公式架（2026-09-20）----------
+   认过一次的公式收成一条横条，摆在工具条**上面**（同一条容器，往上长）。
+   风格和工具条一致（深色玻璃），因为它浮在浅色纸上、和工具条是一路的东西。
+   两种取用法（点 = 放到眼前，拖 = 指哪放哪）在 FormulaShelf 里，判据是"动了没有"。 */
+.bd-shelf {
+  margin-bottom: 6px;
+  background: rgba(22, 26, 34, 0.92); backdrop-filter: blur(10px);
+  border: 1px solid #2e3646; border-radius: 14px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2), 0 10px 30px rgba(0, 0, 0, 0.3);
+  padding: 5px 9px 7px;
+  font-size: calc(12.5px * var(--s));
+}
+.bd-shelf-h { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.bd-shelf-title { color: #cfd6e4; font-weight: 600; }
+.bd-shelf-note { color: #8b95a8; font-size: calc(11px * var(--s)); }
+.bd-shelf-note b { color: #cfd6e4; }
+.bd-shelf-x {
+  margin-left: auto; background: transparent; border: 0; color: #8b95a8;
+  cursor: pointer; font-size: calc(15px * var(--s)); line-height: 1; padding: 0 4px;
+}
+.bd-shelf-x:hover { color: #fff; }
+/* 一格一条公式。`touch-action: none` 是必须的：不然手指/笔在格子上滑动会变成
+   浏览器的滚动，我们收不到 pointermove —— "拖不动"就是这么来的。 */
+.bd-shelf-row { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.bd-shelf-chip {
+  position: relative; flex: 0 0 auto; touch-action: none; user-select: none;
+  background: #1c2230; border: 1px solid #323b4d; border-radius: 9px;
+  color: #e6ebf5; padding: 5px 10px; cursor: grab; max-width: 320px;
+  overflow: hidden; white-space: nowrap;
+}
+.bd-shelf-chip:hover { background: #232b3a; border-color: #4b87e0; }
+.bd-shelf-chip.on { border-color: #4b87e0; box-shadow: 0 0 0 2px rgba(47, 111, 208, 0.35); cursor: grabbing; }
+.bd-shelf-chip .bd-tex-in { font-size: calc(14px * var(--s)); }
+/* 「板上有几处」的角标。同一条公式写在三个地方 → 一格 + ×3（架子回答的是
+   "这条公式我用过没有"，不是"板上有几张卡"）。 */
+.bd-shelf-n {
+  margin-left: 6px; color: #8b95a8; font-size: calc(10.5px * var(--s));
+  border: 1px solid #323b4d; border-radius: 6px; padding: 0 4px;
+}
+/* 拖的时候跟着指针走的那张"影子卡"。
+   ⚠ `pointer-events: none` 是**必须的**：它接走 pointerup 的话，
+     松手就落在影子自己身上 —— 表现是"拖了半天一松手什么都没发生"。
+   ⚠ 它挂在 `document.body` 上（Board.jsx 里用 portal 送出去的），不是架子的孩子：
+     `.bd-shelf` 的 `backdrop-filter` 会把 `position: fixed` 的后代变成**以架子为基准**，
+     影子卡会整张跑到视口外面（用户看到的就是"拖的时候什么都没有"）。 */
+.bd-shelf-ghost {
+  position: fixed; z-index: 60; pointer-events: none;
+  background: rgba(28, 34, 48, 0.96); border: 1px solid #4b87e0; border-radius: 9px;
+  padding: 5px 10px; color: #e6ebf5; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  /* 字号得自己写：它不在 `.bd-shelf` 里了，继承不到那里那一条（`--s` 在 :root 上，
+     所以 A+ / A− 照样跟着变）—— 不写的话影子比格子小一号，拖动时"卡"会跳一下。 */
+  font-size: calc(12.5px * var(--s));
+}
+.bd-shelf-ghost .bd-tex-in { font-size: calc(14px * var(--s)); }
 
 /* ---------- 手写公式：写字板 + 设置 ----------
    这两块是弹层，风格跟白板工具条一致（深色玻璃），因为它们浮在浅色纸上。 */

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import BoardCanvas from './BoardCanvas.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
 import InkToCard from './InkToCard.jsx'
@@ -44,6 +45,10 @@ import { applyViewTo, clampViewScale, combinedScale, panBy, screenLenToWorld, sc
    "算不算动过"四个判据（架构 review 候选 3）。现在只说 begin / during / end。 */
 import { createHistory } from '../lib/history.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
+/* 公式架（2026-09-20）：这张板上**已经认过一次**的公式收成一条随手可取用的架子。
+   它是**推出来的**（由板上的公式卡汇总、按公式去重），不新增任何存盘字段 —— 规矩在
+   lib/formula-shelf.js 的文件头，用户原话也在那儿。 */
+import { shelfItems } from '../lib/formula-shelf.js'
 /* "那颗词摆哪"（浮层锚点别跑出画布、别压到底部工具条）是一条**屏幕像素的政策**，
    单独一个文件 —— 和上面那条映射是两件事（2026-09-17 架构 review 候选 1 的尾巴）。 */
 import { chipPlacement } from '../lib/chip-placement.js'
@@ -150,6 +155,9 @@ const PAPERS = [
 ]
 const DEFAULT_PAPER = 'plain'
 const PAPER_KEY = 'studyhelper.paper'
+/* 公式架开合也存 localStorage（理由同上：这是"我怎么看这张板"，不是板的内容）。
+   默认**收起** —— 它是一条横条，常驻会吃掉画布高度；开一次就记住了。 */
+const SHELF_KEY = 'studyhelper.shelfOpen'
 
 /* 画出一条连接线之后，那排词在屏幕上停多久（毫秒）。
  * 3.5 秒的来历：比你抬笔看一眼再决定要长一点，又不至于一直挂在那儿碍事。
@@ -222,6 +230,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [dirty, setDirty] = useState(false)
   const [hist, setHist] = useState({ undo: 0, redo: 0 })
   const [paper, setPaper] = useState(readPaper)
+  /* 公式架开着还是收着。和纸面同一条理由：**这是"我习惯怎么看这张板"**，
+     不是这张板的内容 —— 所以存 localStorage，不进 board-*.md（默认收起）。 */
+  const [shelfOpen, setShelfOpen] = useState(readShelfOpen)
   const [eraserAt, setEraserAt] = useState(null)
   /* 用笔写字时把鼠标光标收掉 —— 笔尖底下一直跟着一个十字，写字时很碍眼。
      但**不能简单粗暴地 cursor:none**：那样鼠标也会一起没光标，画布上就没法定位了。
@@ -1846,6 +1857,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         setPadOpen((v) => !v)
         return
       }
+      /* F = 公式架（Formula shelf）。挑 F 是因为它没被占，而"公式"两个字都带 f。
+         ⚠ **必须排掉 mod**：Ctrl+F 是浏览器自己的"查找"，抢过来就是"我想查个字，
+         架子却蹦出来了"。上面那些带 mod 的分支各自 return，但 Ctrl+F 不在其中 ——
+         所以这一条得自己判，不然它会漏下来撞上。 */
+      if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'f' || e.key === 'F')) {
+        toggleShelfRef.current()
+        return
+      }
     }
     const onUp = (e) => {
       if (e.code === 'Space') spaceRef.current = false
@@ -1894,6 +1913,86 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        （排队自己就会下一帧开跑；这一次进编辑态量不着，退出编辑时那一趟才量得上。） */
     fitter.queue(c.id, { fitWidth: true, keepCenterX: true })
   }
+
+  /* ══════════ 公式架：这条板上"认过一次"的公式，随手再放一张（2026-09-20）══════════
+   *
+   * 用户的原话是「一次课往往会多次用到同样的公式」——所以取用必须只有**一下**：
+   *   点一格 → 放到**视野中心**（和粘贴同一条规矩：「贴在我正看着的地方」）；
+   *   拖一格 → 落在**松手的地方**（指哪放哪）。
+   *
+   * ★ 放下来的是**一张独立的新卡**（各自可改可删）——用户选的就是这一条。
+   *   它和原来那张唯一的联系是"内容来自它"，而且这个联系**一个字都不存**
+   *   （没有"同源"字段、没有联动）：那种联动要一整套同步规则，
+   *   而推导里每一处用到的公式本来就该各写各的。
+   * ★ 其余照抄 `insertRecognized` 那三步（那是"卡片落到板上"的既有形状）：
+   *   ① `commit` 一次 = **一步撤销**（不用为它单开一条账）；
+   *   ② 落下就**选中**（能立刻拖走 / 缩放手柄就在手边）；
+   *   ③ `fitter` 量一次尺寸 —— 不量的话卡是默认 260 宽，一行短式子会左右一片空白。 */
+  const shelf = useMemo(() => shelfItems(board.cards), [board.cards])
+
+  const insertFromShelf = useCallback(
+    (item, world) => {
+      if (!item) return
+      const at = world && Number.isFinite(world.x) && Number.isFinite(world.y) ? world : stageCenterWorld()
+      const c = newCard('formula', at.x, at.y)
+      /* `src` 一起写上（同 `insertRecognized` 那条 ⚠）：编辑态里编辑的是 src，
+         只填 tex 的话双击进去是个空框，顺手一个回车就把这张卡清空了。 */
+      commit((cur) => ({ ...cur, cards: [...cur.cards, { ...c, src: item.src || item.tex, tex: item.tex || item.src }] }))
+      /* ★ 只**选中**，不**进编辑态**（`focusCard(id, true)` 才是编辑）。
+         差别不是好看不好看：进编辑态的卡里是个 `<textarea>`，而键盘那道闸是
+         "在输入框里打字就不抢按键"（focus.js 的 isTextField）——
+         于是放下来之后 **Ctrl+Z 会被输入框吃掉**（撤销不动板上那张卡），
+         接着点别处也只是"退出编辑"，看起来就是"点了没反应"。
+         取用的语义是"把这条已经认过的公式放到这儿" —— 没有字要改。
+         （这条是探针查出来的：`.cache/probe-shelf.mjs` 里那张卡的 activeElement
+          是 TEXTAREA，见那一轮的 Ctr+Z 断言为什么红。） */
+      setFocus(focusCard(c.id))
+      fitter.queue(c.id, { fitWidth: true, keepCenterX: true })
+    },
+    [commit, fitter, stageCenterWorld]
+  )
+
+  /* 从架子上拖出来的那一格，松手时落在哪（`item` 由架子那一层交过来 ——
+   * "点了还是拖了"是**指针自己的事**，记在 FormulaShelf 里，这一层只管落点）。
+   * ★ 松手落在**画布外面**（工具条上、或窗口外）→ 退回视野中心：
+   *   在看不见的地方放一张卡，比"没放成"更让人摸不着头脑。 */
+  function dropFromShelf(item, clientX, clientY) {
+    const el = wrapRef.current
+    let world = null
+    if (el) {
+      const r = el.getBoundingClientRect()
+      if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+        world = screenToWorld(clientX - r.left, clientY - r.top, boardRef.current.view)
+      }
+    }
+    insertFromShelf(item, world)
+  }
+
+  /* 开合公式架。★ 架子空的时候**不做成灰按钮**（和「✨ 美化手写」同一条规矩：
+   * 灰按钮点不动、也不教人下一步该干什么）—— 点得动，回一句"先认一个"。 */
+  function toggleShelf() {
+    if (!shelf.length) {
+      flash('公式架上还空着 —— 先「✍ 手写公式」认一个，或者框住手写点「∑ 公式」', 'warn')
+      return
+    }
+    setShelfOpen((v) => {
+      const next = !v
+      try {
+        localStorage.setItem(SHELF_KEY, next ? '1' : '0')
+      } catch {
+        /* 存不了就只生效这一次（和纸面那条一样） */
+      }
+      return next
+    })
+  }
+
+  /* 按键那边要叫到"**当前这一版**的 toggleShelf"（它闭包住 shelf.length）——
+     和 `boardRef` / `selRef` 同一个形状：渲染时把最新的那个存进 ref，
+     按键处理器（那个 effect 只注册一次）永远拿到最新的那一个。
+     ⚠ 别图省事把 toggleShelf 塞进 effect 的依赖里：它是每次渲染都新建的普通函数，
+       那样等于每渲染一次就注销 + 重挂一次 window 监听（这个文件里已经有三个了）。 */
+  const toggleShelfRef = useRef(null)
+  toggleShelfRef.current = toggleShelf
 
   /* 换纸。**当场存**，不像板的内容那样等停笔 0.7 秒 ——
      它是"我习惯怎么看这张板"，跟板里画了什么没关系（理由见上面 PAPERS 那段）。
@@ -2379,6 +2478,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       paper={paper} onPaper={pickPaper}
       onWriteFormula={() => setPadOpen(true)}
       onBeautify={() => openInkPanel('text')}
+      shelfOpen={shelfOpen}
+      shelfCount={shelf.length}
+      onToggleShelf={toggleShelf}
       /* 收拢成笔记：把**当前这块活板**（boardRef，不是打开时的那份原文 ——
          上面刚认出来的一张卡也要算数）递给 App，草稿和建文件都在那边。 */
       onGather={() => onGatherNote && onGatherNote(boardRef.current)}
@@ -2437,12 +2539,20 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             卡片通过 children 传进去，就是为了让"世界原点"这件事只有一个地方说话。 */}
         <BoardCanvas {...stageProps} />
 
-        {board.cards.length === 0 && board.strokes.length === 0 && <Hint />}
+        {board.cards.length === 0 && board.strokes.length === 0 && !(board.docs && board.docs.length) && <Hint />}
       </div>
 
       {/* 工具条贴在画布底部。**不再有右侧那一栏**（见文件末尾「关系面板删掉了」）——
           画布从左边栏一直铺到窗口右缘。 */}
-      <div className="bd-cbar">{toolbar}</div>
+      <div className="bd-cbar">
+        {/* 公式架摆工具条**上面**（同一条容器，往上长）—— 它和工具条是一路的：
+            都是"随手拿一件东西"，而不是画布上的内容。 */}
+        {shelfOpen && shelf.length > 0 && (
+          <FormulaShelf items={shelf} onUse={(item) => insertFromShelf(item)} onDrop={dropFromShelf} onClose={() => setShelfOpen(false)} />
+        )}
+        {toolbar}
+      </div>
+
 
       {padOpen && (
         <WritingPad
@@ -2804,9 +2914,108 @@ const SNIP_LABEL = { frac: 'a/b', sqrt: '√', sup: 'xⁿ', sub: 'xₙ', mu0: '�
 
 /* Tex 搬去了 ./Tex.jsx（手写识别也要用它，留在这儿会绕出循环依赖）。 */
 
+// ────────────────────────────── 公式架 ──────────────────────────────
+
+/* 一条随手可取用的公式横条（用户 2026-09-20 要的那件事）。
+ *
+ * 两种取用法都在**同一串指针事件**里，判据只有一条"动了没有"：
+ *   按下 → 松手，中间没动过 = **点**（放到视野中心）；
+ *   按下 → 拖出 4px 再松手 = **拖**（落在松手的地方）。
+ * 为什么不拆成 onClick + onDragStart：HTML5 那套拖放和这个应用的指针世界
+ * （指针种类、指针捕获、笔）是两套东西，混用会多出一堆"笔拖不动"的怪事；
+ * 而这一个组件里两种动作本来就是同一件事的两半。
+ *
+ * ⚠ 4px 是**手指/笔也会抖**的那个量级：太小会把"点一下"误判成拖，
+ *   太大则"想拖一点点"没反应。和别处的手势阈值同类（见 README 的"手势"那条）。
+ * ⚠ 拖的时候那张跟着指针走的"影子"要 `pointer-events: none` ——
+ *   否则它自己会接走 pointerup，松手落在影子卡上就丢失了（那种 bug 的表现是
+ *   "拖了半天，一松手什么都没发生"）。 */
+const SHELF_DRAG_PX = 4
+
+function FormulaShelf({ items, onUse, onDrop, onClose }) {
+  const pressRef = useRef(null)
+  const [dragAt, setDragAt] = useState(null)
+
+  const down = (e, item) => {
+    if (e.button != null && e.button !== 0) return
+    e.preventDefault()
+    pressRef.current = { item, x0: e.clientX, y0: e.clientY, moved: false }
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      /* 捕获不到也能用（事件照样冒泡到这一格上）—— 别为它崩 */
+    }
+  }
+  const move = (e) => {
+    const p = pressRef.current
+    if (!p) return
+    if (!p.moved && Math.hypot(e.clientX - p.x0, e.clientY - p.y0) < SHELF_DRAG_PX) return
+    p.moved = true
+    setDragAt({ item: p.item, x: e.clientX, y: e.clientY })
+  }
+  const up = (e) => {
+    const p = pressRef.current
+    pressRef.current = null
+    setDragAt(null)
+    if (!p) return
+    if (p.moved) onDrop(p.item, e.clientX, e.clientY)
+    else onUse(p.item)
+  }
+
+  return (
+    <div className="bd-shelf" data-shelf="1">
+      <div className="bd-shelf-h">
+        <span className="bd-shelf-title">∑ 公式架</span>
+        <span className="bd-shelf-note">
+          这张板上认过的公式都在这儿（同一条公式只占一格）· <b>点</b>一下放到眼前 · <b>拖</b>到板上指哪放哪
+        </span>
+        <button className="bd-shelf-x" onClick={onClose} title="收起（F）">
+          ×
+        </button>
+      </div>
+      <div className="bd-shelf-row">
+        {items.map((it) => (
+          <button
+            key={it.key}
+            className={'bd-shelf-chip' + (dragAt && dragAt.item.key === it.key ? ' on' : '')}
+            data-shelf-chip="1"
+            data-shelf-tex={it.tex || it.src}
+            title={(it.src || it.tex) + (it.count > 1 ? `\n（板上有 ${it.count} 处）` : '')}
+            onPointerDown={(e) => down(e, it)}
+            onPointerMove={move}
+            onPointerUp={up}
+            onPointerCancel={() => {
+              pressRef.current = null
+              setDragAt(null)
+            }}
+          >
+            <Tex tex={it.tex || it.src} />
+            {it.count > 1 && <span className="bd-shelf-n">×{it.count}</span>}
+          </button>
+        ))}
+      </div>
+      {dragAt &&
+        /* ★ 影子卡必须**挂到 body 上**（portal），不能留在架子里面。
+           2026-09-20 用户报的「拖动过程的可视化不要突然出现在末尾」就是这条：
+           `.bd-shelf` 有 `backdrop-filter`（毛玻璃），而**带 filter / backdrop-filter
+           的元素会成为 `position: fixed` 后代的包含块** —— 于是 `left/top` 写的是
+           视口坐标，画出来却是"架子左上角 + 视口坐标"，整张影子卡跑到视口外面
+           （实测偏离指针 (297, 537) = 架子自己的位置 + 那 14px 偏移）。
+           症状极像"功能没做"：拖的时候屏幕上什么都没有，一松手卡片才在落点冒出来。
+           实测数据与做法见 `.cache/probe-ghost.mjs`（探针已删，结论在 check:shelf 的断言里）。 */
+        createPortal(
+          <div className="bd-shelf-ghost" style={{ left: dragAt.x + 14, top: dragAt.y + 15 }}>
+            <Tex tex={dragAt.item.tex || dragAt.item.src} />
+          </div>,
+          document.body
+        )}
+    </div>
+  )
+}
+
 // ────────────────────────────── 工具条 ──────────────────────────────
 
-function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen }) {
+function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onGather, onInsertDoc, docBusy, docs = [], onReadDeck, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen, shelfOpen, shelfCount, onToggleShelf }) {
   return (
     <div className="bd-tools">
       <div className="bd-group">
@@ -2872,6 +3081,22 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
             ★ 框住之后浮层上还会多一个「∑ 公式」——已经写在板上的式子不用重抄一遍。 */}
         <button className="bd-t" onClick={onBeautify} title="美化手写：先框住你写的字（点「⬚ 框选」拖一个框，或按住笔杆键拖），再点这里">
           ✨ 美化手写
+        </button>
+        {/* 公式架（2026-09-20）：这张板上**认过一次**的公式收成一条随手可取用的横条 ——
+            一次课里同一个公式要写好几遍，不用重抄、也不用重新框选识别。
+            用户原话：「让已经识别一次的公式卡放置在某个便于去用的地方……因为一次课
+            往往会多次用到同样的公式」。架子**由板上的公式卡推出来**，不新增任何存盘字段。 */}
+        <button
+          className={'bd-t' + (shelfOpen ? ' on' : '')}
+          data-tool="shelf"
+          onClick={onToggleShelf}
+          title={
+            shelfCount
+              ? `公式架（F）：这张板上认过的 ${shelfCount} 条公式 —— 点一下放到眼前，拖到板上指哪放哪`
+              : '公式架（F）：这张板上还没有认过的公式 —— 先「✍ 手写公式」认一个，或者框住手写点「∑ 公式」'
+          }
+        >
+          ∑ 公式架{shelfCount ? ` ${shelfCount}` : ''}
         </button>
         {/* 收拢成笔记：白板是过程，笔记是结论。卡片/板框/连接拣成草稿；
             裸手写不再丢下 —— 整板画成一张图发给识别服务抄成 Markdown（要几十秒）。
@@ -3013,6 +3238,15 @@ function readPaper() {
     /* 隐私模式下读不了，用默认 */
   }
   return DEFAULT_PAPER
+}
+
+/* 公式架开着没有？读不出来就当收起（隐私模式 / 第一次用）。 */
+function readShelfOpen() {
+  try {
+    return localStorage.getItem(SHELF_KEY) === '1'
+  } catch {
+    return false
+  }
 }
 
 function load(text, file) {

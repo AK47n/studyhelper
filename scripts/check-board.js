@@ -70,6 +70,8 @@ import {
 } from '../src/lib/board-structure.js'
 /* 词表（第 4 步"结合我的笔记"）：取你自己的词 —— [17]。 */
 import { isSameLayer, pickVocab, termsFromNote } from '../src/lib/note-vocab.js'
+/* 公式架（2026-09-20）：这张板上认过的公式收成一条随手可取用的架子 —— [19]。 */
+import { shelfItems } from '../src/lib/formula-shelf.js'
 import { ARROW_SNAP, CARD_HIT_PAD, COND_SEARCH, edgeDist, edgePointOf, nodeAt, nodeById, nodeList } from '../src/lib/nodes.js'
 import { displayTex, snippetFor, toTex } from '../src/lib/formula.js'
 /* "那颗词摆哪"（浮层锚点夹进可用区域）是一条屏幕像素的政策，单开一个文件
@@ -4906,6 +4908,47 @@ console.log('\n[18] 草稿：结构小节（第 4 步的收口）')
   })
   eq(dedupDraft.md.includes('省掉 1 条重复'), true, '★ 草稿里报得出"省掉了几条重复"')
   eq(dedupDraft.unreadable, 0, '报数那句也是合法行（`>` 开头，不当节点）')
+}
+
+// ═════════════════════ 19. 公式架：这张板上认过的公式 ═════════════════════
+/* 用户 2026-09-20 要的那件事：「让已经识别一次的公式卡放置在某个便于去用的地方……
+   因为一次课往往会多次用到同样的公式」。架子是**推出来的**（板上有哪些公式卡 →
+   哪些格子），所以这一节全是纯函数断言，一条 DOM 都不用碰。 */
+console.log('\n[19] 公式架（已经认过的公式收成一条随手可取用的架子）')
+{
+  const card = (id, x, y, src, tex, kind = 'formula') => ({ id, kind, x, y, w: 100, h: 40, src, tex, text: kind === 'note' ? src : '' })
+
+  const items = shelfItems([
+    card('f1', 0, 0, '\\oint \\vec{B}\\cdot d\\vec{l} = \\mu_0 I', '\\oint \\vec{B}\\cdot d\\vec{l} = \\mu_0 I'),
+    card('f2', 0, 300, '\\oint \\vec{B}\\cdot d\\vec{l} = \\mu_0 I', '\\oint \\vec{B}\\cdot d\\vec{l} = \\mu_0 I'), // 同一条，写在别处
+    card('f3', 0, 600, 'E = mc^2', 'E = mc^2'),
+    card('n1', 0, 900, '牛顿第二定律', '', 'note'), // 文字卡不上架
+    card('f4', 0, 1200, '', ''), // 空卡不上架
+  ])
+  eq(items.length, 2, '★ 只有公式卡上架（文字卡不算），空卡也不算')
+  eq(items[0].tex, '\\oint \\vec{B}\\cdot d\\vec{l} = \\mu_0 I', '顺序跟板面一致（先上后下）')
+  eq(items[0].count, 2, '★ 同一条公式写在两处 = 架子上一格 + 角标 ×2')
+  eq(items[0].ids, ['f1', 'f2'], '那两处是哪两张卡，记着（自检和以后要用）')
+  eq(items[1].tex, 'E = mc^2', '第二条在下面')
+  eq(items[1].count, 1, '只有一处就不带角标')
+  eq(items[0].x, 50, '格子上记着第一处的**中心**（x = 左上角 + 宽/2）')
+  eq(items[0].y, 20, 'y 也是中心')
+
+  /* 同一行（上下差 ≤40px）按左右排 —— 和草稿那边的 byPosition 同一条规矩。 */
+  const sameRow = shelfItems([card('a', 300, 0, 'A', 'A'), card('b', 0, 20, 'B', 'B')])
+  eq(sameRow.map((it) => it.tex), ['B', 'A'], '★ 同一行里按左右排（上下差 20px 算并排）')
+
+  /* `tex` 和 `src` 不一样时：**去重看 tex**，但 src 也要留着（放下来那张卡两个都要写）。 */
+  const both = shelfItems([card('f9', 0, 0, 'a/b', '\\frac{a}{b}')])
+  eq(both[0].tex, '\\frac{a}{b}', 'tex 是渲染用的那串')
+  eq(both[0].src, 'a/b', 'src 一起带着（落下那张卡的编辑框里要显示它）')
+  const twoWays = shelfItems([card('f9', 0, 0, 'a/b', '\\frac{a}{b}'), card('f10', 0, 300, 'a/b', 'a/b')])
+  eq(twoWays.length, 2, '★ `\\frac{a}{b}` 和 `a/b` 是两条式子，不合并（去重不做"看起来一样"的规范化）')
+
+  eq(shelfItems([]), [], '空板 → 空架子（不崩）')
+  eq(shelfItems(null), [], 'null → 空（不崩）')
+  /* 认过但还没渲染出来的（只有 src）：照样上架 —— 手打的那种卡也是"我已经有的公式"。 */
+  eq(shelfItems([card('f5', 0, 0, 'v = \\lambda f', '')]).length, 1, '只有 src 的也上架')
 }
 
 // ═════════════════════ 结果 ═════════════════════
