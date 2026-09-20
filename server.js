@@ -305,7 +305,13 @@ async function handleApi(req, res, url) {
     }
     const file = resolveInData(name)
     if (!file) return sendJson(res, 400, { error: '非法路径' })
-    if (fs.existsSync(file)) return sendJson(res, 409, { error: '同名文件已存在' })
+    if (fs.existsSync(file)) {
+      /* `code` 是给**前端判断**用的机器信号（2026-09-19）：撞名之后要给用户三条路
+         （覆盖 / 换个名字 / 算了），而"是不是撞名"不能靠匹配那句人话 ——
+         那句话随时会为了更像人话而改，字面匹配迟早失配，失配的表现是
+         **"点了覆盖却什么都没发生"**（前端以为是别的错误，走了报错那条路）。 */
+      return sendJson(res, 409, { error: '同名文件已存在', code: 'exists', name })
+    }
     // 分层存储：写之前先把这一层目录建出来（`大物/电磁学/第一章` 直接就能用）
     await fsp.mkdir(path.dirname(file), { recursive: true })
     const text = typeof parsed.text === 'string' ? parsed.text : `# ${pathTitle(name)}\n\n- 第一节\n  - \n`

@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import FormulaBar from './components/FormulaBar.jsx'
 import Preview from './components/Preview.jsx'
-import ContextPanel from './components/ContextPanel.jsx'
 import SourceEditor from './components/SourceEditor.jsx'
 import Board from './components/Board.jsx'
 import { isBoardName, newBoard, serializeBoardDocument } from './lib/board.js'
@@ -16,7 +15,7 @@ import { SEED_BOARD_NAME, boardPath, createFileApi, planStartup, splitTitlePath 
 /* data/ 里的路径（分层）：拆 / 拼 / 摆成左栏那棵树 —— 规矩在 paths.js 里，这里只用。
    ⚠ 一条都不能手写：`'a' + '/' + b` 这种看着没事，但根目录那一层拼出来是 `/b`，
      树里就多出一个空名字的节点（真踩过）。 */
-import { ancestors, baseName, buildFolderTree, EXPORT_DIR, isRenamed, joinPath, layerNeeds, levels, parentPath, pathTitle, pruneTree } from './lib/paths.js'
+import { ancestors, baseName, buildFolderTree, EXPORT_DIR, isRenamed, joinPath, layerNeeds, levels, parentPath, pathTitle, pruneTree, uniqueRelName } from './lib/paths.js'
 /* 「这份笔记用到了哪几种公式字体」—— 读浏览器那本账（document.fonts），
    服务端没有 canvas 量不了。量不出来就空着，导出照做（见 lib/fonts.js）。 */
 import { detectLoadedFamilies } from './lib/fonts.js'
@@ -102,6 +101,28 @@ const ASK = {
     label: '完整路径',
     ok: '移过去',
     required: true,
+  },
+  /* 「这个名字已经有一条笔记了」（2026-09-19）。
+     ── 为什么要有它：从前撞名只 flash 一句"同名文件已存在"，用户既不能覆盖也不能改名 ——
+        只能自己**再想一个名字**、把整个流程（包括已经花掉的转录）再走一遍。
+        而从白板收拢的草稿，默认名字永远是「<板名> · 笔记」—— 撞名是**常态**，不是意外。
+     ── 三条路：覆盖 / 换个名字 / 算了。**默认不覆盖**（回车 = 换个名字那条）：
+        覆盖是把已有那条的内容换掉，而"换个名字"永远不会弄丢任何东西。
+     ── 它是**选择**型的问话（`choices`），没有输入框、也不问"建到哪一层"。
+     ── board 不走这条：白板是**你亲手画的东西**，撞名只报错，不给覆盖的机会
+        （和「移动」那条一样：宁可让你换个名字，也不给一个能一键抹掉手写痕迹的按钮）。 */
+  'note-overwrite': {
+    title: '这个名字已经有一条笔记了',
+    hint: '覆盖 = 那条笔记的内容被这份草稿换掉（换掉就找不回来了）。换个名字则两边都在。',
+    label: null,
+    /* 把"要覆盖的是哪一份"摆出来（文件路径 + 几个节点 + 多大 + 什么时候改过）——
+       比一句"同名文件已存在"可判断得多。内容由调用方通过 `ask(..., { extra })` 给。 */
+    note: true,
+    choices: [
+      { id: 'rename', label: '换个名字', hint: '会替你填一个不撞名的（原样的名字后面加 2）' },
+      { id: 'overwrite', label: '覆盖它', hint: '那条笔记的内容就没了', danger: true },
+      { id: 'cancel', label: '算了，先不写' },
+    ],
   },
   'board-titled': {
     title: '这一课叫什么',
@@ -232,7 +253,7 @@ function readScale() {
  *   · 点背景 = 取消，但**点框本身不取消**（`e.target === e.currentTarget`）——
  *     不然手一抖点在框边上，刚打的字全没了。Esc 是浏览器的 `<dialog>` 默认行为。
  */
-function Ask({ spec, value, multiline, where, layers, onDone }) {
+function Ask({ spec, value, multiline, where, layers, extra, onDone }) {
   const [v, setV] = useState(() => (value == null ? '' : String(value)))
   /* ★ 建到哪一层：**看得见、点得到**（2026-09-21）。
      初值 = 调用方说的那一层（顶栏 = 你现在所在的那一层，目录行的「＋」= 你点的那一行）。
@@ -321,36 +342,65 @@ function Ask({ spec, value, multiline, where, layers, onDone }) {
             </div>
           )}
           {spec.hint && <div className="ask-hint">{spec.hint}</div>}
-          {spec.label && <div className="ask-label">{spec.label}</div>}
-          <div className="ask-field">
-            {spec.prefix && <span className="ask-prefix">{spec.prefix}</span>}
-            {multiline ? (
-              <textarea
-                className="ask-textarea"
-                value={v}
-                rows={4}
-                autoFocus
-                spellCheck={false}
-                onChange={(e) => setV(e.target.value)}
-              />
-            ) : (
-              <input
-                className="ask-input"
-                value={v}
-                autoFocus
-                spellCheck={false}
-                placeholder={spec.placeholder || ''}
-                onChange={(e) => setV(e.target.value)}
-              />
-            )}
-          </div>
+          {/* 「要覆盖的那一份长什么样」——一个文件路径 + 几个数，比"同名文件已存在"可判断得多 */}
+          {spec.note && extra && <div className="ask-note">{extra}</div>}
+          {/* ── 选择型的问话（2026-09-19，`spec.choices`）─────────────────────
+              没有输入框、也不问"建到哪一层"：`onDone` 交回去的是**选项的 id**
+              （和别的问话一样是个字符串，调用方照样 `if (!raw) return` 判取消）。
+              ⚠ 选项按数组顺序画，**第一条是默认的那条**（回车走它）——
+                所以"不会弄丢东西"的那条永远排在前面（见 note-overwrite）。 */}
+          {Array.isArray(spec.choices) && (
+            <div className="ask-choices">
+              {spec.choices.map((c, i) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  autoFocus={i === 0}
+                  className={'ask-choice' + (c.danger ? ' danger' : '')}
+                  onClick={() => onDone(c.id)}
+                >
+                  <b>{c.label}</b>
+                  {c.hint && <span className="ac-hint">{c.hint}</span>}
+                </button>
+              ))}
+            </div>
+          )}
+          {!Array.isArray(spec.choices) && spec.label && <div className="ask-label">{spec.label}</div>}
+          {!Array.isArray(spec.choices) && (
+            <div className="ask-field">
+              {spec.prefix && <span className="ask-prefix">{spec.prefix}</span>}
+              {multiline ? (
+                <textarea
+                  className="ask-textarea"
+                  value={v}
+                  rows={4}
+                  autoFocus
+                  spellCheck={false}
+                  onChange={(e) => setV(e.target.value)}
+                />
+              ) : (
+                <input
+                  className="ask-input"
+                  value={v}
+                  autoFocus
+                  spellCheck={false}
+                  placeholder={spec.placeholder || ''}
+                  onChange={(e) => setV(e.target.value)}
+                />
+              )}
+            </div>
+          )}
           <div className="ask-acts">
-            <button type="button" className="btn" onClick={() => onDone(null)}>
-              {spec.cancel || '取消'}
-            </button>
-            <button ref={okRef} type="submit" className={'btn primary' + (spec.danger ? ' danger' : '')} disabled={!canOk}>
-              {spec.ok || '好'}
-            </button>
+            {!Array.isArray(spec.choices) && (
+              <button type="button" className="btn" onClick={() => onDone(null)}>
+                {spec.cancel || '取消'}
+              </button>
+            )}
+            {!Array.isArray(spec.choices) && (
+              <button ref={okRef} type="submit" className={'btn primary' + (spec.danger ? ' danger' : '')} disabled={!canOk}>
+                {spec.ok || '好'}
+              </button>
+            )}
           </div>
         </form>
       </dialog>
@@ -641,9 +691,23 @@ export default function App() {
   const [toast, setToast] = useState(null)
   const [busy, setBusy] = useState(true)
   const [diskMtime, setDiskMtime] = useState(0)
+  /* 「编辑 / 阅读」双视图：2026-09-19 晚一度砍掉，同日又请回来 —— 两度反转，把账记全：
+     砍的时候它看着像"同一份内容两种摆法"；但「收成笔记」上线后草稿里全是公式，
+     而编辑区是**逐像素对齐的源码层**（两层错一像素就是灾难，见 SourceEditor 顶部，
+     标题连字号都不能变），公式只有光标那一行渲染成气泡。用户原话：
+     「整理出来的公式都没有美观的显示都还是编辑状态的」—— 阅读视图是公式
+     唯一"好看的脸"。砍掉的只有右栏和诊断，这两个不回来。 */
   const [view, setView] = useState('edit') // 'edit' 直接编辑（已渲染的样子） | 'read' 整屏阅读
   const [focusMode, setFocusMode] = useState(false)
-  const [diag, setDiag] = useState(false) // 对齐诊断：两层分别染色，重合处为紫色
+  /* 对齐诊断不再有界面入口（它本来是开发者的排查工具，长在顶栏上是"臃肿"的一部分）。
+     内部还开着：localStorage 塞 `sh.diag=1` 再刷新即可（对齐排查的 diag-* 脚本走这条路）。 */
+  const [diag] = useState(() => {
+    try {
+      return localStorage.getItem('sh.diag') === '1'
+    } catch {
+      return false
+    }
+  })
   const [scale, setScale] = useState(readScale)
   // 画布全屏：把左侧栏、顶栏、关系面板全收掉，只留一张纸。
   // 它和"浏览器全屏"是联动的 —— 所以点一下连地址栏那圈也一起收掉，
@@ -840,12 +904,12 @@ export default function App() {
    * ⚠ 一次只能开一个：后问的那个把前一个 resolve 成 null，不然前一个的 await 永远不返回。
    * `where` 是"建到哪一层"（只有 `here-*` 那两条问话会写出来）—— 它是**你点的那一行**，
      不是输入框里的内容。见 ASK 表里 where 的说明。 */
-  const ask = useCallback((id, { value = '', multiline = false, where = '', layers = null } = {}) => {
+  const ask = useCallback((id, { value = '', multiline = false, where = '', layers = null, extra = '' } = {}) => {
     const spec = ASK[id]
     if (!spec) return Promise.resolve(null) // 名字写错了也得让调用方拿到 null，不能挂住
     setAskState((prev) => {
       if (prev) prev.resolve(null)
-      return { spec, value, multiline, where, layers, resolve: null, id }
+      return { spec, value, multiline, where, layers, extra, resolve: null, id }
     })
     return new Promise((resolve) => {
       setAskState((prev) => (prev && prev.id === id ? { ...prev, resolve } : prev))
@@ -1046,6 +1110,55 @@ export default function App() {
     return r
   }
 
+  /* ── 建一个**新**文件；撞名的时候问一句（2026-09-19）────────────────────────
+   * 从前撞名只 flash 一句"同名文件已存在"，用户既不能覆盖也不能改名 ——
+   * 只能自己再想一个名字、把整个流程（包括已经花掉的转录）再走一遍。
+   * 而从白板收拢的草稿默认就叫「<板名> · 笔记」—— **撞名是常态，不是意外**。
+   *
+   * 判据是服务端回的 `code:'exists'`，**不是匹配那句人话**（人话会为"更像人话"而改，
+   * 字面匹配失配的表现是"点了覆盖却什么都没发生"）。
+   * 返回：{ ok, name, overwritten } ｜ { cancelled: true } ｜ { error }
+   * `onRename(撞名的那个名字)` 由调用方给 —— 只有它知道该拿什么当默认名字。 */
+  async function createNewFile(name, text, { onRename = null } = {}) {
+    let target = name
+    for (;;) {
+      const r = await api.create(target, text)
+      if (!r || !r.error) return { ok: true, name: (r && r.name) || target, overwritten: false }
+      if (r.code !== 'exists') return { error: r.error }
+      const choice = await ask('note-overwrite', { extra: noteFileInfo(target) })
+      if (choice === 'overwrite') {
+        const w = await api.put(target, text)
+        return w && w.error ? { error: w.error } : { ok: true, name: target, overwritten: true }
+      }
+      if (choice !== 'rename') return { cancelled: true }
+      const next = onRename ? await onRename(target) : null
+      if (!next) return { cancelled: true }
+      target = next
+    }
+  }
+
+  /* 「要覆盖的那一份长什么样」：一行字，比"同名文件已存在"可判断得多。
+     数是从 `/api/list` 那份清单里来的（它就是左栏那颗列表的同一份数据）。 */
+  function noteFileInfo(name) {
+    const f = (files || []).find((x) => x && x.name === name)
+    if (!f) return `已有的那一份：${name}`
+    const kb = f.size ? Math.max(1, Math.round(f.size / 1024)) + ' KB' : ''
+    const when = f.mtime ? new Date(f.mtime).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''
+    return ['已有的那一份：' + name, f.nodes ? `${f.nodes} 个节点` : '', kb, when ? when + ' 改过' : ''].filter(Boolean).join(' ｜ ')
+  }
+
+  /* 给"换个名字"用：在这条笔记所在的那一层里找一个不撞名的（原样的名字后面加 2、3…）。
+     用的是 paths.js 的 `uniqueRelName` —— 和"补一张空板"那条路同一个函数。
+     ⚠ 回的是**填进输入框的那一串**（带层、**不带 `.md`**）：那个框里从来只有名字，
+       后缀是流程自己补的（第一次问名字那条路也一样）。 */
+  const suggestFreeName = (name) => {
+    const taken = (files || []).map((f) => f && f.name).filter(Boolean)
+    const dir = parentPath(name)
+    const stem = baseName(name).replace(/\.md$/i, '')
+    const uniq = uniqueRelName(taken, dir, stem, '.md')
+    return uniq ? joinPath(dir, uniq.stem) : null
+  }
+
   async function newNote() {
     /* 和「＋ 白板」同一条规矩（2026-09-21）：名字框里只有名字，层由**框里那一排**选，
        初值 = 你现在所在的这一层。 */
@@ -1055,8 +1168,23 @@ export default function App() {
     const { dir, title } = splitTitlePath(raw)
     if (!title) return
     const name = joinPath(dir, title + '.md')
-    const r = await api.create(name, `# ${title}\n\n- \n`)
-    if (r.error) return flash(r.error, 'err')
+    /* 撞名就问一句（和「收成笔记」同一条路）—— ＋ 笔记也是手打名字，重名同样会碰上。 */
+    const made = await createNewFile(name, `# ${title}\n\n- \n`, {
+      onRename: async (taken) => {
+        const sug = suggestFreeName(taken) || taken
+        const again = await ask('new-note', { value: sug, where: parentPath(sug), layers: folders })
+        if (!again) return null
+        const parsed = splitTitlePath(again)
+        return parsed.title ? joinPath(parsed.dir, parsed.title + '.md') : null
+      },
+    })
+    if (made.cancelled) return
+    if (made.error) return flash(made.error, 'err')
+    await refreshList()
+    await open(made.name, { force: true })
+    flash((made.overwritten ? '覆盖了：' : '建好了：') + made.name)
+  }
+
     await refreshList()
     await open(r.name, { force: true })
     flash('建好了：' + r.name)
@@ -1551,7 +1679,7 @@ export default function App() {
               <button className={view === 'edit' ? 'on' : ''} onClick={() => setView('edit')} title="直接改原文，看到的是渲染后的样子">
                 编辑
               </button>
-              <button className={view === 'read' ? 'on' : ''} onClick={() => setView('read')} title="整屏只读，方便通读">
+              <button className={view === 'read' ? 'on' : ''} onClick={() => setView('read')} title="整屏只读：公式排出来、结构摆开 —— 看笔记用这个">
                 阅读
               </button>
             </div>
@@ -1571,18 +1699,9 @@ export default function App() {
               </button>
             </div>
             {view === 'edit' && (
-              <>
-                <button className="btn ghost" onClick={() => setFocusMode((v) => !v)} title="只亮着光标那一行，其余压暗">
-                  {focusMode ? '专注：开' : '专注'}
-                </button>
-                <button
-                  className={'btn ghost' + (diag ? ' primary' : '')}
-                  onClick={() => setDiag((v) => !v)}
-                  title="诊断对齐：着色层染蓝、编辑框染红，重合处是紫色。字应该是紫色"
-                >
-                  {diag ? '诊断：开' : '诊断'}
-                </button>
-              </>
+              <button className="btn ghost" onClick={() => setFocusMode((v) => !v)} title="只亮着光标那一行，其余压暗">
+                {focusMode ? '专注：开' : '专注'}
+              </button>
             )}
             <button className={'btn' + (dirty ? ' primary' : '')} onClick={save} disabled={!current}>
               保存 <kbd>Ctrl+S</kbd>
@@ -1634,21 +1753,9 @@ export default function App() {
           </div>
         )}
       </main>
+    </>
+  )}
 
-          <aside className="right">
-            <ContextPanel
-              doc={doc}
-              selectedId={selectedId}
-              onSelect={(id) => {
-                setSelectedId(id)
-                const n = doc.nodes.find((x) => x.id === id)
-                if (n) jumpToLine(n.line)
-              }}
-              onRefTitle={onRefTitle}
-              onJumpLine={jumpToLine}
-            />
-          </aside>
-        </>
       )}
 
       {busy && <div className="cover">载入中…</div>}
@@ -1656,12 +1763,13 @@ export default function App() {
           挂在最后 = 压在所有东西上面（它自带的一层遮罩也是这么来的）。 */}
       {askState && (
         <Ask
-          key={askState.id + ':' + askState.value + ':' + askState.where}
+          key={askState.id + ':' + askState.value + ':' + askState.where + ':' + (askState.extra || '')}
           spec={askState.spec}
           value={askState.value}
           multiline={askState.multiline}
           where={askState.where}
           layers={askState.layers}
+          extra={askState.extra}
           onDone={closeAsk}
         />
       )}

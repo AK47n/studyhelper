@@ -121,20 +121,34 @@ const fails = await withBoard(
 
     /* ④ 点一下目录行 → 折起来；再点一下 → 展开（真鼠标点，不是 dispatchEvent）
        ⚠ 定位按 `title` 属性里的**完整路径**（`DENG`），不按名字 ——
-         用户自己也可能有一层叫「电磁学」。 */
-    const box = await s.eval(`(() => {
-      for (const el of document.querySelectorAll('.filelist .folderrow')) {
-        if (el.getAttribute('title') === ${JSON.stringify(DENG)}) {
-          const r = el.getBoundingClientRect()
-          return { x: Math.round(r.left + 30), y: Math.round(r.top + r.height / 2), caret: el.querySelector('.caret').textContent }
+         用户自己也可能有一层叫「电磁学」。
+       ★ 每次点之前先 `scrollIntoView` 再量坐标（2026-09-20 补的）：`data/` 里的板一多，
+         树就长了，深层那一行会**跑到可视区外**（甚至压在侧栏底部那行字下面），
+         而 `getBoundingClientRect` 照样给得出坐标 —— 于是"点"落在底部那行字上，
+         报出来是「点了没折起来」，看着像折叠坏了，其实是**根本没点到它**。
+         人要看这一行也会先滚过去，这里补的就是人本来会做的那一步；
+         顺带按本仓库的老规矩验一次 `elementFromPoint` 命中它自己。 */
+    const rowBox = () =>
+      s.eval(`(() => {
+        for (const el of document.querySelectorAll('.filelist .folderrow')) {
+          if (el.getAttribute('title') === ${JSON.stringify(DENG)}) {
+            el.scrollIntoView({ block: 'center' })
+            const r = el.getBoundingClientRect()
+            const x = Math.round(r.left + 30)
+            const y = Math.round(r.top + r.height / 2)
+            const hit = document.elementFromPoint(x, y)
+            return { x, y, caret: el.querySelector('.caret').textContent, hitSelf: !!(hit && hit.closest('.folderrow') === el) }
+          }
         }
-      }
-      return null
-    })()`)
+        return null
+      })()`)
+    const box = await rowBox()
     if (!box) bad('找不到「' + DENG + '」那一行，点不了')
     else {
       if (box.caret === '▾') ok('展开着的时候箭头是 ▾')
       else bad('箭头不对：' + box.caret)
+      if (box.hitSelf) ok('★ 那一行点得到（elementFromPoint 命中它自己，不是被侧栏别的东西盖着）')
+      else bad('要点的那个坐标上没有这一行 —— 它多半在可视区外/被盖住了')
       await s.mouse(box.x, box.y)
       list = await rows()
       if (!find(DEEP)) ok('点一下 → 折起来了（里面那张板不见了）')
@@ -152,7 +166,9 @@ const fails = await withBoard(
       if (stored2 && !stored2.includes('电磁学') && stored2.includes('大物')) {
         ok('折起来这件事记在 localStorage 里（那一层不在"展开名单"里，别的还在）')
       } else bad('折叠状态没记住：' + stored2)
-      await s.mouse(box.x, box.y)
+      /* 折起来之后树短了，坐标得**重新量**（滚动位置可能跟着变）。 */
+      const box2 = (await rowBox()) || box
+      await s.mouse(box2.x, box2.y)
       list = await rows()
       if (find(DEEP)) ok('再点一下 → 又展开了')
       else bad('点第二下没展开')

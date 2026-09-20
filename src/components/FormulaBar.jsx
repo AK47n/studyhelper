@@ -1,38 +1,59 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { SYMBOLS, TEMPLATES } from '../lib/snippets.js'
 
 /**
- * 常驻公式工具条。纯展示：所有插入逻辑在 useFormulaEditing 里，
+ * 公式工具条。纯展示：所有插入逻辑在 useFormulaEditing 里，
  * 作用对象永远是「最后获得焦点的那个输入框」。
+ *
+ * ★ 默认**收起**（2026-09-19 晚，"笔记臃肿"那轮砍的）：三个页签 + 一排提示
+ *   常驻在编辑区头顶，占掉一条高度 —— 而打公式不是每次写笔记都要做的事。
+ *   收起时只剩左边一个「∑ 公式」的小把手，Ctrl+M 也能开合；
+ *   [[ 引用补全不收 —— 它挂在 .fbar 上（.ac 是 bottom:100%），条在、补全就在。
  */
 export default function FormulaBar({ editing }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
   const [tab, setTab] = useState('template')
   const { ac, doInsert, acceptAutocomplete } = editing
+
+  /* Ctrl+M 开合。挂在窗口上（不在 textarea 上）：手在公式条按钮上时也能用键盘。 */
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'm' || e.key === 'M')) {
+        e.preventDefault()
+        setOpen((v) => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   return (
     <div className="fbar">
       <div className="fbar-row">
-        <button className="fbar-toggle" onClick={() => setOpen((v) => !v)} title="收起 / 展开">
-          <span className="fbar-caret">{open ? '▾' : '▸'}</span> 公式条
+        <button className="fbar-toggle" onClick={() => setOpen((v) => !v)} title="收起 / 展开（Ctrl+M）">
+          <span className="fbar-caret">{open ? '▾' : '▸'}</span> ∑ 公式
         </button>
-        <div className="fbar-tabs">
-          <button className={tab === 'template' ? 'on' : ''} onClick={() => setTab('template')}>
-            结构
-          </button>
-          <button className={tab === 'symbol' ? 'on' : ''} onClick={() => setTab('symbol')}>
-            符号
-          </button>
-          <button className={tab === 'help' ? 'on' : ''} onClick={() => setTab('help')}>
-            快捷
-          </button>
-          <button className={tab === 'format' ? 'on' : ''} onClick={() => setTab('format')}>
-            写法
-          </button>
-        </div>
-        <span className="fbar-note">
-          选中文字再点 = 包进去 · <b>Tab</b> 跳空位 · <b>[[</b> 引用
-        </span>
+        {open && (
+          <>
+            <div className="fbar-tabs">
+              <button className={tab === 'template' ? 'on' : ''} onClick={() => setTab('template')}>
+                结构
+              </button>
+              <button className={tab === 'symbol' ? 'on' : ''} onClick={() => setTab('symbol')}>
+                符号
+              </button>
+              <button className={tab === 'help' ? 'on' : ''} onClick={() => setTab('help')}>
+                快捷
+              </button>
+              <button className={tab === 'format' ? 'on' : ''} onClick={() => setTab('format')}>
+                写法
+              </button>
+            </div>
+            <span className="fbar-note">
+              选中文字再点 = 包进去 · <b>Tab</b> 跳空位 · <b>[[</b> 引用
+            </span>
+          </>
+        )}
       </div>
 
       {open && tab === 'template' && (

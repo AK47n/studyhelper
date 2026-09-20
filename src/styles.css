@@ -16,6 +16,14 @@
   --err: #ff6b6b;
   --mono: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Consolas, 'Microsoft YaHei Mono', monospace;
 
+  /* ---- 美化这轮新加的三个通用量（2026-09-19）----
+     --hov：深色区所有"划过变亮"的底色，原来 #24304a 硬编码了十几处，收拢成一处。
+     --focus-ring：输入框/弹层聚焦时那圈柔光（box-shadow 画，不占布局）。
+     --ease：统一的缓动曲线，过渡别太"弹"也别太线性。 */
+  --hov: #24304a;
+  --focus-ring: 0 0 0 3px rgba(75, 135, 224, 0.16);
+  --ease: cubic-bezier(0.25, 0.6, 0.3, 1);
+
   /* ---- 字号阶梯：改 --s 一个数，整个界面跟着放大/缩小 ---- */
   /* 界面上有个 A- / A+ 按钮会改这个值，也存进 localStorage */
   --s: 1.25;
@@ -31,7 +39,6 @@
   --src-lh: 1.95;
   /* 侧栏宽度也跟着长，不然放大后文字被挤掉 */
   --w-left: calc(240px + 60px * (var(--s) - 1) * 2);
-  --w-right: calc(330px + 90px * (var(--s) - 1) * 2);
 
   /* ---- 画布上的鼠标指针 ----
      为什么不用系统的 `crosshair`：那种光标是"跟背景反色"画的（XOR），
@@ -57,11 +64,22 @@ body {
 }
 
 button { font-family: inherit; color: inherit; cursor: pointer; }
+/* 悬停态的过渡统一交给这一条管：变亮/描边/变色都不再是"啪一下跳变"。
+   时长压在 0.14s —— 再长会让快速划过一排按钮时有黏滞感。 */
+button, .filerow, .folderrow, .hubrow {
+  transition: background-color 0.14s var(--ease), border-color 0.14s var(--ease),
+              color 0.14s var(--ease), box-shadow 0.14s var(--ease), opacity 0.14s var(--ease);
+}
+/* 键盘 Tab 到按钮时给一圈柔光（只圈按钮 —— 输入框有自己的聚焦样式，
+   编辑区 textarea 的 outline 必须 保持 none，否则会和着色层错位）。 */
+button:focus-visible { outline: 2px solid rgba(106, 168, 255, 0.55); outline-offset: 1px; }
 code, kbd { font-family: var(--mono); }
 
+/* 两列：左栏 + 主区。右栏（ContextPanel）2026-09-19 晚整栏砍掉了 ——
+   笔记模式从三栏瘦成两栏，白板模式本来就是这个模板，于是不再需要 board-mode 那条特例。 */
 .app {
   display: grid;
-  grid-template-columns: var(--w-left) minmax(0, 1fr) var(--w-right);
+  grid-template-columns: var(--w-left) minmax(0, 1fr);
   height: 100%;
 }
 
@@ -98,7 +116,7 @@ code, kbd { font-family: var(--mono); }
 }
 .title-label { white-space: nowrap; }
 /* 顶部这一行 = **根目录**的放置目标（拖回根上），所以它也要有"被拖到"的样子 */
-.side-title.drop { background: #24304a; border-color: var(--acc); }
+.side-title.drop { background: var(--hov); border-color: var(--acc); }
 .title-acts { display: flex; gap: 4px; flex: none; margin-left: auto; white-space: nowrap; }
 .filelist { display: flex; flex-direction: column; gap: 2px; overflow: auto; }
 
@@ -112,7 +130,9 @@ code, kbd { font-family: var(--mono); }
   font-size: var(--fs-ui); color: var(--text); cursor: pointer; min-height: 1.7em;
 }
 .filerow:hover, .folderrow:hover { background: var(--panel2); }
-.filerow.on { background: #1d2536; border-color: var(--line2); }
+/* 选中行：底色之外再给一条 2px 主色边（inset，不占布局）——
+   树滚动到中间时，光靠"略亮一点的底色"分不清"选中的"和"划过的" */
+.filerow.on { background: #1d2536; border-color: var(--line2); box-shadow: inset 2px 0 0 var(--acc); }
 .filerow .fname, .folderrow .fname { flex: 1; min-width: 0; }
 .filerow .fmeta, .folderrow .fmeta { flex: none; }
 .caret { width: 0.9em; flex: none; color: var(--dim2); font-size: var(--fs-meta); }
@@ -146,7 +166,7 @@ code, kbd { font-family: var(--mono); }
   border: none; background: transparent; color: var(--dim2); cursor: pointer;
   font-size: var(--fs-meta); padding: 1px 4px; border-radius: 5px; line-height: 1.2;
 }
-.rowbtn:hover { background: #24304a; color: var(--text); }
+.rowbtn:hover { background: var(--hov); color: var(--text); }
 /* ★ 「＋」和「▣」常显（目录行里）—— 它们是"点出来的分层"那两个入口。
    ⚠ 别退回 `.filerow:hover .rowbtn.plus` 那种"划过才亮"：文件行那颗「＋」只在
      目录里出现（根上不出现），它的位置由**所在层**决定，和目录行那颗是两件事。
@@ -155,7 +175,7 @@ code, kbd { font-family: var(--mono); }
 .rowbtn.plus { flex: none; color: var(--dim); padding: 0 4px; }
 .filerow:hover .rowbtn.plus { color: var(--text); }
 .folderrow .rowbtn.plus { color: var(--acc); }
-.folderrow .rowbtn.plus:hover { background: #24304a; color: #cfe6ff; }
+.folderrow .rowbtn.plus:hover { background: var(--hov); color: #cfe6ff; }
 /* ★ 「＋分层」和「改名」**飘**在「＋白板」左边，鼠标上来才出现（2026-09-21）。
    为什么不干脆都常显：实测三个词常显会把目录名挤成省略号
    （"热力学与统计物理" → "热力学与统计…"，一眼看不出那是哪一层）。
@@ -177,7 +197,7 @@ code, kbd { font-family: var(--mono); }
    所以给它一点颜色，让它在两个符号中间看得出来是件独立的事。
    比 ⤳ 宽不少 —— 一行的动作区会跟着变宽，但只在鼠标上来时才显示。 */
 .rowbtn.exp { color: #7ba7dc; padding: 1px 6px; }
-.rowbtn.exp:hover { background: #24304a; color: #cfe6ff; }
+.rowbtn.exp:hover { background: var(--hov); color: #cfe6ff; }
 /* 就地改名的输入框：**占 fname 那一格**（flex: 1，和它替换掉的那个 span 同一个位置），
    所以点下去那一行除了"名字变成可编辑的"以外什么都不动 —— 树不会跳。 */
 .renameinput {
@@ -188,7 +208,7 @@ code, kbd { font-family: var(--mono); }
 }
 .renameinput:focus { outline: none; }
 /* 拖拽时"会落到哪一层"——必须看得见，不然拖完不知道它会去哪 */
-.folderrow.drop { background: #24304a; border-color: var(--acc); }
+.folderrow.drop { background: var(--hov); border-color: var(--acc); }
 .fname { font-size: var(--fs-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fmeta { font-size: var(--fs-meta); color: var(--dim2); }
 
@@ -211,7 +231,7 @@ code, kbd { font-family: var(--mono); }
   background: #1a2030; border: 1px solid var(--line2); border-radius: 7px;
   font-size: var(--fs-meta); padding: 5px 9px; color: var(--acc); text-align: center;
 }
-.side-zoom:hover { background: #24304a; color: #cfe6ff; }
+.side-zoom:hover { background: var(--hov); color: #cfe6ff; }
 /* 左栏底部那一行：放大/缩小按钮 + 当前百分比。
    原来只有一个"字太小 →"（只会放大），白板模式下顶栏不渲染，
    于是整个白板里没有"调小"的入口 —— 这一行补上，并且是成对的。 */
@@ -222,7 +242,7 @@ code, kbd { font-family: var(--mono); }
   font-size: var(--fs-meta); padding: 5px 7px; color: var(--dim2); cursor: pointer;
   min-width: 46px; text-align: center;
 }
-.side-zoom-val:hover { color: var(--text); background: #24304a; }
+.side-zoom-val:hover { color: var(--text); background: var(--hov); }
 /* 左栏底部那一条：导出目录在哪（能点的）。
    2026-09-18 加的 —— 用户问"我在哪里找到存放导出的文件夹"，这就是答案。
    做得比别的次要按钮显眼一点（它是**唯一**能找到那些文件的入口）。 */
@@ -242,7 +262,7 @@ code, kbd { font-family: var(--mono); }
   background: #0d1119; border: 1px solid var(--line); border-radius: 9px; padding: 2px 3px;
 }
 .zoom .mini { border: none; background: transparent; font-size: var(--fs-meta); padding: 3px 7px; }
-.zoom .mini:hover:not(:disabled) { background: #24304a; border-radius: 6px; }
+.zoom .mini:hover:not(:disabled) { background: var(--hov); border-radius: 6px; }
 .zoom .mini:disabled { opacity: 0.35; cursor: default; }
 .zoom-val {
   background: transparent; border: none; color: var(--dim);
@@ -267,9 +287,12 @@ code, kbd { font-family: var(--mono); }
   background: var(--panel2); border: 1px solid var(--line2); border-radius: 8px;
   padding: 6px 12px; font-size: var(--fs-ui);
 }
-.btn:hover:not(:disabled) { background: #202839; }
+.btn:hover:not(:disabled) { background: #202839; border-color: #3a4457; }
+.btn:active:not(:disabled) { transform: translateY(0.5px); }
 .btn:disabled { opacity: 0.4; cursor: default; }
+/* 主按钮原来只有底色、没有悬停态：划上去纹丝不动，像一张贴纸而不是按钮 */
 .btn.primary { background: var(--acc2); border-color: #3d78cf; color: #eaf2ff; }
+.btn.primary:hover:not(:disabled) { background: #3568c0; border-color: #4b87e0; }
 .btn.ghost { background: transparent; }
 .btn.icon { padding: 6px 9px; font-weight: 700; }
 kbd {
@@ -306,7 +329,7 @@ kbd {
   padding: 2px 8px; font-size: calc(var(--fs-ui) * 0.95); font-family: var(--mono); line-height: 1.45;
   min-width: 30px;
 }
-.chip:hover { background: #24304a; border-color: #3f5a8c; color: #fff; }
+.chip:hover { background: var(--hov); border-color: #3f5a8c; color: #fff; }
 .chip.sym { color: #cfe0ff; }
 .chip.struct { color: #ffe0b0; }
 
@@ -656,7 +679,11 @@ kbd {
 }
 .srcscroll.diag .caret { background: #ff4d4d; }
 
-/* ---- 视图切换（编辑 / 阅读）---- */
+/* ---- 视图切换（编辑 / 阅读）----
+   2026-09-19 晚一度砍掉，同日晚请回来：编辑区是逐像素对齐的**源码层**
+   （两层错一像素就是灾难，见 SourceEditor 顶部），公式只有光标那一行
+   会渲染成气泡。「收成笔记」上线后草稿里全是公式，用户看到的"全是编辑状态"
+   —— 阅读视图是公式唯一"好看的脸"，不是同一份内容的第二种摆法。 */
 .viewtabs { display: flex; gap: 3px; background: #0d1119; border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
 .viewtabs button {
   background: transparent; border: none; border-radius: 6px;
@@ -665,7 +692,7 @@ kbd {
 .viewtabs button.on { background: var(--acc2); color: #eaf2ff; }
 .viewtabs button:hover:not(.on) { color: var(--text); }
 
-/* ---- 预览 ---- */
+/* ---- 预览（阅读视图：渲染后的结构）---- */
 .prevwrap { flex: 1 1 48%; min-height: 0; display: flex; flex-direction: column; }
 .prevwrap.big { flex: 1 1 auto; }
 .prevbar {
@@ -734,56 +761,16 @@ kbd {
 
 .katex { font-size: 1.06em; }
 
-/* ================= 右侧 ================= */
-.right {
-  background: var(--panel); border-left: 1px solid var(--line);
-  overflow: auto; min-height: 0;
-}
-.ctx { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
-.ctx-head h3 {
-  margin: 4px 0 9px; font-size: calc(var(--fs-content) * 1.1); line-height: 1.55;
-  overflow-wrap: anywhere;
-}
-.ctx-kicker { font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.5px; }
-.ctx-actions { display: flex; gap: 6px; }
-.ctx-note { font-size: var(--fs-ui); color: var(--dim); margin: 0; }
-.ctx-hint {
-  font-size: var(--fs-ui); color: var(--dim); margin: 7px 0 0; padding: 9px 11px;
-  background: #141b26; border-left: 2px solid var(--acc2); border-radius: 0 8px 8px 0;
-}
-.ctx-hint code { color: #cfe0ff; font-size: var(--fs-key); overflow-wrap: anywhere; }
-
-.verdict { font-size: var(--fs-ui); padding: 7px 11px; border-radius: 9px; }
-.verdict.ok { background: #10251c; color: var(--ok); border: 1px solid #1d4a36; }
-.verdict.warn { background: #241c0e; color: var(--warn); border: 1px solid #453316; }
-
-.ctx-sec { display: flex; flex-direction: column; gap: 3px; }
-.sec-title {
-  font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.6px;
-  padding-bottom: 5px; border-bottom: 1px solid var(--line); margin-bottom: 5px;
-}
-.link-row {
-  background: transparent; border: 1px solid transparent; border-radius: 8px;
-  padding: 6px 9px; display: flex; align-items: center; justify-content: space-between;
-  gap: 9px; text-align: left; font-size: var(--fs-ui);
-}
-.link-row:hover { background: var(--panel2); border-color: var(--line2); }
-.link-row.sub { margin-left: 9px; }
-.link-row.dangling .lr-name { color: var(--warn); }
-.lr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lr-line { font-size: var(--fs-meta); color: var(--dim2); font-family: var(--mono); flex: none; }
-.island-text { color: var(--warn); }
-
-.ctx-field { display: flex; gap: 9px; align-items: baseline; padding: 4px 0; font-size: var(--fs-content); }
-.ctx-field .fval { color: #c3ccdd; overflow-wrap: anywhere; }
-.ctx-plain { font-size: var(--fs-content); color: #aab4c8; overflow-wrap: anywhere; }
-.ctx-kids { margin-top: 7px; display: flex; flex-direction: column; gap: 2px; }
+/* ================= 右侧 =================
+   2026-09-19 晚整栏砍掉了（用户："笔记臃肿难懂"）：ContextPanel 连同
+   .ctx* / .verdict / .link-row / .lr-* / .sec-title / .island-text 这一族样式一起走。
+   "当前节点是谁"编辑区里看得见（选中行有色带），右栏是在复述同一个事实。 */
 
 .mini {
   background: #1a2030; border: 1px solid var(--line2); border-radius: 7px;
   font-size: var(--fs-meta); padding: 3px 9px; color: var(--dim);
 }
-.mini:hover { color: var(--text); background: #24304a; }
+.mini:hover { color: var(--text); background: var(--hov); }
 .dim { color: var(--dim2); }
 .dim.small, .small { font-size: var(--fs-meta); }
 .pad { padding: 4px 8px; }
@@ -798,7 +785,11 @@ kbd {
   background: #1a2331; border: 1px solid var(--line2); border-radius: 10px;
   padding: 10px 18px; font-size: var(--fs-ui); z-index: 200;
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.5); max-width: 76vw;
+  animation: toastin 0.18s var(--ease);
 }
+/* 从底下轻轻浮上来。keyframe 里必须带着 translateX(-50%)：
+   那是水平居中的定位本身，动画把它挤掉，条会先跳到左边再归位 */
+@keyframes toastin { from { opacity: 0; transform: translate(-50%, 10px); } }
 .toast.ok { border-color: #1d4a36; color: #bdf0d7; }
 .toast.warn { border-color: #453316; color: #ffe0b0; }
 .toast.err { border-color: #5a2a24; color: #ffc9c0; }
@@ -809,7 +800,7 @@ kbd {
 .toast { display: flex; align-items: center; gap: 12px; }
 .toast-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .toast-act {
-  flex: none; background: #24304a; border: 1px solid var(--line2); border-radius: 7px;
+  flex: none; background: var(--hov); border: 1px solid var(--line2); border-radius: 7px;
   font-size: var(--fs-meta); padding: 5px 12px; color: #cfe6ff; white-space: nowrap;
 }
 .toast-act:hover { background: #2f3f60; color: #fff; }
@@ -852,6 +843,27 @@ kbd {
 .ask-title { font-size: calc(var(--fs-ui) * 1.15); font-weight: 600; color: #eef2f9; }
 /* 灰字那一行是**说明**，不是装饰：它说清"打斜杠会怎样"。所以它不许折成两团。 */
 .ask-hint { font-size: var(--fs-meta); color: #8b95a8; line-height: 1.65; }
+/* ── 选择型的问话（2026-09-19，`spec.choices`）─────────────────────────────
+   一排"点一下就定"的按钮，每条带一句"它意味着什么"。为什么不是输入框 + 确定：
+   这里问的是**三种不同的后果**（覆盖会弄丢东西、换个名字不会），摊成三颗按钮
+   比让人在一个框里打字清楚得多；而且**第一条就是回车走的那条** ——
+   所以"不会弄丢东西"的选项永远排最前（见 ASK 表的 note-overwrite）。 */
+.ask-choices { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 4px; }
+.ask-choice {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  text-align: left; padding: 9px 12px; cursor: pointer; width: 100%;
+  background: #131c2b; color: #dde3ee;
+  border: 1px solid #2e3646; border-radius: 8px;
+  font: inherit; font-size: calc(var(--fs-ui) * 0.98);
+}
+.ask-choice:hover { border-color: #4b87e0; }
+.ask-choice:focus-visible { outline: 2px solid #4b87e0; outline-offset: 1px; }
+.ask-choice b { font-weight: 600; }
+.ask-choice .ac-hint { font-size: var(--fs-meta); color: #8b95a8; }
+.ask-choice.danger:hover { border-color: #b4553f; }
+.ask-choice.danger b { color: #e8a08e; }
+/* "要覆盖的那一份长什么样"：一个文件名 + 几个数（几个节点、多大、什么时候改过）。 */
+.ask-note { font-size: var(--fs-meta); color: #aab4c8; margin-top: 4px; word-break: break-all; }
 /* "建到哪一层"（2026-09-18 加的）。★ 它**必须显眼**，而且必须比 hint 靠上：
    点出来的那条路上，"我点的是哪一行"就是这次新建的全部位置信息 ——
    不写出来，用户的下一个问题就是"它建到哪儿去了？"（比让他多打一段名字更糟）。
@@ -905,7 +917,8 @@ kbd {
 }
 .ask-prefix + .ask-input { border-radius: 0 8px 8px 0; }
 .ask-textarea { resize: vertical; line-height: 1.6; }
-.ask-input:focus, .ask-textarea:focus { outline: none; border-color: #4b87e0; }
+/* 聚焦：描边换主色 + 一圈柔光。box-shadow 不占布局，量出来的矩形不会变 */
+.ask-input:focus, .ask-textarea:focus { outline: none; border-color: #4b87e0; box-shadow: var(--focus-ring); }
 .ask-input::placeholder, .ask-textarea::placeholder { color: #5d6779; }
 .ask-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; }
 .ask .btn { background: #232b3a; border: 1px solid #3a4457; color: #dde3ee; }
@@ -938,7 +951,8 @@ kbd {
    而且这个坑还会**再来一次**：白板外面套了"文件名那一行"之后，
    只给内层的画布指定格子，那一行文件名的兄弟就会被自动放进第 2 行，
    把画布挤掉一半。所以规则写在外层容器 .bd-shell 上，孩子只管在它里面排。 */
-.app.board-mode { grid-template-columns: var(--w-left) minmax(0, 1fr); }
+/* 白板的 .bd-shell 落在第二列（原来三列时代 board-mode 要改列数，现在两列是默认，
+   这里只剩"告诉 shell 它在哪一格"这一件事）。 */
 .app.board-mode > .bd-shell {
   grid-column: 2; grid-row: 1;
   display: flex; flex-direction: column;
@@ -987,7 +1001,7 @@ kbd {
   flex: 1; background: var(--panel2); border: 1px solid var(--line2); border-radius: 9px;
   color: var(--dim); font-size: var(--fs-ui); padding: 7px 6px; cursor: pointer;
 }
-.modes .mode:hover { color: var(--text); background: #24304a; }
+.modes .mode:hover { color: var(--text); background: var(--hov); }
 .modes .mode.on { background: var(--acc2); border-color: var(--acc); color: #fff; }
 
 .bd {
@@ -1203,7 +1217,8 @@ kbd {
   outline: 1.5px solid var(--bd-ring);
   outline-offset: -1.5px;
   border-radius: var(--bd-radius);
-  box-shadow: 0 3px 14px rgba(20, 24, 33, 0.09);
+  /* 两层阴影：贴地的一小条 + 一层柔和的浮起 —— 比单层大模糊更"纸贴在纸上" */
+  box-shadow: 0 1px 2px rgba(20, 24, 33, 0.06), 0 4px 16px rgba(20, 24, 33, 0.09);
   /* 内边距的实际值写在 Board.jsx 的 style 上（它要跟着视图缩放和卡片倍率走），
      这里只是"万一没有 style"的兜底，两边保持一致。
      2026-09-16 从 10/12 收到 4/8：用户说"边缘留白太多了"。 */
@@ -1219,8 +1234,8 @@ kbd {
   cursor: grab;
   user-select: none;
 }
-.bd-card:hover { box-shadow: 0 6px 20px rgba(20, 24, 33, 0.16); }
-.bd-card.on { --bd-ring: #2f6fd0; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.18), 0 6px 20px rgba(20, 24, 33, 0.16); }
+.bd-card:hover { box-shadow: 0 2px 4px rgba(20, 24, 33, 0.06), 0 8px 24px rgba(20, 24, 33, 0.15); }
+.bd-card.on { --bd-ring: #2f6fd0; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.18), 0 2px 4px rgba(20, 24, 33, 0.06), 0 8px 24px rgba(20, 24, 33, 0.15); }
 .bd-card.dim { opacity: 0.35; }
 .bd-card.editing { cursor: default; box-shadow: 0 10px 34px rgba(20, 24, 33, 0.22); }
 /* 圈的颜色分两种卡。顺序和原来的 `border-color` 一模一样 —— 于是"选中的公式卡圈是什么
@@ -1523,11 +1538,19 @@ kbd {
 }
 .bd-frame {
   position: absolute;
-  border: 1.5px dashed rgba(90, 106, 138, 0.55);
-  border-radius: calc(10px * var(--s));
-  background: rgba(120, 138, 176, 0.045);
+  border: 1.5px dashed rgba(96, 112, 144, 0.5);
+  border-radius: calc(12px * var(--s));
+  background: rgba(120, 138, 176, 0.05);
+  /* 颜色层的过渡：选中/取消选中时不再是"啪一下跳变"。
+     只动颜色和阴影 —— 框的宽高是 JS 算好写进 style 的（成员包围盒），这里碰都不碰。 */
+  transition: border-color 0.14s var(--ease), background-color 0.14s var(--ease), box-shadow 0.14s var(--ease);
 }
-.bd-frame.on { border-color: rgba(47, 111, 208, 0.75); background: rgba(47, 111, 208, 0.07); }
+/* 选中：实色蓝边 + 一圈柔光 —— 和卡片选中态（.bd-card.on）同一套语言 */
+.bd-frame.on {
+  border-color: rgba(47, 111, 208, 0.7);
+  background: rgba(47, 111, 208, 0.06);
+  box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.1);
+}
 
 /* 框的名字：挂在框线**上方**（translateY(-100%)），不占框里的地方 ——
    框里是你随时要写东西的地盘，标题压在上面就永远在挡路。 */
@@ -1536,12 +1559,15 @@ kbd {
   pointer-events: auto; cursor: grab;
   display: inline-flex; align-items: center; gap: 4px;
   background: rgba(255, 255, 255, 0.94); color: #4a566d;
-  border: 1px solid rgba(90, 106, 138, 0.45); border-radius: 999px;
+  border: 1px solid rgba(90, 106, 138, 0.4); border-radius: 999px;
   padding: 0 calc(7px * var(--s));
   font-size: calc(11.5px * var(--s)); line-height: 1.7; white-space: nowrap;
   font-weight: 500; font-family: inherit;
+  /* 一小条贴地影：胶囊从纸上浮起来一点，不再像贴纸印在框线上 */
+  box-shadow: 0 1px 3px rgba(20, 24, 33, 0.08);
+  transition: border-color 0.14s var(--ease), color 0.14s var(--ease), box-shadow 0.14s var(--ease);
 }
-.bd-frame-t:hover { border-color: rgba(47, 111, 208, 0.7); color: #2f6fd0; }
+.bd-frame-t:hover { border-color: rgba(47, 111, 208, 0.7); color: #2f6fd0; box-shadow: 0 2px 6px rgba(20, 24, 33, 0.12); }
 .bd-frame-t:active { cursor: grabbing; }
 .bd-frame-t.dim { color: var(--dim); font-weight: 400; }
 .bd-frame-ico { opacity: 0.75; }
@@ -1553,6 +1579,7 @@ kbd {
   padding: 0 calc(8px * var(--s));
   font-size: calc(11.5px * var(--s)); line-height: 1.7; font-family: inherit;
   outline: none; pointer-events: auto;
+  box-shadow: var(--focus-ring);
 }
 
 /* ---------- 画出来的连接（关系）----------
@@ -1733,8 +1760,8 @@ kbd {
 .bd-hint {
   position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
   width: min(560px, 82%); z-index: 7; text-align: center;
-  background: rgba(255, 255, 255, 0.9); border: 1px dashed #c3c9d6; border-radius: 14px;
-  padding: 22px 26px; color: #3b4354; box-shadow: 0 10px 30px rgba(20, 24, 33, 0.08);
+  background: rgba(255, 255, 255, 0.92); border: 1px dashed #cdd3de; border-radius: 16px;
+  padding: 24px 28px; color: #3b4354; box-shadow: 0 8px 28px rgba(20, 24, 33, 0.07);
 }
 .bd-hint-t { font-size: calc(20px * var(--s)); font-weight: 600; margin-bottom: 8px; color: #1b1d22; }
 .bd-hint-s { font-size: calc(13.5px * var(--s)); line-height: 1.7; color: #5a6478; }
@@ -1818,6 +1845,7 @@ kbd {
   color: #dde3ee; font-family: var(--mono); font-size: calc(13px * var(--s));
   padding: 8px 10px; box-sizing: border-box;
 }
+.wp-edit:focus { outline: none; border-color: #4b87e0; box-shadow: var(--focus-ring); }
 .wp-res .wp-edit { border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; }
 .wp-res-acts { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
 .wp-res-acts .btn { margin-left: auto; }

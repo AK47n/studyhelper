@@ -136,6 +136,13 @@ if (await portBusy()) {
       {
         const r = await post('/api/new', { name: NESTED, text: '{"strokes":[],"cards":[]}' })
         eq(r.ok, true, 'POST /api/new 一条带层次的路径 → 建好')
+        /* ★ 撞名要回一个**机器认得出的信号**（2026-09-19）：前端靠 `code:'exists'`
+           给用户三条路（覆盖 / 换个名字 / 算了）。**不许靠匹配那句人话** ——
+           那句话会为了"更像人话"而改，字面匹配失配的表现是"点了覆盖却什么都没发生"。 */
+        const dup = await post('/api/new', { name: NESTED, text: 'x' })
+        eq(dup.code, 'exists', '★ 撞名 → 回 code:"exists"（前端据此弹三选一，不靠字面匹配）')
+        eq(dup.name, NESTED, '撞名回包里带着**撞的是哪个名字**（问话里要摆给用户看）')
+        eq(typeof dup.error, 'string', '人话那句照样在（用户选了"算了"之后要能看懂）')
         if (fs.existsSync(path.join(DATA, '大物', '电磁学', 'board-第一章.md'))) ok('盘上真的是 data/大物/电磁学/board-第一章.md（中间两层自动建出来）')
         else bad('盘上没有这个文件 —— 服务端没把中间那几层建出来')
         const list = await get('/api/list')

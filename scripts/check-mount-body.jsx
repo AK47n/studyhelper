@@ -82,11 +82,16 @@ export async function run({ window, container, getDiskText, calls }) {
   if (container.querySelector('.zoom-val')) ok('字号控件存在')
   else fail('字号控件缺失')
 
-  const nQty = container.querySelectorAll('.badge.heat, .badge.island').length
-  if (nQty >= 5) ok(`枢纽/孤岛色标出现：${nQty} 个`)
-  else fail(`色标数不对：${nQty}`)
+  /* 枢纽/孤岛的账：阅读视图和右栏一度砍掉又请回（2026-09-19 晚两度反转），
+     现在左栏「枢纽（被引最多）」这一份是**常驻**的，先在这里钉住。 */
+  const nHub = container.querySelectorAll('.hubrow').length
+  const nIsland = (container.querySelector('.island-note') ? 1 : 0)
+  if (nHub + nIsland > 0) ok(`枢纽/孤岛的账出现在左栏（枢纽行 ${nHub}，孤岛提示 ${nIsland}）`)
+  else fail('左栏里没有枢纽行、也没有孤岛提示（连线账没人算了？）')
 
   // ---- 切到「阅读」视图：应该渲染出 KaTeX 公式的树 ----
+  // （2026-09-19 晚一度砍掉又恢复：编辑区是逐像素对齐的源码层，公式只有
+  //   光标那一行渲染；收拢出来的草稿全是公式，阅读视图是它唯一"好看的脸"。）
   results.push('')
   results.push('=== 阅读视图 ===')
   const tabs = [...container.querySelectorAll('.viewtabs button')]

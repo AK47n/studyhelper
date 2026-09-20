@@ -1,20 +1,21 @@
-// 端到端自检：把整棵总结树在 Node 里渲染成 HTML，检查
-//   ① 公式有没有真的被 KaTeX 渲染
+// 端到端自检：对 data/ 里每份笔记做数据级体检，检查
+//   ① 公式有没有真的被 KaTeX 渲染（renderMath.js，和界面同一套参数）
 //   ② 引用是不是连上了（status-ref）还是悬空（status-dangling）
-//   ③ 枢纽/孤岛色标有没有出现
+//   ③ 枢纽/孤岛的账（从 doc.refCount 算，不再看视图 —— 阅读视图 2026-09-19 砍掉了）
+//   ④ 未闭合的 $
 // 只读 data/ 和 src/，不碰服务。
+// ★ 历史：这一版以前是把 Preview/ContextPanel 两个组件真的 mount 起来数 DOM 的；
+//   阅读视图和右栏砍掉后组件没了，检查对象换成**数据本身** —— 界面怎么摆，
+//   "公式排得出、引用连得上"这些事实不变。
 import fs from 'node:fs'
 import path from 'node:path'
-import React from 'react'
-import { renderToStaticMarkup } from 'react-dom/server'
-import Preview from '../src/components/Preview.jsx'
-import ContextPanel from '../src/components/ContextPanel.jsx'
-import { parseDoc, extractRefs } from '../src/lib/parse.js'
+import { parseDoc, extractRefs, hasOpenFormula } from '../src/lib/parse.js'
+import { renderMathToHtml } from '../src/lib/renderMath.js'
 
 const dir = path.join(process.cwd(), 'data')
 /* ⚠ 白板文件也住在 data/ 里、后缀也是 .md（见 README「白板 → 数据长什么样」），
    但它的内容是 JSON，不是笔记格式。第一版没排除它，于是这个自检一打开
-   board-*.md 就报"预览里没有渲染出任何 KaTeX 公式" —— 一条假故障，
+   board-*.md 就报"没有渲染出任何 KaTeX 公式" —— 一条假故障，
    而且看起来像笔记界面坏了。
    凡是"遍历 data/*.md"的脚本，都要先跳过 board- 开头的那批。 */
 const BOARD_RE = /^board-.*\.md$/i
@@ -37,29 +38,48 @@ const fail = (msg) => {
    但也不能装作没看见，所以照常打印，只是归到"待填"里。 */
 const isPlaceholder = (s) => /[【】]/.test(String(s || ''))
 
+/* 抽一段文字里的行内公式（$...$，\$ 转义不算）。
+   和界面上"着色层认公式"同一套边界 —— 数据里只有这一种公式形态。 */
+function formulasOf(s) {
+  const clean = String(s || '').replace(/\\\$/g, '')
+  const out = []
+  const re = /\$([^$]+)\$/g
+  let m
+  while ((m = re.exec(clean))) out.push(m[1])
+  return out
+}
+
 for (const f of files) {
   const text = fs.readFileSync(path.join(dir, f), 'utf8')
   const doc = parseDoc(text)
   console.log(`\n=== ${f} ===`)
 
-  // ① 预览渲染
-  let previewHtml = ''
-  try {
-    previewHtml = renderToStaticMarkup(React.createElement(Preview, { doc, selectedId: null, onSelect() {}, onRefTitle() {} }))
-  } catch (e) {
-    fail('Preview 渲染抛异常: ' + e.message)
-    continue
+  // ① 公式渲染（renderMathToHtml 排不出来回 null —— 和界面"宁可丑不可丢"同一行为）
+  let katexOk = 0
+  let katexBad = []
+  for (const n of doc.nodes) {
+    for (const latex of formulasOf(n.title + ' ' + n.body)) {
+      if (renderMathToHtml(latex)) katexOk++
+      else katexBad.push(`L${n.line + 1} $${latex.slice(0, 24)}…`)
+    }
   }
-  if (!previewHtml.includes('class="katex"')) fail('预览里没有渲染出任何 KaTeX 公式')
-  else console.log(`  ✓ 预览渲染成功，KaTeX 公式块 ${(previewHtml.match(/class="katex"/g) || []).length} 个`)
+  if (katexOk === 0 && katexBad.length === 0) console.log('  （这份笔记里没有公式）')
+  else console.log(`  ✓ KaTeX 排出 ${katexOk} 个公式`)
+  if (katexBad.length) fail(`${katexBad.length} 个公式排不出来: ${katexBad.slice(0, 3).join('；')}`)
 
   // ② 引用状态
-  const refs = (previewHtml.match(/class="ref[^"]*"/g) || []).length
-  const dangling = (previewHtml.match(/class="ref dangling"/g) || []).length
-  const expectedTodo = doc.nodes.reduce((a, n) => {
-    for (const r of extractRefs(n.body)) if (isPlaceholder(r) && !doc.resolveOne(r)) a++
-    return a
-  }, 0)
+  let refs = 0
+  let dangling = 0
+  let expectedTodo = 0
+  for (const n of doc.nodes) {
+    for (const r of extractRefs(n.body)) {
+      refs++
+      if (!doc.resolveOne(r)) {
+        dangling++
+        if (isPlaceholder(r)) expectedTodo++
+      }
+    }
+  }
   if (dangling > 0 && dangling <= expectedTodo) {
     console.log(`  ✓ 引用标签 ${refs} 个；悬空 ${dangling} 处 = 模板里还没填的【】空位`)
   } else {
@@ -67,39 +87,17 @@ for (const f of files) {
     if (dangling > 0) fail(`${dangling} 处引用指向了不存在的节点`)
   }
 
-  // ③ 色标（只数用户真正填过的量；还没替换的【】不算）
-  const heat = (previewHtml.match(/badge heat/g) || []).length
-  const island = (previewHtml.match(/badge island/g) || []).length
+  // ③ 枢纽/孤岛的账（refCount 由 parseDoc 算，阅读视图没了它也照常成立）
   const realQty = doc.quantityNodes.filter((n) => !isPlaceholder(n.title))
-  console.log(`  ✓ 枢纽色标 ${heat} 个，孤岛标记 ${island} 个`)
-  if (realQty.length > 0 && heat === 0) fail('有量节点，但一个枢纽色标都没有——连线没算出来')
+  const hubs = realQty.filter((n) => (doc.refCount.get(n.id) || 0) > 0).length
+  const islands = realQty.length - hubs
+  console.log(`  ✓ 量节点 ${realQty.length} 个：被引用 ${hubs}，孤岛 ${islands}`)
 
   // ④ 未闭合的 $ 检查
-  const unclosed = doc.nodes.filter((n) => {
-    const s = (n.title + ' ' + n.body).replace(/\\\$/g, '')
-    return (s.match(/\$/g) || []).length % 2 === 1
-  })
+  const unclosed = doc.nodes.filter((n) => hasOpenFormula(n.title + ' ' + n.body))
   if (unclosed.length) {
     fail(`${unclosed.length} 个节点的 $ 没配对（公式没写完）: L${unclosed.map((n) => n.line + 1).join(', L')}`)
   } else console.log('  ✓ 所有公式的 $ 都配对了')
-
-  // ⑤ 右侧面板：选一个填过的量节点，看反向索引
-  const q =
-    realQty.find((n) => (doc.refCount.get(n.id) || 0) > 0) || realQty[0] || doc.quantityNodes[0]
-  if (q) {
-    const filled = !isPlaceholder(q.title)
-    let ctx = ''
-    try {
-      ctx = renderToStaticMarkup(
-        React.createElement(ContextPanel, { doc, selectedId: q.id, onSelect() {}, onRefTitle() {}, onJumpLine() {} })
-      )
-    } catch (e) {
-      fail('ContextPanel 渲染抛异常: ' + e.message)
-    }
-    const m = ctx.match(/被这些地方用到（(\d+)）/)
-    console.log(`  ✓ 右侧面板选了「${q.title}」→ 被这些地方用到（${m ? m[1] : '?'}）`)
-    if (filled && (doc.refCount.get(q.id) || 0) > 0 && (!m || m[1] === '0')) fail('反向索引没渲染出来')
-  }
 }
 
 console.log(fails ? `\n有 ${fails} 处问题` : '\n全部通过 ✓')
