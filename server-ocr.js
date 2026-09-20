@@ -36,6 +36,22 @@ export const CONFIG_PATH = ['config', 'ocr.json']
 
    两家都要在"发出去"和"认回来"两头做翻译，也都**必须**能单独测 ——
    见 scripts/check-ocr-server.js（它用一个假的识别服务把两条路各跑一遍）。 */
+
+/* 「界面上能改哪些字段」——**只有这一处**（server.js 的 /api/ocr/config 白名单问它）。
+   ⚠ 漏一个键的表现是"设置里改了、存下去没了"，而且一句报错都没有 ——
+   `boardModel` 就这么丢过一次（自检里 [2] 有一条断言钉着：DEFAULT_CONFIG 的键必须都在这里）。 */
+export const CONFIG_KEYS = [
+  'enabled',
+  'provider',
+  'base',
+  'turbo',
+  'tokenHeader',
+  'token',
+  'dsBase',
+  'model',
+  'boardModel',
+]
+
 export const DEFAULT_CONFIG = {
   enabled: true,
   provider: 'deepseek',

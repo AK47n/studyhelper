@@ -14,7 +14,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
+import { CONFIG_KEYS, callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
 import { extractFilePart, extractTextPart } from './src/lib/multipart.js'
 /* 资料（PDF/PPT 上传与 PPT→PDF 转换）：依赖和 COM 那点事收在 server-docs.js。 */
 import { DOC_MAX_BYTES, saveUpload } from './server-docs.js'
@@ -586,10 +586,11 @@ async function handleApi(req, res, url) {
     } catch {
       return sendJson(res, 400, { ok: false, error: '配置不是合法 JSON' })
     }
-    // 只认我们知道的字段，别让前端随手塞东西进来
-    const allow = ['enabled', 'provider', 'base', 'turbo', 'tokenHeader', 'token', 'dsBase', 'model']
+    // 只认我们知道的字段，别让前端随手塞东西进来。
+    // ⚠ 那份名单在 server-ocr.js 里（`CONFIG_KEYS`）—— **不要在这儿另抄一份**：
+    //   抄一份的下场是"设置面板里新加的字段存不进去"，而且静默（`boardModel` 就丢过一次）。
     const clean = {}
-    for (const k of allow) if (k in patch) clean[k] = patch[k]
+    for (const k of CONFIG_KEYS) if (k in patch) clean[k] = patch[k]
     // 空字符串 = "我要清掉密钥"，这是合法操作，不能当成"没改"
     if (clean.token === '') clean.token = ''
     const cfg = await saveConfig(__dirname, clean)

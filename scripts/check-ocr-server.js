@@ -21,7 +21,7 @@ import { extractFilePart, extractTextPart, buildMultipart } from '../src/lib/mul
 import { httpRequest } from '../src/lib/http.js'
 import { cleanText, interpretOcrResponse } from '../src/lib/ocr.js'
 import {
-  BOARD_PROMPT, BOARD_LINES_PROMPT, DEFAULT_CONFIG, DOC_PROMPT, PROVIDERS, STRUCT_PROMPT, TEXT_PROMPT, authHeaders, boardLinesPrompt,
+  BOARD_PROMPT, BOARD_LINES_PROMPT, CONFIG_KEYS, DEFAULT_CONFIG, DOC_PROMPT, PROVIDERS, STRUCT_PROMPT, TEXT_PROMPT, authHeaders, boardLinesPrompt,
   callDeepSeek, callProvider, callSimpleTex, cleanLatex,
   cleanModelOutput, cleanTextOutput, configFile, endpointOf, hasKey, loadConfig, normalizeConfig, parseProviderResponse,
   publicStatus, saveConfig, testProvider, tinyWhitePng,
@@ -117,6 +117,19 @@ console.log('\n[2] 配置：密钥进得来、出不去')
   eq(normalizeConfig({ token: '   abcdefgh   ' }).token, 'abcdefgh', '密钥两边的空格被去掉')
   eq(normalizeConfig({ enabled: 'no' }).enabled, true, '只认布尔 false 才算关（字符串不算）')
   eq(normalizeConfig(null).turbo, true, 'null 配置 → 全部默认')
+
+  // ★ 界面上能改的字段 = CONFIG_KEYS（server.js 的白名单问它，**只有这一处**）
+  //   漏一个键的表现是"设置里改了、存下去没了"，而且一句报错都没有：`boardModel` 就这么丢过。
+  {
+    const missing = Object.keys(DEFAULT_CONFIG).filter((k) => !CONFIG_KEYS.includes(k))
+    eq(missing.join(','), '', '★ 设置里能改的字段一个都没漏（DEFAULT_CONFIG 的键必须都在 CONFIG_KEYS 里）')
+    eq(CONFIG_KEYS.includes('boardModel'), true, '★ 「整板转录专用模型」能存进去（它丢过一次）')
+    const kept = await saveConfig(root, { boardModel: 'strong-model-x', token: 'abcdef1234567890' })
+    eq(kept.boardModel, 'strong-model-x', '存进去的 boardModel 留得住')
+    eq(publicStatus(kept).boardModel, 'strong-model-x', '状态里报得出它（设置面板回显要用）')
+    await saveConfig(root, { boardModel: '', token: 'abcdef1234567890' })
+    eq((await loadConfig(root)).boardModel, '', '清空 = 回落到普通模型（不是删掉这个键）')
+  }
 
   await fs.rm(root, { recursive: true, force: true })
 }
