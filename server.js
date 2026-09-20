@@ -652,11 +652,11 @@ async function handleApi(req, res, url) {
       })
     }
     const img = part.data
-    /* 这一次认的是公式还是普通文字？字段是表单里的 mode（前端 FormData 里带的）。
-       ★ 只认白名单里的两个值，别的一律当 formula —— 这个接口是给本机页面用的，
+    /* 这一次认的是公式还是普通文字还是**整板转录**还是**课件整理**？字段是表单里的 mode。
+       ★ 只认白名单里的那几个值，别的一律当 formula —— 这个接口是给本机页面用的，
          但"参数没校验"从来不是好习惯。认不出来就走老路，行为可预测。 */
     const modeRaw = extractTextPart(raw, req.headers['content-type'] || '', 'mode')
-    const mode = modeRaw === 'text' ? 'text' : 'formula'
+    const mode = modeRaw === 'text' ? 'text' : modeRaw === 'board' ? 'board' : modeRaw === 'doc' ? 'doc' : 'formula'
     // 只收图片：这是个只给本机前端用的接口，但"顺手当文件上传器"这种事不该发生
     const magic = img.subarray(0, 4)
     const isPng = magic[0] === 0x89 && magic[1] === 0x50 && magic[2] === 0x4e && magic[3] === 0x47

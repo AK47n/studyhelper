@@ -546,6 +546,35 @@ console.log('\n[8] mode=text：认普通文字')
     '★ 结构整理**一张图都不发**（content 里只有文字块）')
   eq(/结构整理来自/.test(rs.note || ''), true, 'note 里报得出这一趟用的是什么（哪儿来的字要看得见）')
 
+  /* ── 2026-09-22：课件整理（mode:'doc'）──────────────────────────────────
+     一页课件 → 知识点 JSON。三件事必须在提示词这一层就钉住，因为它们决定了
+     落到板上的东西对不对：① 页码要写在图上那段文字里（模型只看得到 content）；
+     ② 提示词里**不许有位置/尺寸字段**（摆版是本地算的）；③ 回的 JSON 一行都不能压。 */
+  seen.length = 0
+  reply = { code: 200, body: { choices: [{ message: { content: '```json\n{"page":7,"unit":"拉普拉斯变换","points":[{"kind":"formula","tex":"F(s)=\\\\int_0^\\\\infty f(t)e^{-st}dt"}]}\n```' } }] } }
+  const rd = await callProvider(ds, png, { mode: 'doc', page: 7 })
+  eq(rd.ok, true, '课件整理那一趟成功')
+  eq(promptOf(seen[0]).startsWith(DOC_PROMPT), true, '发出去的是课件整理那段提示词')
+  eq(promptOf(seen[0]).includes('这一页是**第 7 页**'), true, '★ 页码写进了图上那段文字里（doc-cards 靠它把知识点挂到页上）')
+  eq(/points/.test(DOC_PROMPT) && /"kind": "note"/.test(DOC_PROMPT), true, '提示词里给了回话的 JSON 形状（含 kind:note）')
+  eq(/kind":"formula"|kind": "formula"/.test(DOC_PROMPT), true, '提示词里说清了"公式单独成一条"（公式要落成公式卡）')
+  eq(/绝对不要编造/.test(DOC_PROMPT), true, '★ "绝对不要编造"在（白板是学生要信的起点，混进编的比少几条糟得多）')
+  eq(/宁可少而准/.test(DOC_PROMPT), true, '★ "宁可少而准"在（凑数的条目会把白板淹掉）')
+  /* ⚠ 判据要写得具体：`/x|y/` 会命中 `tex`（提示词里到处是它）—— 那种断言看着绿、
+     其实什么都没验。这里只挑"坐标/尺寸"那一族的说法。 */
+  eq(/"x"\s*:|"y"\s*:|坐标为|位置为|宽度|高度|左上角/.test(DOC_PROMPT), false, '★ 提示词里**没有**位置/尺寸这一族字段（摆版由 doc-cards.js 的 projectDeck 算）')
+  eq(Array.isArray(msgContent(seen[0])) && msgContent(seen[0]).filter((x) => x.type === 'image_url').length === 1, true,
+    '课件整理**要发图**（和结构整理相反）')
+  eq(rd.text.includes('"page":7'), true, '回话原样带回来（围栏剥掉，JSON 一个字符不改）')
+  /* 不传页码时不加那一行 —— 免得提示词里出现"第 0 页"这种会把它带偏的话。 */
+  seen.length = 0
+  await callProvider(ds, png, { mode: 'doc' })
+  eq(/第 0 页/.test(promptOf(seen[0])), false, '不传 page 时不加"第 N 页"那一行')
+  /* SimpleTex 干不了这一趟 —— 要在服务端就挡掉并说清换哪一家。 */
+  const sxDoc = await callProvider(sx, png, { mode: 'doc' })
+  eq(sxDoc.ok, false, 'SimpleTex + 课件整理 → 拒')
+  eq(sxDoc.kind, 'provider', '归类成 provider（"这家干不了这件事"，用户该换一家）')
+  eq(/课件整理/.test(sxDoc.error || ''), true, '错误里点名是"课件整理"要用 DeepSeek：' + String(sxDoc.error || '').slice(0, 30) + '…')
 
   srv.close()
 }
@@ -589,7 +618,7 @@ console.log('\n[9] 服务端旧版：不许把"认公式的结果"当成文字�
   /* 第 ① 道防线就在 status 里：`modes` 是老服务端不会有的字段。
      这里断言它确实跟着 PROVIDERS 一起发出去（面板靠它提前警告）。 */
   const st = publicStatus(normalizeConfig({ provider: 'deepseek' }))
-  eq(st.providers.deepseek.modes, ['formula', 'text'], 'status 里报得出"DeepSeek 能认公式也能认文字"（老服务端没这个字段）')
+  eq(st.providers.deepseek.modes, ['formula', 'text', 'board', 'structure', 'doc'], 'status 里报得出"DeepSeek 能认公式、认文字、整板转录、结构整理、课件整理"（老服务端没这个字段 —— 这是第一道防线）')
   eq(st.providers.simpletex.formulaOnly, true, 'status 里说清了 SimpleTex 只认公式（面板据此提前警告，而不是等失败）')
 }
 

@@ -45,6 +45,8 @@
     "check:shelf": "node scripts/check-shelf.js",
     "regather": "node scripts/regather.js",
     "check:doc": "node scripts/check-doc.js",
+    "check:doc-read": "node scripts/check-doc-read.js",
+    "check:deck": "node scripts/check-deck.js",
     "check:doc-data": "node scripts/check-doc-data.js",
     "diag:board": "node scripts/diag-board.js",
     "diag:pan": "node scripts/diag-pan-frame.js",

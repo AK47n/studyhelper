@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import katex from 'katex'
 import BoardCanvas from './BoardCanvas.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
 import InkToCard from './InkToCard.jsx'
@@ -13,12 +14,17 @@ import {
    教训：删一个 import 之前，先确认这个标识符在同一文件里没人用；
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
-import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
+import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, newId, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
 /* 资料（铺在画布上的 PDF/PPT，见 docs.js 的文件头）：常量与几何在那边只有一份；
    页面的拉取/渲染在 doc-pages.js；两层界面在 DocLayer.jsx。 */
 import { DOC_DEFAULT_W, DOC_ID_PREFIX, docBounds, pageRects } from '../lib/docs.js'
 import { readDocInfo } from '../lib/doc-pages.js'
 import { DocBars } from './DocLayer.jsx'
+import DeckReview from './DeckReview.jsx'
+/* 课件整理（2026-09-22）：把资料的一段页交给模型读成知识点、贴到板上。
+   ⚠ 这个文件里**不解析模型的话、也不摆版** —— 那两件事在 doc-cards.js（纯函数、有自检）；
+     渲染那一趟在 doc-read.js。这里只做三件本地的事：量尺寸、摆版、写盘。 */
+import { ORIGIN_GAP, makeMeasureHost, measureDeck, pagesLabel, projectDeck } from '../lib/doc-cards.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
 import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
@@ -2225,6 +2231,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    */
   const docInputRef = useRef(null)
   const [docBusy, setDocBusy] = useState(null) // 非空 = 正在上传/转换/量页面（工具条上显示这句话）
+  /* 正在整理哪一份资料（非空 = 那个窗口开着）。见下面「课件整理」那一节。 */
+  const [deckFor, setDeckFor] = useState(null)
+
   async function insertDocFile(f) {
     if (!f) return
     setDocBusy('正在上传…')
@@ -2289,6 +2298,107 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   function docRemove(id) {
     commit((cur) => ({ ...cur, docs: cur.docs.filter((x) => x.id !== id) }))
     flash('资料移掉了：PDF 文件还在 data/.资料/ 里，写过的注释也留在板上', 'ok')
+  }
+
+  /* ══════════════════ 课件整理：把一段页读成知识点、贴到板上 ══════════════════
+   *
+   * 用户 2026-09-22 要的：「整理出来这个 pdf/ppt 这节课的内容……贴到白板上，
+   * 这样就能让学生不从一个空的白板开始，而是从一个**已经有知识的内容**开始」。
+   *
+   * 三件事，各有各的家：
+   *   · 读（渲染页面 + 出网 + 缓存）—— `doc-read.js`；
+   *   · 认（模型的话 → 知识点）和摆（知识点 → 世界坐标）—— `doc-cards.js`（纯函数）；
+   *   · **这个文件只做本地这三下**：量尺寸、写进板、把尺寸交给 fitter。
+   *
+   * ★ 摆在哪：**资料右边**（`docBounds` 右边缘 + ORIGIN_GAP）。
+   *   为什么不摆在资料上面/中间：那会盖住你正要看的课件页 —— 而"看着课件写"是这个功能的用法。
+   *   为什么不用"当前视野中心"：贴完一张板要找半天它在哪；固定在资料右边，
+   *   位置是可预期的（下次整理同一份课件还摆在那儿）。
+   * ★ 一次 commit 写进去：**一步撤销**把整批卡片全退掉（和"擦原笔迹 + 加卡片"同一条规矩）。
+   * ★ 量尺寸要用**当前视图缩放**：卡片的屏幕尺寸 = 世界 × s × k，而"内容折成几行"
+   *   只有那个尺寸下才准（和 fitCardSize 量的是同一个东西，见 doc-cards.js 那一节）。
+   */
+  function deckCardNodes(tex) {
+    /* 公式卡在板上长这样（Board.jsx 的 Card 里是 `<Tex tex block />`）——
+       量尺寸必须用**同一个形状**，不然量出来的是另一种排版。 */
+    const span = document.createElement('span')
+    span.className = 'bd-tex-in'
+    try {
+      span.innerHTML = katex.renderToString(tex, { throwOnError: false, displayMode: true, strict: false, trust: false })
+    } catch {
+      return null
+    }
+    return span
+  }
+
+  /** 把整理好的知识点贴到板上。返回**到底贴上去没有** —— 调用方拿它决定要不要说一句
+   *  （"量不出来"那条路上如果只 return，用户看到的是"点了没反应"）。 */
+  function placeDeckCards({ units, items, pages }) {
+    if (!items || !items.length) return false
+    /* ⚠ 量尺寸的台子挂在**板容器**里（不是 document.body）：卡片字号里的 `--s`
+       由板容器定，挂错了地方量出来的高度会比板上真实的大一截，
+       紧接着摆的那张卡就会压在它身上（见 doc-cards.js 的 makeMeasureHost）。 */
+    const host = makeMeasureHost(wrapRef.current)
+    let made
+    try {
+      made = measureDeck({ items, renderTex: deckCardNodes, host, s: boardRef.current.view.s || 1 })
+    } finally {
+      if (host.parentNode) host.parentNode.removeChild(host)
+    }
+    if (made.missing) flash(`有 ${made.missing} 条量不出尺寸（多半是公式排不出来），这一次没贴它们`, 'warn')
+
+    const sized = items.filter((it) => made.sizes.has(it.id))
+    if (!sized.length) return false
+    /* 起点：**你整理的那几页右边**（不是资料右边）。
+       ★ 为什么是"那几页"而不是"这份资料"：49 页的课件里，你半路整理第 25-30 页时，
+         卡片落在第 1 页旁边 = 隔着几百屏 —— 贴完你根本不知道它去哪儿了。
+         挂在被整理的那几页旁边，视线一挪就到（这正是"看着课件写"的用法）。
+       资料不在板上（刚被移掉）就落在**当前视野中心**。 */
+    const d = deckFor ? (boardRef.current.docs || []).find((x) => x.id === deckFor.id) : null
+    const el = wrapRef.current
+    let origin
+    let anchor = null
+    if (d) {
+      const rects = pageRects(d)
+      /* 用 `pages` 里**最小的那一页**当锚（可能不是第 1 页）。 */
+      const nums = (pages || []).map(Number).filter((n) => n > 0).sort((a, b) => a - b)
+      const first = (nums.length && rects[nums[0] - 1]) || rects[0] || null
+      anchor = first
+      const b = first || docBounds(d)
+      origin = { x: b.x + DOC_DEFAULT_W + ORIGIN_GAP, y: b.y }
+    } else {
+      const v = boardRef.current.view
+      origin = screenToWorld((el ? el.clientWidth : 800) / 2, (el ? el.clientHeight : 600) / 3, v)
+    }
+    const columnH = el ? Math.max(900, el.clientHeight / (boardRef.current.view.s || 1)) : 1500
+    const plan = projectDeck({ sections: units || [], items: sized, sizes: made.sizes, origin, columnH })
+    if (!plan.cards.length) return false
+
+    const fresh = plan.cards.map((c) =>
+      c.heading
+        ? { ...newCard('note', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, text: c.text }
+        : c.tex
+          ? { ...newCard('formula', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src, tex: c.tex }
+          : { ...newCard('note', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, text: c.text }
+    )
+    commit((cur) => ({ ...cur, cards: [...cur.cards, ...fresh] }))
+    /* 落进 DOM 之后**再让 fitter 量一趟**（它量的是同一套数，所以通常一次就收敛）——
+       这是"卡片贴合内容"那条规矩的第二道保险：万一我这边的换算差了半像素，
+       它会收拢到卡片自己算出来的那个数，而不是把一个错值永远留在文件里。
+       ⚠ `fitWidth: false`：宽度是我量出来的（按内容的自然宽度），别再让它去收一遍 ——
+         文字卡那条"收自然宽"的路会把一句话拉成一条 1200 宽的长条。 */
+    for (const c of fresh) fitter.queue(c.id, { fitWidth: false })
+    /* 贴完**把视野挪过去**：卡片落在几十页之外的时候，"贴好了"那句话是不够的 ——
+       你看不见它们，会以为没贴上去（用户报过这一类）。把**你整理的那一页**摆到
+       偏左偏上的位置，右边那一栏卡片就正好在视野里。缩放**一个字节不改**（只平移）。 */
+    if (el && anchor) {
+      const v = boardRef.current.view
+      const a = worldToScreen({ x: anchor.x, y: anchor.y }, v)
+      setView((cur) => ({ ...cur, tx: cur.tx + el.clientWidth * 0.2 - a.x, ty: cur.ty + el.clientHeight * 0.3 - a.y }))
+    }
+    const where = d ? '摆在课件右边' : '摆在视野中心'
+    flash(`贴好了：${fresh.length} 张卡（${pagesLabel(pages || [])}），${where}。Ctrl+Z 能整批退掉`, 'ok')
+    return true
   }
 
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
@@ -2497,6 +2607,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           onDrag={docDrag}
           onDragEnd={docDragEnd}
           onDelete={docRemove}
+          /* 「✧ 整理」= 就整理我这一份（板上挂了几份课件时才需要选）。 */
+          onRead={(id) => {
+            const d = (boardRef.current.docs || []).find((x) => x.id === id)
+            if (d) setDeckFor(d)
+          }}
         />
         {board.cards.map((c) => (
           <Card
@@ -2582,6 +2697,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }}
       docBusy={docBusy}
       docs={board.docs || []}
+      /* 课件整理：打开那个窗口（挑页 → 一页一页读 → 校对 → 贴到板上）。
+         板上有几份课件就整理**第一份**（想整理另一份就从它的资料条上进）——
+         资料条上那颗「✧ 整理」是"就整理我这一份"的意思。 */
+      onReadDeck={() => {
+        const list = boardRef.current.docs || []
+        if (!list.length) {
+          flash('板上还没有课件 —— 先用「📄 插入 PDF/PPT」放一份上去，再回来整理它的内容', 'warn')
+          return
+        }
+        setDeckFor(list[0])
+      }}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
       onFit={() => {
@@ -2684,8 +2810,43 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           flash={flash}
         />
       )}
+      {/* 课件整理那个窗口（2026-09-22）：挑页 → 一页一页读 → 校对 → 贴。
+          ⚠ 它**自己发请求、自己停**（doc-read.js），Board 这边只在最后收货：
+            「确认」回调一到，就量尺寸、摆版、一次 commit 写进板。 */}
+      {deckFor && (
+        <DeckReview
+          doc={deckFor}
+          defaultPages={defaultDeckPages(deckFor, sel)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onCancel={() => setDeckFor(null)}
+          onConfirm={(payload) => {
+            setDeckFor(null)
+            if (!placeDeckCards(payload)) flash('这几条没量出尺寸（公式排不出来？），一张都没贴上去 —— 换个写法再试，或者先贴文字那几条', 'warn')
+          }}
+        />
+      )}
     </div>
   )
+}
+
+/* 「打开整理窗口时预选哪几页」：
+ *   · 如果你正**框着资料上的某一页**（框和那一页的矩形明显相交）→ 就是那几页。
+ *     "这几页我看不懂，整理一下"是这个功能最常见的用法，少点几下；
+ *   · 否则**全部页**（用户原话里"往往是几十页这个数量级"，默认从头读）。
+ * 预选只是**初值** —— 窗口里随时能改（点缩略图，或者写一个区间）。
+ * ⚠ 这个函数住在 Board 这一层（不在 DeckReview 里），因为"框住了什么"只有 Board 知道。 */
+function defaultDeckPages(doc, sel) {
+  const rects = pageRects(doc)
+  if (!rects.length) return []
+  const box = sel && sel.box
+  if (box && Number(box.x1) > Number(box.x0)) {
+    const hit = rects
+      .map((r, i) => ({ i: i + 1, r }))
+      .filter(({ r }) => r.x < box.x1 && r.x + r.w > box.x0 && r.y < box.y1 && r.y + r.h > box.y0)
+      .map(({ i }) => i)
+    if (hit.length) return hit
+  }
+  return rects.map((_, i) => i + 1)
 }
 
 // ────────────────────────────── 卡片 ──────────────────────────────
@@ -3220,6 +3381,23 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
           title="插入 PDF/PPT（很长的课件也行）：铺在画布上，直接用笔在上面写注释、圈重点、认公式"
         >
           {docBusy ? docBusy : '📄 插入 PDF/PPT'}
+        </button>
+        {/* 课件整理（2026-09-22）：把资料的某一段页交给模型读成**知识点**，贴到板上 ——
+            让学生不从一个空的白板开始，而是从"已经有知识的内容"开始。
+            ★ 这个按钮**读的是板上那一份**（板上有几份资料时，先用「整理这几页」那颗
+              从资料条上指定是哪一份 —— 见 DocLayer.jsx 的 DocBars）。
+              一份都没有时它就是"先插一份课件"的入口。 */}
+        <button
+          className="bd-t"
+          data-tool="deckread"
+          onClick={onReadDeck}
+          title={
+            docs.length
+              ? '课件整理：把这份 PDF/PPT 的某一段页读成知识点、贴到白板上（先挑页，再一页一页读）'
+              : '课件整理：板上还没有课件 —— 先用「📄 插入 PDF/PPT」放一份上去'
+          }
+        >
+          ✧ 课件整理
         </button>
         {/* 收拢成笔记：白板是过程，笔记是结论。卡片/板框/连接拣成草稿；
             裸手写不再丢下 —— 整板画成一张图发给识别服务抄成 Markdown（要几十秒）。

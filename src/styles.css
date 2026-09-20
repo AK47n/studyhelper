@@ -2065,4 +2065,135 @@ kbd {
 .trv-acts { padding: 10px 18px; border-top: 1px solid #232a37; }
 
 
+/* ────────────────────────── 课件整理（.dkr，2026-09-22）──────────────────────────
+   「把这个 PDF/PPT 的某一段页读成知识点、贴到白板上」那个窗口。
+   骨架样式（弹层卡片、头部、按钮、.dim/.small/.mini/.btn）蹭 .wp 那一套 ——
+   组件上同时挂了 wp 类，这里只写差异和它自己的东西。
+
+   为什么它比转录校对还宽：这里一页一块是**两栏**（左图右字），
+   而一页里可能有三四条知识点要塞进右边那一栏。 */
+.dkr-back {
+  position: fixed; inset: 0; z-index: 420; /* 和 .trv 同层：开着的时候别让人点到板 */
+  background: rgba(8, 11, 16, 0.62);
+  display: grid; place-items: center; padding: 18px;
+}
+.dkr {
+  width: min(1200px, 97vw);
+  max-height: 94vh;
+  overflow: hidden; /* 滚动交给 .dkr-body —— 见下面那条 */
+}
+/* ⚠ .wp 自带 `overflow: auto`（整块滚）。这里要的是**头和脚钉住、中间滚**，
+   所以把它改成 hidden，再由 .dkr-body 自己 flex:1 + overflow:auto。
+   不改的话，滚动条会挂在最外圈，头和"贴到白板上"那颗按钮一起被滚走。 */
+.dkr-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 14px; }
+
+/* ── 挑页 ── */
+.dkr-pick { padding: 12px 16px 4px; display: flex; flex-direction: column; gap: 10px; }
+.dkr-pickrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dkr-range {
+  flex: 0 1 260px; background: #1c212b; color: #dde3ee;
+  border: 1px solid #2e3646; border-radius: 8px; padding: 6px 10px; font: inherit;
+}
+.dkr-range:focus { outline: 1px solid #4b87e0; }
+/* 一摞页码按钮：49 页的课件要能一眼扫完，所以是一格一格的方按钮、自动折行。
+   ★ 这一摞只是"微调"用的（挑三五页）；几十页那条路是上面那个区间输入 ——
+     用户原话里"往往是几十页这个数量级"，点 30 下不是人干的事。 */
+.dkr-pages { display: flex; flex-wrap: wrap; gap: 5px; max-height: 26vh; overflow: auto; padding: 3px 1px; }
+.dkr-pg {
+  min-width: 34px; height: 30px; padding: 0 6px;
+  background: #1c212b; color: #b9c2d2; border: 1px solid #2e3646; border-radius: 7px;
+  cursor: pointer; font: inherit;
+}
+.dkr-pg:hover { background: #232b3a; color: #fff; }
+.dkr-pg.on { background: #2f6fd0; border-color: #4b87e0; color: #fff; }
+.dkr-pg-n { font-variant-numeric: tabular-nums; }
+
+/* ── 一页一块：左边图、右边知识点 ── */
+.dkr-pgblk {
+  display: grid; grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.15fr);
+  gap: 12px; padding-bottom: 12px; border-bottom: 1px solid #232a37;
+}
+.dkr-pgblk.pending { grid-template-columns: 1fr; }
+.dkr-pgblk.bad { border-bottom-color: #6b2f2f; }
+.dkr-pgh {
+  grid-column: 1 / -1; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: calc(13px * var(--s)); color: #e6ebf4;
+}
+.dkr-pgh b { font-weight: 600; }
+/* 这一页属于哪一节（模型只在换小节的那一页写 unit）——和块名一样，
+   让人一眼知道"我在改课的哪一段"。 */
+.dkr-unit {
+  padding: 1px 8px; border-radius: 999px; font-size: calc(11.5px * var(--s));
+  background: #1e2637; border: 1px solid #33405a; color: #9fc0f0;
+}
+.dkr-err { color: #ff9b8a; font-size: calc(12px * var(--s)); }
+.dkr-retry { font-size: calc(11.5px * var(--s)); padding: 2px 8px; margin-left: auto; }
+/* 发给模型的那张图（和 DocPage 显示的是同一套渲染，只是档位不同） */
+.dkr-img {
+  background: #fbfbf9; border: 1px solid #2e3646; border-radius: 8px;
+  overflow: auto; display: grid; place-items: center; padding: 6px; max-height: 40vh;
+}
+.dkr-img img { max-width: 100%; height: auto; display: block; }
+
+.dkr-items { display: flex; flex-direction: column; gap: 8px; }
+.dkr-item {
+  border: 1px solid #2e3646; border-radius: 9px; background: #1a1f29; padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+/* 「✕ 不要」的那一条：留着（随时收得回来），但一眼看得出它不会被贴上去 */
+.dkr-item.off { opacity: 0.45; border-style: dashed; }
+.dkr-itemrow { display: flex; align-items: center; gap: 7px; }
+.dkr-kind {
+  flex: none; padding: 1px 7px; border-radius: 999px; font-size: calc(11px * var(--s));
+  background: #2b3342; color: #cfd7e6; border: 1px solid #39435a;
+}
+.dkr-t {
+  flex: 1; min-width: 0; background: #131820; color: #eaf0fa; font: inherit; font-weight: 600;
+  border: 1px solid #2e3646; border-radius: 7px; padding: 5px 8px;
+}
+.dkr-b {
+  width: 100%; resize: vertical; background: #131820; color: #dde3ee; font: inherit; line-height: 1.65;
+  border: 1px solid #2e3646; border-radius: 7px; padding: 6px 8px;
+}
+.dkr-tex {
+  width: 100%; background: #131820; color: #ffe9a8; font-family: var(--mono); font-size: calc(12.5px * var(--s));
+  border: 1px solid #2e3646; border-radius: 7px; padding: 6px 8px;
+}
+.dkr-t:focus, .dkr-b:focus, .dkr-tex:focus { outline: 1px solid #4b87e0; }
+/* 公式预览：白底 —— 和公式卡在板上一个样（深色底上排公式，上下标看着会发飘）。
+   ⚠ 和卡片一样只给 `overflow-x: auto`（"有没有被裁"这条判据靠它，见 styles.css 的 .bd-card）。 */
+.dkr-texprev {
+  flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden;
+  background: #fffdf4; color: #1b1d22; border: 1px solid #e2d9bc; border-radius: 7px;
+  padding: 5px 8px;
+}
+.dkr-texprev .katex-display { margin: 0; }
+
+.dkr-warn {
+  margin: 10px 16px 0; padding: 8px 11px;
+  border: 1px dashed #e0d3a6; border-radius: 8px; background: #fffbe9; color: #5c4a12;
+  font-size: calc(12.5px * var(--s));
+}
+/* 拦路的是**配置问题**（没填密钥 / 换了家服务）时，那句话旁边摆一颗去设置的按钮 ——
+   用户不用自己去找那颗按钮在哪。 */
+.dkr-goset { margin-left: 9px; font-size: calc(11.5px * var(--s)); padding: 2px 9px; }
+.dkr-acts { padding: 10px 16px; border-top: 1px solid #232a37; }
+
+
+/* ── 资料条上那颗「✧ 整理」（2026-09-22）──
+   和 ✕ 并排住在资料条右端。板上有几份课件时，它就是"就整理我这一份"的答案
+   （工具条上那颗整理的是第一份）。
+   ⚠ `.bd-docbar` 整条是 `pointer-events: none`（只有按钮自己收指针），
+     所以这里**必须**写上 `pointer-events: auto` —— 漏了的表现是"点上去毫无反应"。 */
+.bd-docbar-r {
+  pointer-events: auto; cursor: pointer;
+  border: 1px solid rgba(90, 106, 138, 0.35); border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94); color: #4a566d;
+  font-size: calc(11px * var(--s)); line-height: 1.8; font-family: inherit;
+  padding: 0 calc(7px * var(--s)); white-space: nowrap;
+}
+.bd-docbar-r:hover { border-color: rgba(47, 111, 208, 0.7); color: #2f6fd0; }
+
+
+
 
