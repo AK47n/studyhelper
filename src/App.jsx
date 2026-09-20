@@ -2076,7 +2076,7 @@ export default function App() {
               不然画了半天不知道画在哪张板上（有五张板的时候非常要命）。 */}
           <div className="bd-topline">
             <span className="bd-file">{current || '（没有打开白板）'}</span>
-            <span className="dim small">自动保存 · 手写笔直接画 · 两根手指平移缩放</span>
+            <span className="dim small">自动保存 · 手写笔直接画 · 手指拖平移、两根手指捏合缩放</span>
           </div>
           <Board
             key={current}
