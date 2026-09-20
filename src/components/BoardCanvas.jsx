@@ -5,6 +5,9 @@ import { LINK_DELETE, LINK_KINDS } from '../lib/link-kinds.js'
 import { applyViewTo, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen } from '../lib/view.js'
 import { drawStroke } from '../lib/ink.js'
 import { shapeHandlePoints } from '../lib/shape-object.js'
+/* 资料层（PDF/PPT 的页面）：铺在墨迹和连线**底下**的背景层，
+   渲染与懒加载都在 DocLayer.jsx / doc-pages.js 里，这里只挂上去。 */
+import DocLayer from './DocLayer.jsx'
 /* 画布本体：两层 canvas（已提交的笔迹 / 正在画的那一笔）+ 一层 SVG（卡片之间的连线）。
  *
  * ── 为什么是两层 canvas ──
@@ -59,6 +62,8 @@ export default function BoardCanvas({
   /* 板框（见 ADR-0001）：`frames` 是 [{frame, box}]（box 是按成员现算的框线，世界坐标）。 */
   frames = [], frameEditId = null, selectedFrameId = null,
   onFrameSelect, onFrameDragStart, onFrameDrag, onFrameDragEnd, onFrameEdit, onFrameTitle, onFrameEditClose,
+  /* 资料（PDF/PPT 页面层，见 DocLayer.jsx）：只管挂上去，摆位/懒渲染都在那里面。 */
+  docs = [],
   /* 卡片那一层（.bd-world）的容器。外面（Board.jsx）会在手势里直接给它写一条
      "补正"变换 —— 为什么需要、为什么必须同步写，见 Board.jsx 的 syncViewCorrection。 */
   worldRef,
@@ -161,6 +166,10 @@ export default function BoardCanvas({
         height={Math.max(1, Math.round(size.h * dpr))}
         style={{ width: size.w, height: size.h }}
       />
+
+      {/* 资料层：z-index 1，压在纸面（背景）上、垫在连线/墨迹/卡片下面。
+          页面不吃指针 —— 往它上面落笔就是写字（DocLayer.jsx 文件头）。 */}
+      <DocLayer docs={docs} view={view} size={size} />
 
       {/* 卡片之间的连线。画在墨迹**上面**、卡片**下面**：
           这样线被卡片挡住两端，看起来是"连着卡片"而不是"穿过卡片"。 */}

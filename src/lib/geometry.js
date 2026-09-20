@@ -16,6 +16,10 @@
  */
 /* fitView 要用视图那一份实现里的两件：缩放归一 + "把某个点摆进容器中心"。 */
 import { centerOn, clampViewScale } from './view.js'
+/* 资料（铺在画布上的 PDF）的包围盒 —— fitView 得把它也装进屏幕，
+   不然"打开一张带课件的板"看到的是一片空白（用户以为内容丢了）。
+   docs.js 不依赖任何东西，这一条 import 成不了环。 */
+import { docBounds } from './docs.js'
 
 /* 关系判定的距离阈值，单位是**世界坐标像素**。
    为什么是 26：这是"手画的时候看起来连着、但其实没碰到"的典型间距。
@@ -457,7 +461,10 @@ export function fitView(board, screenW, screenH, pad = 60) {
     strokeBounds
   )
   const cbox = boundsOfAll((board && board.cards) || [], cardBounds)
-  const all = box && cbox ? unionRect(box, cbox) : box || cbox
+  /* 资料也算"内容"：一张只插了 PDF、还没写字的板，装回屏幕必须看得到那份 PDF。 */
+  const dbox = boundsOfAll((board && board.docs) || [], docBounds)
+  let all = box && cbox ? unionRect(box, cbox) : box || cbox
+  all = all && dbox ? unionRect(all, dbox) : all || dbox
   if (!all || all.w <= 0 || all.h <= 0) return { s: 1, tx: screenW / 2, ty: screenH / 2 }
   const raw = Math.min((screenW - pad * 2) / all.w, (screenH - pad * 2) / all.h)
   const s = clampViewScale(Math.max(READABLE_FIT_S, Math.min(raw, 2)))

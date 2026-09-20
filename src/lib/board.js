@@ -28,6 +28,8 @@ import { toFlat } from './geometry.js'
 /* 只借一个"最后一截是什么" —— data/ 里的路径从 2026-09-17 起可以带层
    （`大物/电磁学/board-第一章.md`），拆路径这件事只在 paths.js 里有一份。 */
 import { baseName } from './paths.js'
+/* 资料（铺在画布上的 PDF，见 docs.js 的文件头）：读写都过它那一份 normalize。 */
+import { normalizeDocs, serializeDoc } from './docs.js'
 
 export const BOARD_VERSION = 4
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
@@ -238,6 +240,9 @@ export function newBoard(title = '新白板') {
     /* 连接（你宣告的那条关系，见 ADR-0001 与 normalizeLinks）：两端 + 一个词。
        形状/位置猜出来的连接**不存**，所以这个字段里只有你亲口说过的话。 */
     links: [],
+    /* 资料（铺在画布上的 PDF/PPT，见 docs.js）：只存"指向哪个文件 + 页面尺寸表"，
+       PDF 本体在 data/.资料/ 里（板文件是纯文本，二进制不进来）。 */
+    docs: [],
   }
 }
 
@@ -442,6 +447,8 @@ export function parseBoardDocument(text, fallbackTitle = '新白板') {
     cardIds: new Set(b.cards.map((c) => c.id)),
     frameIds: new Set(b.frames.map((f) => f.id)),
   })
+  /* 资料（铺在画布上的 PDF，见 docs.js）：路径不合法、页面尺寸不成立的整个丢掉。 */
+  b.docs = normalizeDocs(raw.docs)
   /* 「条件就是这个」（`cond: 'card:x'` / `'ink:y'`）指的东西可能已经没了
      （卡删了、那笔擦了）—— 那句话作废，不留尸体（和板框同一条规矩）。
      笔迹上、连接记录上各有一处，用的是同一套判据。 */
@@ -738,6 +745,12 @@ export function serializeBoardDocument(board) {
         })
       }
       return ls.length ? { links: ls } : {}
+    })(),
+    /* 资料（见 docs.js）：**只在真有时才写** —— 没插过资料的板一个字节都不多，
+       老文件在 Git 里纹丝不动（和 frames / links 同一条纪律）。排在最后（新字段追加在尾部）。 */
+    ...(() => {
+      const ds = (board.docs || []).map(serializeDoc).filter(Boolean)
+      return ds.length ? { docs: ds } : {}
     })(),
   }
   return JSON.stringify(out, null, 1) + '\n'

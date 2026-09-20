@@ -16,6 +16,10 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
 import { extractFilePart, extractTextPart } from './src/lib/multipart.js'
+/* 资料（PDF/PPT 上传与 PPT→PDF 转换）：依赖和 COM 那点事收在 server-docs.js。 */
+import { DOC_MAX_BYTES, saveUpload } from './server-docs.js'
+/* 板文件里资料 path 的形状（`.资料/xxx.pdf`）—— 前端用的同一份规矩。 */
+import { isDocPath } from './src/lib/docs.js'
 /* 导出：**依赖被关在 server-export.js 里**（那个文件才 import katex）。
    server.js 自己的底线是"没有任何第三方依赖"，别在这儿直接 import 排版模块。 */
 import { exportNoteHtml, warmUp as warmUpExport } from './server-export.js'
@@ -153,13 +157,13 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-// 二进制版本（手写识别要收 PNG）。和上面同一个体积上限。
-async function readBodyBuffer(req, limit = 8 * 1024 * 1024) {
+// 二进制版本（手写识别要收 PNG；资料上传收 PDF/PPT —— 上限和报错的话各给各的）。
+async function readBodyBuffer(req, limit = 8 * 1024 * 1024, tooBig = '图片太大（超过 8MB）—— 白板上的笔迹不该有这个体积') {
   const chunks = []
   let size = 0
   for await (const c of req) {
     size += c.length
-    if (size > limit) throw new Error('图片太大（超过 8MB）—— 白板上的笔迹不该有这个体积')
+    if (size > limit) throw new Error(tooBig)
     chunks.push(c)
   }
   return Buffer.concat(chunks)
@@ -695,6 +699,41 @@ async function handleApi(req, res, url) {
       conf: r.conf,
       note: r.conf != null && r.conf < 0.6 ? '这次置信度偏低，多半得手动改两笔' : '',
       debug: { bytes: img.length, endpoint: cfg.turbo ? 'turbo' : 'standard', requestId: r.requestId },
+    })
+  }
+
+  /* ─────────────── 资料：PDF/PPT 的上传与下发 ───────────────
+     板上插一份课件 = 上传到这里（PDF 直存，PPT 转成 PDF），存进 data/.资料/
+     （点开头 → 左栏不显示；.gitignore 排掉 → 公开的 GitHub 备份里没有课件）。
+     板文件里只存 `{ path, pages }` —— 见 src/lib/docs.js。 */
+  if (p === '/api/doc/upload' && req.method === 'POST') {
+    const raw = await readBodyBuffer(req, DOC_MAX_BYTES, '文件太大（超过 300MB）—— 那么大的课件先压缩一下')
+    const part = extractFilePart(raw, req.headers['content-type'] || '')
+    if (!part || !part.filename) {
+      return sendJson(res, 400, { error: '没收到文件（这里要的是 multipart/form-data，字段名 file）' })
+    }
+    try {
+      const r = await saveUpload(DATA_DIR, part.data, part.filename)
+      console.log(`  [资料] ${part.filename} → ${r.path}${r.converted ? '（PPT 已转成 PDF）' : ''}（${Math.round(part.data.length / 1024)} KB）`)
+      return sendJson(res, 200, { ok: true, ...r })
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: String(e && e.message ? e.message : e) })
+    }
+  }
+
+  /* 下发资料本体：pdf.js 按这个地址拉整份文件来渲染页面。
+     路径只认 `.资料/xxx.pdf`（isDocPath + resolveInData 两道闸，跟别的接口一样硬）。 */
+  const dm = p.match(/^\/api\/doc\/file\/(.+)$/)
+  if (dm && req.method === 'GET') {
+    const rel = safeDecode(dm[1])
+    if (!isDocPath(rel)) return sendJson(res, 400, { error: '非法资料路径' })
+    const abs = resolveInData(rel)
+    if (!abs) return sendJson(res, 400, { error: '非法资料路径' })
+    const s = await statOf(abs)
+    if (!s) return sendJson(res, 404, { error: '这份资料不在了（可能被移走或删掉了）' })
+    return send(res, 200, await fsp.readFile(abs), {
+      'Content-Type': 'application/pdf',
+      'Cache-Control': 'public, max-age=31536000, immutable',
     })
   }
 

@@ -14,6 +14,11 @@ import {
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
 import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
+/* 资料（铺在画布上的 PDF/PPT，见 docs.js 的文件头）：常量与几何在那边只有一份；
+   页面的拉取/渲染在 doc-pages.js；两层界面在 DocLayer.jsx。 */
+import { DOC_DEFAULT_W, DOC_ID_PREFIX, docBounds, pageRects } from '../lib/docs.js'
+import { readDocInfo } from '../lib/doc-pages.js'
+import { DocBars } from './DocLayer.jsx'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
 import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
@@ -2210,6 +2215,82 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     st.g.end()
   }
 
+  /* ══════════════════ 资料：插入 / 拖动 / 移除 ══════════════════
+   * 一份 PDF/PPT 铺在画布最底下（DocLayer，z1），注释照常写 ——
+   * 笔迹/卡片本来就存世界坐标、画在资料层上面，这里不需要任何新机制。
+   *
+   * 上传走 `/api/doc/upload`（服务端把 PPT 转成 PDF、存进 data/.资料/）；
+   * 拿到路径后 pdf.js 量一次每页尺寸（readDocInfo）存进板文件 ——
+   * 以后打开只靠这张尺寸表摆页面，不再解析 PDF。
+   */
+  const docInputRef = useRef(null)
+  const [docBusy, setDocBusy] = useState(null) // 非空 = 正在上传/转换/量页面（工具条上显示这句话）
+  async function insertDocFile(f) {
+    if (!f) return
+    setDocBusy('正在上传…')
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const up = await fetch('/api/doc/upload', { method: 'POST', body: fd }).then((r) => r.json())
+      if (!up || up.ok === false) {
+        flash((up && up.error) || '插入失败：服务端没回话', 'warn')
+        return
+      }
+      setDocBusy('正在读页面…')
+      const info = await readDocInfo(up.path)
+      /* 摆放：当前视野正中（第一页顶边对准视野上三分之一处），用户再拖。
+         宽度用默认 720 世界像素 —— 够读、不霸板（见 docs.js 的 DOC_DEFAULT_W）。 */
+      const el = wrapRef.current
+      const v = boardRef.current.view
+      const at = screenToWorld((el ? el.clientWidth : 800) / 2, (el ? el.clientHeight : 600) / 3, v)
+      const doc = {
+        id: newId(DOC_ID_PREFIX),
+        path: up.path,
+        ...(up.title ? { title: up.title } : {}),
+        x: Math.round(at.x - DOC_DEFAULT_W / 2),
+        y: Math.round(at.y),
+        w: DOC_DEFAULT_W,
+        pages: info.pages,
+      }
+      commit((cur) => ({ ...cur, docs: [...(cur.docs || []), doc] }))
+      flash(`放好了（${info.pages.length} 页）：直接用笔在上面写，拖顶上的条子挪位置`, 'ok')
+    } catch (e) {
+      flash('插入失败：' + String(e && e.message ? e.message : e), 'warn')
+    } finally {
+      setDocBusy(null)
+    }
+  }
+
+  /* 整份资料拖动：和板框同一套账（ledger.begin/during/end，一次拖动 = 一步撤销）。 */
+  const docDragRef = useRef(null)
+
+  function docDragStart(id) {
+    docDragRef.current = { id, g: ledger.begin() }
+  }
+
+  function docDrag(id, dxScreen, dyScreen) {
+    const st = docDragRef.current
+    if (!st || st.id !== id) return
+    st.g.during((cur) => {
+      const k = cur.view.s || 1
+      const dx = screenLenToWorld(dxScreen, k)
+      const dy = screenLenToWorld(dyScreen, k)
+      return { ...cur, docs: cur.docs.map((x) => (x.id === id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
+    })
+  }
+
+  function docDragEnd(id) {
+    const st = docDragRef.current
+    docDragRef.current = null
+    if (!st || st.id !== id) return
+    st.g.end()
+  }
+
+  function docRemove(id) {
+    commit((cur) => ({ ...cur, docs: cur.docs.filter((x) => x.id !== id) }))
+    flash('资料移掉了：PDF 文件还在 data/.资料/ 里，写过的注释也留在板上', 'ok')
+  }
+
   /* 那排词放在哪：连接线的中点上、再往上让开一点 ——
      线中段常常写着你顺手写的条件（"仅当…"），压在上面会挡住它。
      ★ 还要**夹进画布范围**：浮出来的东西跑到屏幕外或压到底部工具条底下，
@@ -2375,6 +2456,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
     /* 板框那一族（见 frames.js）：渲染要的是"框 + 框线矩形"，交互只有把手那三件事。 */
     frames: framesToDraw,
+    /* 资料那一族（见 docs.js / DocLayer.jsx）：页面层在画布底下，把手条在卡片层。 */
+    docs: board.docs,
     frameEditId,
     selectedFrameId,
     onFrameSelect: (id) => setFocus(focusFrame(id)),
@@ -2405,6 +2488,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        只负责叠放（z-index 要高过收事件层，卡片才点得到），给它加变换就多做一次平移。 */
     children: (
       <>
+        {/* 资料的把手条：住在卡片层（z6 > 收事件层 z5）里才点得到 ——
+            页面本身不吃指针（DocLayer 整层 none），只有这条收拖动和移除。 */}
+        <DocBars
+          docs={board.docs}
+          view={board.view}
+          onDragStart={docDragStart}
+          onDrag={docDrag}
+          onDragEnd={docDragEnd}
+          onDelete={docRemove}
+        />
         {board.cards.map((c) => (
           <Card
             key={c.id}
@@ -2484,6 +2577,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       /* 收拢成笔记：把**当前这块活板**（boardRef，不是打开时的那份原文 ——
          上面刚认出来的一张卡也要算数）递给 App，草稿和建文件都在那边。 */
       onGather={() => onGatherNote && onGatherNote(boardRef.current)}
+      onInsertDoc={() => {
+        if (docInputRef.current) docInputRef.current.click()
+      }}
+      docBusy={docBusy}
+      docs={board.docs || []}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
       onFit={() => {
@@ -2553,6 +2651,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         {toolbar}
       </div>
 
+      {/* 资料的文件选择器：藏在根上，工具条那颗「📄 插入 PDF/PPT」点它。
+          选完立刻清 value —— 同一个文件连插两次才两次都会触发 onChange。 */}
+      <input
+        ref={docInputRef}
+        type="file"
+        accept=".pdf,.ppt,.pptx"
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0]
+          e.target.value = ''
+          insertDocFile(f)
+        }}
+      />
 
       {padOpen && (
         <WritingPad
@@ -3097,6 +3208,18 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
           }
         >
           ∑ 公式架{shelfCount ? ` ${shelfCount}` : ''}
+        </button>
+        {/* 插入资料（PDF/PPT）：铺在画布最底下一层，笔迹/卡片/识别全都照常在它上面用。
+            PPT 由服务端转成 PDF（本机装了 PowerPoint 就能转），PDF 原样收。
+            上传/转换期间按钮上显示进度那句话，并且不再接受第二份（并发上传没有意义）。 */}
+        <button
+          className="bd-t"
+          data-tool="doc"
+          disabled={!!docBusy}
+          onClick={onInsertDoc}
+          title="插入 PDF/PPT（很长的课件也行）：铺在画布上，直接用笔在上面写注释、圈重点、认公式"
+        >
+          {docBusy ? docBusy : '📄 插入 PDF/PPT'}
         </button>
         {/* 收拢成笔记：白板是过程，笔记是结论。卡片/板框/连接拣成草稿；
             裸手写不再丢下 —— 整板画成一张图发给识别服务抄成 Markdown（要几十秒）。
