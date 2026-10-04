@@ -18,9 +18,9 @@
  *     外加"这一下是冲纸面还是冲面板"的 `onPaper`。
  *
  * interface：
- *   FOCUS_NONE · focusCard(id, editing?) · focusFrame(id, editing?) · focusInk(ids, cards?)
- *   focusCardId(f) / focusFrameId(f) / focusInkIds(f) / focusInkCards(f) / editingCardId(f) / editingFrameId(f)
- *   beginEdit(f) / endEdit(f) / clearInkFocus(f)
+ *   FOCUS_NONE · focusCard(id, editing?) · focusFrame(id, editing?) · focusInk(ids, cards?, box?)
+ *   focusCardId(f) / focusFrameId(f) / focusInkIds(f) / focusInkCards(f) / focusInkBox(f) / editingCardId(f) / editingFrameId(f)
+ *   beginEdit(f) / endEdit(f) / clearInkFocus(f, box?)
  *   isTextField(t) · PAPER_SELECTOR · onPaper(t, selector?)
  *   deleteIntent(focus, key, target, opts?) → { kind: 'none' | 'delete-card' | 'delete-ink' | 'dissolve-frame', … }
  *   escapeIntent({ focus, linkPick }) → { kind: 'none' | 'dismiss-link' |
@@ -46,11 +46,46 @@ export const FOCUS_NONE = Object.freeze({ kind: 'none' })
 
 export const focusCard = (id, editing = false) => (id ? { kind: 'card', id, editing: !!editing } : FOCUS_NONE)
 export const focusFrame = (id, editing = false) => (id ? { kind: 'frame', id, editing: !!editing } : FOCUS_NONE)
-export const focusInk = (ids, cards = []) => {
+/* `box` = 这一次框选的那个矩形（世界坐标 `{x0,y0,x1,y1}`）。
+ *
+ * ★★ 2026-09-21：**框里空着也要留得下这个框**。
+ *   用户原话：「我框选的肯定是 ppt 上的一部分或者解说卡片啊，我不可能框选我自己的字迹，
+ *   但是他要求必须框选字迹，这个就有问题了」。
+ *   根子就在这儿：框选的产物从前只有 `ids`（笔的 id），而"框里没有笔"被表达成
+ *   `FOCUS_NONE` —— 那个**矩形**就跟着丢了。于是"圈住课件上的一块"这件事
+ *   在系统里**根本无处表达**（框是真的拖了，可记录里一点痕都不剩），
+ *   「？问这里」也就只能退回去要求"你得先框到字"。
+ *   ⇒ 让这个矩形能自己立住：`focusInk([], [], box)` 是一个**合法的焦点**
+ *     （kind 仍是 `ink`，只是 `ids` 空着）—— 它说的是"我圈了这一块地方"。
+ *     一旦框里真有笔 / 卡片，`ids` / `cards` 照旧填上，行为一个字不变。
+ *
+ * ⚠ 为什么不做成第五种 kind（比如 `region`）：屏幕上的虚线框、整组拖动、手柄、
+ *   删除、复制粘贴那一整套全是按 `kind === 'ink'` 认亲的（见下面 deleteIntent）。
+ *   新开一种 kind = 把那一整套的判据全改一遍，而"圈了一块地方"和"圈住一撮东西"
+ *   本来就是**同一件事**（只是那撮东西可能是空集）。少改一处判据就少一个静默错。
+ * ⚠ 空框 + 空笔的旧写法 `focusInk([], [])` 仍然回 FOCUS_NONE（没给 box 就是"什么都没发生"）——
+ *   这个函数有好几处调用方拿它当"清空"用，不能反过来。 */
+export const focusInk = (ids, cards = [], box = null) => {
   const list = [...(ids || [])].filter(Boolean)
   const clist = [...(cards || [])].filter(Boolean)
-  if (!list.length && !clist.length) return FOCUS_NONE
-  return clist.length ? { kind: 'ink', ids: list, cards: clist } : { kind: 'ink', ids: list }
+  const b = normFocusBox(box)
+  if (!list.length && !clist.length) return b ? { kind: 'ink', ids: [], box: b } : FOCUS_NONE
+  return {
+    kind: 'ink',
+    ids: list,
+    ...(clist.length ? { cards: clist } : {}),
+    ...(b ? { box: b } : {}),
+  }
+}
+
+/** 焦点里那个框：认得出就用，认不出就当没有（**不硬凑半个空壳**，和板文件那些字段同一条）。
+ *  ⚠ 形状只认 `{x0,y0,x1,y1}` 四个数齐 —— 这个仓库里"框"有两种形状
+ *    （另一种是 `{x,y,w,h}`），认错了不会崩，只会得到一个空的答案（踩过两次）。 */
+function normFocusBox(box) {
+  if (!box) return null
+  const n = [box.x0, box.y0, box.x1, box.y1].map(Number)
+  if (!n.every((v) => Number.isFinite(v))) return null
+  return { x0: n[0], y0: n[1], x1: n[2], y1: n[3] }
 }
 
 /* 读：把那个值翻译成界面各处要问的那几个问题（每个问题都只有一个答案）。 */
@@ -59,6 +94,9 @@ export const focusFrameId = (f) => (f && f.kind === 'frame' ? f.id : null)
 export const focusInkIds = (f) => (f && f.kind === 'ink' ? f.ids : null)
 /* 框里那些**卡片**的 id（没框卡片时是空数组，绝不是 undefined —— 调用方不用先判）。 */
 export const focusInkCards = (f) => (f && f.kind === 'ink' ? f.cards || [] : [])
+/** 焦点里那个"我圈了哪一块"的矩形（`{x0,y0,x1,y1}` 世界坐标；没有就是 null）。
+ *  ★ 和 `focusInkIds` 的区别正是这一刀的要害：**框里有笔才有 ids，而框本身永远有**。 */
+export const focusInkBox = (f) => (f && f.kind === 'ink' ? f.box || null : null)
 export const editingCardId = (f) => (f && f.kind === 'card' && f.editing ? f.id : null)
 export const editingFrameId = (f) => (f && f.kind === 'frame' && f.editing ? f.id : null)
 
@@ -67,8 +105,32 @@ export const editingFrameId = (f) => (f && f.kind === 'frame' && f.editing ? f.i
 export const beginEdit = (f) => (f && (f.kind === 'card' || f.kind === 'frame') ? { ...f, editing: true } : FOCUS_NONE)
 /** 退出编辑（焦点**留着** —— Esc 第一下收编辑、第二下才取消选中）。 */
 export const endEdit = (f) => (f && f.editing ? { ...f, editing: false } : f || FOCUS_NONE)
-/** 只清"框住的墨迹"那一种（有几处从前就只清 inkSel，卡片 / 板框的选中留着 —— 不改行为）。 */
-export const clearInkFocus = (f) => (f && f.kind === 'ink' ? FOCUS_NONE : f || FOCUS_NONE)
+/** 只清"框住的墨迹"那一种（有几处从前就只清 inkSel，卡片 / 板框的选中留着 —— 不改行为）。
+ *
+ *  ⚠ 2026-09-21：给了 `box` 就是"**这一次框选发生了**，只是框里没笔"——
+ *    那时要留下一个"只有框"的焦点，而不是清空（理由见 `focusInk` 那段）。
+ *    不给 `box` 的调用方一个都没改：它们的语义就是"取消失焦"，拿到的是 FOCUS_NONE。
+ *
+ *  ⚠⚠ 2026-09-22 修一个**只看得见第一次**的 bug（用户报的「问这里依旧无法框选
+ *    ppt 与解说卡片」）：原来写成 `if (f && f.kind === 'ink') return focusInk([], [], box)`，
+ *    也就是**只有当焦点本来就是 ink** 时才留框。而用户最自然的那一次操作 ——
+ *    打开板 → 切「⬚ 框选」 → 圈住课件上一块（**一筆都不圈**）—— 焦点本来是 `none`，
+ *    于是框当场被丢掉，`sel.box` 是 null，「？问这里」永远是灰的。
+ *    ⇒ 判据改成"**这次框选发生了没有**"（box 在不在），不是"焦点原来是什么"。
+ *  ★ 为什么自检没抓到：`check-followup-browser` 的 [4′] 前面 [4] 先框住过一笔
+ *    （焦点已经是 ink）—— 它是"沾了上一次的光"。**第一次空框**这条路从来没被走过。 */
+export const clearInkFocus = (f, box = null) => {
+  /* 卡片 / 板框那两种**原样返回**（哪怕给了框）—— 那几处从前就只清 inkSel。
+     ⚠ 这条顺序不能倒：下面"box 在就留框"是**框选松手**那条路专用的，
+        而 `setFocus(clearInkFocus)`（不给框）那几处的语义是"别的东西别动"。 */
+  const k = f && f.kind
+  if (k === 'card' || k === 'frame') return f
+  /* box 在 = 这次框选真的发生了 → 留下一个"只有框"的 ink 焦点。
+     ⚠ 交给 `focusInk`：认不出的框（NaN / 半截）它自己会退回 FOCUS_NONE，
+       这里不另判一遍（两份判据就是"存得出去、读不回来"那一类错）。 */
+  if (box) return focusInk([], [], box)
+  return FOCUS_NONE
+}
 
 /* ── "这一下是冲纸面还是冲面板" ──────────────────────────────────────────────
  * 判据：事件目标在**画布容器**里，或者压根没有焦点（body / html）→ 冲纸面；
@@ -110,6 +172,11 @@ export function deleteIntent(focus, key, target, opts = {}) {
      少了它，框住"几笔字 + 一张卡"按 Delete 会只删掉字，
      而屏幕上看起来就是"删除只做了一半"（卡片还杵在原地）。 */
   if (f.kind === 'ink') {
+    /* ⚠ 只有框、框里什么都没有（2026-09-21 起合法：圈住课件上的一块去追问）→ 没东西可删。
+       少了这一句，Delete 会变成 `{kind:'delete-ink', ids: []}` —— 一个"要删零样东西"
+       的意图，而删除那一段对空数组**不一定**当成没事（它可能拿它去记一步撤销，
+       于是账本上多出一步什么都不干的撤销）。 */
+    if (!f.ids.length && !(f.cards || []).length) return { kind: 'none' }
     const out = { kind: 'delete-ink', ids: f.ids.slice() }
     if (f.cards && f.cards.length) out.cards = f.cards.slice()
     return out

@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import katex from 'katex'
+import { katexHtml } from '../lib/renderMath.js'
 import BoardCanvas from './BoardCanvas.jsx'
+import { Card, CardItem } from './BoardCard.jsx'
+import { FormulaShelf, Hint, Toolbar } from './BoardBar.jsx'
 import WritingPad, { OcrSettings } from './WritingPad.jsx'
 import InkToCard from './InkToCard.jsx'
 import {
@@ -14,20 +16,62 @@ import {
    教训：删一个 import 之前，先确认这个标识符在同一文件里没人用；
    构建工具不会替你查这个（它只是个运行时才会炸的未定义变量）。 */
 import { drawStroke, MIN_STEP_SCREEN } from '../lib/ink.js'
+/* 笔和纸长什么样（颜色 / 粗细 / 纸面）在 lib/skin.js —— Board.jsx 和工具条那一排
+   按钮都要用，所以两头都不许自己留一份。 */
+import { COLORS, DEFAULT_PAPER, PAPERS, PAPER_KEY, SHELF_KEY, WIDTHS } from '../lib/skin.js'
 import { CARD_FONTS, CARD_MIN_H, DEFAULT_CARD_FONT, HL_COLOR, HL_WIDTH, fontCss, newId, nextCardScale, newCard, newStroke, parseBoardDocument, serializeBoardDocument, textCardRect } from '../lib/board.js'
 /* 资料（铺在画布上的 PDF/PPT，见 docs.js 的文件头）：常量与几何在那边只有一份；
    页面的拉取/渲染在 doc-pages.js；两层界面在 DocLayer.jsx。 */
-import { DOC_DEFAULT_W, DOC_ID_PREFIX, docBounds, pageRects } from '../lib/docs.js'
-import { readDocInfo } from '../lib/doc-pages.js'
+import { DOC_DEFAULT_W, DOC_ID_PREFIX, pageRects } from '../lib/docs.js'
+/* ⚠ `pageTextItems`（只有速查在用）也在这儿：同一份 PDF 的打开/缓存只有一处记账
+   （doc-pages.js 的 getDoc），谁再自己 require 一次 pdf.js 都会多一本冷却不了的日志。 */
+import { pageTextItems, readDocInfo } from '../lib/doc-pages.js'
+import { pickWord } from '../lib/doc-words.js'
+import { richHtml } from '../lib/rich.js'
 import { DocBars } from './DocLayer.jsx'
 import DeckReview from './DeckReview.jsx'
-/* 课件整理（2026-09-22）：把资料的一段页交给模型读成知识点、贴到板上。
+import BoardHelp from './BoardHelp.jsx'
+/* 框选追问（2026-09-22）：页边那个问答小窗。**不碰板** —— 见 AskBox.jsx 的文件头。 */
+import AskBox from './AskBox.jsx'
+/* 速查（2026-09-28）：上课突然不懂的那个词。**同一条规矩：不碰板** ——
+   见 QuickLook.jsx 的文件头；它和 AskBox 的区别是"快"，不是"能不能改我的板"。 */
+import QuickLook from './QuickLook.jsx'
+/* 作业辅导（2026-09-22）：说清作业在哪一份 PDF、报"第几页第几题"，每题要一份
+   「答案 + 说人话的解析」。**同样不碰板** —— 见 HomeworkBox.jsx 的文件头。
+   ⚠ 它和「课件整理」是两件事：整理是老师讲他的（一页一遍、贴到板上），
+     辅导是老师做**你的**题（你点哪几道就哪几道，答案浮在窗里、板上一个字节不动）。 */
+import HomeworkBox from './HomeworkBox.jsx'
+/* 「这本书有几百页，我只要那几页」—— 问页码的小窗（2026-09-21）。
+   ⚠ 它是浮层那一族的新成员（回车 / Esc 关），所以这两个键不许漏到画布上去。 */
+import DocPagePicker from './DocPagePicker.jsx'
+/* 「只抽这几页」：一本几百页的书，做几道题用不着整本传（来龙去脉写在 doc-slice.js）。 */
+import { SLICE_ASK_MIN, openLocalPdf, sliceFileName } from '../lib/doc-slice.js'
+/* 作业辅导那颗按钮上的字、以及"本地服务没重启"那句提示 —— 都只有一处（homework.js）。 */
+import { HW_BUTTON } from '../lib/homework.js'
+/* 课件整理（2026-09-22 立；2026-09-20 换成"老师讲解"）：把资料的每一页交给模型讲一遍，
+   讲解贴右边、重点和公式贴左边。
    ⚠ 这个文件里**不解析模型的话、也不摆版** —— 那两件事在 doc-cards.js（纯函数、有自检）；
      渲染那一趟在 doc-read.js。这里只做三件本地的事：量尺寸、摆版、写盘。 */
-import { ORIGIN_GAP, makeMeasureHost, measureDeck, pagesLabel, projectDeck } from '../lib/doc-cards.js'
+import { SIDE_W, cardText, columnOccupancy, makeMeasureHost, measureDeck, pageGapDeltas, pagesLabel, planAnswerCard, projectDeck, shiftLaterPageCards } from '../lib/doc-cards.js'
+/* 整节课那一层（提纲 + 做题须知）那一半：判据（`isDeckLevel` / `SUMMARY_KIND` / `RULES_KIND`）
+   和它们自己的摆位（`placeDeckCard` —— 两张**共用同一个摆位函数**，一上一下排开）。
+   **它们不在 doc-cards.js 里** —— 那一份是"一页一课"的，整节课那两张是"一节课一张卡"，
+   两件事的字段、文案、摆位没有交集（见 doc-summary.js 的文件头）。
+   ⚠ 分半的判据永远用 `isDeckLevel`，别在这里写 `kind === 'summary'` / `kind === 'rules'`
+     字面量（那两个是**条目层**的 kind；而且散开的字面量会让"再加一张整节课的卡"
+     必须改好几处 —— 漏掉一处的后果见下面 `placeDeckCards` 那段注释）。 */
+import { RULES_KIND, SUMMARY_KIND, isDeckLevel, placeDeckCard } from '../lib/doc-summary.js'
+/* 框选追问（2026-09-22）：你圈的那一块**落在课件的哪一页、页内哪个位置**（纯函数，
+   `check:ask` 在 node 里钉着它）。渲染那两张图在 ask-images.js，界面在 AskBox.jsx。
+   `normalizeAsk` / `serializeAsk` 是**存进板文件**的那个字段（卡片的 `ask`，见 ADR-0006）。 */
+import { docForPath, findAskRegion, normBox, normalizeAsk, regionToWorld } from '../lib/ask-region.js'
+/* 「留到板上」（ADR-0006）：追问 / 作业里那一轮问答 → 一张卡的内容。
+   正文那一半住在 answer-cards.js（两个窗各自调 `askThreadText` / `homeworkText`），
+   这一层只要 `answerItem`（它把内容包成量尺寸 / 摆版认的那个条目）。 */
+import { ASK_MARK_GLYPH, answerItem } from '../lib/answer-cards.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
    板框的几何（成员包围盒 + 内边距 / 框选命中）2026-09-17 也进了那儿。 */
-import { buildRelations, descendantsOf, fitView, frameBounds, membersInBox, simplifyPoints, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
+import { buildRelations, descendantsOf, fitView, fitViewIn, frameBounds, membersInBox, simplifyPoints, strokeBounds, strokeHitsCircle, toFlat, toPoints } from '../lib/geometry.js'
 /* 卡片「按内容量尺寸」那一套规矩（什么时候量得准、什么时候算稳定、门槛多少）搬去了
    card-fit.js —— 从前它锁在这个文件里，自检够不着（见那个文件的文件头）。 */
 import { createCardFitter } from '../lib/card-fit.js'
@@ -40,13 +84,16 @@ import { createLinkReader } from '../lib/links.js'
      还躺在那个 module 里，但**界面入口已经没有了** —— 它们唯一的脸就是关系面板，
      而那块面板删掉了（见文件末尾「关系面板删掉了」那段）。 */
 import {
-  applyStrokeLink, freezeFrameSelection, readSelection, removePick, transformPick,
+  applyStrokeLink, clearCond, freezeFrameSelection, readSelection, removePick, specCond, transformPick, vetoCond,
 } from '../lib/selection.js'
 /* 板框 / 连接这两个概念的**动作**（留下 / 加进来 / 改标题 / 拆开 / 整体挪 / 删掉连接 /
    吸附到最近的卡片或板框）在 frames.js —— 和 selection.js 一个路子：纯函数、有断言。见 ADR-0001。 */
 import { declareLink, dissolveFrame, removeLink, setFrameTitle, setLinkKind, snapNode, translateFrame } from '../lib/frames.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { ARROW_LINK, LINK_DELETE, LINK_KINDS, linkKind } from '../lib/link-kinds.js'
+/* 「？问这里」那颗按钮上的字、以及"本地服务没重启"那句提示 —— 都只有一处（followup.js）。
+   ⚠ 文件名叫 followup 不叫 ask：`ask` 那个名字被「询问框」占了（App.jsx 的 Ask、check:ask）。 */
+import { ASK_BUTTON } from '../lib/followup.js'
 /* 视图映射（屏幕 = 世界 × s + t）只有一份实现，在 view.js 里 ——
    从前这句公式在这两个组件里被手抄 14 处、canvas 变换写两份、捏合还复制了一份
    （于是"导出的那份有自检、手指走的是复制品"）。现在浮层位置、canvas 变换、
@@ -67,7 +114,7 @@ import { chipPlacement } from '../lib/chip-placement.js'
    从前它是四个 useState + 二十处 ad hoc 的互斥 if + 一串按键 if（候选 7）。 */
 import {
   FOCUS_NONE, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit, escapeIntent,
-  focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkCards, focusInkIds, isTextField,
+  focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkCards, focusInkBox, focusInkIds, isTextField,
 } from '../lib/focus.js'
 /* 复制 / 粘贴（框住一块 → 装进剪贴板 → 落到**任何一块板**上）在 clipboard.js：
    "只装内容不装关系"、"落点用相对偏移"、"粘贴出来一律是新 id" 三条规矩都在那儿，纯函数、有断言。 */
@@ -124,6 +171,17 @@ const SAVE_RETRY_MS = 3000
    白跑一遍（见下面 `shapeHits` 那一段）。240ms 的取法：比"手停下来的感觉"略短，
    又明显长于两次 pointermove 的间隔（60fps 是 16.7ms），所以拖动中它永远不会触发。 */
 const SHAPE_SETTLE_MS = 240
+/* 「手势算停了没有」—— 缩放/平移期间卡片层收起来（`.bd.gesting`），停手多久之后放回来。
+   取 200ms 的**实测依据**（2026-09-21 第十一刀，用户："越修越卡"）：
+   · 真人的滚轮/触摸板是**一阵一阵**的：实测一串 3 个事件挤在 16ms 内、隔 140ms 再来一串。
+     原来是"最后一个事件之后一帧"就放回来 → 每一串之间卡片闪一下、下一串再收走
+     （实测 2 秒里收放 10~11 次），而"收/放"本身要全量重排一次 —— 净收益是负的
+     （Layout 总量 1298ms vs 闸摘掉 1294ms），换来的只有屏幕上闪。
+   · 200ms > 一串滚轮的间隔（140ms）→ 连着滚时它一直收着，那笔钱才真的省下来；
+     又短到人不会觉得"卡片卡住了"。
+   ⚠ 别把它调成"一帧"或 0：那就是"每串之间闪一次"那个病。
+   ⚠ 也别调到半秒以上：手势停了卡片还不回来，看起来像丢了东西。 */
+const GEST_LINGER_MS = 200
 /* "板安静多久才算安静"（公式卡重新量尺寸那个防抖）跟着那条政策搬去了
    `src/lib/card-fit.js` 的 `FIT_IDLE_MS`（2026-09-17 架构 review 候选 6）——
    这个文件里不再留一份。 */
@@ -138,42 +196,21 @@ const ERASER_R_SCREEN = 14
    这个文件里**不再各留一份** —— 曾经两处各写了一份 #ffd43b / 16，
    改一处忘一处就是"荧光笔颜色改不动"或者"宽度对不上"的经典来源。 */
 
-const COLORS = [
-  { id: 'ink', v: '#1b1d22', name: '黑' },
-  { id: 'red', v: '#d9480f', name: '红' },
-  { id: 'blue', v: '#1c7ed6', name: '蓝' },
-  { id: 'green', v: '#2f9e44', name: '绿' },
-  { id: 'purple', v: '#7048e8', name: '紫' },
-]
-const WIDTHS = [1.6, 2.6, 4.2]
-
-/* ── 纸面：几种背景，用户自己挑 ──
- * 2026-09-16 用户：「现在白板背景是十字格子纸，可以改成纯白纸，或者说有几种类型的
- * 背景让用户去选择」。于是做成**四档可挑**，并且把默认从"十字格子"改成**纯白**
- * （他那句话的头半句就是"可以改成纯白纸"）。
- *
- * ★ 纸面存在 localStorage，**不进 board-*.md**。理由两条：
- *   ① 纸是"我习惯怎么看这张板"，不是这张板的内容 —— 用户心里只有一种纸，
- *      存进文件就变成"每张板各有一张纸"，切板时纸跟着跳，很吵；
- *   ② 板文件是自动存的（停笔 0.7 秒写盘），多一个字段就是多一处假 diff 的来源
- *      —— 这条纪律 README 里写过（见"压力保留两位小数"那一段）。
- * id 同时是 CSS 类名后缀（.paper-<id>），改 id 记得改 styles.css。 */
-const PAPERS = [
-  { id: 'plain', name: '纯白', hint: '一张干净的白纸，什么都不铺（默认）', tile: 0 },
-  { id: 'grid', name: '方格', hint: '一格 32 世界像素的十字格子，画图对得齐', tile: 32 },
-  { id: 'rule', name: '横线', hint: '只有横线，写一行对一行', tile: 32 },
-  { id: 'dots', name: '点阵', hint: '一层小点，比格子安静', tile: 24 },
-]
-const DEFAULT_PAPER = 'plain'
-const PAPER_KEY = 'studyhelper.paper'
-/* 公式架开合也存 localStorage（理由同上：这是"我怎么看这张板"，不是板的内容）。
-   默认**收起** —— 它是一条横条，常驻会吃掉画布高度；开一次就记住了。 */
-const SHELF_KEY = 'studyhelper.shelfOpen'
-
 /* 画出一条连接线之后，那排词在屏幕上停多久（毫秒）。
  * 3.5 秒的来历：比你抬笔看一眼再决定要长一点，又不至于一直挂在那儿碍事。
  * 指针停在那排词上时不会收（LinkChips 的 onPointerEnter）。 */
 const LINK_PICK_MS = 3500
+
+/* ── 触屏上"按住不放" = 查这个词（Surface 没键盘时的那条路，2026-09-28）──────
+ * 600ms 的来历：明显长于"点一下"（触屏上一记 tap 是 100ms 上下），
+ *   又短于"让人觉得它在卡"（超过一秒手指就开始怀疑了）。
+ * ⚠ 这两个常量**不要写在 Board 组件里**：它们必须和 `armPress` 一样是常量，
+ *   而写在组件里每渲染一次就新建一个对象/值 —— 定时器读到的是拿一次性的问题
+ *   还好说，真正的问题是它们会漏进依赖数组，而"每帧重绑手势"正是最难查的那一类错。 */
+const LOOK_PRESS_MS = 600
+/* 手在这 600ms 里允许挪动的范围（px）。手指按住是会抖的，一点余量都不给的话
+ * 这个手势等于没有 —— 但也不能太宽，否则"按住拖一下"（平移/框选）会被误判成长按。 */
+const LOOK_PRESS_SLOP = 10
 
 /* ── 纸面在屏幕上的几何：格距 + 原点 ──
  * ★ 用户 2026-09-16 的第二条：「平移的时候有一种背景不动字动的感觉，
@@ -220,6 +257,8 @@ function paperGeometry(view, paperId) {
 export default function Board({ file, initialText, reloadToken, onSave, flash, scale, onScale, onScaleReset, fullscreen, onToggleFullscreen, onGatherNote }) {
   const [board, setBoard] = useState(() => load(initialText, file))
   const [tool, setTool] = useState('pen')
+  /* 「?」帮助浮层（2026-09-26）。不进板文件、不进 localStorage —— 开着看一眼就关的东西。 */
+  const [helpOpen, setHelpOpen] = useState(false)
   const [color, setColor] = useState(COLORS[0].v)
   const [width, setWidth] = useState(WIDTHS[1])
   /* ── 焦点：**一个值**（2026-09-17 架构 review 候选 7）────────────────────────
@@ -258,6 +297,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      而大字号公式卡（KaTeX 一大坨 span + 一圈模糊阴影）面积大、画起来贵，
      转起来就是一顿一顿的。见 README 第 53 条。 */
   const [xforming, setXforming] = useState(false)
+  /* ★★ 手势进行中（2026-09-21 第十刀；第十一刀改成"停手 200ms 才放回来"）——
+     缩放/平移/捏合那一小段时间里，把卡片层整个从**布局**里摘出去
+     （`.bd.gesting .bd-cardworld`，见 styles.css 那一段）。
+     为什么非做不可、以及"停手 200ms"这个口径是怎么量出来的：
+     见下面 `markGesticulating` 顶上那一段（那里有实测数字）。
+     一句话：卡片可见那一路，60 帧连滚要花 930ms 的样式失效 + 155ms 的布局；
+     摘掉之后分别掉到 ~100ms / ~20ms。代价是手势期间看不见卡片。 */
+  const [gesting, setGesting] = useState(false)
+  const gestingRef = useRef(false)
+  const gestTimerRef = useRef(null)
   const lassoRef = useRef(null)
   const inkMoveRef = useRef(null)
   /* 刚画完一条连接线时浮出来的那排词（见 applyLink / LinkChips）。
@@ -276,6 +325,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   const [inkMode, setInkMode] = useState(null) // null | 'text' | 'formula'
 
   const wrapRef = useRef(null)
+  /* 工具条那一层（`.bd-cbar`）。只用来量它浮在画布上占了多高 ——
+     "装回屏幕"得把那一段从可用高度里扣掉，见 fitForView。 */
+  const cbarRef = useRef(null)
   const sceneRef = useRef(null)
   const liveRef = useRef(null)
   const boardRef = useRef(board)
@@ -329,6 +381,11 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      （选中、改内容、量尺寸……）跟视图无关 —— 没有这道闸的话，每一趟都要
      querySelector + 又写又删 transform，白制造样式重算（平移时每帧都跑）。 */
   const corrRef = useRef(null)
+  /* 上一次写进 DOM 的那四个诊断数（见 syncViewCorrection）。
+     同一条规矩：它们写在 `.bd-world` 上，而 `.bd-world` 是**整棵卡片子树的祖先**
+     —— 每帧无条件写 4 个 dataset，等于每帧让浏览器把子树里所有"属性选择器"
+     重匹配一遍（板上有 3 万节点时这笔钱看得见）。值没变就一个字节都不写。 */
+  const diagRef = useRef(null)
 
   boardRef.current = board
   dirtyRef.current = dirty
@@ -373,12 +430,24 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          用眼睛看不出来，只能靠它（自检也读它）。
      `commit` 是 useCallback([])（身份稳定），所以这个 fitter 一个组件实例只建一次，
      排队状态也就跟着实例走。 */
+  /* ★★ 量尺寸自己写的那次板变化，**不算"板变了"**（2026-09-21 第十一刀）。
+     为什么非要有这个 ref：`commit` 会换掉 `board.cards` 的引用，而下面那条
+     "板安静下来自己再量一次"的 effect 盯的正是这个引用 —— 于是量尺寸每提交一次
+     就把**全队公式卡重新排上一遍**。一张收敛慢的卡（实测用户那张板上有一张每趟
+     缩 2px、要十来趟）就足以让它变成一台不停转的机器：每次提交 → 400ms 防抖 →
+     125 张卡全量一遍 → 又提交 → 再来。实测空转 5 秒 523 次 data-fit（≈ 每秒一整趟）。
+     判据是"这次板变化是不是我自己写的"：是就咽下不排。
+     ⚠ 用户在编辑器里改完内容那条路不受影响 —— 那条走 `editing-ended` 和
+       **用户自己**的 commit（不经过这个计数器）。 */
+  const fitWriteRef = useRef(0)
   const fitter = useMemo(
     () =>
       createCardFitter({
         sample: (id, opts) => sampleCardForFit(id, opts),
-        commit: (id, patch) =>
-          commit((c) => ({ ...c, cards: c.cards.map((x) => (x.id === id ? { ...x, ...patch } : x)) }), false),
+        commit: (id, patch) => {
+          fitWriteRef.current++
+          commit((c) => ({ ...c, cards: c.cards.map((x) => (x.id === id ? { ...x, ...patch } : x)) }), false)
+        },
         frame: (fn) => requestAnimationFrame(fn),
         later: (fn, ms) => setTimeout(fn, ms),
         clearLater: (h) => clearTimeout(h),
@@ -396,8 +465,18 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   )
 
   /* 把"这张卡现在长什么样"采下来交给 card-fit.js。
-     采的都是**屏幕像素**，而且必须来自**同一瞬间**的布局：卡片的宽度和内容的高度
-     要是来自不同的渲染帧，算出来的尺寸就是错的（那正是第 17 条那个坑）。 */
+     采的都是**世界像素**，而且必须来自**同一瞬间**的布局：卡片的宽度和内容的高度
+     要是来自不同的渲染帧，算出来的尺寸就是错的（那正是第 17 条那个坑）。
+
+     ★★ 为什么是世界像素（2026-09-21 第十一刀，用户那句"越修越卡"）：
+       卡片自从按世界坐标渲染（`width: card.w`，缩放交给 `.bd-cardworld` 那一层
+       transform），这里读到的就**已经是**世界像素 —— `offsetWidth` / `offsetHeight`
+       是**布局值，不受祖先 transform 影响**（这正是不用 getBoundingClientRect 的原因，
+       见下面那条）。
+       而 card-fit.js 当时还在按"屏幕像素"折（`card.w × s`）—— 两边只在 s=1 时相等，
+       别的档位每张卡每帧都判 'stale'，于是拟合器每帧把全板卡片重量一遍（实测用户那张板
+       空转 1 秒 2625 次）。所以：**这里采什么档，card-fit.js 就按什么档判**，
+       现在的口径是"世界像素进、世界像素出"，`s` 不许出现在这一族里。 */
   function sampleCardForFit(id, opts = {}) {
     const cur = boardRef.current.cards.find((c) => c.id === id)
     if (!cur) return { state: 'gone' } // 卡片已经从板里没了
@@ -406,9 +485,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     if (!cardEl) return { state: 'missing' } // 还没挂上，下一帧再来
     if (cardEl.classList.contains('editing')) return { state: 'wait' } // 编辑态量不得
     const el = cardEl.querySelector('.bd-card-body')
-    if (!el) return { state: 'missing' }
+    if (!el) return { state: 'missing' } // 还没挂上，下一帧再来
+    /* ★ 卡片**不在布局里**就量不得（2026-09-21 第十一刀）：手势期间整个卡片层是
+       `display:none`（`.bd.gesting`），这时候 offsetWidth 是 0 —— 量它只会得到
+       "DOM 没跟上"（'stale'）而白烧重试次数，最后把这张卡判成 'gave-up'。
+       卡片回来的时候 `markGesticulating` 那条定时器会补一趟 kick()。 */
+    if (cardEl.offsetWidth === 0 && Number(cur.w) > 0) return { state: 'wait' }
 
-    /* 内边距 + 边框（屏幕像素）：这个仓库全局是 `box-sizing: border-box`，
+    /* 内边距 + 边框（世界像素）：这个仓库全局是 `box-sizing: border-box`，
        卡片上写的 width/min-height **都把这一圈算在里面**，所以算尺寸时必须加上它 ——
        不加就正好少一整圈，宽度那条线上直接表现为**内容被裁掉**（实测 `E = mc²` 少了 c²）。
        ⚠ 2026-09-17 起卡片那一圈是 `outline`（styles.css 的 .bd-card），
@@ -425,13 +509,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     const snap = {
       state: 'ok',
       card: cur,
-      s: boardRef.current.view.s,
       /* ★★ 量的是**布局尺寸**（offsetWidth/offsetHeight），不是 `getBoundingClientRect()`。
          2026-09-21 卡片能旋转之后这一条变成硬要求：`getBoundingClientRect()` 返回的是
          **变换之后**的外接框 —— 一张转过 30° 的卡，量出来的宽高是它斜着那个大框，
          于是 fitPass 会拿这个虚高的数去改 `w`/`h`（卡片会越转越胖，而且**存进文件**）。
          `offsetWidth/offsetHeight` 是布局值，和 transform 无关（四舍五入到整数，
-         而 fitPass 的门槛是 1.5 屏幕像素，够用）。 */
+         而 fitPass 的门槛是 1.5 世界像素，够用）。
+         ⚠ 它同时也**不带视图缩放** —— 这就是为什么这一族全是世界像素。 */
       domW: cardEl.offsetWidth,
       bodyH: el.offsetHeight,
       padX,
@@ -556,14 +640,99 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   /* 把这几个"跟着视野走"的层收成一份：`.bd-world`（卡片 + 板框）用 ref，
      其余（两层 canvas + 两层 SVG）用 `data-view-follow` 找 —— 它们在
      BoardCanvas 里声明自己，这里不用再维护一张平行的 ref 清单
-     （清单一定会漏，而漏掉的那一层就是继续滑动的那一层）。 */
+     （清单一定会漏，而漏掉的那一层就是继续滑动的那一层）。
+
+     ── ★★ 找一遍就记住（2026-09-25）──────────────────────────────────────
+     `syncViewCorrection` 每帧要它两次（手势里一次、墨迹画完一次），
+     而 `querySelectorAll` 是在**整个舞台子树**（大板 3 万节点）里跑属性选择器 ——
+     探针实测 70ms / 60 帧，是优化之后剩下最大的一笔单项 JS。
+     这几层是**声明在那儿就不动**的（BoardCanvas 三层 + DocLayer 一层），
+     所以查一次存起来；什么时候失效由下面那个 MutationObserver 说了算
+     （层被挂载/替换/卸载 → 缓存作废），另外每一趟都验一遍"还在文档里"。
+     ⚠ 失效那条路必须留着：缓存要是认不出"新来了一层"，新层就吃不到补正
+       —— 而"漏掉的那一层"正是这一族最怕的那个错。 */
+  const followCacheRef = useRef(null)
   const viewFollowNodes = useCallback(() => {
     const out = []
     if (worldRef.current) out.push(worldRef.current)
     const stage = wrapRef.current
-    if (stage) out.push(...stage.querySelectorAll('[data-view-follow]'))
+    if (!stage) return out
+    let nodes = followCacheRef.current
+    if (!nodes || nodes.some((n) => !n.isConnected)) {
+      nodes = [...stage.querySelectorAll('[data-view-follow]')]
+      followCacheRef.current = nodes
+    }
+    out.push(...nodes)
     return out
   }, [])
+
+  /* 上面那份缓存的失效闸：舞台里**结构**一变（层挂上来、摘掉、换掉）就作废。
+     ⚠ 只听 childList —— 补正自己写的是 style，不会反过来把缓存冲掉
+       （那样每帧都失效，缓存就白做了）。 */
+  useEffect(() => {
+    const stage = wrapRef.current
+    if (!stage || typeof MutationObserver === 'undefined') return
+    const mo = new MutationObserver(() => {
+      followCacheRef.current = null
+    })
+    mo.observe(stage, { childList: true, subtree: true })
+    return () => mo.disconnect()
+  }, [])
+
+  /* ══════════ 手势降级：卡片层"收起来"，屏幕刷新率归操作 ══════════
+   *
+   * 谁调它：**每一次视图变化**（setView）。连着滚就是一直续期，
+   * 停手 GEST_LINGER_MS 之后才把卡片放出来。
+   *
+   * 为什么非做不可（实测，用户那张 213 张卡 / 3 万节点的板）：
+   *   卡片层已经改成"世界坐标 + 一层 transform"，语义上确实不用重排 ——
+   *   但 Chromium 仍然要为**变换的元素树**走一趟几何遍历 + 样式失效：
+   *   实测 60 帧连滚，卡片可见那一路 RecalcStyle 941ms（帧中位 50ms）；
+   *   把这一层 `display:none` 掉，掉到 35ms（帧中位 **16.7ms，满帧**）。
+   *   （探针 `npm run perf:cost` 的 [1]/[4] 两组，以及 `perf:zoom`。）
+   *   代价是手势期间**看不见卡片**（白板上是课件、墨迹、连线）——
+   *   这是拿"看得见卡"换"手感"，用户 2026-09-21 报的就是手感（"放大缩小的时候有点卡"）。
+   *
+   * ★★ 为什么是"停手 200ms"而不是"最后那个事件之后一帧"（2026-09-21 第十一刀）：
+   *   原来这里走的是"等真正的屏幕刷新"（rAF 之间隔 ≥6ms 就放出来）—— 实际效果是
+   *   **最后一个事件之后一帧**就把 3 万个节点放回布局。而真人的滚轮/触摸板是
+   *   **一阵一阵**的（实测节奏：3 个事件挤在 16ms 内，隔 140ms 再来一串）：
+   *   每一串之间那一帧卡片就"啪"地回来、下一串再收走 —— 于是缩放时卡片**一闪一闪**，
+   *   而"收/放"这个动作本身又要全量重排一次（那正是这个闸本来要省掉的那笔钱）。
+   *   实测：一串一串地滚 2 秒，卡片收放 **10~11 次**（可见性翻转 20 次），
+   *   而 Layout 总量和"闸摘掉"几乎一样（1298ms vs 1294ms）——
+   *   也就是说旧口径下这个闸**一点钱都没省下**，只换来屏幕上闪。
+   *   判据改成"停手 200ms"之后：连着滚 → 全程收着（省下那笔钱）；
+   *   停手 → 200ms 后放回来一次（不闪）。
+   *   ⚠ 200ms 这个数：比一串滚轮的间隔（实测 140ms）长，比"我以为你停手了"的手感短。
+   *
+   * ⚠ 放回来之后要**补一趟量尺寸**：手势期间卡片不在布局里，`offsetWidth` 是 0，
+   *   拟合器那一趟只能判 'wait'（见 sampleCardForFit 里那条）—— 卡片回来了才有得量。
+   */
+  const markGesticulating = useCallback(() => {
+    if (!gestingRef.current) {
+      gestingRef.current = true
+      setGesting(true)
+    }
+    if (gestTimerRef.current) clearTimeout(gestTimerRef.current)
+    gestTimerRef.current = setTimeout(() => {
+      gestTimerRef.current = null
+      gestingRef.current = false
+      setGesting(false)
+      /* 卡片回到布局里了 —— 手势期间量不得的那几张现在量得上。 */
+      fitter.kick()
+    }, GEST_LINGER_MS)
+  }, [fitter])
+
+  /* 卸载时把那个定时器撤掉（换板 / 关页的路上不留活着的定时器）。
+     ⚠ 定时器是 setTimeout 不是 rAF：后台标签页里 rAF 会停，卡片层就会一直藏着
+       （屏幕上像"卡片没了"）。setTimeout 在后台只是被降频到 ~1s —— 照样会放回来。 */
+  useEffect(
+    () => () => {
+      if (gestTimerRef.current) clearTimeout(gestTimerRef.current)
+    },
+    []
+  )
 
   /* ★★ 补正唯一的入口：**算多少、写到哪儿**。
      · 基准（drawn）= 屏幕上**已经画出来了**的那一版视图（见 `drawnViewRef`）；
@@ -592,10 +761,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
        2026-09-18：这一族数字是"把补正做成可观测"的唯一办法，别删。 */
     const w = worldRef.current
     if (w) {
-      w.dataset.liveTx = String(live ? live.tx : '')
-      w.dataset.liveS = String(live ? live.s : '')
-      w.dataset.drawnTx = String(drawn ? drawn.tx : '')
-      w.dataset.drawnS = String(drawn ? drawn.s : '')
+      /* ★ 只在**真的变了**的时候写（2026-09-25）：这四个数是给自检看的，
+         而写在 `.bd-world` 上就等于每次都让整棵子树重匹配属性选择器。
+         手势里它们每帧都变（照写），别的时候大多数帧根本没变（不写）。 */
+      const lt = String(live ? live.tx : '')
+      const ls = String(live ? live.s : '')
+      const dt = String(drawn ? drawn.tx : '')
+      const ds = String(drawn ? drawn.s : '')
+      const prev = diagRef.current
+      if (!prev || prev.lt !== lt) w.dataset.liveTx = lt
+      if (!prev || prev.ls !== ls) w.dataset.liveS = ls
+      if (!prev || prev.dt !== dt) w.dataset.drawnTx = dt
+      if (!prev || prev.ds !== ds) w.dataset.drawnS = ds
+      diagRef.current = { lt, ls, dt, ds }
     }
     /* 只在**真的变了**的时候动 DOM（见 corrRef 的说明）。 */
     if (corrRef.current === tf) return
@@ -646,13 +824,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       /* 先记下"要去的视图"再提交：`commit` 内部是函数式更新，等它跑的时候
          已经不好拿到这个值了。补正用的就是这个和**已经画出来的那一版**的差。 */
       liveViewRef.current = next
+      /* ★ 视图一动 = 手势开始（滚轮/捏合/平移全走这里）—— 把卡片层收起来，
+         屏幕刷新率全归这一件事（见上面「手势降级」那一段）。
+         ⚠ 放在 `syncViewCorrection` **之前**：先让 DOM 少掉一大块，再谈补正。 */
+      markGesticulating()
       syncViewCorrection()
       commit(
         (cur) => ({ ...cur, viewPinned: pin ? true : cur.viewPinned, view: typeof v === 'function' ? v(cur.view) : v }),
         false
       )
     },
-    [commit, syncViewCorrection]
+    [commit, syncViewCorrection, markGesticulating]
   )
 
   /* ── 换文件 / 点「重载」：整块重来。白板是"一节课一页"，不混着开 ──
@@ -696,8 +878,12 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       const el = wrapRef.current
       if (!el) return
       if (!boardRef.current.viewPinned) {
-        const f = fitView(boardRef.current, el.clientWidth, el.clientHeight, 70)
-        commit((cur) => ({ ...cur, view: f }), false)
+        /* ★ 也要按字号档折算（见上面那段说明）：不然字号档一大，
+           "开窗就是卡片探出画布、右边那颗 × 点不到"。
+           ⚠ 这里读的是**渲染期的 `scale`**，而 use 在 raf 里 ——
+             字号档是 App 级状态、开板那一刻不会同时在变，不存在读到旧值的窗口。
+             真撞上了，下一帧重装/改窗口也会按新 `--s` 纠回来。 */
+        commit((cur) => ({ ...cur, view: fitForView(el.clientWidth, el.clientHeight) }), false)
       }
     })
     return () => cancelAnimationFrame(raf)
@@ -737,8 +923,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      现在都在 `card-fit.js` 里（`FIT_IDLE_MS` + `notify`，2026-09-17 候选 6）——
      这里只报一句"板变了"，不再自己拿一个 setTimeout。
 
-     ⚠ 正在编辑的那张会挂起来等（card-fit.js 的 'wait'）。 */
+     ⚠ 正在编辑的那张会挂起来等（card-fit.js 的 'wait'）。
+     ⚠ 量尺寸**自己**写的那次变化要跳过（`fitWriteRef`）—— 不然它会把自己重新排上，
+       于是一张收敛慢的卡就能让全板永远在量（见那个 ref 上面的一段）。 */
   useEffect(() => {
+    if (fitWriteRef.current > 0) {
+      fitWriteRef.current = 0
+      return
+    }
     fitter.notify({ reason: 'board-changed' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board.strokes, board.cards])
@@ -830,10 +1022,469 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      （规矩和来历见 src/lib/selection.js 的文件头）。
      判据都在那个 module 里：集合完全相等才算"这个框"、正好一条才算"这条线"。 */
   const inkCards = useMemo(() => focusInkCards(focus), [focus])
-  const sel = useMemo(() => readSelection(board, inkSel, links, inkCards), [board, inkSel, links, inkCards])
+  /* ★ `inkBox` 是"我圈了哪一块地方"的那个矩形 —— 框里没笔时它是**唯一**留着这件事的东西
+     （见 focus.js 的 `focusInk` 与 selection.js 的 `box`）。 */
+  const inkBox = useMemo(() => focusInkBox(focus), [focus])
+  const sel = useMemo(() => readSelection(board, inkSel, links, inkCards, inkBox), [board, inkSel, links, inkCards, inkBox])
   /* 框住的卡片（一个 Set，给"整体拖动"那条路用）。和 `inkSel` 一个形状，
      所以下面"整组拖着走"那一段两半写起来是对称的。 */
   const cardSel = useMemo(() => new Set(sel.cardIds), [sel.cardIds])
+
+  /* ══════════════════ 框选追问：你圈的那一块落在课件的哪一页 ══════════════════
+   *
+   * 用户 2026-09-22：「现在的痛点在于即使有讲解仍然有没理解的地方……直接用框选，
+   * 框中的地方是有疑问的地方并且可以询问这是为什么」。
+   *
+   * ★ "这一块在第几页"**必须**由几何算出来，不能让用户选页号 ——
+   *   他圈的就是他看不懂的地方，让他再去说一遍"这是第 7 页"是多余的动作，
+   *   而且会说错。规矩在 `ask-region.js`（纯函数，`check:ask` 钉着）。
+   * ★ 为什么在这里算、而不是在 AskBox 里算：AskBox 是**不碰板**的（它连 board 都
+   *   拿不到），而"哪一页"要用 board.docs + 选区几何。分工和 shapeHits 一样：
+   *   **判断住在 Board，界面只显示**。
+   *
+   * ═══ 2026-09-21 修正：圈住的是课件，不是自己的字迹 ═══════════════════════
+   * 用户原话：「我框选的肯定是 ppt 上的一部分或者解说卡片啊，我不可能框选我自己的字迹，
+   * 但是他要求必须框选字迹，这个就有问题了」。
+   *
+   * 一针见血。这条链路从「框选」那套机制里借了**选区**（`sel`），而选区的主语一直是
+   * **笔迹**（`readSelection` 的 `ids` 就是笔的 id）：于是"框里有没有笔"变成了
+   * "能不能问"的隐含前提，而追问要问的恰恰是**课件上那一块**——
+   * 用户圈的是 PPT 里那个他看不懂的符号，跟他自己写没写字毫无关系。
+   * 症状很具体：圈住课件空白处（或者整页扫一下）→ 什么都框不到 → `strokesBBox` 是
+   * null → 按钮灰着 → 点了一下说「框里没有课件页面」，而那句话是**错的**
+   * （圈里明明就是课件）。
+   *
+   * ⇒ 判据改成"**框有多大**"，不是"框里有多少笔"：
+   *   几何取**框选那个矩形本身**（`sel.box`，就是屏幕上画出来的那个虚线框）。
+   *   圈住课件 = 有矩形 = 能问；圈住的地方正好压着课件页 = 问得到。
+   *   笔迹和卡片都**不再是必要条件**（有也照常，矩形会把它们圈进去）。
+   *   ⚠ 用 `sel.box` 而不是 `strokesBBox`：两者在"框里只有卡片"时就不一样了
+   *     （`pickBox` 把卡片的可视外接框也并进来，而卡片是能放大旋转的）。
+   *     这一处**只能有一份** "我圈的是哪一块" 的答案 —— 屏幕上那个虚线框画的就是
+   *     `sel.box`（见下面传给 BoardCanvas 的 `inkBox`），拿别的形状去问，
+   *     问出来的地方和用户看到的那一圈会对不上。
+   */
+  const askRegion = useMemo(() => {
+    const docs = board.docs || []
+    /* 板上没有课件 → 这件事无从谈起（按钮会是灰的）。这一步先挡掉，
+       免得每一帧都去扫一遍页面矩形。 */
+    if (!docs.length) return null
+    /* ⚠ 判据是**框本身的尺寸**，不是 `sel.ids.length`。
+       `sel.box` 同时是"框选"和"整组拖着走"共用的那个框（`pickBox`），
+       所以它天然就是"我圈的那一块"。null = 没框选过 / 框是空的。 */
+    const norm = sel.box ? normBox({ x0: sel.box.x0, y0: sel.box.y0, x1: sel.box.x1, y1: sel.box.y1 }) : null
+    if (!norm) return null
+    /* ⚠ `cards` 也要给它：讲解卡摆在页面**旁边**（不压在页面上），圈住它时只有
+       "卡上写着它在讲第几页"这条路能认出来（ask-region.js 的第 ② 条路）。 */
+    return findAskRegion({ box: norm, docs, cards: board.cards })
+  }, [board.docs, board.cards, sel.box])
+
+  /* 小窗开着时的状态：圈的是哪一页 / 页内哪一块 / 出生时摆在屏幕哪儿。
+     ⚠ anchor 是**开窗那一刻**算的屏幕坐标（像素），之后不再跟着视野走 ——
+       小窗是"浮在看板上的一张纸条"，跟手指一起跑反而看不清（见 AskBox 的文件头）。 */
+  const [ask, setAsk] = useState(null)
+
+  /* ══════════════════ 速查（2026-09-28）：上课突然不懂的那个词 ══════════════════
+   *
+   * 用户原话："学生上课时可能突然需要知道一个词是什么意思，那么他需要询问有地方
+   *   快速的帮他解决"，并且点明了要"既可以查我写的也可以查 ppt 上的"。
+   *
+   * ── ★ 为什么在这**一层**接线（不像作业那个窗几乎自己管自己）────────────────
+   *   从课件上挑出那个字需要两样只有 Board 手上有、拿不到就**无从算起**的东西：
+   *     ① 铺在画布上的那几份资料和它们的页面矩形（`board.docs` + `pageRects`）；
+   *     ② 当前视野（`view`），用来把"屏幕上点了一下"翻译成"第几页的第几个字"。
+   *   ⇒ QuickLook 于是可以很薄：只管显示和发请求，和监督 AskBox 一样**碰不到板**
+   *     （ADR-0006）。"答案会不会污染我的板"这件事在这一族里从来没有例外。
+   *
+   * ── 两条进来的路，各对应他点明的半个需求 ──────────────────────────────────
+   *   ① **双击课件上的字** → `pageTextItems` 取出带坐标的字、`pickWord` 挑一个候选。
+   *      这条路是"查 ppt 上的"。
+   *   ② **Ctrl+K 手打** → 这条路是"查我写的"。为什么手写那半个只能是手打：
+   *      纸上的字在被识别成卡片之前，在画布上就是一撮**笔迹**（xy 点串），
+   *      机器读不出它是什么词 —— 要读得先付一次识别的钱，而那恰好违背这个功能
+   *      "三秒内"的立意。所以这条路他自己打，而写了一手的笔记可以以"上下文"带过去。
+   */
+  const [look, setLook] = useState(null)
+  /* ⚠ Ctrl+K 那个挂在 window 上的监听要读"现在开没开"，但不能把 `look` 放进
+     依赖数组（窗开着的每一秒 `look` 都在变：改一个词就得重新绑一次监听）。
+     用 ref 镜像一份，和下面 `toggleShelfRef` 同一条路。 */
+  const lookRef = useRef(null)
+  const toggleLookRef = useRef(null)
+  useEffect(() => {
+    lookRef.current = look
+  }, [look])
+
+  /* "这门课叫什么" —— 它同时是给模型的语境、也是缓存的那一半键。
+     ⚠ 判据是**资料所在的那一层目录**（`data/信号与系统/lec3.md` → `信号与系统`），
+       不是文件名：一门课有一打的笔记，用 "lec3" 当键的话每一份都会错过上一次的缓存，
+       而"同一个词反复查"正是这个功能最该省下的那笔钱（见 lookup.js 文件头）。 */
+  const lookContext = useMemo(() => {
+    const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean)
+    const base = (parts.pop() || '').replace(/\.md$/i, '')
+    const dir = parts.pop() || ''
+    return dir || base
+  }, [file])
+
+  /* 世界坐标 → 落在哪份资料的哪一页、页内的归一化位置。
+     ⚠ 几何一律走 `pageRects`（docs.js 里只有那一份），这里不再自己推一遍 ——
+       "页面摆在哪"已经有了唯一答案，再推一遍就是两处各算一遍（必错其一）。 */
+  function docPointAt(world) {
+    for (const d of boardRef.current.docs || []) {
+      const rects = pageRects(d)
+      for (let i = 0; i < rects.length; i += 1) {
+        const r = rects[i]
+        if (!(world.x >= r.x && world.x <= r.x + r.w)) continue
+        if (!(world.y >= r.y && world.y <= r.y + r.h)) continue
+        return { doc: d, page: i + 1, x: r.w ? (world.x - r.x) / r.w : 0, y: r.h ? (world.y - r.y) / r.h : 0 }
+      }
+    }
+    return null
+  }
+
+  /* 开窗。（`cx/cy` 是**客户端坐标**，没有值时摆在视野上半部分 —— Ctrl+K 用的那一路。）
+     ⚠ 位置用**屏幕坐标**、不用世界坐标：它是"浮着瞄一眼"的东西，
+       平移/缩放不该把它带走（这一族和公式架、询问框同一条规矩，
+       而"板上不存屏幕坐标"那条规定说的是**卡片**，不是这种看完就走的浮层）。
+     ⚠ 最后交给 `chipPlacement` 夹回视野内 —— 浮出来的东西跑到屏幕外、
+       或者压在底部工具条底下，用户就点不到了（缩放柄、连接词那一族踩过好几遍的坑）。 */
+  const openLook = useCallback(
+    (seed, cx, cy) => {
+      const el = wrapRef.current
+      const w = (el && el.clientWidth) || 800
+      const h = (el && el.clientHeight) || 600
+      const rect = el ? el.getBoundingClientRect() : { left: 0, top: 0 }
+      const raw = cx == null ? { x: w / 2 - 170, y: Math.round(h * 0.16) } : { x: cx - rect.left + 16, y: cy - rect.top + 18 }
+      setLook({
+        /* ★ `key` 带上词和时间：**换一个词 = 换一个窗**。不换的话输入框里那段字、
+           已经查回来的那几条会跟着搬到新词下面 —— 那正是最难查的一类错
+           （界面把它当成"上一次的续集"，而用户要的是一次新的查）。 */
+        key: `${Date.now()}:${(seed && seed.term) || ''}`,
+        seed: { term: '', line: '', context: lookContext, ...(seed || {}) },
+        at: chipPlacement(raw, { w, h }),
+        doc: (seed && seed.doc) || null,
+      })
+    },
+    [lookContext]
+  )
+
+  /* Ctrl+K：开着就收走（同一个键管开关），没开就带上"此刻可能想要的那个词"。
+     ⚠ 预填的判据是他**此刻高亮的那几个字**（window.getSelection），不是去猜哪张卡 ——
+       选区是他自己说出来的"就是这个"；而"此刻该问哪张卡上的哪个词"没有依据可猜
+       （仓里那条规矩：猜的东西必须摆明让他改，不能假装自己知道）。 */
+  const toggleLook = useCallback(
+    (cx, cy) => {
+      if (lookRef.current) {
+        setLook(null)
+        return
+      }
+      let picked = ''
+      try {
+        const s = typeof window.getSelection === 'function' ? window.getSelection() : null
+        picked = String((s && s.toString()) || '').trim().slice(0, 40)
+      } catch {
+        picked = ''
+      }
+      openLook(picked ? { term: picked } : {}, cx, cy)
+    },
+    [openLook]
+  )
+  toggleLookRef.current = toggleLook
+
+  /* ★ 从"屏幕上这一点"挑出一个词 —— **双击**和**长按**共用这一份（2026-09-28）。
+     抽出来的理由：两条路做的是同一件事，各写一份的话"这一页读不出来怎么办"
+     这种判断迟早只改一处（这个仓库那条账：同一个东西两处实现必错其一）。
+     返回 null 表示"这儿挑不出词" —— 双击/长按在课件空白处、或者这一页是张扫描图
+     （图片资料，`pageTextItems` 返回 null）时都是这个结果，那种情况**一律不给反应**：
+     弹出一个空窗会让人以为自己点中了什么。 */
+  async function lookWordAt(clientX, clientY) {
+    const el = wrapRef.current
+    if (!el) return null
+    const rect = el.getBoundingClientRect()
+    const world = screenToWorld(clientX - rect.left, clientY - rect.top, boardRef.current.view)
+    const hit = docPointAt(world)
+    if (!hit) return null
+    let items = null
+    try {
+      items = await pageTextItems(hit.doc.path, hit.page)
+    } catch {
+      items = null /* 这一页读不出来（坏 PDF / 扫描页）时当"这儿没有字"，不是一个崩溃 */
+    }
+    if (!items || !items.length) return null
+    const got = pickWord(items, hit.x, hit.y)
+    if (!got || !got.term) return null
+    return { term: got.term, line: got.line, doc: { path: hit.doc.path, page: hit.page } }
+  }
+
+  /* 双击课件上的字 → 速查。
+     ⚠ 挂在 `.bd-stagewrap`（画布最外层）上，而不是塞进 DocLayer 里面：资料那一整层
+       是 `pointer-events: none`（笔要能写在 PPT 上，这是这个应用立身的那一条），
+       指针事件只能从下面这一层收。
+     ⚠⚠ 而且必须是 **Capture**（这个结果是实测出来的，不是猜的，2026-09-28）：
+       第一下按下去就已经生成一个选区了，而选区的**手柄正好垫在鼠标底下**
+       ⇒ 第二下按的是手柄（`dblclick` 的 target 是 `.bd-pickhandle`），
+       而手柄上挂着 `stopPropagation`（BoardCanvas 里那句"双击别落到纸上"）——
+       写在冒泡阶段的话这个事件**永远到不了这里**，而界面上唯一看得见的是
+       工具条那句「框太小了」，谁也想不到是双击这条路断在这儿。
+       捕获阶段是从外面往里走 ⇒ 手柄那句拦不住它。
+     ⚠ 也正是这一条让上面那个 `closest(...)` 车闸成为必需：捕获阶段什么都看得见，
+       于是"双击一张卡"也会被它看见 —— 那些有 owner 的东西得自己让开（见下面）。
+     ⚠ **只在真的挑出一个词的时候才开窗**：双击在课件空白处、或者这一页是张扫描图
+       （图片资料，`pageTextItems` 返回 null）时一律不给反应 ——
+       弹出一个空窗会让人以为自己点中了什么。
+     ⚠ 笔还握在手上时（`tool !== 'select'`）不开窗：双击会顺手留下两撮墨点，
+       而他多半只是想把笔挪一下。那时候给一句人话，把正确的手势教给他。 */
+  async function onStageDoubleClick(e) {
+    /* ★★ 双击**已经有别人在管的东西不算**：双击一张卡是"改这张卡的字"、
+       双击板框上那个名字是"给这一节起名" —— 它们都自带 handler，
+       这里不能顺手再开一个窗（卡片摆在课件页面上的时候，一次双击会变成两件事）。
+       ⚠ **手柄不在这份名单里**，这一点是刻意的：框选工具下第一下按下去就会生成一个零宽选区，
+       而它的手柄正好垫在鼠标底下 ⇒ 第二下按到的就是手柄（实测：target 是 `.bd-pickhandle`）。
+       手柄只是"别让双击取消选中"，它并不拥有双击这件事 ——
+       把它算进来的人，第一次"双击课件上的字"就永远叫不出来。 */
+    const t = e.target
+    if (t && t.closest && t.closest('.bd-card, .bd-docbar, .bd-frame-t')) return
+    const got = await lookWordAt(e.clientX, e.clientY)
+    if (!got) return
+    if (tool !== 'select') {
+      flash('查词：先点工具条上的「⬚ 框选」，再双击课件上的字（握着笔的时候双击会在纸上留下两个墨点）', 'ok')
+      return
+    }
+    openLook(got, e.clientX, e.clientY)
+  }
+
+  /* ── ★★ 没有键盘的那半边（2026-09-28，用户问的原话：「surface 没键盘的时候
+     怎么摁这些快捷键」）────────────────────────────────────────────────────
+     原先那两条进来的路**都要键盘、或者要手快**：
+       · Ctrl+K —— 平板上没有 Ctrl，为了它去接一个外接键盘，正是用户不想做的事
+         （他的老规矩见 BoardBar 里「⧉ 粘贴」那条注释）；
+       · 双击 —— 触屏上确实能用，但浏览器认"双击"的判据是**两次点击落在半秒之内**，
+         手指和笔做不到那么准，而老师已经在讲下一句了。
+     ⇒ 补一条**按住不放**：手指或笔停在课件那个词上别动，就当他要查这个。
+       这是触屏上唯一不要求"又快又准"的输入，也最接近课堂上的真实动作
+       （愣了一下、手指就停在那个词上了）。
+     ⚠ 只对 touch / pen 启用：鼠标那边双击和 Ctrl+K 都好好的，
+       给鼠标加长按只会让"按住拖一下"多出一个误触源。
+     ⚠ 手指一动就把定时器掐了：平移画布、框选、翻页划动，全都长得像"按下 + 移动"，
+       所以"没动"是长按判据的一部分。
+     ⚠ 取词仍然走上面那个 `lookWordAt` —— 手势各不相同，怎么挑词只有一处说话。 */
+  const pressRef = useRef(null)
+  function cancelPress() {
+    const p = pressRef.current
+    pressRef.current = null
+    if (p && p.timer) clearTimeout(p.timer)
+  }
+  async function pressLook(x, y) {
+    const got = await lookWordAt(x, y)
+    if (!got) return
+    openLook(got, x, y)
+  }
+  function armPress(e) {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return
+    if (tool !== 'select') return
+    const t = e.target
+    if (t && t.closest && t.closest('.bd-card, .bd-docbar, .bd-frame-t')) return
+    cancelPress()
+    const x = e.clientX
+    const y = e.clientY
+    const timer = setTimeout(() => {
+      pressRef.current = null
+      pressLook(x, y)
+    }, LOOK_PRESS_MS)
+    pressRef.current = { x, y, timer }
+  }
+  /* ⚠ 一律走**捕获阶段** —— 手柄、卡片上的 `stopPropagation` 会把手势掐死在半路上
+     （双击那条就是这样断过一次的，上面那段就是当时的现场记录）。 */
+  const onStagePointerDownCapture = (e) => {
+    trackPointerKind(e)
+    armPress(e)
+  }
+  const onStagePointerMoveCapture = (e) => {
+    trackPointerKind(e)
+    const p = pressRef.current
+    if (!p) return
+    /* 动了就不算"按住"。10px 是留给手抖的：没人能在触屏上一动不动，
+       而 600ms 里偏个两三个像素是常事。 */
+    if (Math.abs(e.clientX - p.x) > LOOK_PRESS_SLOP || Math.abs(e.clientY - p.y) > LOOK_PRESS_SLOP) cancelPress()
+  }
+
+  /* 「⬇ 留到板上」的兑现：
+     · 这个词是**从课件上双击来的** ⇒ 贴到那一页旁边，走 `keepAnswer`
+       （这一页多占的那点空、后面那些页要跟着挪，全是那一套，同一件事只有一处代码）；
+     · 是 **Ctrl+K 手打的** ⇒ 板上没有它对应的一页，"贴在那页旁边"这句话说不出来
+       （"旁边"要有东西才叫旁边），那就摆在**视野中央** —— 和手写识别落成卡片同一个地方。
+     ⚠ 下面这一段看着像把 keepAnswer 抄了一遍，其实只有"摆在哪"这件事是新的：
+       量尺寸（`measureDeck` + `deckCardNodes` + `richHtml` + `SIDE_W`）、
+       卡上的字（`cardText`）、包成它认的那个条目（`answerItem`）都是同一个函数，
+       刻意不去动 keepAnswer 里那套 pageGaps / shiftLaterPageCards ——
+       它没有一页可对齐，硬塞一个 `at` 参数进去会把它搅成两种语义混在一个函数里。 */
+  function keepQuick({ made, doc } = {}) {
+    if (doc && doc.path && Number(doc.page) > 0) {
+      return keepAnswer({ docPath: doc.path, page: Number(doc.page), made, from: 'look' })
+    }
+    const item = answerItem('keep1', made)
+    if (!item) {
+      flash('这一条是空的，没什么可留的', 'warn')
+      return false
+    }
+    const host = makeMeasureHost(wrapRef.current)
+    let sized
+    try {
+      sized = measureDeck({
+        items: [item],
+        renderTex: deckCardNodes,
+        renderRich: richHtml,
+        host,
+        s: boardRef.current.view.s || 1,
+        fixedW: SIDE_W,
+      })
+    } finally {
+      if (host.parentNode) host.parentNode.removeChild(host)
+    }
+    const sz = sized.sizes.get(item.id)
+    if (!sz) {
+      flash('这张卡量不出尺寸（公式排不出来？）—— 没能贴上去，换个问法再试', 'warn')
+      return false
+    }
+    const c = stageCenterWorld()
+    const fresh = {
+      ...newCard('note', 0, 0),
+      x: Math.round(c.x - sz.w / 2),
+      y: Math.round(c.y - sz.h / 2),
+      w: sz.w,
+      h: sz.h,
+      text: cardText(item),
+      rich: true,
+      answer: true,
+    }
+    commit((cur) => ({ ...cur, cards: [...cur.cards, fresh] }))
+    fitter.queue(fresh.id, { fitWidth: false })
+    flash('留在板上了：摆在你正看着的这一屏中央 —— 点「↶ 撤销」（或 Ctrl+Z）能退，拖到哪儿随你', 'ok')
+    return true
+  }
+
+  /* 板变了之后，小窗指着的那一页 / 那一块可能已经没了（换了板、把课件移掉了、
+     删了资料）。这时候**自己收掉**，而不是让一个指着空气的窗留着。
+     判据：拿出生时那份页内矩形（region）反算世界矩形，再看它还在不在同一页上 ——
+     这样连"课件被拖走了"也认得出（矩形不重合了，说明它指的是别处）。 */
+  const askSig = board.docs && board.docs.length ? board.docs.map((d) => d.id + ':' + d.x + ':' + d.y).join(',') : ''
+  useEffect(() => {
+    if (!ask) return
+    const d = (boardRef.current.docs || []).find((x) => x.id === ask.docId)
+    const rects = d ? pageRects(d) : []
+    const r = rects[ask.page - 1]
+    if (!r) {
+      setAsk(null)
+      flash('那一页已经从板上移走了，追问的小窗收起来了', 'warn')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [askSig, ask && ask.docId, ask && ask.page])
+
+  /** 开窗：把"圈住的这一块"变成一个可以追问的对象。
+   *  三种"不能问"各自给一句人话 —— 「点了没反应」是这一族最糟的失败方式。 */
+  function openAsk() {
+    /* ⚠ 判据是"**圈过了没有**"（`sel.box`），不是"圈到笔了没有"（`sel.ids`）——
+       见上面 askRegion 那段 2026-09-21 的修正：追问圈的是**课件**。 */
+    if (!sel.box) {
+      flash('先框住课件上你不懂的那一块（点「⬚ 框选」拖一个框，或者按住笔杆键拖）', 'warn')
+      return
+    }
+    if (!(boardRef.current.docs || []).length) {
+      flash('这块板上还没有课件 —— 追问问的是课件上的哪一块，先「📄 插入 PDF/PPT」', 'warn')
+      return
+    }
+    const hit = askRegion
+    if (!hit) {
+      flash('框里没有课件页面 —— 追问要圈在课件的页面上，或者圈住某一页旁边的讲解卡（问的就是它在讲的那一页）', 'warn')
+      return
+    }
+    /* 圈住的是卡片、不是页面本身 → 说清楚问的是哪一页（不然小窗突然讲起别的东西）。 */
+    if (hit.fromCard) flash(`圈住的是讲解卡 —— 按它讲的**第 ${hit.page} 页**来问`, 'ok')
+    /* 摆放：选区块**右边**、顶边对齐。右边放不下（贴着窗口右缘）就翻到左边。
+       上下按画布高度夹住 —— 小窗比选区高多了，不夹的话它下半截会被底部工具条盖住
+       （那一带是 z-index 20，而按钮"看得见点不到"这个坑这个仓库踩过三次）。 */
+    const el = wrapRef.current
+    const v = boardRef.current.view
+    const at = worldToScreen({ x: hit.box.x1, y: hit.box.y0 }, v)
+    const W = 366
+    const H = 460
+    const vw = el ? el.clientWidth : 900
+    const vh = el ? el.clientHeight : 600
+    const gap = 14
+    const left = at.x + gap + W <= vw - 8 ? at.x + gap : Math.max(8, at.x - gap - W)
+    const top = Math.max(8, Math.min(at.y, vh - H - 96))
+    setAsk({
+      docId: hit.doc.id,
+      doc: hit.doc,
+      page: hit.page,
+      /* 页内归一化矩形（0~1）—— **存它而不是世界矩形**：世界矩形要跟着资料走，
+         而"这一块在页面的哪个位置"是这一页自己的事（ask-region.js 那条口径）。 */
+      region: hit.region,
+      box: hit.box,
+      clipped: hit.clamped,
+      anchor: { x: left, top },
+    })
+    if (hit.clamped) flash('圈到页面外面了 —— 按页内的那一块问', 'ok')
+  }
+
+  /** 圈住的这一块**落在课件的第几页**（0 = 不在任何一页上）—— 按钮的灰不灰看它。 */
+  const askPage = askRegion ? askRegion.page : 0
+  /* 小窗开着时画在板上的那一圈高亮：**世界矩形**现算（跟着视野走）。
+     ⚠ 不能用 `ask.box`（那是开窗那一刻的）—— 平移之后它会留在原地，
+       而小窗讲的是活的那一块地方。 */
+  const askMark = useMemo(() => {
+    if (!ask) return null
+    const rects = (board.docs || []).filter((d) => d.id === ask.docId).flatMap((d) => pageRects(d))
+    const r = rects[ask.page - 1]
+    if (!r) return null
+    const box = regionToWorld(ask.region, r)
+    return box ? { box, page: ask.page } : null
+  }, [ask, board.docs])
+
+  /* ── 「留到板上」留下的卡：点它左下角那颗 ◎，把"我当时圈的是哪一块"亮出来 ─────────
+   * 卡片上的 `ask` 字段（ADR-0006 决定 ③）就是为这一下存在的 —— 不然它是一堆没人读的字节。
+   * 高亮的画法和追问那一圈**共用**（`.bd-askmark` / BoardCanvas 的 `askRegionBox`）：
+   * 两套画法会长成两个样子，而"框画歪了"这种事只能靠眼睛发现。
+   * ★ 判据：**点一下亮、再点收起**（不做"过几秒自己消失"）——
+   *   用笔的人腾不出手去追一个会自己跑掉的东西。 */
+  const [keptMark, setKeptMark] = useState(null) // { cardId, docPath, page, region } | null
+  const keptBox = useMemo(() => {
+    if (!keptMark) return null
+    const live = (board.cards || []).some((c) => c.id === keptMark.cardId)
+    if (!live) return null
+    const docs = board.docs || []
+    /* "卡上那份 `ask.doc` 指的是板上哪一份资料"只有 ask-region.js 那一份判据。 */
+    const d = docForPath(docs, keptMark.docPath)
+    const r = d ? pageRects(d)[keptMark.page - 1] : null
+    if (!r) return null
+    const box = regionToWorld(keptMark.region, r)
+    return box ? { box, page: keptMark.page } : null
+  }, [keptMark, board.cards, board.docs])
+
+  /** 卡片上那颗 ◎：亮出 / 收起"这张卡问的是哪一块"。三种亮不出来各自给一句人话。 */
+  function toggleAskMark(card) {
+    const a = card && card.ask
+    if (!a) return
+    if (keptMark && keptMark.cardId === card.id) {
+      setKeptMark(null)
+      return
+    }
+    if (!a.region) {
+      flash('这张卡没记下圈的是哪一块（当时圈得太小了）—— 它记着的是第 ' + a.page + ' 页', 'warn')
+      return
+    }
+    const docs = boardRef.current.docs || []
+    const d = a.doc ? docs.find((x) => x.path === a.doc) : docs.length === 1 ? docs[0] : null
+    if (!d) {
+      flash('这张卡问的那份课件已经不在板上了 —— 位置还在卡片里记着，课件铺回来就看得见', 'warn')
+      return
+    }
+    if (!pageRects(d)[a.page - 1]) {
+      flash(`这张卡问的是第 ${a.page} 页，那份课件里没有这一页了`, 'warn')
+      return
+    }
+    setKeptMark({ cardId: card.id, docPath: d.path, page: a.page, region: a.region })
+  }
+
   /* ── 框住的笔里，有哪些是"能规整的形状" ────────────────────────────────────
    * 用户 2026-09-18：「加入常用形状优化方式，比如我画个圆他给我优化成真正的圆形，
    * 直线也是还有常用的矩形，三角形都能自动优化」。
@@ -1383,7 +2034,20 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          这一条在写字板上也踩过一次（README 的坑 #7），是同一个错。
          记法：**捕获的对象和挂监听的对象必须是同一个元素。** */
       e.currentTarget.setPointerCapture?.(e.pointerId)
-      pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      /* ★ 僵尸指针自愈（2026-09-30，上课时用户被"写不了字、拖不动卡、选区清不掉"
+         卡住）：触屏/笔/触控板有一次手势被系统半路抢走（手掌误触、Edge 手势接管、
+         长按弹菜单）时，pointerup / pointercancel 可能一条都不来 ——
+         这条记录就**永远留在 Map 里**，size 从此 >= 1。下一次正常落笔恰好凑成
+         "双指"进了下面的捏合分支：笔画作废、按下全被吞 —— 写不出字、按不动卡、
+         连"点空白清选区"都走不到（它在这个分支后面），整个白板看起来就是死的。
+         自愈判据：**10 秒前"按下"的指针不可能还按着**（正常落笔一两秒内必然松手），
+         down 的时候顺手把超时的老条目清掉，世界就恢复正常了。
+         （每个条目记下按下的时刻 `t`；move 更新坐标时也刷新它。） */
+      const nowT = Date.now()
+      for (const [pid, pp] of pointersRef.current) {
+        if (nowT - (pp.t || 0) > 10000) pointersRef.current.delete(pid)
+      }
+      pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY, t: nowT })
 
       // 双指 → 缩放；同时**作废已经起笔的那一笔**（写字时手掌误触非常常见）
       if (pointersRef.current.size === 2) {
@@ -1520,7 +2184,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
 
       if (pointersRef.current.has(e.pointerId)) {
-        pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+        pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY, t: Date.now() })
       }
 
       // 捏合缩放
@@ -1659,11 +2323,20 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           if (one) ids = [one.id]
         }
         /* 框住了 → 焦点变成"这一撮东西"（笔迹 + 卡片）；框空了 → 只取消墨迹那一种
-           （板框的选中留着，和从前一样）。 */
-        setFocus((f) => (ids.length || cards.length ? focusInk(ids, cards) : clearInkFocus(f)))
+           （板框的选中留着，和从前一样）。
+           ⚠ `pickBox` 会把这次框选的矩形交给空选区（2026-09-21，见下面那条注释）——
+              所以"框里没有笔"不再等于"这次框选没发生"。 */
+        setFocus((f) => (ids.length || cards.length ? focusInk(ids, cards) : clearInkFocus(f, box)))
         /* 空框说一句人话。静默什么都不发生是最让人迷惑的 ——
-           用户会以为"框选坏了"，而其实只是框小了/框到空白上了。 */
-        if (!ids.length && !cards.length) flash('框里没有笔迹 —— 框大一点，或者框到字上', 'warn')
+           用户会以为"框选坏了"，而其实只是框小了/框到空白上了。
+           ★ 2026-09-21 改口径：从前这句是「框里没有笔迹 —— 框大一点，或者框到字上」，
+             把"框到字上"说成了框选的**唯一**用处。而圈住课件上的一块去「？问这里」
+             本来就不需要框到任何字（用户投诉的正是这一点）。所以只在"框太小"
+             这一种情况下提醒，别的东西一概不唠叨 —— 圈在课件上是**合法的**用途。 */
+        if (!ids.length && !cards.length) {
+          const tiny = worldLenToScreen(box.x1 - box.x0, vs) <= 4 && worldLenToScreen(box.y1 - box.y0, vs) <= 4
+          if (tiny) flash('框太小了 —— 按住拖一个框，圈住你要处理的那一块', 'warn')
+        }
         return
       }
 
@@ -1726,6 +2399,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
   }, [setView])
 
   // ── 键盘 ──
+  /* ★ 箭头工具**只有一个入口实现**（2026-09-24）：按 A 和点工具条上那颗按钮都走它。
+     从前工具条那颗自己写了一遍"切工具 + 说一句提示"，而它在那个组件里**拿不到 `flash`**
+     —— `flash` 是 App 传下来的 prop，不是随手可用的全局函数（2026-09-17 加那颗按钮时
+     就这么写下了，一直是个 `ReferenceError`：工具照样切了，只是那句话出不来，
+     而且报错只落在控制台里，界面上看不出事）。
+     合成一个 `pickArrow` 之后，两个入口说的也是同一句话 —— 改词只改一处。 */
+  const pickArrow = useCallback(() => {
+    setTool('arrow')
+    flash('箭头工具：从一样东西划到另一样东西（画完自动回到笔）', 'ok')
+  }, [flash])
+
   useEffect(() => {
     /* "在输入框里打字"这条判据住在 focus.js（它和"冲纸面还是冲面板"是姊妹条 ——
        从前这里是一条 `/^(INPUT|TEXTAREA)$/`，而面板上的 `<button>` 不算 input，
@@ -1735,6 +2419,19 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       if (e.code === 'Space' && !inField(e.target)) {
         spaceRef.current = true
         e.preventDefault()
+        return
+      }
+      /* ★☆ 速查 Ctrl+K（2026-09-28）：上课突然不懂的那个词。
+         ⚠⚠ 必须排在 `inField` 那道闸**之前**，这一点是刻意的，不是漏了：
+           这个功能最常见的用法恰恰是"我正写着笔记 / 改着卡片，突然想问一个词" ——
+           闸在前面的话，正在打字的时候按 Ctrl+K 会毫无反应，而那正是最要用它的时刻。
+           （上面那些带 mod 的分支不受影响：`inField` 挡的是单个字母键的工具切换，
+            比如在这里打一个 `e` 不能把工具切成橡皮。）
+         ⚠ 走 ref 而不是闭包里的函数：`toggleLook` 每次渲染都是新对象，写进依赖数组
+           就会每改一个词重新绑一次 window 监听（和上面 `toggleShelfRef` 同一条路）。 */
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        if (toggleLookRef.current) toggleLookRef.current()
         return
       }
       if (inField(e.target)) return
@@ -1783,9 +2480,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       }
       if (mod && e.key === '0') {
         e.preventDefault()
-        const el = wrapRef.current
         // 装回屏幕 = 程序适配，不是你定的视野 → pin=false，下次打开还会重新适配
-        if (el) setView(fitView(boardRef.current, el.clientWidth, el.clientHeight, 70), false)
+        fitToScreen()
         return
       }
       /* 那排词浮着的时候：`1`~`5` 直接选一个（鼠标用户不用去点它），`Esc` 收走。
@@ -1858,11 +2554,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       if (e.key === 's' || e.key === 'S') return setTool('select')
       /* A = arrow：箭头工具（一次性的，见 ADR-0001）。挑 A 是因为它没被占，
          而且"Arrow"这个词本身就带着它 —— 用笔的人不用跑去点栏上那颗按钮。 */
-      if (e.key === 'a' || e.key === 'A') {
-        setTool('arrow')
-        flash('箭头工具：从一样东西划到另一样东西（画完自动回到笔）', 'ok')
-        return
-      }
+      if (e.key === 'a' || e.key === 'A') return pickArrow()
       // W = write：写字板。挑 W 是因为它没被占（P 是笔、E 是橡皮、Space 是平移）
       if (e.key === 'w' || e.key === 'W') {
         setPadOpen((v) => !v)
@@ -1890,7 +2582,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      selectedFrameId 四个 —— 四个里漏一个，"按键读到的是旧的焦点"（删错东西）。
      `copySel` / `pasteSel` 也必须进来：它们闭包住 `inkSel` / `sel`，
      漏了就会"框住了新的一撮、Ctrl+C 复制的还是上一撮"。 */
-  }, [undo, redo, setView, focus, commit, deleteInkSel, linkPick, linkByStroke, copySel, pasteSel, regularizeInkSel])
+  }, [undo, redo, setView, focus, commit, deleteInkSel, linkPick, linkByStroke, copySel, pasteSel, regularizeInkSel, pickArrow, flash])
 
   // ══════════════════ 卡片 ══════════════════
   const stageCenterWorld = useCallback(() => {
@@ -2045,6 +2737,48 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash(locked ? '固定住了：拖不动、双击也不会进编辑（点 📌 解开）' : '解开了，可以拖了', 'ok')
   }
 
+  /* 「全部解开」一颗（2026-09-30，上课时用户被 196 张钉住的讲义卡堵住）：
+   * 课件整理贴上来的卡**一律先钉住**（见下面贴卡那条 ★★），一节课贴下来一两百张，
+   * 每张左下角一颗 📌 —— 想挪版面的人一颗颗点回去不现实，整块板看起来就像"卡死了"。
+   * 这颗把**所有** `locked: true` 一次解开；写 `locked: false` 是安全的
+   * （序列化只在真的锁了的时候才写这个字段，见 lib/board.js —— 落盘还是干净的）。
+   * 对称的"全部固定"故意不做：钉住是贴卡的默认，想钉哪张点哪张的 📌。 */
+  function unlockAllCards() {
+    const n = boardRef.current.cards.filter((x) => x.locked === true).length
+    if (!n) {
+      flash('没有钉住的卡', 'ok')
+      return
+    }
+    commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.locked === true ? { ...x, locked: false } : x)) }))
+    flash('解开了 ' + n + ' 张钉住的卡 —— 现在都能拖了；要重新钉住哪张就点它左下角的 📌', 'ok')
+  }
+
+  /* 「⟲ 恢复操作」一颗（2026-09-30，和上面那颗同一天、同一个症状）：
+   * 一次手势**没收尾**的时候，它的状态就留在那些 ref 里（按下、平移、捏合、框选、箭头、
+   * 整块拖动各有一份）。只要有一份没收，下一次落笔就可能走进"还在上一次手势里"那条路 ——
+   * 用户眼里就是：写不出字、按不动卡、选区一直清不掉，**整个白板像死了**。
+   * 什么时候会没收尾：切窗口（Alt+Tab）、系统弹窗、手掌误触、笔尖离开屏幕太快 ——
+   * 这些时候浏览器常常**一个 pointerup / pointercancel 都不给**。
+   *
+   * 这一颗就是那个明确的"重新开始"：**把手势状态全部清空 + 取消选中 + 擦掉没画完的那一笔**。
+   * 它**不动板上的内容**（一笔一划、卡片位置一个字节都不改），所以点了不会有损失 ——
+   * 这也是它比"刷新页面"好的地方：刷新要等重新加载，而写了一半的稿子还在。
+   * ⚠ 和 10 秒自愈（见 onPointerDown 那条注）是两道闸，不是重复：
+   *   自愈是"下一次落笔时顺手清理"（得等一次落笔），这一颗是"我现在就要好"。 */
+  function resetGestures() {
+    pointersRef.current.clear()
+    pinchRef.current = null
+    panRef.current = null
+    drawRef.current = null
+    lassoRef.current = null
+    arrowRef.current = null
+    inkMoveRef.current = null
+    setLasso(null)
+    clearLive(liveRef)
+    setFocus(FOCUS_NONE)
+    flash('已经把手势和选中都清掉了 —— 板上的东西一个字节都没动', 'ok')
+  }
+
   /* ── 箭头工具：一次划动 = 一条连接（见 ADR-0001）───────────────────────────
    *
    * 用户 2026-09-17：「现在在识别上箭头啊、墨迹块啊很可能达不到用户的需求，
@@ -2153,6 +2887,43 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    *   （一句话说出口、重开之后就没路，那是单向门）。
    */
 
+  /* 连接线浮层（`.bd-inklink`）上这三颗按钮的处理器：把 `selection.js` 里
+     `vetoCond` / `specCond` / `clearCond` 三个纯函数接回界面（关系面板 2026-09-19 删了，
+     这是它们的新家）。三个都走 `commit` —— 一句话说出去、按一下 Ctrl+Z 能退回。 */
+  function applyVetoCond(link) {
+    if (!link) return
+    const b = boardRef.current
+    const next = vetoCond(b, link)
+    if (next === b) return
+    commit(next)
+    flash('这条连接：条件不算了（Ctrl+Z 能退回）', 'ok')
+  }
+  function applySpecCond(link) {
+    if (!link) return
+    const cards = (sel.cards || []).filter((c) => c && c.id)
+    const inks = (sel.strokes || []).filter((s) => s.id && s.id !== link.strokeId)
+    const targets = [...cards, ...inks]
+    if (targets.length !== 1) {
+      flash('先框住要当条件的那一张卡（或那一笔），再点「就是它」', 'warn')
+      return
+    }
+    const t = targets[0]
+    const value = cards.includes(t) ? `card:${t.id}` : `ink:${t.id}`
+    const b = boardRef.current
+    const next = specCond(b, link, value)
+    if (next === b) return
+    commit(next)
+    flash(`条件指定为${cards.includes(t) ? '那张卡' : '那一笔'}，按位置读不再生效（Ctrl+Z 能退回）`, 'ok')
+  }
+  function applyClearCond(link) {
+    if (!link) return
+    const b = boardRef.current
+    const next = clearCond(b, link)
+    if (next === b) return
+    commit(next)
+    flash('这条连接：回到按位置读条件（Ctrl+Z 能退回）', 'ok')
+  }
+
   /* ── 板框：留下 / 拆开 / 改标题 / 整体挪（见 ADR-0001、lib/frames.js）──────────
    * 从前这里叫"固定成一块"（`groups`）：**不可见**、只能装笔迹。现在它是**板框** ——
    * 有框线、有标题、成员可以是笔迹和卡片，还能整体拖动。
@@ -2230,23 +3001,133 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    * 以后打开只靠这张尺寸表摆页面，不再解析 PDF。
    */
   const docInputRef = useRef(null)
-  const [docBusy, setDocBusy] = useState(null) // 非空 = 正在上传/转换/量页面（工具条上显示这句话）
-  /* 正在整理哪一份资料（非空 = 那个窗口开着）。见下面「课件整理」那一节。 */
+  /* 这个文件框**这次是给谁用的**：'insert' = 铺到板上当资料；'deck' = 只收进 data/.资料/，
+     直接整理成知识点。一个框两个用途，所以意图要在点它**之前**记下来 ——
+     `change` 事件里读不出用户点的是哪一颗按钮。 */
+  const docIntentRef = useRef('insert')
+  /* 非空 = 正在上传/转换/量页面（`who` 决定这句话显示在哪颗按钮上）。 */
+  const [docBusy, setDocBusy] = useState(null)
+  /* 「要不要只抽这几页」那个小窗开着没有（`null` = 没在问，`total` = 这份有多少页）。
+     ★ **一个 Promise 桥**：选文件那趟是异步的，而"用户写了哪几页"要从窗里回来 ——
+       本文件里凡是"等用户回一句"的浮层都是这个形状（各写一套的话，一定会有一处忘记关窗）。
+       开窗的那个是 `askDocPages`、收话的是 `answerDocPages`。 */
+  const [sliceAsk, setSliceAsk] = useState(null)
+  const sliceResolveRef = useRef(null)
+  /* 刚才那一份是不是**抽出来的**（`maybeSlicePdf` 里置位）：抽出来的那几页就是要
+     做题的，所以那句提示得换一套说法 —— 告诉他"圈住题号就能交给老师"，
+     而不是"拖顶上的条子挪位置"（他根本不打算挪）。 */
+  const slicedRef = useRef(false)
+
+  /** 弹那个小窗，等到用户回了话：回的是页码数组（`[]` = 整本都要、`null` = 算了）。 */
+  function askDocPages(ask) {
+    return new Promise((resolve) => {
+      sliceResolveRef.current = resolve
+      setSliceAsk(ask)
+    })
+  }
+
+  /** 那个小窗交回话（`pages = null` 就是他在框上按了 ✕ / Esc）。 */
+  function answerDocPages(pages) {
+    const r = sliceResolveRef.current
+    sliceResolveRef.current = null
+    setSliceAsk(null)
+    if (r) r(pages)
+  }
+  /* 正在整理哪一份课件（非空 = 那个窗口开着）。见下面「课件整理」那一节。
+     ⚠ 它**不一定在板上** —— 「直接选文件」那条路给的是一个临时对象（见 readDeckFromFile）。 */
   const [deckFor, setDeckFor] = useState(null)
+  /* 作业辅导那个窗口开着没有；`hwDoc` = 窗里选中的是**哪一份**（'' = 板上第一份）；
+     `hwTarget` = 这一次是从**框住的那一块**进来的（非空 = {docId, doc, page, region}）。
+     见下面「作业辅导」那一节。 */
+  const [hwOpen, setHwOpen] = useState(false)
+  const [hwDoc, setHwDoc] = useState('')
+  const [hwTarget, setHwTarget] = useState(null)
+
+  function pickDocFile(intent) {
+    docIntentRef.current = intent
+    if (docInputRef.current) docInputRef.current.click()
+  }
+
+  /** 收这份之前先看一眼：**这本书有多厚**？够厚的话问他一句"只要这几页吗"。
+   *
+   *  ★ 三条入口（插入 / 课件整理 / 作业辅导）共用这一处 —— 上传本来就只有
+   *    `receiveDoc` 一条路，抽页跟着住在那儿，就不会出现"作业那条路没抽成"这种事。
+   *
+   *  ⚠ **读不出页数就当它不厚**，原样整本传：部分教材 PDF 是加密/损坏的，
+   *    那不该变成一道墙 —— 抽页是给抽得动的那一份准备的便利，不是必经的步骤。
+   *  ⚠ `null` = 他在那个框里按了「算了」（整个插入取消，由调用方收摊）。 */
+  async function maybeSlicePdf(f, who) {
+    if (!f || !/\.pdf$/i.test(f.name || '')) return f
+    let pdf = null
+    try {
+      pdf = await openLocalPdf(f)
+    } catch {
+      return f /* 读不动：整本传，别拦着他 */
+    }
+    if (!pdf || !Number.isFinite(pdf.count) || pdf.count < SLICE_ASK_MIN) return f
+    setDocBusy({ who, text: '等你说是哪几页…' })
+    let pages = null
+    try {
+      /* ★ 连缩略图那台机器一起递进去：他要"先看一眼是不是这几页"（书上的页码
+         和 PDF 的页码常常差一点 —— 封面没算进去）。机器**由那个窗自己**在要画
+         第一张时才开，这里不替他开。 */
+      pages = await askDocPages({ name: f.name, total: pdf.count, preview: pdf.thumbs })
+    } finally {
+      /* ⚠ 窗关了就必须把那份 pdf.js 文档放掉：它是**额外**开的一份
+         （和屏幕翻页那份并存），一本几百页的书开两份不是小数。 */
+      pdf.close()
+    }
+    if (!pages) return null
+    if (!pages.length) return f /* 他要整本 */
+    setDocBusy({ who, text: `正在抽 ${pages.length} 页…` })
+    const blob = await pdf.slice(pages)
+    slicedRef.current = true
+    /* ★ 名字里带着页数范围：同一本书抽三段，盘上是三份各有名字的资料，
+       回头不会再错认成"这一份怎么只有三页"。 */
+    return new File([blob], sliceFileName(f.name, pages), { type: 'application/pdf' })
+  }
+
+  /** 收一份课件（PDF/PPT/图片）：上传（服务端把 PPT 转成 PDF）+ 量每一页的尺寸。**不碰板**。
+   *  两条路共用：插到板上做资料（`insertDocFile`）、直接整理（`readDeckFromFile`）。
+   *  ★ 同一个文件服务端按内容认得住（server-docs.js 的 findByContent）：收过就返回
+   *    原来那份（`up.duplicate`），于是缓存、页码、"这是哪一份"全都还对得上。
+   *  ⚠ 返回 `null` = 他在"抽哪几页"那个框上按了「算了」（没人收拾键盘/flash，他自己知道的）。 */
+  async function receiveDoc(f, who) {
+    setDocBusy({ who, text: '正在上传…' })
+    try {
+      slicedRef.current = false
+      const src = await maybeSlicePdf(f, who)
+      if (!src) return null
+      const fd = new FormData()
+      fd.append('file', src)
+      const up = await fetch('/api/doc/upload', { method: 'POST', body: fd }).then((r) => r.json())
+      if (!up || up.ok === false) throw new Error((up && up.error) || '服务端没回话')
+      setDocBusy({ who, text: '正在读页面…' })
+      const info = await readDocInfo(up.path)
+      return { up, info }
+    } finally {
+      setDocBusy(null)
+    }
+  }
 
   async function insertDocFile(f) {
     if (!f) return
-    setDocBusy('正在上传…')
     try {
-      const fd = new FormData()
-      fd.append('file', f)
-      const up = await fetch('/api/doc/upload', { method: 'POST', body: fd }).then((r) => r.json())
-      if (!up || up.ok === false) {
-        flash((up && up.error) || '插入失败：服务端没回话', 'warn')
+      const got = await receiveDoc(f, 'insert')
+      /* 他在"抽哪几页"那个框上按了「算了」—— 什么都不做（也不骂人：他自己按的）。 */
+      if (!got) return
+      const { up, info } = got
+      /* ★ 抽出来的那几页是**为做题**才挑的 —— 那句话就要顺着说下去：
+         "圈住题号 → 做这道题"，而不是"拖条子挪位置"（他根本不打算挪）。
+         整本放上来的仍旧说老那一句。 */
+      const sliced = slicedRef.current
+      /* 板上**已经有这一份**（服务端按内容认出来是同一个文件）：不再摆第二份 ——
+         引用同一个 PDF 的两份资料没有意义（docs.js 的 normalizeDocs 也是这么判的），
+         而且用户多半只是又点了一次「插入」。 */
+      if ((boardRef.current.docs || []).some((d) => d.path === up.path)) {
+        flash('这份课件已经在板上了 —— 直接拖它顶上的把手挪位置就行', 'ok')
         return
       }
-      setDocBusy('正在读页面…')
-      const info = await readDocInfo(up.path)
       /* 摆放：当前视野正中（第一页顶边对准视野上三分之一处），用户再拖。
          宽度用默认 720 世界像素 —— 够读、不霸板（见 docs.js 的 DOC_DEFAULT_W）。 */
       const el = wrapRef.current
@@ -2262,11 +3143,14 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         pages: info.pages,
       }
       commit((cur) => ({ ...cur, docs: [...(cur.docs || []), doc] }))
-      flash(`放好了（${info.pages.length} 页）：直接用笔在上面写，拖顶上的条子挪位置`, 'ok')
+      flash(
+        sliced
+          ? `放好了（${info.pages.length} 页）：圈住题号 → 点浮层上「✎ 做这道题」。页码从头算起，第 1 页就是你要的那一页`
+          : `放好了（${info.pages.length} 页）：直接用笔在上面写，拖顶上的条子挪位置`,
+        'ok'
+      )
     } catch (e) {
       flash('插入失败：' + String(e && e.message ? e.message : e), 'warn')
-    } finally {
-      setDocBusy(null)
     }
   }
 
@@ -2300,104 +3184,549 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     flash('资料移掉了：PDF 文件还在 data/.资料/ 里，写过的注释也留在板上', 'ok')
   }
 
-  /* ══════════════════ 课件整理：把一段页读成知识点、贴到板上 ══════════════════
+  /* ══════════════════ 课件整理：老师逐页讲，讲解贴到那一页旁边 ══════════════════
    *
    * 用户 2026-09-22 要的：「整理出来这个 pdf/ppt 这节课的内容……贴到白板上，
    * 这样就能让学生不从一个空的白板开始，而是从一个**已经有知识的内容**开始」。
+   * 2026-09-20 他又把那句话收窄了：「这样子得出来的这些东西只能说是"可以读"但是完全
+   * 无法自行理解……我们的目的是让这样整理 pdf/PPT 后学生能够在摆脱老师的情况下仍然
+   * 能够学习。所以说这样子，我们 ppt 与 pdf 正常显示，但由你来扮演老师，在每一页的
+   * 右侧和左侧都可以进行详细的说明与讲解，标注重点之类的」。
+   * 所以现在**课件页在中间，老师的话在两边**：右栏讲解、左栏重点和公式。
    *
    * 三件事，各有各的家：
    *   · 读（渲染页面 + 出网 + 缓存）—— `doc-read.js`；
-   *   · 认（模型的话 → 知识点）和摆（知识点 → 世界坐标）—— `doc-cards.js`（纯函数）；
+   *   · 认（模型的话 → 讲解/重点/公式）和摆（→ 世界坐标）—— `doc-cards.js`（纯函数）；
    *   · **这个文件只做本地这三下**：量尺寸、写进板、把尺寸交给 fitter。
    *
-   * ★ 摆在哪：**资料右边**（`docBounds` 右边缘 + ORIGIN_GAP）。
-   *   为什么不摆在资料上面/中间：那会盖住你正要看的课件页 —— 而"看着课件写"是这个功能的用法。
-   *   为什么不用"当前视野中心"：贴完一张板要找半天它在哪；固定在资料右边，
-   *   位置是可预期的（下次整理同一份课件还摆在那儿）。
+   * ★ 摆在哪：**贴着每一页**（`pageRects` 给的页面矩形，左右各一栏，见 doc-cards.js 的
+   *   `sideColumns` / `projectDeck`）。为什么不摆在资料上面/中间：那会盖住你正要看的课件页。
+   * ★ **课件必须在板上**：这一版的讲解是"贴着页"的，页面上不了板就没有"旁边"可言
+   *   —— 所以「直接选文件」那条路现在也把课件铺到板上（见 readDeckFromFile）。
    * ★ 一次 commit 写进去：**一步撤销**把整批卡片全退掉（和"擦原笔迹 + 加卡片"同一条规矩）。
    * ★ 量尺寸要用**当前视图缩放**：卡片的屏幕尺寸 = 世界 × s × k，而"内容折成几行"
    *   只有那个尺寸下才准（和 fitCardSize 量的是同一个东西，见 doc-cards.js 那一节）。
    */
+  /** 「这一份在不在板上、是哪一条」—— **只有这一处说了算**（摆卡片和窗口的预选都用它）。
+   *  先按 id 找（板上那份）；找不到再按 path 找 —— 用户选的正好是板上已经有的同一份 PDF 时，
+   *  服务端按内容认、返回的是同一个路径（见 server-docs.js 的 findByContent），
+   *  那就该当成"就是板上那一份"：卡片贴着它摆、预选也跟着框走。
+   *  ⚠ 认不出来 = 这份只在 `.资料/` 里（"直接选文件"那条路）—— 卡片落视野中心。 */
+  function boardDocOf(d) {
+    if (!d) return null
+    return (boardRef.current.docs || []).find((x) => x.id === d.id || x.path === d.path) || null
+  }
+
+  /** 课件整理 · **直接选文件**那条路：把文件收进 `data/.资料/`、**铺到板上**，然后开窗。
+   *  ★ 为什么这一版一定要铺到板上（2026-09-20 改）：讲解是"贴着每一页"摆的
+   *    （右栏讲解、左栏重点和公式），页面上不了板就没有"旁边"可言。
+   *    上一版是知识点卡排在资料右边，所以那会儿可以不铺 —— 产出换了，这条跟着换。
+   *  ★ 板上已经有这一份（服务端按内容认得出来）就**不再摆第二份**，直接用它。
+   *  ⚠ 同一份文件再选一次**不会**在 `.资料/` 里多存一份，于是缓存照样命中：
+   *    讲过的页不会再花一次钱（doc-read 的缓存键是"路径 + 页号"）。 */
+  async function readDeckFromFile(f) {
+    if (!f) return
+    try {
+      const got = await receiveDoc(f, 'deck')
+      if (!got) return /* 「算了」—— 同上 */
+      const { up, info } = got
+      let doc = (boardRef.current.docs || []).find((x) => x.path === up.path) || null
+      if (doc) {
+        flash(`这份课件已经在板上了（${info.pages.length} 页）—— 直接用` + (up.duplicate ? '它原来那份' : ''), 'ok')
+      } else {
+        /* 摆放：当前视野正中（第一页顶边对准视野上三分之一处），和「📄 插入 PDF/PPT」同一条规矩。
+           ★ 左右各留一栏的空（SIDE_W + 间距 + 一点余量）：不这样的话，第一次开窗时
+             左栏会被挤到视野外面去，用户以为没贴。 */
+        const el = wrapRef.current
+        const v = boardRef.current.view
+        const at = screenToWorld((el ? el.clientWidth : 800) / 2, (el ? el.clientHeight : 600) / 3, v)
+        doc = {
+          id: newId(DOC_ID_PREFIX),
+          path: up.path,
+          ...(up.title ? { title: up.title } : {}),
+          x: Math.round(at.x - DOC_DEFAULT_W / 2),
+          y: Math.round(at.y),
+          w: DOC_DEFAULT_W,
+          pages: info.pages,
+        }
+        commit((cur) => ({ ...cur, docs: [...(cur.docs || []), doc] }))
+        flash(`课件放好了（${info.pages.length} 页）—— 挑一段，让老师逐页讲`, 'ok')
+      }
+      setDeckFor(doc)
+    } catch (e) {
+      flash('收这份课件失败：' + String(e && e.message ? e.message : e), 'warn')
+    }
+  }
+
+  /* ══════════════════ 作业辅导：你报"第几页第几题"，每题给一份答案 + 解析 ══════════════════
+   *
+   * 用户 2026-09-22 要的（原话抄在 HomeworkBox.jsx 的文件头）：
+   *   · 作业**通常在书上** —— 所以要挑"作业所在的那一份 PDF"，
+   *     而他手上常常只有讲课的 PPT（挑错时要提醒他补传，窗口里那条 `pptHint` 管这事）；
+   *   · 报"第几页第几题"，**结合本节课的知识**（板上那些讲解卡）答得更准；
+   *   · 每题一份**答案 + 解析**，解析说人话。
+   * ★ 这个入口只做**一件本地的活**：把作业那份收进来（上传 + 铺到板上）。
+   *   出网、解析回话、那个窗口都在别处（homework-read.js / homework.js / HomeworkBox.jsx）——
+   *   和「课件整理」同一条分工：Board 只管"板上多了一样东西"。
+   * ★ **铺到板上是用户选的**（2026-09-22 问他"作业 PDF 要不要铺到板上"，他选"也铺到板上"）：
+   *   作业是要**做**的，铺上去才能在书上圈题、写过程；不用了从资料条上 ✕ 掉。
+   */
+  async function readHomeworkFromFile(f) {
+    if (!f) return
+    try {
+      const got = await receiveDoc(f, 'homework')
+      if (!got) return /* 「算了」—— 同上 */
+      const { up, info } = got
+      const onBoard = (boardRef.current.docs || []).find((x) => x.path === up.path) || null
+      if (onBoard) {
+        flash(`这份已经在板上了（${info.pages.length} 页）—— 就用它` + (up.duplicate ? '原来那份' : ''), 'ok')
+      } else {
+        /* 摆放：和「📄 插入 PDF/PPT」同一条规矩（视野正中，第一页顶边对准上三分之一处）。 */
+        const el = wrapRef.current
+        const v = boardRef.current.view
+        const at = screenToWorld((el ? el.clientWidth : 800) / 2, (el ? el.clientHeight : 600) / 3, v)
+        const doc = {
+          id: newId(DOC_ID_PREFIX),
+          path: up.path,
+          ...(up.title ? { title: up.title } : {}),
+          x: Math.round(at.x - DOC_DEFAULT_W / 2),
+          y: Math.round(at.y),
+          w: DOC_DEFAULT_W,
+          pages: info.pages,
+        }
+        commit((cur) => ({ ...cur, docs: [...(cur.docs || []), doc] }))
+        flash(`作业放好了（${info.pages.length} 页）—— 在窗口里写「第几页第几题」`, 'ok')
+      }
+      setHwDoc(up.path)
+      setHwTarget(null)
+      setHwOpen(true)
+    } catch (e) {
+      flash('收这份作业失败：' + String(e && e.message ? e.message : e), 'warn')
+    }
+  }
+
+  /** 开「作业辅导」那个窗。**两条入口走同一个动作**（工具条那颗 + 选区浮层那颗）——
+   *  和「？问这里」同一条纪律：**判断只写一处**，两条入口各写一份的话，
+   *  "什么情况下能圈题"一定会有一处漏掉（这个仓库为"同一句话两份实现"栽过两次）。
+   *
+   *  ★ 你**框住了课件页上的一块**（多半就是题号）就带着它进去：那时候"做哪道题"
+   *    由那个框说了算，窗里连页码都不用写 —— 用户 2026-09-22 要的第二种选法
+   *    （「选题目允许靠用户圈住题号来实现」）。
+   *  ★ 没框住东西（或者框里没有课件页面）就开一个空窗，靠打字说"第 12 页第 3 题"。
+   *    ⚠ 这里**不拦**"框里没有课件"那一种：那个框对打字那条路毫无影响，
+   *      为了它把窗拦下来，用户还得先去取消框选才能问 —— 那才是添乱。 */
+  function openHomework() {
+    const hit = askRegion
+    if (hit) {
+      setHwDoc(hit.doc.path)
+      setHwTarget({ docId: hit.doc.id, doc: hit.doc, page: hit.page, region: hit.region })
+    } else {
+      setHwTarget(null)
+    }
+    setHwOpen(true)
+  }
+
   function deckCardNodes(tex) {
     /* 公式卡在板上长这样（Board.jsx 的 Card 里是 `<Tex tex block />`）——
        量尺寸必须用**同一个形状**，不然量出来的是另一种排版。 */
     const span = document.createElement('span')
     span.className = 'bd-tex-in'
-    try {
-      span.innerHTML = katex.renderToString(tex, { throwOnError: false, displayMode: true, strict: false, trust: false })
-    } catch {
-      return null
-    }
+    /* ★ 走 `renderMath.js` 那一份（全仓只有它调 katex，且带缓存 ——
+       同一批讲义反复量尺寸不会把同一个式子排上几十遍）。 */
+    const html = katexHtml(tex, { throwOnError: false, displayMode: true, strict: false, trust: false })
+    if (html == null) return null
+    span.innerHTML = html
     return span
   }
 
-  /** 把整理好的知识点贴到板上。返回**到底贴上去没有** —— 调用方拿它决定要不要说一句
+  /** 把老师讲解贴到板上（**贴着每一页**：右栏讲解、左栏重点和公式）。
+   *  返回**到底贴上去没有** —— 调用方拿它决定要不要说一句
    *  （"量不出来"那条路上如果只 return，用户看到的是"点了没反应"）。 */
-  function placeDeckCards({ units, items, pages }) {
+  function placeDeckCards({ items, pages }) {
     if (!items || !items.length) return false
+    /* ★ 这一版**必须贴在页面上**（右栏讲解、左栏重点，都靠页面矩形定位）——
+       资料不在板上就没有"旁边"可言。理论上走不到这里（开窗前一定先把课件铺上），
+       但宁可说一句也不要点完没反应。 */
+    const d = boardDocOf(deckFor)
+    if (!d) {
+      flash('这份课件不在板上 —— 先把它铺到板上，讲解才有地方贴', 'warn')
+      return false
+    }
+    const rects = pageRects(d)
     /* ⚠ 量尺寸的台子挂在**板容器**里（不是 document.body）：卡片字号里的 `--s`
        由板容器定，挂错了地方量出来的高度会比板上真实的大一截，
        紧接着摆的那张卡就会压在它身上（见 doc-cards.js 的 makeMeasureHost）。 */
     const host = makeMeasureHost(wrapRef.current)
     let made
     try {
-      made = measureDeck({ items, renderTex: deckCardNodes, host, s: boardRef.current.view.s || 1 })
+      made = measureDeck({
+        items,
+        renderTex: deckCardNodes,
+        /* 讲义卡的正文渲染：**和 Card 那一侧同一个 richHtml**（见 rich.js）。 */
+        renderRich: richHtml,
+        host,
+        s: boardRef.current.view.s || 1,
+        /* ★ 文字卡**固定一栏宽**（SIDE_W）：讲解是几段话，按内容量会成一条又宽又矮的横幅。 */
+        fixedW: SIDE_W,
+      })
     } finally {
       if (host.parentNode) host.parentNode.removeChild(host)
     }
     if (made.missing) flash(`有 ${made.missing} 条量不出尺寸（多半是公式排不出来），这一次没贴它们`, 'warn')
-
     const sized = items.filter((it) => made.sizes.has(it.id))
     if (!sized.length) return false
-    /* 起点：**你整理的那几页右边**（不是资料右边）。
-       ★ 为什么是"那几页"而不是"这份资料"：49 页的课件里，你半路整理第 25-30 页时，
-         卡片落在第 1 页旁边 = 隔着几百屏 —— 贴完你根本不知道它去哪儿了。
-         挂在被整理的那几页旁边，视线一挪就到（这正是"看着课件写"的用法）。
-       资料不在板上（刚被移掉）就落在**当前视野中心**。 */
-    const d = deckFor ? (boardRef.current.docs || []).find((x) => x.id === deckFor.id) : null
-    const el = wrapRef.current
-    let origin
-    let anchor = null
-    if (d) {
-      const rects = pageRects(d)
-      /* 用 `pages` 里**最小的那一页**当锚（可能不是第 1 页）。 */
-      const nums = (pages || []).map(Number).filter((n) => n > 0).sort((a, b) => a - b)
-      const first = (nums.length && rects[nums[0] - 1]) || rects[0] || null
-      anchor = first
-      const b = first || docBounds(d)
-      origin = { x: b.x + DOC_DEFAULT_W + ORIGIN_GAP, y: b.y }
-    } else {
-      const v = boardRef.current.view
-      origin = screenToWorld((el ? el.clientWidth : 800) / 2, (el ? el.clientHeight : 600) / 3, v)
-    }
-    const columnH = el ? Math.max(900, el.clientHeight / (boardRef.current.view.s || 1)) : 1500
-    const plan = projectDeck({ sections: units || [], items: sized, sizes: made.sizes, origin, columnH })
-    if (!plan.cards.length) return false
 
-    const fresh = plan.cards.map((c) =>
-      c.heading
-        ? { ...newCard('note', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, text: c.text }
-        : c.tex
-          ? { ...newCard('formula', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src, tex: c.tex }
-          : { ...newCard('note', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, text: c.text }
-    )
-    commit((cur) => ({ ...cur, cards: [...cur.cards, ...fresh] }))
+    /* ★★ 两半：**整节课那一层**（提纲 + 须知，一份各一张，落在第一页左边）
+       和**逐页那些**（落在每页两侧）。
+       为什么必须在这里分开：`projectDeck` 的循环是**严格按页走的**（它靠 `rects[n-1]` 定位，
+       靠 `pageGaps` 推下一页），而它们**没有页号**（`page: 0`/`sectionId: null`）——
+       混进去就是两个后果：① 它们被归到 `page: 0` 那一组，`rects[-1]` 取不到，
+       `noRect` 里多一个 `0`，然后 flash 里冒出一句"有 1 页在板上找不到位置（页号对不上？）"
+       ——一句**没有指任何人**的错；② 就算给它们一个页号凑进去，它们也会把那页的
+       `pageGaps` 算高一截，把后面所有页往下推（而它们自己不占那个位置）。
+       ⚠ 判据用 `isDeckLevel`（住在 doc-summary.js），**不要在这里写 `kind === 'summary'`**：
+         那种字面量散开之后，"加一种没有页号的卡"就得改好几处 —— 而漏掉一处的表现
+         正是上面那两种（一个是没指任何人的 flash、一个是整版往下错）。 */
+    const deckLevel = sized.filter((it) => isDeckLevel(it))
+    const onPage = sized.filter((it) => !isDeckLevel(it))
+
+    /* ★★ 「整节课那两张先站住第一页左栏」——在摆逐页那些卡**之前**先把这一栏让出来。
+       为什么非让不可：整节课那两张和逐页那些卡**不是一起摆的**（前者走 placeDeckCard、
+       后者走 projectDeck），而两者都可能落在"第一页左栏、从页顶起"这同一块地上 ——
+       逐页的左栏从 `occupied` 起摆，而 `occupied` 是从**板上现有的卡**算的，
+       里面**没有**这些还没落地的卡。于是第一页的重点卡和它们正正压在一起。
+       用户那边这**看不出来**（要一张张拖开才知道自己少看了一张）。
+       ⇒ 顺序反过来：先把它们量好、占位写进 `occupied`，再交给 projectDeck。
+          `pageGaps` 照旧不含它们（铁律②：整节课那两张不把任何一页往下推）—— 这里只动
+          "这一栏从哪儿开始摆"，不动"这一页占多高"。
+       ★ 两张之间也靠同一个机制排开（后一张从**前一张的底边**起），
+         所以它们不会自己叠在一起 —— 见上面那个 for 里 `usedDeck` 那段。
+
+       ⚠ 占位算的是**整条左栏横带**的高度，不是"提纲自己的宽那块地"：
+         左栏那几张是**右对齐到资料左边**的（`x = r.x - gap - sz.w`），
+         所以它们的**左边缘**随各自宽度浮动 —— 只按提纲真正的宽去占，
+         一张更宽的重点卡照样会伸到提纲左边、和它叠上。
+         这条横带一占，谁摆进来都压不着。 */
+    const occupied = columnOccupancy({ rects, cards: boardRef.current.cards || [] })
+    /* ── 整节课那两张：**一张接一张**占住第一页左栏 ──────────────────────────
+       ★ 顺序由**条目表里的先后**定（DeckReview 的 `confirm` 就是把提纲放前面、须知放后面）——
+         这里不自己排序：摆版的顺序和界面上看到的顺序、以及交给模型读的顺序是**同一个**，
+         三处各排一遍必然有一处不一样（而"须知在提纲上面"这种不一致没人会去查）。
+       ★ 两张共用 `placeDeckCard`：第一张从 `occupied` 起、第二张从**第一张的底边**起 ——
+         "我怎么知道我是第几张"这件事被折成"调用方把 `used` 抬上去"，函数本身不用知道。
+       ⚠ 只动 `[0]`（第一页）：整节课那两张只占第一页，别的页一个字节都不该被动。
+       ⚠ `rects[0]` 可能没有（一页都没铺），那时 `spot` 也必然是 null。 */
+    const deckCards = []
+    const usedDeck = []
+    for (const it of deckLevel) {
+      const sz = made.sizes.get(it.id)
+      const spot = sz
+        ? placeDeckCard({ rects, used: occupied[0] ? occupied[0].left : null, w: sz.w, h: sz.h })
+        : null
+      if (!spot) {
+        flash(`这一块${it.kind === RULES_KIND ? '做题须知' : '提纲'}在板上找不到第一页（课件没铺好？）—— 这一块没贴`, 'warn')
+        continue
+      }
+      deckCards.push(it)
+      usedDeck.push({
+        /* ⚠ 这个 `kind` 是**条目层**的（`SUMMARY_KIND` / `RULES_KIND`），不是板层的 ——
+           它只用来让下面 `fresh` 认出"这一张要打 `sum: true` / `rules: true`"。
+           它**不会**原样写进板文件（`newCard` 会把板层的 kind 定成 'note'）。 */
+        span: { ...spot, side: 'left', page: 0, kind: it.kind, itemId: it.id, text: cardText(it) },
+      })
+      /* ★ 占位：把"第一页左栏占到哪儿了"这个数**抬到这一张的底边**。
+         整节课那两张贴在资料左边、从页顶起，和左栏的卡片是同一条横带
+         （都右对齐到资料左边缘），所以它们的底边就是左栏新的起点。 */
+      if (rects[0] && occupied[0]) {
+        const had = occupied[0].left
+        occupied[0].left = Math.max(had == null ? -Infinity : had, spot.y + spot.h)
+      }
+    }
+
+    /* 按页分组（摆版按页走：一页一个"讲台"）。 */
+    const byPage = new Map()
+    for (const it of onPage) {
+      const n = Number(it.page) || 0
+      if (!byPage.has(n)) byPage.set(n, [])
+      byPage.get(n).push(it)
+    }
+    const plan = projectDeck({
+      pages: [...byPage].map(([page, list]) => ({ page, items: list })),
+      sizes: made.sizes,
+      rects,
+      /* ★ 这一页两栏里**已经有的东西**（「留到板上」留下的答案卡、你自己拖过去的卡，
+         以及**刚刚占住第一页左栏的那些整节课的卡**）—— 讲解接在它们下面，不许压上去
+         （`columnOccupancy` 那一段说了为什么）。 */
+      occupied,
+      /* ★ 资料里**已经写着的**空：`rects` 里已经含着它们，shift 只能累加增量 ——
+         不传的话，在整理过的课件上再整理一次，第 2 页开始的卡片会一页比一页低
+         （见 projectDeck 的 `existing` 那一段）。 */
+      existing: d.pageGaps,
+    })
+    /* ⚠ `deckCards` 是**条目表**里那几张（`deckLevel` 里量得出尺寸的那些），
+       `usedDeck` 才是它们的落点。两者一一对应（上面那个 for 同时 push 的）。 */
+    const allCards = [...plan.cards, ...usedDeck.map((u) => u.span)]
+    if (!allCards.length) return false
+    if (plan.noRect.length) flash(`有 ${plan.noRect.length} 页在板上找不到位置（页号对不上？），那几页的讲解没贴`, 'warn')
+
+    /* ★★ 贴上去的卡片**一律先钉住**（`locked: true`）——
+       用户 2026-09-22：「这些解说的卡片生成后默认状态应该是定住的，用户要移动再解开」。
+       理由就在这条功能的用法里：整理完是**照着课件往下读**，而用笔的人手会一直蹭到屏幕，
+       位置定好的讲义卡一蹭就被拖走（或者点出一堆手柄），一节课下来版面全乱。
+       钉住之后卡片变成"纸的一部分"：拖不动、双击不进编辑、📌 也选不中
+       （框选会跳过 `locked`，见上面框选那一段），但**笔照样能在它上面写字**
+       （墨迹层本来就画在卡片上面）—— 那正是"一边读讲解一边在旁边推公式"。
+       要动它：卡片**左下角那颗 📌** 一直亮着（锁定的卡只剩它能点），点一下就解开。
+       ⚠ 它写进文件的是 `locked: true` —— 这是**有意的**，不是漏了个默认值：
+         素材卡的"钉住"是这条功能的产物，重开这张板得还是钉住的。
+         代价：同一段页再整理一次，老卡片的 `locked` 不会被这次的行为覆盖（它们已经钉着了）。 */
+    /* ⚠ 贴的是 **`allCards`**，不是 `plan.cards` ——
+       `plan.cards` 只有逐页那些（`projectDeck` 的产出），整节课那两张在 `usedDeck` 里。
+       第一版这里写的是 `plan.cards.map(...)`，后果是：`allCards` 只用来做"一条都没有"的判空，
+       提纲那一张**算出来了位置、也进了 flash 那句话，但从来没被 commit** ——
+       文件里没有它（屏幕上也没有），而界面上一切正常（不报错、右下角还写着"提纲在第一页左边"）。
+       ★ 这正是这一节自检要抓的那一类错："说了会贴，但没贴"。 */
+    const fresh = allCards.map((c) => {
+      /* ★ 卡上记一句"**我讲的是第几页**"（`ask: { doc, page }`）。
+         ⚠ 这不是多余的字节：讲解卡摆在页面**旁边**，不压在页面上 ——
+            没有它，「？问这里」在圈住讲解卡时认不出该问哪一页，那颗按钮永远是灰的
+            （用户 2026-09-22 报的「问这里依旧无法框选解说卡片」就是这一条）。
+            规矩（认不出的不硬凑、形状只有一种）在 ask-region.js 的 `normalizeAsk`。
+         ★ 整节课那两张**没有 `page`**（它们不属于任何一页）→ `from` 是 null，
+           于是它们**不带 `ask`**。「圈住整节课的提纲 → 问这里」这件事在语义上就说不通
+           （问哪一页？），而 ask-region 那条路本来就是按页找的 —— 不给它们 ask 是对的，
+           不是漏了。 */
+      const from = c.page ? { ask: { doc: d.path, page: c.page } } : null
+      return c.tex
+        ? { ...newCard('formula', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src, tex: c.tex, locked: true, ...from }
+        : /* 讲义卡（讲解 / 重点 / 整节课的提纲 / 做题须知，以及「留到板上」那张答案卡）：
+             正文里有 `$…$` 的式子要排出来（`rich: true`）。
+             ⚠ `contentAt` 不在这一条路上 —— 它算的是**要往板上写多少空**，
+               而这里的 `plan.pageGaps` 只由 `projectDeck` 报（整节课那两张不在其中）。
+             ★★ **整节课那两张在板上的 `kind` 仍是 `'note'`（不是 `'summary'`/`'rules'`）**——
+               这一条是有讲究的，别"顺手改对"：
+               · `Board` 的 `kind`（`CARD_KINDS`）管的是**画成什么形状**（公式 or 文字），
+                 只有两种；它们就是文字卡，画法一个字都不差。
+               · 加第三种要动 `newCard` 的白名单、`Card` 的分支、`board.js` 的
+                 normalize —— 而它们**一个**渲染分支都用不上（`ink` 那条路已经是
+                 "出处写在**另一个字段**上，不动 kind"的先例，见 CONTEXT.md）。
+               · 所以出处记在 `sum: true` / `rules: true` 这两个**独立字段**上
+                 （和 `ask` / `rich` 平级）：要认"这是整节课的提纲"就查 `sum`，
+                 要认"这是做题须知"就查 `rules`，而不是查 kind。
+                 ★ 两个字段而不是一个"是整节课的东西"：两者的**去处不同** ——
+                   `homework.js` 的 `collectKnowledge` 会把它们分两段摆，
+                   而 `spotOfCard` 用同一个判据把它们都钉成 `page: 0`。
+               ⚠ 判据仍然走 `isDeckLevel` / `isSummary` / `isRules`（doc-summary.js）——
+                 别在别处写 `kind === 'summary'` 字面量（那两份东西是**条目层**的 kind）。 */
+          { ...newCard('note', 0, 0), x: c.x, y: c.y, w: c.w, h: c.h, text: c.text, rich: true, locked: true, ...(c.kind === SUMMARY_KIND ? { sum: true } : c.kind === RULES_KIND ? { rules: true } : null), ...from }
+    })
+    /* ★ 卡片和"每页多占的那点空"**一次 commit 写进去**：两者是一件事 ——
+       讲解把这一页撑高了，下一页就得往下挪（`projectDeck` 算出来的 pageGaps）。
+       分两次写的话，中间那一帧卡片和页面对不上（看着像贴歪了）。
+       ★★ 而且这一批里**只要有哪一页的空涨了，它后面那些页上「已经在板上」的卡片
+          也得跟着挪**（2026-09-23，和 `keepAnswer` 那条同一个不变量）。
+          这一条在"分次整理"时最要命 —— 用户那张板就是先整理了 24~30 页、
+          后来又整理 37/38 页：后整理的那一页只要比页面高，下面已经摆好的讲解卡
+          当场全错位，而文件里看不出来（`pageGaps` 只记了"多高"，
+          没记"谁因此被推下去"）。判据和挪法都在 `shiftLaterPageCards`。 */
+    let shiftedMoved = 0
+    commit((cur) => {
+      const keep = Array.isArray(d.pageGaps) ? d.pageGaps.slice() : []
+      for (let i = 0; i < plan.pageGaps.length; i += 1) {
+        const g = Number(plan.pageGaps[i]) || 0
+        if (g > 0) keep[i] = Math.max(Number(keep[i]) || 0, g) // **只涨不缩**：地占下了就留着
+      }
+      const shifted = shiftLaterPageCards({ cards: cur.cards || [], docPath: d.path, deltas: pageGapDeltas(keep, d.pageGaps) })
+      shiftedMoved = shifted.moved
+      return {
+        ...cur,
+        docs: (cur.docs || []).map((x) => (x.id === d.id && keep.some((v) => v > 0) ? { ...x, pageGaps: keep } : x)),
+        cards: [...shifted.cards, ...fresh],
+      }
+    })
     /* 落进 DOM 之后**再让 fitter 量一趟**（它量的是同一套数，所以通常一次就收敛）——
        这是"卡片贴合内容"那条规矩的第二道保险：万一我这边的换算差了半像素，
        它会收拢到卡片自己算出来的那个数，而不是把一个错值永远留在文件里。
-       ⚠ `fitWidth: false`：宽度是我量出来的（按内容的自然宽度），别再让它去收一遍 ——
-         文字卡那条"收自然宽"的路会把一句话拉成一条 1200 宽的长条。 */
+       ⚠ `fitWidth: false`：宽度是我按一栏宽钉死的（SIDE_W），别再让它收一遍 ——
+         那会把讲解卡拉成一条 1200 宽的长条。 */
     for (const c of fresh) fitter.queue(c.id, { fitWidth: false })
-    /* 贴完**把视野挪过去**：卡片落在几十页之外的时候，"贴好了"那句话是不够的 ——
-       你看不见它们，会以为没贴上去（用户报过这一类）。把**你整理的那一页**摆到
-       偏左偏上的位置，右边那一栏卡片就正好在视野里。缩放**一个字节不改**（只平移）。 */
+
+    /* 贴完**把视野挪到第一页**："讲好了"那句话是不够的 —— 卡片落在几十页之外时，
+       你看不见它们，会以为没贴上去（用户报过这一类）。缩放一个字节不改（只平移），
+       把**你整理的第一页**摆到偏左偏上的位置：左边那栏重点、右边那栏讲解都进视野。
+       ⚠ 用 `plan.rects`（已经加过"前面那些页多占的空"）—— 用原来的 y 会偏上一大截。
+       ★ 有提纲那一张时**更要把左边让出来**：它就在第一页左边那一片，
+         而 `0.42` 那个位置本来就是"左边那栏也在视野里"。提纲比左栏那几张宽不了多少
+         （同一栏宽），所以这个数不用为它单独调 —— 它落在同一片视野里。 */
+    const el = wrapRef.current
+    const nums = (pages || []).map(Number).filter((n) => n > 0).sort((x, y) => x - y)
+    const finalRects = plan.rects || rects
+    const anchor = (nums.length && finalRects[nums[0] - 1]) || finalRects[0] || null
     if (el && anchor) {
       const v = boardRef.current.view
-      const a = worldToScreen({ x: anchor.x, y: anchor.y }, v)
-      setView((cur) => ({ ...cur, tx: cur.tx + el.clientWidth * 0.2 - a.x, ty: cur.ty + el.clientHeight * 0.3 - a.y }))
+      const at = worldToScreen({ x: anchor.x, y: anchor.y }, v)
+      setView((cur) => ({ ...cur, tx: cur.tx + el.clientWidth * 0.42 - at.x, ty: cur.ty + el.clientHeight * 0.22 - at.y }))
     }
-    const where = d ? '摆在课件右边' : '摆在视野中心'
-    flash(`贴好了：${fresh.length} 张卡（${pagesLabel(pages || [])}），${where}。Ctrl+Z 能整批退掉`, 'ok')
+    /* ★ 这句话里必须带上"**钉住了**"那半句：卡片被钉住是一件**看不出来**的事
+       （屏幕上只是"拖不动"），不提前说的话，用户想挪那一栏时只会觉得"卡片坏了"。
+       📌 在哪也一起说 —— 锁定的卡只剩那颗按钮能点，找不到它就真的动不了。
+       ★ 整节课那两张要**单独点名 + 说清它在哪**：它们不在"每页旁边"那一族的任何一处，
+         只说"贴好了"的话，人会往每页旁边找，找不到那一块。
+       ★ 两张**分开说**（不是一句"整节课的东西也贴了"）：提纲和须知是两样不同的东西，
+         用户找的时候是按名字找的。只有一张时也只说那一张（别说了一样不存在的贴上去）。 */
+    const deckNames = deckCards.map((it) => (it.kind === RULES_KIND ? '做题须知' : '提纲'))
+    const deckWords = deckNames.length ? `整节课的${deckNames.join('和')}贴在**第一页左边**（${deckNames.length} 块）。` : ''
+    flash(
+      `老师讲完了：${pagesLabel(pages || [])} —— 讲解贴在每页右边、重点和公式贴在左边（${fresh.length} 张卡）。` +
+        deckWords +
+        '都**钉住了**（手蹭上去不会把它拖走）：想挪就点卡片左下角那颗 📌 解开。Ctrl+Z 能整批退掉',
+      'ok'
+    )
+    return true
+  }
+
+  /* ══════════════════ 「留到板上」：追问 / 作业的答案落成页边的一张卡 ══════════════════
+   *
+   * 用户 2026-09-22：「把答案留住：追问 / 作业的答案关掉就散」。
+   * 完整的设计（五条决定 + 被否掉的替代方案）在 **ADR-0006**；这里只说接线。
+   *
+   * ── 两个窗和这一层的分工 ────────────────────────────────────────────────
+   *   · `AskBox` / `HomeworkBox`：**还是不碰板**（它们拿不到 board）。
+   *     它们能做的只有一件事：`onKeep({...})` —— "把这一轮问答留下"这个**请求**。
+   *     落成什么卡、摆哪儿、写不写盘，全在这一层决定。所以
+   *     "答案会不会污染我的板"这个问题，答案仍然是"**你不点它就不会**"。
+   *   · 内容那一半走 `answer-cards.js`（纯函数），几何那一半走 `planAnswerCard`。
+   *   · 这里只做四件事：量尺寸、算位置、一次 commit、把话说清楚。
+   *
+   * ── 为什么是**同步**返回 true/false ─────────────────────────────────────
+   * 量尺寸这条链（`measureDeck`）本来就是同步的，而调用方（那两颗按钮）要立刻知道
+   * "到底留下了没有"才能把按钮变成「✓ 已在板上」。做成 Promise 的话，
+   * 按钮会有一小段"点了没反应"的时间 —— 那正是这一族最糟的失败方式。
+   *
+   * @param {object} arg
+   *   · docPath 这一问是针对**哪一份资料**（`AskBox` / `HomeworkBox` 手上的那一份）
+   *   · page    落在第几页（1 起）
+   *   · region  页内归一化矩形（圈出来的才有；打字问作业时没有）
+   *   · made    `answer-cards.js` 拼好的 `{title, body, clipped}`，或者它的原料
+   *   · from    'ask' | 'homework' —— 只用来把 flash 那句话说得准一点
+   */
+  function keepAnswer({ docPath = '', page = 0, region = null, made = null, from = 'ask' } = {}) {
+    const list = boardRef.current.docs || []
+    const d = list.find((x) => x.path === docPath) || null
+    /* 资料不在板上就贴不了（"旁边"要有东西才叫旁边）—— 说一句人话，别点完没反应。 */
+    if (!d) {
+      flash('这份课件不在板上 —— 「留到板上」是贴在它那一页旁边的，先把课件铺回来', 'warn')
+      return false
+    }
+    const rects = pageRects(d)
+    const n = Math.trunc(Number(page))
+    if (!(n > 0) || !rects[n - 1]) {
+      flash(`第 ${n || '?'} 页在这份课件里找不到 —— 这张卡没能留下`, 'warn')
+      return false
+    }
+    const item = answerItem('keep1', made)
+    if (!item) {
+      flash('这一条是空的，没什么可留的', 'warn')
+      return false
+    }
+    /* 量尺寸：**和课件整理同一套**（`measureDeck` + 同一个 richHtml），
+       ⚠ 而且文字卡按**一栏宽**量（`fixedW: SIDE_W`）—— 它和讲解卡是同一栏里的两块，
+         宽度不一样会看着像两栏。 */
+    const host = makeMeasureHost(wrapRef.current)
+    let sized
+    try {
+      sized = measureDeck({
+        items: [item],
+        renderTex: deckCardNodes,
+        renderRich: richHtml,
+        host,
+        s: boardRef.current.view.s || 1,
+        fixedW: SIDE_W,
+      })
+    } finally {
+      if (host.parentNode) host.parentNode.removeChild(host)
+    }
+    const sz = sized.sizes.get(item.id)
+    if (!sz) {
+      flash('这张卡量不出尺寸（公式排不出来？）—— 没能贴上去，换个问法再试', 'warn')
+      return false
+    }
+    const plan = planAnswerCard({ rects, page: n, cards: boardRef.current.cards || [], w: sz.w, h: sz.h })
+    if (!plan) {
+      flash('这一页在板上找不到位置 —— 这张卡没能留下', 'warn')
+      return false
+    }
+    /* 「这一问落在课件的哪一块」（`ask`）：`doc` 存**路径**（不是资料 id —— id 换个会话
+       就变了，路径才是那个 PDF 的身份）。认不出就写 `{page}` 甚至整个不写，
+       由 ask-region.js 的 normalizeAsk 决定（同一份判据读盘也用）。 */
+    const ask = normalizeAsk({ doc: d.path, page: n, region })
+    const fresh = {
+      ...newCard('note', 0, 0),
+      x: plan.x,
+      y: plan.y,
+      w: plan.w,
+      h: plan.h,
+      /* ★ 卡上的字必须**和量尺寸那一趟同一份**（`cardText`，doc-cards.js）——
+         这里自己拼一遍的话，高度和真实渲染对不上，卡片就会和旁边那张互相压住，
+         而"压住"在板上是看不出来的。 */
+      text: cardText(item),
+      /* 讲义卡：正文里的 `$…$` 要排出来（和讲解卡同一套渲染）。 */
+      rich: true,
+      /* ★ 出处：**这是一张答案卡**，不是课件整理贴上去的讲解。
+         板层 kind 只有 note/formula，所以出处记在独立字段上（和 `sum`/`rules` 同一套路）——
+         `homework.js` 的 `isLessonCard` 靠它把答案卡挡在"这节课的知识"外面，
+         否则上一题的答案会被当成讲义喂给下一题。 */
+      answer: true,
+      ...(ask ? { ask } : {}),
+    }
+    /* ★★ 卡片和"这一页多占的那点空"**一次 commit** —— 和 `placeDeckCards` 同一条账：
+       分两次写的话，中间那一帧卡片和页面对不上。`pageGaps` 只涨不缩（地占下了就留着）。
+       ★★ 而**这一页的空一旦涨了，它后面那些页上的卡片必须跟着挪**（2026-09-23 用户报的
+          「问这里后印上板子会让原本与ppt对齐的卡片错位」）。
+          `pageGaps[n-1]` 一写大，`pageRects` 就把第 n 页后面**每一页**推下去，
+          而那些页上的卡片是绝对坐标、谁都不会动 —— 页面走了、卡片留在原地。
+          用他真板算过：第 37 页那边要涨 418，第 38 页连着它那 5 张卡当场错位。
+          ⇒ `shiftLaterPageCards` 把那些卡按**同样的增量**挪一遍（判据是卡片自己
+             `ask.page`，见那个函数的说明）。这一笔必须和 `pageGaps`、和这张新卡
+             **在同一个 commit 里**，否则中间那一帧就是错的版面。 */
+    const was = Math.max(0, Number((Array.isArray(d.pageGaps) ? d.pageGaps : [])[n - 1]) || 0)
+    const gap = Math.max(was, Number(plan.pageGap) || 0)
+    const delta = gap - was
+    /* 交给 `shiftLaterPageCards` 的"涨了多少"：**只有这一页**涨了（这一笔只动第 n 页）。 */
+    const deltas = []
+    if (delta > 0) deltas[n - 1] = delta
+    /* ⚠ `moved` 是在 commit 的**回调**里拿到的（它读的是 `cur.cards`，那一刻的板），
+       而 `commit` 是同步的 —— 所以回调返回之后这个变量一定已经填好了，
+       下面那句 flash 读得到。别把它改成"commit 之前先算一遍"：那等于读两次板，
+       两份读数之间只要有人动一下就会分叉（这个仓库记过十几条这样的账）。 */
+    let shiftedMoved = 0
+    commit((cur) => {
+      const shifted = shiftLaterPageCards({ cards: cur.cards || [], docPath: d.path, deltas })
+      shiftedMoved = shifted.moved
+      return {
+        ...cur,
+        docs: (cur.docs || []).map((x) => {
+          if (x.id !== d.id) return x
+          if (!(gap > 0)) return x
+          const keep = Array.isArray(x.pageGaps) ? x.pageGaps.slice() : []
+          keep[n - 1] = gap
+          return { ...x, pageGaps: keep }
+        }),
+        cards: [...shifted.cards, fresh],
+      }
+    })
+    fitter.queue(fresh.id, { fitWidth: false })
+    /* 落进视野这件事**不用管**：这张卡就贴在你正看着的那一页旁边（追问和作业都是从
+       那一页上圈出来的），视野一动反而会把你甩到别处去。 */
+    flash(
+      `留在板上了：第 ${n} 页右边那一栏（${from === 'homework' ? '这道题' : '这段问答'}成了板上的一张卡）。` +
+        (made && made.clipped ? '⚠ 内容太长，后面一段没留下。' : '') +
+        /* ★ 挪了别的卡就要说一声（只在这时候说）：不说的话，用户会觉得"我贴一张卡，
+           下面的东西怎么自己跑了" —— 而那是**对的**行为，得让他知道是为什么。 */
+        (shiftedMoved ? `（这一页比原来高了 ${delta}，后面那 ${shiftedMoved} 张卡跟着往下让了 —— 它们还贴着自己那一页）` : '') +
+        '不想要了 Ctrl+Z 退掉；想钉住就选中它点 📌',
+      'ok'
+    )
     return true
   }
 
@@ -2471,11 +3800,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    * ★ 落点 = 你圈的那块笔迹的左上角，宽度先按那块笔迹算（textCardRect，纯函数、有自检）；
    *   插进去之后立刻按**真实内容**量一次，收到贴着内容为止 —— 卡片**不去盖**那几笔手写
    *   （2026-09-16 用户定的：「不用盖住，就让框贴合公式和字就行」）。
-   *   所以原来的手写会露在卡片周围：不想要它了，就勾面板上那个"顺便把原来的手写擦掉"。
    *
-   * ★ 擦原笔迹是**可选**的（面板上那个勾），而且和"加卡片"合并成**一次 commit**：
-   *   一次 Ctrl+Z 把两件事一起退回去。分开两次 commit 的话，
-   *   用户按一次撤销只退了擦除、卡片还留着，看起来像"撤销坏了"。
+   * ★ 擦原笔迹**默认就擦**（2026-09-22 用户改的：「美化字迹与公式卡默认是放置时都是
+   *   自动擦除原有字迹的」）：内容已经抄进卡片、卡片又不盖它，那几笔就是废墨。
+   *   想留着原笔迹，面板上那个勾去掉即可（`erase` 从那边来，默认 true 在 InkToCard.jsx）。
+   *
+   * ★ 擦除和"加卡片"合并成**一次 commit**：一次 Ctrl+Z 把两件事一起退回去。
+   *   分开两次 commit 的话，用户按一次撤销只退了擦除、卡片还留着，看起来像"撤销坏了"。
    *
    * ★ 插完直接进编辑态：识别总会有认错的时候，直接让你改比"先放上去、再双击"少两步
    *   （和手写公式那条路同一个做法）。 */
@@ -2499,13 +3830,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     setFocus(focusCard(card.id, true))
     /* 卡片落进 DOM 之后按真实内容量一次尺寸（"留白太多"就是这一步治的）——
        两条轴都收，公式卡和文字卡一样（"就让框贴合公式和字"）。
-       勾不勾"擦掉原笔迹"只影响**那几笔还在不在**，不再影响卡片多大。
+       擦不擦原笔迹只影响**那几笔还在不在**，不影响卡片多大。
        ★ 插完是进编辑态的，所以这一次量不着（编辑器不是内容）——
          排进队里，等退出编辑时那一趟（`notify('editing-ended')`）量。 */
     fitter.queue(card.id, { fitWidth: true })
+    /* 那句话里必须说清"那几笔去哪了"：默认擦掉之后，用户回头想找原来写的字时
+       得知道是**这次操作收走的**（而不是"我的字被吃了一张卡"）—— Ctrl+Z 能退。 */
     flash(
       (isFormula ? '公式卡放上去了' : '放上去了') +
-        (erase ? '，原来那几笔已擦掉（Ctrl+Z 能退回）' : '，原来那几笔还留在板上（卡片不盖它）')
+        (erase ? '，原来那几笔已擦掉（Ctrl+Z 能退回）' : '，原来那几笔留着（卡片不盖它）')
     )
   }
 
@@ -2550,6 +3883,150 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     return out
   }, [board])
 
+  /* ★★ 卡片层那一层的**基础视图变换**（2026-09-21 第九刀，见 README 第 58 条）。
+     卡片现在按世界坐标摆（`left: card.x`），把"世界 → 屏幕"这一份**只写一次**，
+     写在装它们的那一层上。公式和 canvas 的 `ctx.setTransform`、
+     SVG 的 `viewTransformAttr`、资料层的 `.bd-docworld` 是同一条：
+     `translate(tx, ty) scale(s)`，原点 `0 0`。
+     ⚠ 别在这里 round（view.js 那条口径：round 是写进 DOM/CSS 那一步的事，
+       而这一步就是那一步 —— 但 4 位小数足够，浮点尾巴会让浏览器以为"变了"）。
+     ⚠ 它**不含补正**：补正在外面的 `.bd-world` 上（那是"还没重画的那一版"的差），
+       两层各表达各的，叠起来正好是屏幕上的最终位置。 */
+  const cardWorldStyle = useMemo(() => {
+    const v = board.view
+    const s = Number(v && v.s) || 1
+    const tx = Number(v && v.tx) || 0
+    const ty = Number(v && v.ty) || 0
+    return {
+      transform: `translate(${tx.toFixed(4)}px, ${ty.toFixed(4)}px) scale(${s.toFixed(6)})`,
+      transformOrigin: '0 0',
+      /* ★★ 把**这一层的缩放**报给 CSS（2026-09-21，修「点白板删除按钮没有用」）。
+       *
+       * 为什么需要它：卡片上那几颗手柄（× / 缩放柄 / 📌 / ◎）的宽高和贴边偏移
+       * 写的是**卡内长度**，而这个祖先的 `scale(s)` 会把它们一起放大 ——
+       * 于是"往外越界 10px"在屏幕上变成 `10×s` px。卡片靠到画布边缘时，
+       * 越界的那一块落到 `.bd-stagewrap` 的 `overflow: hidden` 外面，
+       * 被裁掉之后**一颗像素都点不到**（`elementFromPoint` 回 null）。
+       *
+       * ⚠ 我第一版把它当成"卡片自己的倍率 `--bd-card-scale`"来修 —— 错了。
+       *   `--bd-card-scale` 是 `combinedScale(1, k)`，只含卡自己的 k（默认 1），
+       *   而真正放大手柄的是**这一层**的视图缩放 s。实测（卡片贴画布右边沿）：
+       *     界面字号档 1.6 → × 可见 95%，缩放柄/📌 落到工具条底下
+       *     界面字号档 2.0 → × 可见 **0%**，点上去 elementFromPoint 是 null
+       *   （字号档之所以牵动它，是因为 `--s` 会把卡片里的字号撑大 → 卡片变宽 →
+       *    右边缘越过画布 → 手柄跟着出界。s 本身由 fitView 定，两件事一起作用。）
+       *
+       * 送到 CSS 之后，`:root` 那边 `.bd-card-del` 一族把尺寸和偏移都乘 `1/它`，
+       * 手柄的**屏幕大小和贴边量就和缩放无关**了。 */
+      '--bd-world-s': String(s.toFixed(6)),
+    }
+  }, [board.view])
+
+  /* ★★ "装回屏幕"要按**界面字号档**折算一下（2026-09-21，用户报「点击白板删除按钮没有用」的第二半）。
+   *
+   * 为什么：`fitView` 算的是**世界坐标**该缩多少倍，而卡片实际有多大是世界长度 × 字号档
+   * （卡里的字号是 `calc(15px * var(--s) * --bd-card-scale)`，`--s` 一调大卡片就撑宽）。
+   * 于是"装回屏幕"把世界宽度装进屏幕宽度之后，屏幕上还要再乘一份 `--s` ——
+   * 字号档越大，卡片越探出画布。实测（卡片贴画布右边沿、窗口 900×620、字号档 2.0）：
+   *   卡片屏幕宽 440，右边缘 896 > 画布右边界 866，出界 30px。
+   * 而卡片右边缘之外正是 × 待的地方（`right: -10px`），`.bd-stagewrap` 又是 overflow: hidden ——
+   * 那颗 × 就这样被裁掉，屏幕上看着还在，点下去 elementFromPoint 回 null。
+   *
+   * 修法（两条，缺一个都还是点不到）：
+   *   ① 可用宽度按 `--s` 折回去（传 `w / s`）—— 卡片才不会探出**左右**。
+   *   ② 可用高度里**扣掉工具条真正占的那一块** —— 卡片才不会探到**底下**。
+   *      工具条（`.bd-cbar`）是 `position: absolute` **浮**在画布上的
+   *      （见 styles.css / Board.jsx 的渲染结构），`.bd-stagewrap` 的 clientHeight
+   *      里**含**它盖住的那一段。实测（窗口 900×620）：
+   *        字号 0.95 → 工具条 107px，画布 437px
+   *        字号 1.6  → 工具条 222px，画布 392px（换行了）
+   *        字号 2.0  → 工具条 254px，画布 **377px 里被盖掉 266px**
+   *      字号越大工具条越会换行、越往上涨，而画布高度不变 ——
+   *      于是"装回屏幕"把内容居中的那一块，几乎整块压在工具条底下。
+   *   ⚠ 工具条高度是**量的**（barRef.current.offsetHeight），不是猜的常量：
+   *     它随 `--s` 和窗口宽度换行变化，写死一个数下次加按钮就错。
+   *   ⚠ `--s` 和工具条高度都不进 `fitView`（那是个纯几何函数，够不着 DOM，也不该够着）——
+   *     在这里折成"世界坐标下的可用区域"再传进去，`fitView` 的口径一个字不用改。
+   *   ⚠ 只影响"装回屏幕"这一类**程序适配**；你自己滚轮定的视野（viewPinned）照旧原样保留。 */
+  const fitForView = useCallback((w, h) => {
+    const s = Number(scale) > 0 ? Number(scale) : 1
+    const barW = (cbarRef.current && cbarRef.current.offsetWidth) || 0
+    const barH = (cbarRef.current && cbarRef.current.offsetHeight) || 0
+    /* ★★ 传的是"**能用的那一块**"，不是"把 screenH 改小"。
+       ⚠ 只把高度改小是**修不好**的：那只是让内容缩得更小，而 `fitView` 仍把它
+         居中到**整个容器**的一半处 —— 内容照样压在工具条底下
+         （实测：卡片顶部越出画布 119px、被工具条压住 139px）。
+         要挪的是**居中的那一点**，所以这里传的是可用区域矩形，
+         由 `fitViewIn` 负责"在它里面居中"。 */
+    return fitViewIn(boardRef.current, {
+      x: 0,
+      y: 0,
+      w: (barW > 0 ? Math.min(w, barW) : w) / s,
+      h: Math.max(120, h - barH) / s,
+    }, 70)
+  }, [scale])
+
+  /* 工具条那颗「⤢ 装回屏幕」和 Ctrl+0 都走这里。 */
+  const fitToScreen = useCallback(() => {
+    const el = wrapRef.current
+    if (el) setView(fitForView(el.clientWidth, el.clientHeight), false)
+  }, [fitForView, setView])
+
+  /* ── 卡片那批**稳定回调**（2026-09-21 第九刀，见 CardItem 顶上那段）──
+  /* ── 卡片那批**稳定回调**（2026-09-21 第九刀，见 CardItem 顶上那段）──
+     ⚠ 每一个都必须是 `useCallback`，而且只依赖"真正会变的东西"（账本 / ref / setState）。
+       一旦在里面读到 `board` / `view` / `selectedId`，依赖就会每帧换新，
+       CardItem 的 memo 立刻失效 —— **213 张卡又全部重渲染**（就是这一刀要修的病）。
+       所以这些函数只做"按 id 办事"，需要的最新板一律走 `boardRef.current`。 */
+  const cardSelect = useCallback((id) => setFocus(focusCard(id)), [])
+  const cardStartEdit = useCallback((id) => setFocus(focusCard(id, true)), [])
+  const cardStartDrag = useCallback((card) => {
+    const c0 = card ? boardRef.current.cards.find((x) => x.id === card.id) : null
+    /* 一次拖动 = 一步撤销：起点交给账本（"点了一下没拖"由 `end()` 判）。 */
+    dragStartRef.current = c0 ? { id: c0.id, x: c0.x, y: c0.y, g: ledger.begin() } : null
+  }, [ledger])
+  const cardCommit = useCallback((id, patch) => {
+    commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === id ? { ...x, ...patch } : x)) }))
+  }, [])
+  const cardCloseEdit = useCallback(() => setFocus(endEdit), [])
+  const cardDrag = useCallback((id, dxScreen, dyScreen) => {
+    /* 中途每一帧只改板、不记账 —— 这一次拖动的那一步由 dragEnd 的 `end()` 记。 */
+    const g = dragStartRef.current && dragStartRef.current.g
+    if (!g) return
+    g.during((cur) => {
+      /* 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）——走 view.js 那一处。
+         ⚠ 这里读 `cur.view.s` 是对的：cur 就是**这一帧最新的板**。 */
+      const k = cur.view.s
+      const dx = screenLenToWorld(dxScreen, k)
+      const dy = screenLenToWorld(dyScreen, k)
+      return { ...cur, cards: cur.cards.map((x) => (x.id === id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
+    })
+  }, [])
+  const cardDragEnd = useCallback(() => {
+    const st = dragStartRef.current
+    dragStartRef.current = null
+    if (!st) return
+    /* "点了一下没拖"由账本判（收尾那版板和起点是不是同一个样，数字按 0.5
+       世界像素的余量比）—— 从前这里是 `|dx| < 0.5 && |dy| < 0.5`。 */
+    st.g.end()
+  }, [])
+  const cardDelete = useCallback((id) => {
+    commit((cur) => ({ ...cur, cards: cur.cards.filter((x) => x.id !== id) }))
+    setFocus(FOCUS_NONE)
+  }, [])
+  /* ── 放大缩小（拖右下角那个柄）──
+     ★ 手势的移动/松手**挂在 window 上**，不靠 setPointerCapture、也不靠
+       "指针还在手柄上"。两个理由，都是踩出来的：
+       ① 手柄只有 18px，鼠标拖两下就出去了，靠元素自己的 onPointerMove
+          会当场收不到事件（自检里实测：拖了 120px，倍率纹丝不动）；
+       ② 卡片本身会 stopPropagation，窗口级 + 捕获阶段最省事。
+     这个手势和"拖动"是同一种东西：中途只改板不进撤销栈，
+     松手时由账本补成**一步**撤销（见 startResize）。 */
+  const cardStartResize = useCallback((id, rectW, startX) => startResize(id, rectW, startX), [])
+  const cardToggleLock = useCallback((id) => toggleLock(id), [])
+  /* 「◎ 问我圈的是哪一块」：亮着的那一张才显示 `hide`（见 Card 里那段）。 */
+  const cardAskMark = useCallback((card) => toggleAskMark(card), [])
+
   /* stageProps 里那些东西要一起传给画布：卡片层作为 children（同一个世界原点）。 */
   const stageProps = {
     sceneRef, liveRef, view: board.view, size,
@@ -2563,6 +4040,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     strokes: board.strokes, relations, cardById,
     cardsForInk: inkPairs, eraserAt,
     links, selLink: sel.link, linkPick, onPickLink: openLinkPick, onApplyLink: applyLink,
+    onVetoCond: applyVetoCond, onSpecCond: applySpecCond, onClearCond: applyClearCond,
+    /* 框选追问：`askPage` 决定「？问这里」那颗按钮亮不亮，`askRegionBox` 是
+       小窗开着时画在板上的那一圈高亮（世界坐标）。见上面那两段。
+       ★ `onHomeworkInk` 是「✎ 做这道题」那颗（作业辅导的第二个入口）——
+         和工具条那颗**同一个函数**。 */
+    askPage, onAskInk: openAsk, askRegionBox: askMark || keptBox,
+    onHomeworkInk: openHomework,
     inkFrame: sel.frame, onKeepFrame: keepFrame, onDissolveFrame: dissolveFrameNow,
     /* 板框那一族（见 frames.js）：渲染要的是"框 + 框线矩形"，交互只有把手那三件事。 */
     frames: framesToDraw,
@@ -2582,6 +4066,13 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
     },
     onPointerDown, onPointerMove, onPointerUp,
     lasso, inkBox: sel.box, inkHasStrokes: sel.ids.length > 0, onDeleteInk: deleteInkSel, onCopyInk: copySel,
+    /* ★ 「⧉ 粘贴」的**第二处入口**（2026-09-23，BoardCanvas 里紧挨着「⧉ 复制」）。
+       和工具条那颗、以及 Ctrl+V 走的是**同一个 `pasteSel`** —— 三处各写一份的话，
+       "贴到哪儿"（视野中心）那套算法迟早会分叉，而分叉了没人看得出来。
+       ★ 为什么要在浮层里也放一颗：复制那条路的按钮本来就在这儿（复制完
+         选区还框着、浮层还在眼前），所以"复制完顺手贴一下"最顺的位置是这儿。
+         工具条那颗管的是**另一块板**（切过去之后浮层根本不出现）。 */
+    onPasteInk: pasteSel,
     /* 「◯ 规整」：`shapeHits` 是**有没有结果**（有才出现那颗按钮），
        `onRegularizeInk` 是点下去真做的事。两个一起递进去 ——
        按钮该不该出现这件事的价值判断在 shapes.js，画布那边只管显示。 */
@@ -2613,108 +4104,116 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             if (d) setDeckFor(d)
           }}
         />
-        {board.cards.map((c) => (
-          <Card
-            key={c.id}
-            card={c}
-            selected={c.id === selectedId}
-            /* ★ 这张卡**在框住的那一块里**吗 —— 在的话，拖它 = 拖整块（见 Card 的 onPointerDown）。
-               判据就是当前选区里的卡片集合（`cardSel`），和"框选收了谁"是同一份。 */
-            inPick={cardSel.has(c.id)}
-            onPickMove={pickMoveFromCard}
-            dimmed={focusIds ? !focusIds.has(c.id) : false}
-            editing={c.id === editingId}
-            view={board.view}
-            /* 选中一张卡 = 焦点是它（板框自然不再是"当前这个" —— 互斥在类型里，
-               不用再手写一句 setSelectedFrameId(null)，见 focus.js）。 */
-            onSelect={() => setFocus(focusCard(c.id))}
-            onStartDrag={() => {
-              const c0 = boardRef.current.cards.find((x) => x.id === c.id)
-              /* 一次拖动 = 一步撤销：起点交给账本（"点了一下没拖"由 `end()` 判）。 */
-              dragStartRef.current = c0 ? { id: c.id, x: c0.x, y: c0.y, g: ledger.begin() } : null
-            }}
-            onStartEdit={() => {
-              setFocus(focusCard(c.id, true))
-            }}
-            onCommit={(patch) => commit((cur) => ({ ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, ...patch } : x)) }))}
-            onCloseEdit={() => setFocus(endEdit)}
-            onDrag={(dxScreen, dyScreen) => {
-              /* 中途每一帧只改板、不记账 —— 这一次拖动的那一步由 onDragEnd 的 `end()` 记。 */
-              const g = dragStartRef.current && dragStartRef.current.g
-              if (!g) return
-              g.during((cur) => {
-                // 屏幕位移 → 世界位移：除以**当前**缩放（不是按下那一刻的）——走 view.js 那一处
-                const k = cur.view.s
-                const dx = screenLenToWorld(dxScreen, k)
-                const dy = screenLenToWorld(dyScreen, k)
-                return { ...cur, cards: cur.cards.map((x) => (x.id === c.id ? { ...x, x: x.x + dx, y: x.y + dy } : x)) }
-              })
-            }}
-            onDragEnd={() => {
-              const st = dragStartRef.current
-              dragStartRef.current = null
-              if (!st) return
-              /* "点了一下没拖"由账本判（收尾那版板和起点是不是同一个样，数字按 0.5
-                 世界像素的余量比）—— 从前这里是 `|dx| < 0.5 && |dy| < 0.5`。 */
-              st.g.end()
-            }}
-            /* ── 放大缩小（拖右下角那个柄）──
-               ★ 手势的移动/松手**挂在 window 上**，不靠 setPointerCapture、也不靠
-                 "指针还在手柄上"。两个理由，都是踩出来的：
-                 ① 手柄只有 18px，鼠标拖两下就出去了，靠元素自己的 onPointerMove
-                    会当场收不到事件（自检里实测：拖了 120px，倍率纹丝不动）；
-                 ② 卡片本身会 stopPropagation，窗口级 + 捕获阶段最省事。
-               这个手势和"拖动"是同一种东西：中途只改板不进撤销栈，
-               松手时由账本补成**一步**撤销（见上面的 startResize）。 */
-            onStartResize={(rectW, startX) => startResize(c.id, rectW, startX)}
-            onToggleLock={() => toggleLock(c.id)}
-            onDelete={() => {
-              commit((cur) => ({ ...cur, cards: cur.cards.filter((x) => x.id !== c.id) }))
-              setFocus(FOCUS_NONE)
-            }}
-          />
-        ))}
+        {/* ★★ 卡片层：**世界坐标 + 一层视图变换**（2026-09-21 第九刀的性能修，
+            见 README 第 58 条）。
+            从前卡片按 `屏幕 = 世界 × s + t` 逐张算 left/top，缩放时 213 张卡
+            每张改 6 个属性 → 浏览器对 3 万个 DOM 节点全量重排
+            （实测用户的板：30 次滚轮 7.4 秒，其中 4.0 秒纯 layout）。
+            现在卡只写**世界坐标**，视图变换在这一层做一次 ——
+            缩放时只有这一行 transform 变，浏览器走合成层，**一次 layout 都不做**。
+            这和外层 `.bd-world`（吃补正）、资料层那两层（`.bd-doclayer` 吃补正
+            + `.bd-docworld` 带基础变换）是**同一个套路**：基础变换和自己的补正
+            各占一层，谁也不覆盖谁。
+            ⚠ `transform-origin: 0 0` 必须有 —— 那条公式是以原点推的。
+            ⚠ 这一层只管**坐标**，不管叠放：z-index 那件事还是 `.bd-world` 的
+              （卡片要压过 .bd-hit(5)，见 BoardCanvas 里那一大段）。 */}
+        <div className="bd-cardworld" data-card-world="1" style={cardWorldStyle}>
+          {board.cards.map((c) => (
+            <CardItem
+              key={c.id}
+              card={c}
+              selected={c.id === selectedId}
+              /* ★ 这张卡**在框住的那一块里**吗 —— 在的话，拖它 = 拖整块（见 Card 的 onPointerDown）。
+                 判据就是当前选区里的卡片集合（`cardSel`），和"框选收了谁"是同一份。 */
+              inPick={cardSel.has(c.id)}
+              dimmed={focusIds ? !focusIds.has(c.id) : false}
+              editing={c.id === editingId}
+              askMarked={!!keptMark && keptMark.cardId === c.id}
+              /* ⚠ 下面这一批必须是**稳定引用**（useCallback 造的，见上面那段）——
+                 现写内联箭头的话，213 张卡每次缩放全部重渲染，memo 白加。
+                 也**不再传 `view`**：传了同样会全员重渲染（见 Card 顶上那段说明）。 */
+              onSelectCard={cardSelect}
+              onStartEditCard={cardStartEdit}
+              onStartDragCard={cardStartDrag}
+              onCommitCard={cardCommit}
+              onCloseEditCard={cardCloseEdit}
+              onDragCard={cardDrag}
+              onDragEndCard={cardDragEnd}
+              onDeleteCard={cardDelete}
+              onStartResizeCard={cardStartResize}
+              onToggleLockCard={cardToggleLock}
+              onAskMarkCard={cardAskMark}
+              onPickMove={pickMoveFromCard}
+            />
+          ))}
+        </div>
       </>
     ),
   }
 
   const toolbar = (
-    <Toolbar
-      tool={tool} setTool={setTool}
+<Toolbar
+            tool={tool} setTool={setTool} onPickArrow={pickArrow}
       color={color} setColor={setColor}
       width={width} setWidth={setWidth}
       paper={paper} onPaper={pickPaper}
       onWriteFormula={() => setPadOpen(true)}
       onBeautify={() => openInkPanel('text')}
+      /* 框选追问：板上的入口就这一颗（选区浮层上还有一颗，见 BoardCanvas）。
+         ⚠ 它走的是同一条 `openAsk` —— 两条入口各写一份判断的话，
+           "什么情况下能问"一定会有一处漏掉（这个仓库为"同一句话两份实现"栽过两次）。 */
+      onAsk={openAsk}
+      /* 🔍 速查：**Ctrl+K 的那半个，留给没有键盘的时候**（2026-09-28，Surface 场景）。
+         ⚠ 走的是同一个 `toggleLook` —— 两处各写一份的话，"手工唤起时不替他预填一个词"
+           这种约定迟早只改一边（「⧉ 粘贴」和 Ctrl+V 当初就是照这个规矩做的）。
+         ⚠★ 这里要**包一层**，不能直接 `onLook={toggleLook}`：JSX 的 onClick 会把
+           **事件对象**当第一个参数送进来，`toggleLook(cx, cy)` 于是拿那个 event
+           当横坐标去算位置 ⇒ 算出 NaN。而工具条这条路本来就没有"点在哪儿"这回事
+           （它的按钮不在画布上），该摆在默认位置 —— 所以明确地什么都不传。
+           这类错的症状极难查：窗其实开了，只是位置不对（表现为"点了没反应"）。
+         ⚠ 它 `useCallback` 包着 ⇒ 引用稳定，工具条那颗按钮不会每次重渲染都换一个 props。 */
+      onLook={() => toggleLook()}
       shelfOpen={shelfOpen}
       shelfCount={shelf.length}
       onToggleShelf={toggleShelf}
       /* 收拢成笔记：把**当前这块活板**（boardRef，不是打开时的那份原文 ——
          上面刚认出来的一张卡也要算数）递给 App，草稿和建文件都在那边。 */
       onGather={() => onGatherNote && onGatherNote(boardRef.current)}
-      onInsertDoc={() => {
-        if (docInputRef.current) docInputRef.current.click()
-      }}
-      docBusy={docBusy}
+      /* ⧉ 粘贴：工具条那颗。**和 Ctrl+V 走的是同一个 `pasteSel`** ——
+         两条路各写一份的话，"贴到哪儿"（视野中心）那套算法迟早会分叉。
+         ★ 这就是给 Surface / 笔用户补的那一半：复制本来就有按钮（选区浮层），
+           而粘贴时手里什么都没有、浮层不出现，只有工具条能放它。 */
+      onPaste={pasteSel}
+      onInsertDoc={() => pickDocFile('insert')}
+      docBusy={docBusy && docBusy.who === 'insert' ? docBusy.text : null}
+      deckBusy={docBusy && docBusy.who === 'deck' ? docBusy.text : null}
       docs={board.docs || []}
       /* 课件整理：打开那个窗口（挑页 → 一页一页读 → 校对 → 贴到板上）。
-         板上有几份课件就整理**第一份**（想整理另一份就从它的资料条上进）——
-         资料条上那颗「✧ 整理」是"就整理我这一份"的意思。 */
+         · 板上有课件 → 整理**第一份**（想整理另一份就从它的资料条上进 / 或者窗口里
+           「📄 换一份文件…」）—— 资料条上那颗「✧ 整理」是"就整理我这一份"的意思；
+         · 板上一份都没有 → **直接开选文件那个框**（2026-09-20）。不逼用户先把几十页
+           铺到板上才有资格整理 —— 那条路见 `readDeckFromFile`。 */
       onReadDeck={() => {
         const list = boardRef.current.docs || []
         if (!list.length) {
-          flash('板上还没有课件 —— 先用「📄 插入 PDF/PPT」放一份上去，再回来整理它的内容', 'warn')
+          pickDocFile('deck')
           return
         }
         setDeckFor(list[0])
       }}
+      /* 作业辅导：开那个窗口。**板上没有资料也照样开** —— 窗口里会让他传一份
+         （和「课件整理」那条"没有课件就直接开选文件框"是同一个意思；只是这边
+         可以慢慢来：先挑是哪一份、再写做哪几题、要不要带上这节课的讲义）。
+         ★ 两条入口（工具条 + 选区浮层）走的是**同一个** `openHomework` ——
+           你正框着题号的话，它顺手把那一块带进窗里。 */
+      onHomework={openHomework}
+      /* 「🔓 全部解开」：见 unlockAllCards 那条注 —— 196 张钉住的讲义卡一次全开。 */
+      onUnlockAll={unlockAllCards}
+      /* 「⟲ 恢复操作」：见 resetGestures 那条注 —— 手势没收尾时用它，不用刷新页面。 */
+      onResetGestures={resetGestures}
       onUndo={undo} onRedo={redo}
       canUndo={hist.undo > 0} canRedo={hist.redo > 0}
-      onFit={() => {
-        const el = wrapRef.current
-        // 装回屏幕 = 程序适配，不是你定的视野 → pin=false，下次打开还会重新适配
-        if (el) setView(fitView(boardRef.current, el.clientWidth, el.clientHeight, 70), false)
-      }}
+      onFit={fitToScreen}
       onZoom={(f) => {
         const el = wrapRef.current
         if (el) setView((v) => zoomAt(v, f, el.clientWidth / 2, el.clientHeight / 2))
@@ -2725,6 +4224,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       dirty={dirty}
       fullscreen={fullscreen}
       onToggleFullscreen={onToggleFullscreen}
+      onHelp={() => setHelpOpen(true)}
     />
   )
 
@@ -2742,7 +4242,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      写字板那块小板也要跟着换纸，而它是 .bd 的兄弟分支，不是 stagewrap 的孩子。
      挂在根上，一条 `.paper-grid .bd-stagewrap, .paper-grid .wp-padwrap` 就都管得住。 */
   return (
-    <div className={'bd paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '') + (xforming ? ' xforming' : '')}>
+    <div className={'bd paper-' + paper + (fullscreen ? ' bd-fs' : '') + (penInk ? ' penink' : '') + (xforming ? ' xforming' : '') + (gesting ? ' gesting' : '')}>
       {/* ★ 指针种类在**捕获阶段**就记下来（挂在最外层，卡片上的事件也会先经过这里）。
           为什么不能只在 .bd-hit 上记：笔悬停到**卡片**上时，事件被卡片接走了，
           .bd-hit 上的监听收不到 —— 于是"上一次是笔"要等按下才知道，
@@ -2756,8 +4256,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
            写在 .bd-stagewrap 上而不是 .bd 上：这几个变量只有底纹用得到，
            写字板那块小板是另一个坐标系（它不跟着视图走）。 */
         style={paperGeometry(board.view, paper)}
-        onPointerMoveCapture={trackPointerKind}
-        onPointerDownCapture={trackPointerKind}
+        /* ⚠ 这三个都走**捕获阶段**：① 指针种类要看得见卡片上的停留（原有的）；
+           ② 触屏长按要在任何 `stopPropagation` 之前就能起步。 */
+        onPointerMoveCapture={onStagePointerMoveCapture}
+        onPointerDownCapture={onStagePointerDownCapture}
+        onPointerUpCapture={cancelPress}
+        onPointerCancelCapture={cancelPress}
+        /* 双击课件上的字 → 速查。为什么挂在这一层、为什么是 **Capture**，
+           见 `onStageDoubleClick` 上面那两段（★ 那条是实测抓出来的）。 */
+        onDoubleClickCapture={onStageDoubleClick}
       >
         {/* 画布、连线、卡片都在 BoardCanvas 里面 —— 它们必须是同一个世界原点。
             卡片通过 children 传进去，就是为了让"世界原点"这件事只有一个地方说话。 */}
@@ -2767,8 +4274,10 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       </div>
 
       {/* 工具条贴在画布底部。**不再有右侧那一栏**（见文件末尾「关系面板删掉了」）——
-          画布从左边栏一直铺到窗口右缘。 */}
-      <div className="bd-cbar">
+          画布从左边栏一直铺到窗口右缘。
+          ⚠ `cbarRef` 是给"装回屏幕"量它占了多高的（见 fitForView）：
+            它是 absolute 浮在画布上的，画布的 clientHeight 里含它盖住的那一段。 */}
+      <div className="bd-cbar" ref={cbarRef}>
         {/* 公式架摆工具条**上面**（同一条容器，往上长）—— 它和工具条是一路的：
             都是"随手拿一件东西"，而不是画布上的内容。 */}
         {shelfOpen && shelf.length > 0 && (
@@ -2777,19 +4286,87 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
         {toolbar}
       </div>
 
-      {/* 资料的文件选择器：藏在根上，工具条那颗「📄 插入 PDF/PPT」点它。
-          选完立刻清 value —— 同一个文件连插两次才两次都会触发 onChange。 */}
+      {/* ★ 框选追问的那个小窗（2026-09-22）：浮在页边。
+          ⚠ 它挂在这里（`.bd` 里、`.bd-stagewrap` 的**兄弟**），不是画布里面 ——
+            画布那一层 overflow: hidden，挂进去会被裁掉半截；而且它是"看的方式"，
+            不是纸上的内容（和不进板文件的询问框、公式架同一族）。
+          ⚠ `key` 带上页号和那一块矩形：**换一块地方问 = 换一个小窗** ——
+            不换的话 `turns` 会跟着搬过去，于是"第 3 页那一段的追问"会被贴到
+            第 9 页的答案下面（对话和它讲的那一块必须同生共死）。
+          ★ `onKeep` 是「留到板上」（ADR-0006）：小窗**还是不碰板** ——
+            它只能发一个"把这一轮留下"的请求，落成什么卡、摆哪儿、写不写盘
+            全在 `keepAnswer` 那一层。所以"答案会不会污染我的板"这句话的回答
+            仍然是"**你不点它就不会**"（`check:followup-browser` 盯着这一条）。 */}
+      {/* 「?」帮助浮层：手势 / 快捷键 / 功能入口对照（工具条右下角那颗「?」开的）。
+          和询问框同族：不进板文件，关了就没了。 */}
+      {helpOpen && <BoardHelp onClose={() => setHelpOpen(false)} />}
+
+      {ask && ask.doc && (
+        <AskBox
+          key={`ask:${ask.page}:${Math.round(ask.region.x * 1000)}:${Math.round(ask.region.y * 1000)}`}
+          anchor={ask.anchor}
+          target={{ doc: ask.doc, page: ask.page, region: ask.region, rect: ask.box }}
+          onKeep={(p) => keepAnswer({ ...p, from: 'ask' })}
+          onClose={() => setAsk(null)}
+          flash={flash}
+        />
+      )}
+
+      {/* 速查那个小窗（2026-09-28）：上课突然不懂的那个词。
+          ⚠ 同样挂在 `.bd` 里、`.bd-stagewrap` 的**兄弟**位置 ——
+            画布那一层 overflow: hidden，挂进去会被裁掉半截；而且它是"看的方式"，
+            不是纸上的内容（和公式架、询问框、作业窗同一族：不进板文件，关了就没了）。
+          ⚠ `onKeep` 交出去的仍然只是**请求**：`keepQuick` 决定落成什么卡、摆在哪儿，
+            所以"我查个词会不会污染我的板"的回答仍然是"**你不点『留到板上』就不会**"。 */}
+      {look && (
+        <QuickLook
+          key={look.key}
+          at={look.at}
+          seed={look.seed}
+          contextLabel={lookContext}
+          onKeep={(p) => keepQuick({ ...p, doc: look.doc })}
+          onClose={() => setLook(null)}
+          flash={flash}
+        />
+      )}
+
+      {/* 资料的文件选择器：藏在根上，工具条那几颗按钮点它 ——
+          「📄 插入 PDF/PPT」、「✧ 课件整理」（板上没有课件时直接走这条路），
+          以及「✎ 作业辅导」窗口里那颗「📄 传一份作业的 PDF…」。
+          ⚠ 谁点的由 `docIntentRef` 记着（change 事件里读不出这个）。
+          选完立刻清 value —— 同一个文件连选两次才两次都会触发 onChange。
+          ★ **图片也收**（png/jpg/webp）：题目常常只要一张截图/一张照片就够，
+            犯不着为三道题传一本几百页的书 —— 图片进来就是一页资料，
+            书上该有的本事（圈起来问、当作业那份书）它全都有。 */}
       <input
         ref={docInputRef}
         type="file"
-        accept=".pdf,.ppt,.pptx"
+        accept=".pdf,.ppt,.pptx,.png,.jpg,.jpeg,.webp"
         style={{ display: 'none' }}
         onChange={(e) => {
           const f = e.target.files && e.target.files[0]
           e.target.value = ''
-          insertDocFile(f)
+          const intent = docIntentRef.current
+          docIntentRef.current = 'insert'
+          if (intent === 'deck') readDeckFromFile(f)
+          else if (intent === 'homework') readHomeworkFromFile(f)
+          else insertDocFile(f)
         }}
       />
+
+      {/* 「这本书有几百页，我只要那几页」那个小窗（2026-09-21）：只在进来的是一份
+          够厚的 PDF 时弹出（见 `maybeSlicePdf`）；三个出口都长在 DocPagePicker 里。
+          ★ `preview` 是**画缩略图那台机器**（`pdf.thumbs`，见 doc-slice.js）：
+            书上的页码和 PDF 的页码差一点是常事，他得能先看一眼再定。 */}
+      {sliceAsk && (
+        <DocPagePicker
+          name={sliceAsk.name}
+          total={sliceAsk.total}
+          preview={sliceAsk.preview}
+          onPick={answerDocPages}
+          onCancel={() => answerDocPages(null)}
+        />
+      )}
 
       {padOpen && (
         <WritingPad
@@ -2815,14 +4392,48 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
             「确认」回调一到，就量尺寸、摆版、一次 commit 写进板。 */}
       {deckFor && (
         <DeckReview
+          /* ★ `key` = 这一份课件的 id：窗口里「📄 换一份文件…」换的是 doc，
+             没有这个 key 的话，新那份会**接着上一份的状态**（读过的页、挑中的区间）
+             往下跑 —— 那正是最难查的一类错（两处各说各的，还都不报错）。 */
+          key={deckFor.id}
           doc={deckFor}
-          defaultPages={defaultDeckPages(deckFor, sel)}
+          /* 预选：**只有这份在板上**时才看"你正框着哪几页" ——
+             选文件收进来的那份画面上根本没有，拿一个看不见的矩形去框它没有意义。 */
+          defaultPages={defaultDeckPages(deckFor, boardDocOf(deckFor) ? sel : null)}
           onOpenSettings={() => setSettingsOpen(true)}
+          onPickFile={() => pickDocFile('deck')}
           onCancel={() => setDeckFor(null)}
           onConfirm={(payload) => {
             setDeckFor(null)
             if (!placeDeckCards(payload)) flash('这几条没量出尺寸（公式排不出来？），一张都没贴上去 —— 换个写法再试，或者先贴文字那几条', 'warn')
           }}
+        />
+      )}
+      {/* 作业辅导那个窗口（2026-09-22）：挑作业在哪一份 → 写"第几页第几题" → 每题一份答案 + 解析。
+          ⚠ 它和 `AskBox` 一样**没有 onCommit 这种东西** —— 组件拿不到"往板上写"的口子，
+            所以"答案会不会污染我的板"这个问题在结构上就不存在（不是靠自觉）。
+            ★ `onKeep` 是「留到板上」（ADR-0006）：它交出来的只是一个**请求**
+              （哪一份、第几页、哪一块、什么内容），落不落、落在哪儿由 `keepAnswer` 决定。
+          ⚠ 挂在 `.bd` 里、`.bd-stagewrap` 的**兄弟**位置：画布那一层 overflow: hidden，
+            挂进去会被裁掉半截；而且它是"看的方式"，不是纸上的内容（和询问框、公式架同一族）。 */}
+      {hwOpen && (
+        <HomeworkBox
+          docs={board.docs || []}
+          cards={board.cards}
+          docPath={hwDoc}
+          target={hwTarget}
+          /* 换一份资料 = 那个框作废：`region` 是**相对某一页**的归一化矩形，
+             换一本书之后它指的地方完全变了一个意思（见 HomeworkBox 里那段）。 */
+          onDoc={(p) => {
+            setHwDoc(p)
+            setHwTarget(null)
+          }}
+          onClearTarget={() => setHwTarget(null)}
+          onPickFile={() => pickDocFile('homework')}
+          onKeep={(p) => keepAnswer({ ...p, from: 'homework' })}
+          onClose={() => setHwOpen(false)}
+          uploadBusy={docBusy && docBusy.who === 'homework' ? docBusy.text : ''}
+          flash={flash}
         />
       )}
     </div>
@@ -2849,628 +4460,6 @@ function defaultDeckPages(doc, sel) {
   return rects.map((_, i) => i + 1)
 }
 
-// ────────────────────────────── 卡片 ──────────────────────────────
-
-function Card({ card, selected, dimmed, editing, view, inPick, onSelect, onStartEdit, onStartDrag, onCommit, onCloseEdit, onDrag, onDragEnd, onDelete, onStartResize, onToggleLock, onPickMove }) {
-  const dragRef = useRef(null)
-  const taRef = useRef(null)
-  const [draft, setDraft] = useState('')
-  const [draftFont, setDraftFont] = useState(DEFAULT_CARD_FONT)
-  const isFormula = card.kind === 'formula'
-  /* 固定（钉住）：这张卡不再收指针事件 —— 见下面 .bd-card.locked 和 pinCard 的说明。 */
-  const locked = card.locked === true
-  /* 卡片的"放大缩小"倍率（见 lib/board.js 的 nextCardScale）。
-     一个数管全部：字号、内边距、圆角、宽高都乘它 ——
-     只改宽高不把字号跟着变的话，卡片越拉越大、字还是那么小，看着像坏了。 */
-  const k = Number(card.scale) > 0 ? Number(card.scale) : 1
-  /* 这张卡在屏幕上唯一的倍率（世界 × s × k）—— 尺寸、字号、内边距、圆角全用它，
-     而且它由 view.js 的 combinedScale 算（别在这里手写 `view.s * k`：那条口径
-     以前手抄在三处，ADR-0002 那根黑线就是从这种手抄里长出来的）。 */
-  const f = combinedScale(view.s, k)
-
-  useEffect(() => {
-    if (!editing) return
-    setDraft(isFormula ? card.src || '' : card.text || '')
-    setDraftFont(card.font || DEFAULT_CARD_FONT)
-    const raf = requestAnimationFrame(() => {
-      const el = taRef.current
-      if (!el) return
-      el.focus()
-      el.setSelectionRange(el.value.length, el.value.length)
-    })
-    return () => cancelAnimationFrame(raf)
-  }, [editing, isFormula, card.src, card.text, card.font])
-
-  function commitEdit() {
-    if (isFormula) {
-      /* ★ 空提交什么都不改。
-         公式卡显示的是 tex，而编辑框里编辑的是 src ——
-         一旦空串提交进来，下面这句 `tex: toTex(draft)` 会把 tex 清掉，
-         整张卡变成"双击写公式"，而用户只是"想确认一下"。
-         实测栽过一次（手写识别插入的卡片原来 src 是空的，一按回车就没了）。
-         想清空有「删除」，想放弃有「取消」，所以这里把"空"当成"没有修改"。 */
-      if (!draft.trim()) {
-        onCloseEdit()
-        return
-      }
-      onCommit({ src: draft, tex: toTex(draft) })
-    } else {
-      /* 文字卡不一样：这里**允许清空**（清空就是"这张卡不要了，但先留着框"）。
-         但字体要一起提交 —— 用户可能只想换个字体，一个字都没动。 */
-      onCommit({ text: draft, font: draftFont })
-    }
-    onCloseEdit()
-  }
-
-  let body
-  if (editing) {
-    body = (
-      <div className="bd-card-edit" onPointerDown={(e) => e.stopPropagation()}>
-        <textarea
-          ref={taRef}
-          value={draft}
-          spellCheck={false}
-          rows={1}
-          /* 文字卡的编辑框里直接用它自己的字体写 —— 你在这儿选字体，
-             看到的就该是那个字体的样子（而不是先保存、再看出效果）。 */
-          style={isFormula ? undefined : { fontFamily: fontCss(draftFont) }}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            e.stopPropagation()
-            if (e.key === 'Escape') {
-              e.preventDefault()
-              onCloseEdit()
-            } else if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              commitEdit()
-            }
-          }}
-          placeholder={isFormula ? 'F = ma  ·  dS/dt  ·  sqrt(x^2+y^2)' : '一句话'}
-        />
-        {!isFormula && (
-          <div className="bd-fonts">
-            {CARD_FONTS.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                className={'bd-font' + (draftFont === f.id ? ' on' : '')}
-                style={{ fontFamily: f.css }}
-                /* 不让按钮抢走焦点：在 textarea 里改字改到一半去点字体，
-                   焦点一跳就没有光标了，回来还得再点一次输入框。 */
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => setDraftFont(f.id)}
-                title={f.note}
-              >
-                {f.name}
-              </button>
-            ))}
-          </div>
-        )}
-        {isFormula && (
-          <div className="bd-mini-preview">
-            {draft.trim() ? <Tex tex={toTex(draft)} block /> : <span className="dim small">上面写的会变成这样</span>}
-          </div>
-        )}
-        {isFormula && (
-          <div className="bd-snips">
-            {SNIP_KEYS.map((k) => (
-              <button
-                key={k}
-                type="button"
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  const el = taRef.current
-                  const s = el ? el.selectionStart : draft.length
-                  const t = el ? el.selectionEnd : draft.length
-                  const ins = snippetFor(k, draft.slice(s, t))
-                  setDraft(draft.slice(0, s) + ins + draft.slice(t))
-                  const pos = s + ins.length
-                  requestAnimationFrame(() => {
-                    taRef.current?.focus()
-                    taRef.current?.setSelectionRange(pos, pos)
-                  })
-                }}
-              >
-                {SNIP_LABEL[k]}
-              </button>
-            ))}
-          </div>
-        )}
-        <div className="bd-card-acts">
-          <button className="mini" onClick={onCloseEdit}>取消</button>
-          <button className="mini primary" onClick={commitEdit}>好了</button>
-        </div>
-      </div>
-    )
-  } else if (isFormula) {
-    const tex = displayTex(card)
-    body = tex ? <div className="bd-tex"><Tex tex={tex} block /></div> : <div className="bd-card-empty">双击写公式</div>
-  } else {
-    /* 文字卡按它自己选的字体渲染 —— "字变好看"就落在这一行上。
-       字体是一串候选（见 board.js 的 CARD_FONTS），系统里装了哪个用哪个，
-       一个字体文件都不下载。 */
-    body = card.text
-      ? <div className="bd-note" style={{ fontFamily: fontCss(card.font) }}>{card.text}</div>
-      : <div className="bd-card-empty">双击写字</div>
-  }
-
-  /* 卡片左上角的屏幕位置：世界 → 屏幕，走 `view.js` 那一道缝（只有一份实现）。
-     ⚠ `worldToScreen` 返回 `{x, y}`，**不是** `{left, top}` —— 直接展开进 style
-       卡片会没有 left/top、静默退回 CSS 定位（整版错位，自检 [6] 当场抓到过）。 */
-  const at = worldToScreen({ x: card.x, y: card.y }, view)
-
-  return (
-    <div
-      className={'bd-card' + (isFormula ? ' is-formula' : ' is-note') + (locked ? ' locked' : '') + (selected ? ' on' : '') + (dimmed ? ' dim' : '') + (editing ? ' editing' : '')}
-      /* 这两条 dataset 是给自检看的（浏览器里看不到卡片数据，
-         而"插进去的是不是文字卡、字体对不对"只有真 DOM 能证明）。
-         和画布那三个 dataset.strokes/pts/flat 是同一个道理。
-         data-card-locked 也一样：锁定是个**行为**，自检要能一眼读到它。 */
-      data-card-kind={card.kind}
-      data-card-font={card.kind === 'note' ? card.font || DEFAULT_CARD_FONT : undefined}
-      data-card-locked={locked ? '1' : undefined}
-      /* data-card-id 是给"插完量一下真实高度"用的（fitCardHeight 靠它找内容元素）。
-         id 只在文件内唯一，DOM 里也够用。 */
-      data-card-id={card.id}
-      /* ★ 位置用 JS 算，不用 CSS transform。公式就是世界坐标那一个映射：
-             屏幕 = 世界 * s + t
-         四个数（left/top/width/字号缩放）一起算，缩放才能"整体一致地"变小 ——
-         只缩 left/top 不缩字号，卡片会一边跑到正确位置、一边保持原来的大小。 */
-      style={{
-        /* 位置 = 世界 → 屏幕（点）；尺寸/字号/内边距 = **带倍率的世界长度**。
-           两条映射都住在 view.js 的同一处：`f` 是这张卡唯一的倍率（世界 × s × k）。
-           从前这里手写 6 遍 `view.s * k`，量尺寸那一趟和缩放柄各再抄一遍 ——
-           而"那圈是屏幕像素、宽是世界像素"这件事就藏在这种手抄里（ADR-0002 的根子）。 */
-        left: at.x,
-        top: at.y,
-        width: worldLenToScreen(card.w, f),
-        minHeight: worldLenToScreen(card.h, f),
-        /* 字号和内边距也按同一个倍率走，卡片才是"整体一致地"变大变小。
-           只缩 left/top/width 而不缩字号，卡片会跑到正确的位置却保持原来的大小。
-           CSS 里只有一个 --bd-card-scale，所以在这里乘好再写出去。 */
-        '--bd-card-scale': f,
-        /* 内边距从 10/12 收到 4/8（用户 2026-09-16：「边缘留白太多了」）。
-           为什么不干脆给 0：字贴着边框线看着像画坏了，而且卡片一选中、
-           边框一加粗就会压到字上。4px 是"看着贴、但不顶边"的那个数。 */
-        padding: `${worldLenToScreen(4, f)}px ${worldLenToScreen(8, f)}px`,
-        borderRadius: Math.max(3, worldLenToScreen(10, f)),
-        /* ★ 旋转（2026-09-21，用户要的「卡片都应该能够放大，旋转，这点类似 oneNote」）。
-           绕**卡片自己的中心**转 —— `transform-origin` 显式写出来，不靠 CSS 默认值：
-           `.bd-card` 哪天有人给它设了别的 origin（比如为了那个补正），
-           旋转的轴就会悄悄跑到角上去（卡片会绕着角甩，而且看起来"像是我拖歪了"）。
-           ⚠ 这条 transform **只管旋转**，绝不参与定位：位置还是上面那两行
-             `left/top` 按"屏幕 = 世界 × s + t"算的（README 第 3 条：
-             同一个位移两处各表达一遍，就一定有一处会多加一次）。
-           ⚠ 没转过（`rot` 为 0/没有）时**一个字节的 style 都不写** ——
-             和文件里那个字段同一条纪律（老卡片的 DOM 也纹丝不动）。 */
-        ...(card.rot ? { transform: `rotate(${card.rot}rad)`, transformOrigin: '50% 50%' } : {}),
-      }}
-      onPointerDown={(e) => {
-        /* ★ 固定住的卡片**什么都不接**：不选中、不拖动。
-           CSS 那边已经给了 pointer-events: none（事件会落到下面的 .bd-hit，
-           于是笔在这上面能写字、手指在这上面能平移），这里是第二道闸 ——
-           万一以后有人给卡片加了个自己的可点区域，拖动的入口也不会漏。 */
-        if (locked) return
-        /* ★ 编辑态里**也能拖**，只要不是按在输入框/按钮上。
-           原来这里是 `if (editing) return` —— 而"放到白板上"之后卡片就在编辑态，
-           于是用户按它毫无反应，报的就是「卡片应该能够移动」（2026-09-16）。
-           编辑器占的只是卡片中间那一块，四周的边留给人拖。 */
-        if (editing && e.target.closest('textarea, button, input, .bd-snips')) return
-        e.stopPropagation()
-        /* ★★ 这张卡**在框住的那一块里** → 拖它 = 拖**整块**（2026-09-21）。
-           为什么必须有这一条：卡片自己收指针事件（它比 .bd-hit 高一层），
-           所以"按在卡片上"根本到不了 Board 里那个整组拖动的分支 ——
-           不接这一条的话，症状是"框住字 + 卡，按着卡拖，只有卡动了"，
-           屏幕上就是**拖散了**（和"只搬笔迹不搬卡片"是同一个错，换了个入口）。
-           ⚠ 这里**不调用 onSelect()**：那会把焦点换成这张卡、整块选区当场散掉 ——
-             而用户的意思明明是"动这一整块"。想单独动它就先点一下空白（取消选中）。 */
-        if (inPick) {
-          dragRef.current = { pick: true }
-          e.currentTarget.setPointerCapture?.(e.pointerId)
-          onPickMove?.(e, 'start')
-          return
-        }
-        onSelect()
-        onStartDrag?.()
-        dragRef.current = { x: e.clientX, y: e.clientY, moved: false }
-        e.currentTarget.setPointerCapture?.(e.pointerId)
-      }}
-      onPointerMove={(e) => {
-        const d = dragRef.current
-        if (!d || editing || locked) return
-        /* 整块拖动那一条：坐标换算在 Board 那边（它才知道画布容器的原点）。 */
-        if (d.pick) {
-          onPickMove?.(e, 'move')
-          return
-        }
-        /* 这里只报**屏幕位移**，换算成世界坐标由 Board 按当前缩放做 ——
-           在这个闭包里读 view.s 会读到"按下那一刻"的缩放，
-           缩放过一次之后拖动就会跑得比手指快/慢。 */
-        const dx = e.clientX - d.x
-        const dy = e.clientY - d.y
-        if (Math.abs(dx) < 0.4 && Math.abs(dy) < 0.4) return
-        d.x = e.clientX
-        d.y = e.clientY
-        d.moved = true
-        onDrag(dx, dy)
-      }}
-      onPointerUp={() => {
-        if (!dragRef.current) return
-        /* 整块拖动那条路收尾：一次拖动 = 一步撤销（判"动没动过"由账本做）。 */
-        if (dragRef.current.pick) onPickMove?.(null, 'end')
-        else onDragEnd()
-        dragRef.current = null
-      }}
-      onDoubleClick={(e) => {
-        e.stopPropagation()
-        /* 固定的卡片双击也不进编辑态：用笔的时候双击太容易误触，
-           而"我把它钉住了"这句话的意思就是"别动它"。
-           想改内容就点一下 📌 解开 —— 那是个明确的动作。 */
-        if (locked) return
-        onStartEdit()
-      }}
-      title={
-        locked
-          ? '这张卡固定住了：拖不动、也不会误触（点左下角 📌 解开）'
-          : '拖动挪位置 · 拖右下角放大缩小 · 双击改内容 · Delete 删掉 · 左下角 📌 固定住防误触（用笔时卡片让路，写在卡片上也画得出）'
-      }
-    >
-      {/* 内容包一层：fitCardHeight 量的就是它的高度（量卡片自己等于量 min-height，
-          永远量不出"其实只有一行字"）。这一层不参与任何布局计算，只是给量高度一个准星。 */}
-      <div className="bd-card-body">{body}</div>
-
-      {/* 固定：**锁定之后整张卡只剩这一个能点**（它自己带 pointer-events: auto），
-          所以"钉死了拿不下来"这件事不会发生。
-          没锁的时候只在你选中它时出现 —— 和 × / 缩放柄同一个规矩：
-          不选中时卡片上一个手柄都不该有（这条也是踩过的，见 README 第 14 条）。
-          ⚠ 位置在**左下角**（.bd-card-pin 的 CSS）：左上角是"抓住卡片拖走"最顺手的
-            那一点，放个按钮在那儿就等于把拖动变成点按钮 —— 这条真踩过，
-            `check-ocr-browser` 的拖动断言当场变成"拖不动（0, 0）"。 */}
-      {(locked || (selected && !editing)) && (
-        <button
-          className={'bd-card-pin' + (locked ? ' on' : '')}
-          /* 给自检用的钩子：这个按钮**点了会发生什么**（lock / unlock）。
-             光看 📌 和 📍 两个 emoji 分不出状态，而"锁定/解锁"正是要断言的。 */
-          data-card-pin={locked ? 'unlock' : 'lock'}
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation()
-            onToggleLock?.()
-          }}
-          title={locked ? '解开：解开就又能拖了' : '固定住：拖不动、双击也不会进编辑（防误触）'}
-        >
-          {locked ? '📌' : '📍'}
-        </button>
-      )}
-
-      {selected && !editing && !locked && (
-        <>
-          <button
-            className="bd-card-del"
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation()
-              onDelete()
-            }}
-            title="删掉这张（Ctrl+Z 能撤销）"
-          >
-            ×
-          </button>
-          {/* 缩放柄：拖它按比例放大缩小**整张卡**（字跟着一起变）。
-              手势本身在 startResize 里（window 级监听）—— 这里只负责"按下"。
-              手柄这么小，靠它自己的 onPointerMove 收后续事件是收不到的。 */}
-          <div
-            className="bd-card-resize"
-            title="拖这里放大缩小：字会跟着一起变（双击卡片可以改内容）"
-            onPointerDown={(e) => {
-              e.stopPropagation()
-              e.preventDefault()
-              const host = e.currentTarget.closest('.bd-card')
-              /* ⚠ `offsetWidth`（布局宽）而不是 `getBoundingClientRect().width`：
-                 卡片转过之后后者是**斜着的外接框**，拖缩放柄的手感会跟着歪
-                 （倍率算成"外接框 / 布局框"那个虚高的数）。见 sampleCardForFit 那段。 */
-              const rectW = host ? host.offsetWidth : worldLenToScreen(card.w, f)
-              onStartResize?.(rectW, e.clientX)
-            }}
-          >
-            ⤡
-          </div>
-        </>
-      )}
-    </div>
-  )
-}
-
-const SNIP_KEYS = ['frac', 'sqrt', 'sup', 'sub', 'mu0', 'pi', 'cdot', 'int', 'sum', 'vec']
-const SNIP_LABEL = { frac: 'a/b', sqrt: '√', sup: 'xⁿ', sub: 'xₙ', mu0: 'μ₀', pi: 'π', cdot: '·', int: '∫', sum: 'Σ', vec: '向量' }
-
-/* Tex 搬去了 ./Tex.jsx（手写识别也要用它，留在这儿会绕出循环依赖）。 */
-
-// ────────────────────────────── 公式架 ──────────────────────────────
-
-/* 一条随手可取用的公式横条（用户 2026-09-20 要的那件事）。
- *
- * 两种取用法都在**同一串指针事件**里，判据只有一条"动了没有"：
- *   按下 → 松手，中间没动过 = **点**（放到视野中心）；
- *   按下 → 拖出 4px 再松手 = **拖**（落在松手的地方）。
- * 为什么不拆成 onClick + onDragStart：HTML5 那套拖放和这个应用的指针世界
- * （指针种类、指针捕获、笔）是两套东西，混用会多出一堆"笔拖不动"的怪事；
- * 而这一个组件里两种动作本来就是同一件事的两半。
- *
- * ⚠ 4px 是**手指/笔也会抖**的那个量级：太小会把"点一下"误判成拖，
- *   太大则"想拖一点点"没反应。和别处的手势阈值同类（见 README 的"手势"那条）。
- * ⚠ 拖的时候那张跟着指针走的"影子"要 `pointer-events: none` ——
- *   否则它自己会接走 pointerup，松手落在影子卡上就丢失了（那种 bug 的表现是
- *   "拖了半天，一松手什么都没发生"）。 */
-const SHELF_DRAG_PX = 4
-
-function FormulaShelf({ items, onUse, onDrop, onClose }) {
-  const pressRef = useRef(null)
-  const [dragAt, setDragAt] = useState(null)
-
-  const down = (e, item) => {
-    if (e.button != null && e.button !== 0) return
-    e.preventDefault()
-    pressRef.current = { item, x0: e.clientX, y0: e.clientY, moved: false }
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId)
-    } catch {
-      /* 捕获不到也能用（事件照样冒泡到这一格上）—— 别为它崩 */
-    }
-  }
-  const move = (e) => {
-    const p = pressRef.current
-    if (!p) return
-    if (!p.moved && Math.hypot(e.clientX - p.x0, e.clientY - p.y0) < SHELF_DRAG_PX) return
-    p.moved = true
-    setDragAt({ item: p.item, x: e.clientX, y: e.clientY })
-  }
-  const up = (e) => {
-    const p = pressRef.current
-    pressRef.current = null
-    setDragAt(null)
-    if (!p) return
-    if (p.moved) onDrop(p.item, e.clientX, e.clientY)
-    else onUse(p.item)
-  }
-
-  return (
-    <div className="bd-shelf" data-shelf="1">
-      <div className="bd-shelf-h">
-        <span className="bd-shelf-title">∑ 公式架</span>
-        <span className="bd-shelf-note">
-          这张板上认过的公式都在这儿（同一条公式只占一格）· <b>点</b>一下放到眼前 · <b>拖</b>到板上指哪放哪
-        </span>
-        <button className="bd-shelf-x" onClick={onClose} title="收起（F）">
-          ×
-        </button>
-      </div>
-      <div className="bd-shelf-row">
-        {items.map((it) => (
-          <button
-            key={it.key}
-            className={'bd-shelf-chip' + (dragAt && dragAt.item.key === it.key ? ' on' : '')}
-            data-shelf-chip="1"
-            data-shelf-tex={it.tex || it.src}
-            title={(it.src || it.tex) + (it.count > 1 ? `\n（板上有 ${it.count} 处）` : '')}
-            onPointerDown={(e) => down(e, it)}
-            onPointerMove={move}
-            onPointerUp={up}
-            onPointerCancel={() => {
-              pressRef.current = null
-              setDragAt(null)
-            }}
-          >
-            <Tex tex={it.tex || it.src} />
-            {it.count > 1 && <span className="bd-shelf-n">×{it.count}</span>}
-          </button>
-        ))}
-      </div>
-      {dragAt &&
-        /* ★ 影子卡必须**挂到 body 上**（portal），不能留在架子里面。
-           2026-09-20 用户报的「拖动过程的可视化不要突然出现在末尾」就是这条：
-           `.bd-shelf` 有 `backdrop-filter`（毛玻璃），而**带 filter / backdrop-filter
-           的元素会成为 `position: fixed` 后代的包含块** —— 于是 `left/top` 写的是
-           视口坐标，画出来却是"架子左上角 + 视口坐标"，整张影子卡跑到视口外面
-           （实测偏离指针 (297, 537) = 架子自己的位置 + 那 14px 偏移）。
-           症状极像"功能没做"：拖的时候屏幕上什么都没有，一松手卡片才在落点冒出来。
-           实测数据与做法见 `.cache/probe-ghost.mjs`（探针已删，结论在 check:shelf 的断言里）。 */
-        createPortal(
-          <div className="bd-shelf-ghost" style={{ left: dragAt.x + 14, top: dragAt.y + 15 }}>
-            <Tex tex={dragAt.item.tex || dragAt.item.src} />
-          </div>,
-          document.body
-        )}
-    </div>
-  )
-}
-
-// ────────────────────────────── 工具条 ──────────────────────────────
-
-function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onGather, onInsertDoc, docBusy, docs = [], onReadDeck, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen, shelfOpen, shelfCount, onToggleShelf }) {
-  return (
-    <div className="bd-tools">
-      <div className="bd-group">
-        <button className={'bd-t' + (tool === 'pen' ? ' on' : '')} data-tool="pen" onClick={() => setTool('pen')} title="笔（P）：手写笔默认就是这个">
-          ✎ 笔
-        </button>
-        <button className={'bd-t' + (tool === 'highlighter' ? ' on' : '')} data-tool="highlighter" onClick={() => setTool('highlighter')} title="荧光笔：盖在字上做记号">
-          ▬ 荧光
-        </button>
-        <button className={'bd-t' + (tool === 'eraser' ? ' on' : '')} data-tool="eraser" onClick={() => setTool('eraser')} title="橡皮（E）：碰到哪一笔就擦掉整笔">
-          ◻ 橡皮
-        </button>
-        {/* 箭头（A）：从一样东西划到另一样东西，松手就连上（见 ADR-0001）。
-            一次性的 —— 画完自己回到笔，因为"两个板块之间连一笔"通常就是一笔。
-            它**不落墨**：屏幕上那条箭头是应用画的（贴着框/卡的边、跟着它们走）。 */}
-        <button
-          className={'bd-t' + (tool === 'arrow' ? ' on' : '')}
-          data-tool="arrow"
-          onClick={() => {
-            setTool('arrow')
-            flash('箭头工具：从一样东西划到另一样东西（画完自动回到笔）', 'ok')
-          }}
-          title="箭头（A）：从一样东西划到另一样东西，松手就连上。一次性 —— 画完自动回到笔；纸上不留墨，那条线是应用画的"
-        >
-          → 箭头
-        </button>
-        {/* 框选（S）：拖一个矩形圈住笔迹。原来只有"笔杆侧键"这一条路，
-            所以用鼠标、或者笔上没有侧键的人根本选不中笔迹 —— 认公式/美化也就无从谈起。 */}
-        <button className={'bd-t' + (tool === 'select' ? ' on' : '')} data-tool="select" onClick={() => setTool('select')} title="框选（S）：拖一个框圈住要认的手写 —— 圈住之后框上方浮出「∑ 公式」「✨ 美化」「✕ 删除」。★ 用笔时卡片会给笔让路，想拖卡片 / 缩放 / 双击改字就切到这个工具">⬚ 框选</button>
-      </div>
-
-      <div className="bd-group">
-        {COLORS.map((c) => (
-          <button
-            key={c.id}
-            className={'bd-swatch' + (color === c.v && tool !== 'highlighter' ? ' on' : '')}
-            style={{ background: c.v }}
-            onClick={() => {
-              setColor(c.v)
-              if (tool === 'eraser' || tool === 'highlighter') setTool('pen')
-            }}
-            title={c.name}
-          />
-        ))}
-        {WIDTHS.map((w, i) => (
-          <button key={w} className={'bd-w' + (width === w ? ' on' : '')} onClick={() => setWidth(w)} title={'粗细 ' + (i + 1)}>
-            <span style={{ height: Math.max(1, w - 1), width: 18 - i * 4 }} />
-          </button>
-        ))}
-      </div>
-
-      <div className="bd-group">
-        {/* 「∑ 公式」「▤ 便签」两个入口收掉了 —— 现在只留手写公式。
-            卡片本身的渲染和编辑都还在，所以已经存下来的卡片不会坏，只是不能再新建。 */}
-        <button className="bd-t" onClick={onWriteFormula} title="手写一个公式，认出来变成好看的式子（也可以用键盘打）">
-          ✍ 手写公式
-        </button>
-        {/* 字写得不好看就走这条：框住你写的字 → 认成文字 → 用好看的字体排成一张卡。
-            和「手写公式」并列放，因为它们是同一件事的两半：一个认式子，一个认字。
-            ★ 没框选时**不做成灰的**：灰按钮点不动、也不教人下一步该干什么，
-              而这条路的入口恰恰是"先用框选圈住字"这件反直觉的事。
-              可点 + 当场提示「先用「⬚ 框选」圈住要认的手写」才是最省事的说明书。
-            ★ 框住之后浮层上还会多一个「∑ 公式」——已经写在板上的式子不用重抄一遍。 */}
-        <button className="bd-t" onClick={onBeautify} title="美化手写：先框住你写的字（点「⬚ 框选」拖一个框，或按住笔杆键拖），再点这里">
-          ✨ 美化手写
-        </button>
-        {/* 公式架（2026-09-20）：这张板上**认过一次**的公式收成一条随手可取用的横条 ——
-            一次课里同一个公式要写好几遍，不用重抄、也不用重新框选识别。
-            用户原话：「让已经识别一次的公式卡放置在某个便于去用的地方……因为一次课
-            往往会多次用到同样的公式」。架子**由板上的公式卡推出来**，不新增任何存盘字段。 */}
-        <button
-          className={'bd-t' + (shelfOpen ? ' on' : '')}
-          data-tool="shelf"
-          onClick={onToggleShelf}
-          title={
-            shelfCount
-              ? `公式架（F）：这张板上认过的 ${shelfCount} 条公式 —— 点一下放到眼前，拖到板上指哪放哪`
-              : '公式架（F）：这张板上还没有认过的公式 —— 先「✍ 手写公式」认一个，或者框住手写点「∑ 公式」'
-          }
-        >
-          ∑ 公式架{shelfCount ? ` ${shelfCount}` : ''}
-        </button>
-        {/* 插入资料（PDF/PPT）：铺在画布最底下一层，笔迹/卡片/识别全都照常在它上面用。
-            PPT 由服务端转成 PDF（本机装了 PowerPoint 就能转），PDF 原样收。
-            上传/转换期间按钮上显示进度那句话，并且不再接受第二份（并发上传没有意义）。 */}
-        <button
-          className="bd-t"
-          data-tool="doc"
-          disabled={!!docBusy}
-          onClick={onInsertDoc}
-          title="插入 PDF/PPT（很长的课件也行）：铺在画布上，直接用笔在上面写注释、圈重点、认公式"
-        >
-          {docBusy ? docBusy : '📄 插入 PDF/PPT'}
-        </button>
-        {/* 课件整理（2026-09-22）：把资料的某一段页交给模型读成**知识点**，贴到板上 ——
-            让学生不从一个空的白板开始，而是从"已经有知识的内容"开始。
-            ★ 这个按钮**读的是板上那一份**（板上有几份资料时，先用「整理这几页」那颗
-              从资料条上指定是哪一份 —— 见 DocLayer.jsx 的 DocBars）。
-              一份都没有时它就是"先插一份课件"的入口。 */}
-        <button
-          className="bd-t"
-          data-tool="deckread"
-          onClick={onReadDeck}
-          title={
-            docs.length
-              ? '课件整理：把这份 PDF/PPT 的某一段页读成知识点、贴到白板上（先挑页，再一页一页读）'
-              : '课件整理：板上还没有课件 —— 先用「📄 插入 PDF/PPT」放一份上去'
-          }
-        >
-          ✧ 课件整理
-        </button>
-        {/* 收拢成笔记：白板是过程，笔记是结论。卡片/板框/连接拣成草稿；
-            裸手写不再丢下 —— 整板画成一张图发给识别服务抄成 Markdown（要几十秒）。
-            ★ 没配识别密钥时转录会失败，但**不拦路**：照样收卡片，提示说清原因。 */}
-        <button
-          className="bd-t"
-          data-tool="gather"
-          onClick={onGather}
-          title="收拢成笔记：卡片/板框/连接拣成草稿 + 整板手写由机器转录成文字（有手写时要几十秒；没配识别密钥就只收卡片）"
-        >
-          ▤ 收成笔记
-        </button>
-      </div>
-
-      <div className="bd-group">
-        <button className="bd-t icon" onClick={onUndo} disabled={!canUndo} title="撤销 Ctrl+Z">↶</button>
-        <button className="bd-t icon" onClick={onRedo} disabled={!canRedo} title="重做 Ctrl+Shift+Z">↷</button>
-      </div>
-
-      {/* 字号：**成对**的加减 + 当前百分比。
-          为什么白板里也要有：白板模式下顶栏不渲染（白板用自己的工具条），
-          原来只剩左栏那一个按钮 —— 而它写死了"只放大"。
-          于是白板里没有"调小"的入口，用户看到的正是这个。
-          注意别和右边那组搞混：那组是**画布缩放**（纸本身放大缩小），
-          这组是**界面字号**（按钮和面板上的字大小）。 */}
-      <div className="bd-group">
-        <button className="bd-t icon" onClick={() => onScale(-0.05)} disabled={scale <= 0.9} title="界面字号小一点">A−</button>
-        <button className="bd-t zoomish" onClick={onScaleReset} title={'当前 ' + Math.round((scale || 1) * 100) + '%，点一下回到 125%'}>
-          {Math.round((scale || 1) * 100)}%
-        </button>
-        <button className="bd-t icon" onClick={() => onScale(0.05)} disabled={scale >= 2} title="界面字号大一点">A+</button>
-      </div>
-
-      {/* 纸面：四种纸直接**画在按钮上**（所点即所得，不用看名字猜）。
-          为什么不做成下拉菜单：工具条上同类的东西（颜色、粗细）都是当场摆出来的，
-          纸面是同一类选择，多一层展开只多一次点击。
-          ⚠ 别和右边那组混：那个 `纸` 是**画布缩放**（把纸放大缩小），
-            这里是**纸长什么样** —— 所以这里的标签写"背景"，两个字不一样。 */}
-      <div className="bd-group">
-        <span className="bd-zoomlabel">背景</span>
-        {PAPERS.map((p) => (
-          <button
-            key={p.id}
-            data-paper={p.id}
-            className={'bd-paper p-' + p.id + (paper === p.id ? ' on' : '')}
-            onClick={() => onPaper(p.id)}
-            title={'纸面 · ' + p.name + '：' + p.hint}
-            aria-label={'纸面：' + p.name}
-            aria-pressed={paper === p.id}
-          />
-        ))}
-      </div>
-
-      <div className="bd-group right">
-        <span className={'bd-save' + (dirty ? ' on' : '')}>{dirty ? '正在存…' : '已存'}</span>
-        <span className="bd-zoomlabel" title="这两个是画布缩放：把整张纸放大缩小">纸</span>
-        <button className="bd-t icon" onClick={() => onZoom(1 / 1.2)} title="画布缩小（纸变小）">−</button>
-        <button className="bd-t icon" onClick={onFit} title="把所有内容装回屏幕（Ctrl+0）">⤢</button>
-        <button className="bd-t icon" onClick={() => onZoom(1.2)} title="画布放大（纸变大）">＋</button>
-        {/* 全屏：把两侧栏和顶栏全收掉，连浏览器那圈也一起收，只留一张纸（Esc 退出）。
-            放在这组最右边是有意的 —— 它和"纸缩放"一样是"怎么看这块画布"的操作。 */}
-        <button
-          className={'bd-t' + (fullscreen ? ' on' : '')}
-          onClick={onToggleFullscreen}
-          title={fullscreen ? '退出全屏（Esc）' : '画布全屏：只留一张纸，四周什么都收起来'}
-        >
-          ⛶ {fullscreen ? '退出' : '全屏'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
 // ─────────────── 关系面板：整块删掉了（2026-09-19，用户说不要右边那一栏）───────────────
 /*
  * 用户：「白板页面我觉得不需要右侧关系栏，可以删掉了」—— 连栏里独有的那几个操作一起不要。
@@ -3490,27 +4479,6 @@ function Toolbar({ tool, setTool, color, setColor, width, setWidth, paper, onPap
  *   ③ 那些按钮的命中测试要单独验（行本身是 button、按钮是行内的 span）——
  *      旧自检 check-link 的 [12]/[13] 就是这么写的，删掉之前它一直是绿的。
  */
-
-// ────────────────────────────── 空板提示 ──────────────────────────────
-
-function Hint() {
-  return (
-    <div className="bd-hint">
-      <div className="bd-hint-t">拿笔直接画</div>
-      <div className="bd-hint-s">
-        写公式不用管格式：点工具条上的「✍ 手写公式」，在那块小板上把式子写一遍，
-        它会认成排好的样子，再放到板上。
-      </div>
-      <div className="bd-hint-s dim">
-        觉得自己字丑：点「⬚ 框选」把你写的字圈起来，再点「✨ 美化手写」——
-        它会认成文字，用好看的字体排一张卡盖在原处（原笔迹不删，拖开就回来）。
-      </div>
-      <div className="bd-hint-s dim">
-        笔尖写字，翻过来就是橡皮。触屏：一根手指拖 = 平移，两根手指捏 = 缩放。
-      </div>
-    </div>
-  )
-}
 
 // ─────────────── 变体切换：也删了（三种摆法本来就是"翻着挑"的临时形态）───────────────
 /* A / B / C 三套摆法存在的唯一理由是**给关系面板找地方**（右栏 / 抽屉 / 左列）。

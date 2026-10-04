@@ -145,6 +145,17 @@ if (!fs.existsSync(realConfig) && fs.existsSync(stash)) {
   } catch {}
 }
 if (fs.existsSync(realConfig)) {
+  /* ★ 老备份**不许被顶掉**（2026-09-20 改）：`renameSync` 在 Windows 上是覆盖式的，
+     所以下面那一行以前会**悄悄删掉**上一次没跑完时留下的 `.checkocr-bak`
+     （里面装的是用户的真密钥）。改名留着，收尾会把它打出来。
+     ⚠ 和 check-deck.js 的 stashConfig 是同一条规矩：改之前先问"删的是谁的"。 */
+  if (fs.existsSync(stash)) {
+    const keep = stash + '.' + new Date().toISOString().replace(/[:.]/g, '-')
+    try {
+      fs.renameSync(stash, keep)
+      console.log('  （上次没跑完留下的备份留着没删：config/' + path.basename(keep) + '）')
+    } catch {}
+  }
   fs.renameSync(realConfig, stash)
   stashed = true
 }
@@ -657,6 +668,18 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
     await drawStroke(spot.x, spot.y, 150, 12)
     await drawStroke(spot.x, spot.y + 40, 150, 12)
     await s.sleep(600)
+    /* ★ 偶发（**这台机器上几乎是必发**）：两笔里只落下一笔 —— 2026-09-22 用
+       `git stash` 跑过**改动之前的基线，连着两次都是**「白板上没画出笔迹：1」。
+       而后面整节都靠这两笔（框选 → 美化 → 认公式），所以它一红就带出三条连锁红。
+       所以：① 给两次重画的机会；② 在这儿把话说清楚，别让下一个人以为是新改坏的。
+       ⚠ 重画之前**先数一遍**：够了就别多画（多画的笔会让"卡片落在框左上角"那类断言变味）。 */
+    for (let round = 0; round < 2; round += 1) {
+      const n = Number(await s.eval(`document.querySelector('canvas.bd-ink').dataset.strokes`))
+      if (n >= 2) break
+      console.log(`  （只落下 ${n} 笔 —— 重画一次；合成指针事件的既有偶发，基线也这样）`)
+      await drawStroke(spot.x + 20 * (round + 1), spot.y + 60 + 30 * round, 150, 12)
+      await s.sleep(700)
+    }
   }
   const inkAfterDraw = await s.eval(`document.querySelector('canvas.bd-ink').dataset.strokes`)
   const inkCount = Number(inkAfterDraw)
@@ -743,6 +766,24 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
   else bad('清洗结果不对：' + JSON.stringify(panel.draft) + ' 期望 ' + JSON.stringify(RECOGNIZED))
 
   // ── ④ 挑一个字体，放上去 ──
+  /* ★★ 先验那个勾的**默认值**（要在面板还开着的时候 —— 一按"放到白板上"它就没了）。
+     2026-09-22 用户改的：「美化字迹与公式卡默认是放置时都是自动擦除原有字迹的」。
+     这一节随后走的是"**留着**原笔迹"那条路，所以这里验完默认值就把它**去掉勾**。 */
+  {
+    const eraseBox = await s.eval(`(() => {
+      const c = document.querySelector('.bp-check input')
+      return c ? { checked: !!c.checked, label: (c.closest('label') || {}).textContent || '' } : null
+    })()`)
+    if (eraseBox && eraseBox.checked) ok('★ 面板上那个"把原来的手写擦掉"**默认是勾上的**（用户 2026-09-22 定的）')
+    else bad('那个勾不是默认勾上的：' + JSON.stringify(eraseBox))
+    if (eraseBox && eraseBox.checked) {
+      await s.eval(`(() => { const c = document.querySelector('.bp-check input'); if (c) c.click(); return 1 })()`)
+      await s.sleep(120)
+      const off = await s.eval(`(() => { const c = document.querySelector('.bp-check input'); return c ? !!c.checked : null })()`)
+      if (off === false) ok('去掉那个勾 → 这一次不擦原笔迹（用户能选择留下自己的字）')
+      else bad('去掉勾没生效：' + JSON.stringify(off))
+    }
+  }
   const fonts = await s.eval(`(() => {
     const btns = [...document.querySelectorAll('.bp-font')]
     return { n: btns.length, names: btns.map(b => b.textContent), families: btns.map(b => b.style.fontFamily) }
@@ -815,8 +856,12 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
     else bad(`落点不对：卡 ${JSON.stringify(landed)} vs 框 ${JSON.stringify(boxRect)}`)
   } else bad('拿不到卡片/包围框的坐标，落点验不了')
 
+  /* ★★ 这一条走的是**"留着原笔迹"那条路**：上面已经把这个勾去掉了
+     （它默认是勾上的，见 ④ 开头那一段）。
+     ⚠ 判据必须是"去掉勾之后笔迹还在"，不能反过来去点一下勾（那样在旧默认下
+       反而变成擦除，断言的意思就没了）—— 这一条测的是**用户能不能选择留下**。 */
   const inkAfterInsert = await s.eval(`document.querySelector('canvas.bd-ink').dataset.strokes`)
-  if (inkAfterInsert === inkAfterDraw) ok(`原笔迹**一个字节都没删**（还是 ${inkAfterInsert} 笔，照旧留在板上）`)
+  if (inkAfterInsert === inkAfterDraw) ok(`去掉勾之后原笔迹**一个字节都没删**（还是 ${inkAfterInsert} 笔，照旧留在板上）`)
   else bad(`笔迹被动了：${inkAfterDraw} → ${inkAfterInsert}`)
 
   // ── ⑤ Esc 退出编辑态，看**渲染出来的**那张卡（字体是不是真的用上了） ──
@@ -905,7 +950,10 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
   if (afterUndo.ink === inkAfterDraw) ok('撤销之后手写还在（这就叫"随时能改回手写"）')
   else bad(`撤销之后笔迹数变了：${afterUndo.ink}`)
 
-  // ── ⑥ 勾上"擦掉原笔迹"：一次 commit 里把两件事都做了 ──
+  // ── ⑥ 默认就擦原笔迹：一次 commit 里把两件事都做了 ──
+  /* ⚠ 这里**不再点那个勾** —— 默认已经勾上了（2026-09-22 改的默认值）。
+     点一下反而会把它关掉，于是"擦除"这条就验反了：笔迹还在，报出来像功能坏了。
+     所以这一节验的是"**什么都不动**，放上去就该把废墨收走"。 */
   if (spot) {
     await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: spot.x - 18, y: spot.y - 22, button: 'left', buttons: 1, clickCount: 1 })
     await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: spot.x + 90, y: spot.y + 40, button: 'left', buttons: 1 })
@@ -921,8 +969,11 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
         if (await s.eval(`!!document.querySelector('.bp .wp-res')`)) break
       }
       const cards2 = await s.eval(`document.querySelectorAll('.bd-card').length`)
-      await s.eval(`(() => { const c = document.querySelector('.bp-check input'); if (c) c.click(); return 1 })()`)
-      await s.sleep(150)
+      /* ★ 这里**故意不碰那个勾**（它默认就是勾上的）——
+         顺手点一下会把它关掉，而那正是上一节刚验过的"保留原笔迹"。 */
+      const stillOn = await s.eval(`(() => { const c = document.querySelector('.bp-check input'); return c ? !!c.checked : null })()`)
+      if (stillOn === true) ok('第二次开面板时那个勾还是默认勾上的（没被上一次的操作记住成"不擦"）')
+      else bad('那个勾的状态不对（应当是默认勾上）：' + JSON.stringify(stillOn))
       const clicked = await s.eval(`(() => {
         const b = [...document.querySelectorAll('.bp .wp-res-acts .btn')].find(x => /放到白板上/.test(x.textContent))
         if (b) b.click()
@@ -934,8 +985,8 @@ let spot = null // 画字的空白落点（[9] 还要用它来重新框选）
         cards: document.querySelectorAll('.bd-card').length,
         ink: document.querySelector('canvas.bd-ink').dataset.strokes,
       }))()`)
-      if (erased.ink === '0') ok('勾了"擦掉原笔迹" → 手写被清掉了（卡片留着）')
-      else bad(`勾了擦除但笔迹还在：${erased.ink}`)
+      if (erased.ink === '0') ok('★ **默认**擦掉了原笔迹 → 手写被清掉（卡片留着）')
+      else bad(`默认没擦掉原笔迹（笔迹还在 ${erased.ink} 笔）—— 那个勾的默认值改回去了？`)
       if (erased.cards === cards2 + 1) ok(`同时多了一张卡（${cards2} → ${erased.cards}）`)
       else bad(`卡片数不对：${cards2} → ${erased.cards}`)
 
@@ -1084,6 +1135,12 @@ console.log('\n[9] 卡片交互：移动 / 缩放 / 非选中 / 笔能在卡片�
     if (b4.font > b3.font + 1) ok(`字也跟着变大了：字号 ${Math.round(b3.font)}px → ${Math.round(b4.font)}px`)
     else bad(`框变大了但字号没变（${b3.font} → ${b4.font}）—— 那是"拉框"不是"放大"`)
     const inkNow = await s.eval(`document.querySelector('canvas.bd-ink').dataset.strokes`)
+    console.log('  （诊断：这一刻画布上有 ' + inkNow + ' 笔；上一次读到的是 2）')
+    /* ⚠ 这一条**和"美化/公式默认擦除"那次改动无关**（2026-09-22 用 git stash 跑过基线：
+       改动之前它就是这个样子）。现象是"拖完卡片之后这一刻读到 0 笔，而上一节
+       明确读到过 2 笔"，夹具守卫是绿的（不是被本地服务写盘扰了）。
+       留着这段是为了下一个人别把它当成"我刚改坏的那条"。
+       跟着它的两条红是连锁的：没有笔迹 → 框不出东西 → 认公式的面板弹不出来。 */
     if (inkNow === '2') ok('缩放的时候也没有落墨')
     else bad(`缩放的时候落墨了（${inkNow} 笔）`)
   } else bad('没有缩放柄，放大缩小验不了')
@@ -1309,12 +1366,12 @@ console.log('\n[10] 框选 → 认公式；顺带量卡片的留白')
     if (req && /公式识别工具/.test(req.promptText)) ok('发出去的是**认公式**那段提示词（mode=formula 走通了）')
     else bad('提示词不对（还是认文字那段？）：' + String(req && req.promptText).slice(0, 60))
 
-    // 放到白板上：勾"擦掉原笔迹"，卡片就该**完全贴着内容**（没有要盖的东西了）
+    // 放到白板上：**默认就擦原笔迹**（2026-09-22 起），卡片就该**完全贴着内容**
+    // （没有要盖的东西了）。⚠ 这里**不再点那个勾** —— 点一下等于把它关掉。
     const selInfo = await s.eval(`(() => ({
       inkBefore: Number(document.querySelector('canvas.bd-ink').dataset.strokes),
       picked: Number(((document.querySelector('.bp-src b') || {}).textContent || '').replace(/[^0-9]/g, '')),
     }))()`)
-    await s.eval(`(() => { const c = document.querySelector('.bp-check input'); if (c) c.click(); return 1 })()`)
     await s.eval(`(() => { const b = [...document.querySelectorAll('.bp .wp-res-acts .btn')].find(x => /放到白板上/.test(x.textContent)); if (b) b.click(); return 1 })()`)
     let injected = false
     for (let i = 0; i < 20; i++) {
@@ -1449,7 +1506,11 @@ console.log('\n[11] 收成笔记：你圈的板框成为笔记小节（一块 = 
   }
   const n0 = seen.length
 
-  /* 点「▤ 收成笔记」（真鼠标 + elementFromPoint：浮出来的东西只有命中测试能证明点得到）。 */
+  /* 点「▤ 收成笔记」（真鼠标 + elementFromPoint：浮出来的东西只有命中测试能证明点得到）。
+     ⚠ 它 2026-09-26 收进了「⋯ 更多」菜单 —— 真点之前先把菜单点开（菜单常驻 DOM，
+     eval click 在按钮上永远有效；但 elementFromPoint 只有开着才命中）。 */
+  await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && !m.classList.contains('on')) m.click(); return 1 })()`)
+  await s.sleep(150)
   const gb = await s.eval(`(() => {
     const b = document.querySelector('[data-tool="gather"]')
     if (!b) return null
@@ -1591,6 +1652,9 @@ console.log('\n[12] 转录的手感：内容缓存 / 单块重认 / 停止（第
   const NOTE = '收成测试 · 笔记.md'
   const notePath = path.join(ROOT, 'data', NOTE)
   const askAndGo = async () => {
+    /* 「▤ 收成笔记」在「⋯ 更多」菜单里 —— 先开菜单再量坐标（见上面 [11] 的说明）。 */
+    await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && !m.classList.contains('on')) m.click(); return 1 })()`)
+    await s.sleep(150)
     const gb = await s.eval(`(() => {
       const b = document.querySelector('[data-tool="gather"]')
       if (!b) return null
@@ -1753,6 +1817,9 @@ console.log('\n[13] 两趟：按行抄 + 读结构（第 4 步）')
   }
   await open()
   const n0 = seen.length
+  /* 「▤ 收成笔记」在「⋯ 更多」菜单里 —— 先开菜单再量坐标（见 [11] 的说明）。 */
+  await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && !m.classList.contains('on')) m.click(); return 1 })()`)
+  await s.sleep(150)
   const gb = await s.eval(`(() => {
     const b = document.querySelector('[data-tool="gather"]')
     if (!b) return null

@@ -14,12 +14,16 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { CONFIG_KEYS, callProvider, loadConfig, publicStatus, saveConfig, testProvider } from './server-ocr.js'
-import { extractFilePart, extractTextPart } from './src/lib/multipart.js'
-/* 资料（PDF/PPT 上传与 PPT→PDF 转换）：依赖和 COM 那点事收在 server-docs.js。 */
-import { DOC_MAX_BYTES, saveUpload } from './server-docs.js'
-/* 板文件里资料 path 的形状（`.资料/xxx.pdf`）—— 前端用的同一份规矩。 */
-import { isDocPath } from './src/lib/docs.js'
+import { CONFIG_KEYS, callProvider, loadConfig, lookupInput, parseAskHistory, publicStatus, saveConfig, secondImagePart, testProvider } from './server-ocr.js'
+import { extractFilePart, extractFilePartNamed, extractTextPart } from './src/lib/multipart.js'
+/* 资料（PDF/PPT 上传、PPT→PDF 转换、"这份是不是 PPT 转来的"）：依赖和 COM 那点事收在 server-docs.js。 */
+import { DOC_MAX_BYTES, DOC_MIME, docOrigin, forgetDeckPage, forgetDeckPages, readDeckPages, saveUpload, writeDeckPage } from './server-docs.js'
+/* 板文件里资料 path 的形状（`.资料/xxx.pdf` / `.资料/xxx.png`）—— 前端用的同一份规矩。 */
+import { docExtOf, isDocPath } from './src/lib/docs.js'
+/* 「作业辅导」一次最多问几页 —— **那个数住在前端那份纯口径里**（src/lib/homework.js），
+   server.js 和窗口读的是同一个。在这儿另写一个 3 的话，改一处就会出现
+   "前端发 4 页、服务端只收 3 页"这种不出声的少一张图。 */
+import { HW_MAX_PAGES } from './src/lib/homework.js'
 /* 导出：**依赖被关在 server-export.js 里**（那个文件才 import katex）。
    server.js 自己的底线是"没有任何第三方依赖"，别在这儿直接 import 排版模块。 */
 import { exportNoteHtml, warmUp as warmUpExport } from './server-export.js'
@@ -217,8 +221,100 @@ async function tickWatch() {
   watchState.clear()
   for (const [k, v] of Object.entries(snap)) watchState.set(k, v)
 }
-setInterval(tickWatch, 700).unref?.()
+/* ⚠ 用变量存着这个定时器，而不是 `setInterval(...)` 一扔了之：
+   删东西那一步要**先停掉它**（见 /api/delete 里那段），不然它会拿着
+   "删除发生之前"读到的目录清单把刚删掉的文件又塞回 watch 快照里。 */
+let watchTimer = setInterval(tickWatch, WATCH_TICK_MS)
+watchTimer.unref?.()
 tickWatch()
+
+/* ── 把一样东西送进**回收站**（2026-09-21，给 /api/delete 用）────────────────
+ *
+ * 为什么要单独写一个函数：这段代码里有四件事都是"踩过才知道"的 ——
+ *   ① `fs.rmSync` **不进回收站**，删错了就永久没了。这个仓库在 config/ 上
+ *      已经吃过一次同样的亏（README 那条"清理逻辑先问'删的是谁的'"）。
+ *   ② node 里**没有**跨平台的回收站 API，所以只能借系统那一套：
+ *      Windows 上用 Shell.Application 的 COM（PowerShell 的
+ *      Microsoft.VisualBasic 那条要 `Add-Type` 编译，node 里没有）。
+ *   ③ COM 那条路**报错的方式很阴**：`MoveHere` 失败（回收站被禁用、网络盘、
+ *      或者路径太长）时**不一定抛**，可能只是"什么都没发生" ——
+ *      所以不能只看它有没有抛，得**回头确认源路径真的没了**。
+ *      只看异常的话，症状是"界面说删好了、文件还在盘上"，用户下次打开又看见它。
+ *   ④ 参数必须用**绝对路径**，而且 COM 对反斜杠敏感（`/` 有时不认）。
+ *   返回 true = 已经进回收站；false = **东西还在原地**（调用方必须拒绝这次删除）。
+ */
+async function recycle(abs) {
+  /* ★ 先确认"它本来在"：不在的话这次调用什么都没干，不能回 true。
+     谁会在意这个 —— 万一以后有人把 /api/delete 里那道 404 挪走，
+     回 true 就成了"界面说删掉了、其实那东西从来没存在过"，
+     而这两件事在用户眼里分不出（都是"界面上没了"），
+     等哪天它又冒出来，就完全解释不清了。 */
+  if (!fs.existsSync(abs)) return false
+  const target = path.resolve(abs).replace(/\//g, '\\')
+  if (process.platform === 'win32') {
+    /* 单引号里只做两处转义（`'` 变 `''`）—— 路径里出现单引号是合法的
+       （Windows 文件名允许它），不转义就会把整段 PowerShell 弄坏。 */
+    const ps = [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `$p='${target.replace(/'/g, "''")}';` +
+        `try{$sh=New-Object -ComObject Shell.Application;` +
+        `$it=$sh.Namespace(0).ParseName($p);` +
+        `if($it){$it.InvokeVerb('delete')}}catch{}`,
+    ]
+    await new Promise((resolve) => {
+      let done = false
+      const fin = () => {
+        if (!done) {
+          done = true
+          resolve()
+        }
+      }
+      try {
+        const ch = spawn('powershell.exe', ps, { windowsHide: true, stdio: 'ignore' })
+        ch.on('close', fin)
+        ch.on('error', fin)
+        /* 超时兜底：COM 偶尔会卡在弹窗上（比如"这个文件正在使用"）——
+           卡住时**不能**当成删成功，所以只是放弃等待（下面还会回头确认盘上）。 */
+        setTimeout(fin, 15000)
+      } catch {
+        fin()
+      }
+    })
+  } else if (process.platform === 'darwin') {
+    await runQuiet('osascript', ['-e', `tell application "Finder" to delete POSIX file "${target}"`])
+  } else {
+    /* Linux 没有统一的回收站命令（gio / trash-cli 都可能没装）——
+       试一遍，不行就老实回 false（**不退化成 rm**：宁可删不掉）。 */
+    const okGio = await runQuiet('gio', ['trash', target])
+    if (!okGio) await runQuiet('trash-put', [target])
+  }
+  /* ★ 判据只有一个：**源路径还在不在**。不看返回码、不看异常、不看上面那条命令
+     说了什么 —— "它到底走没走"才是这件事的全部（④）。 */
+  return !fs.existsSync(abs)
+}
+
+/** 跑一个命令、只关心"起没起来 + 退出码是不是 0"（不抓输出、不抛）。 */
+function runQuiet(cmd, args) {
+  return new Promise((resolve) => {
+    let done = false
+    const fin = (v) => {
+      if (!done) {
+        done = true
+        resolve(v)
+      }
+    }
+    try {
+      const ch = spawn(cmd, args, { windowsHide: true, stdio: 'ignore' })
+      ch.on('error', () => fin(false))
+      ch.on('close', (code) => fin(code === 0))
+      setTimeout(() => fin(false), 15000)
+    } catch {
+      fin(false)
+    }
+  })
+}
 
 async function handleApi(req, res, url) {
   const p = url.pathname
@@ -368,6 +464,128 @@ async function handleApi(req, res, url) {
     await fsp.mkdir(path.dirname(targetAbs), { recursive: true })
     await fsp.rename(fromAbs, targetAbs)
     return sendJson(res, 200, { ok: true, from, to: target, moved: true })
+  }
+
+  /* ── 删掉一个文件 / 一整层（左栏行尾那颗「删除」，2026-09-21）──────────────
+   *
+   * 用户要的是"整理的时候能把不要的丢掉"（分层能建出来，就得能拆掉 ——
+   * 只建不拆的话，分错的那一层永远挂在树里）。
+   *
+   * ── 三道闸，缺一条都可能吃掉不该吃的东西 ────────────────────────────────
+   *   ① `normalizeRel` + `resolveInData`：和别的接口同一套（穿越 / 绝对路径 /
+   *      盘符一律拒）。**别在这儿另写一条正则**。
+   *   ② **根目录不能删**：`rel === ''` 是"整个 data/"—— `resolveInData('')`
+   *      会把 DATA_DIR 原样还回来，不挡的话一次请求就把用户所有笔记删了。
+   *      这是这个接口最危险的一格，所以它单独写一条、写在最前面。
+   *   ③ **`.` 开头的拒**：`normalizeRel` 放它过去（它对点开头的名字没有意见），
+   *      但 `data/.资料` 是资料的存储目录、`.导出` 是导出产物、`.git` 是版本库 ——
+   *      它们**不出现在左栏里**，所以左栏永远没有理由请求删它们。
+   *      这一条挡的是"手写一个请求"和"以后有人往左栏加了点开头的行"。
+   *
+   * ── 空目录 vs 带东西的目录 ──────────────────────────────────────────────
+   *   目录里还有东西时必须显式带 `force: true`，不然回 409 附上"里面有几个"。
+   *   为什么要这个中间态：左栏的「删除」是**一颗行尾小按钮**，手指滑过去点一下的代价
+   *   极低；而"删掉一整层"可能一次带走几十张板。让调用方先把数量说出来、用户点头，
+   *   比一个点了就递归的路要安全得多（`/api/list` 的 `nodes` 字段前端本来就有，
+   *   报个数不用多绕一趟）。
+   *
+   * ── 为什么走**回收站**而不是 `fs.rmSync` ────────────────────────────────
+   *   `rmSync` **不进回收站**，删错了就是永久没了（这个仓库在 config/ 上已经吃过一次
+   *   同样的亏，见 README）。删文件、删目录都不难，但"手滑"恰恰是删东西最常见的姿势
+   *   —— 所以这里宁可麻烦一点。Windows 上唯一的办法是 Shell.Application 的 COM
+   *   （PowerShell 的 Microsoft.VisualBasic 那条要 Add-Type 编译，node 里没有）。
+   *
+   * ⚠ **送不进回收站就拒绝，绝不退化成 `fs.rm`**：「删了个寂寞」是烦人，
+   *   而"以为进了回收站、其实永久删了"是不可逆的。宁可回一句"这个删不了，
+   *   请去资源管理器里删"，让用户知道东西还在。 */
+  if (p === '/api/delete' && req.method === 'POST') {
+    const body = await readBody(req)
+    let parsed = {}
+    try {
+      parsed = JSON.parse(body || '{}')
+    } catch {
+      return sendJson(res, 400, { error: '请求不是合法 JSON' })
+    }
+    const rawWant = String(parsed.path == null ? '' : parsed.path).trim().replace(/\\/g, '/')
+    const force = parsed.force === true
+
+    if (!rawWant) return sendJson(res, 400, { error: '删哪一个？（路径不能为空）' })
+    /* ★ 闸②：根目录。放在 normalizeRel **之前** —— 它归一化之后会把两侧的空段丢掉，
+       `'/'` 和 `''` 到这里长得一样，而这两个都该拒。 */
+    if (rawWant.replace(/^\/+|\/+$/g, '') === '') {
+      return sendJson(res, 400, { error: 'data/ 这一层不能删（那是所有笔记的家）' })
+    }
+    /* 目录不带 `.md`、文件带 —— 由最后一段是不是 `.md` 自己说，调用方不用多传一个字段。 */
+    const file = /\.md$/i.test(rawWant)
+    const rel = normalizeRel(rawWant, { file })
+    if (!rel) return sendJson(res, 400, { error: '这个路径不能用' })
+    /* ★ 闸③：点开头的东西不在左栏里，左栏就没有理由请求删它 */
+    if (rel.split('/').some((seg) => seg.startsWith('.'))) {
+      return sendJson(res, 403, { error: '这个删不了（它以 . 开头，不是左栏里的东西）' })
+    }
+    const abs = resolveInData(rel)
+    if (!abs) return sendJson(res, 400, { error: '非法路径' })
+    let st = null
+    try {
+      st = await fsp.stat(abs)
+    } catch {
+      st = null
+    }
+    if (!st) return sendJson(res, 404, { error: '这个东西已经不在了（可能在别处删过了）' })
+
+    const isDir = st.isDirectory()
+    let inside = 0
+    if (isDir) {
+      /* 递归数一遍里面有几样东西（文件和目录都算）。带东西又没 `force` 就回 409 ——
+         `count` / `samples` 是给前端"问一句"用的（和 /api/new 撞名回 `code:'exists'`
+         一条道理：人话随时会改，机器判据不能靠字面匹配）。 */
+      const walk = async (d) => {
+        let ents = []
+        try {
+          ents = await fsp.readdir(d, { withFileTypes: true })
+        } catch {
+          return 0
+        }
+        let n = 0
+        for (const e of ents) {
+          if (e.name.startsWith('.')) continue
+          n += 1
+          if (e.isDirectory()) n += await walk(path.join(d, e.name))
+        }
+        return n
+      }
+      inside = await walk(abs)
+      if (inside > 0 && !force) {
+        let samples = []
+        try {
+          samples = (await fsp.readdir(abs)).filter((n) => !n.startsWith('.')).slice(0, 6)
+        } catch {
+          samples = []
+        }
+        return sendJson(res, 409, { error: '这一层里还有东西', code: 'not-empty', path: rel, count: inside, samples })
+      }
+    }
+
+    /* 写盘之前先取消挂起 —— 删完要立刻把列表和 watch 快照对齐，
+       不然左栏那一行可能还留着（`/api/watch` 也说它还在），点一下就是 404。 */
+    clearInterval(watchTimer)
+    let stashed = true
+    try {
+      stashed = await recycle(abs)
+    } catch {
+      stashed = false
+    } finally {
+      watchTimer = setInterval(tickWatch, WATCH_TICK_MS)
+      watchTimer.unref?.()
+      await tickWatch()
+    }
+    if (!stashed) {
+      return sendJson(res, 500, {
+        error: '删不了这个（回收站不收：可能是网络盘、或者盘上没启用回收站）—— 东西还在原地，请去资源管理器里删',
+        code: 'no-recycle',
+      })
+    }
+    return sendJson(res, 200, { ok: true, path: rel, dir: isDir, count: inside })
   }
 
   if (p === '/api/watch' && req.method === 'GET') {
@@ -639,6 +857,102 @@ async function handleApi(req, res, url) {
     })
   }
 
+  /* ─────────── 课件提纲 + 做题须知：讲完之后，把整节课串成两张卡 ───────────
+     收一段**纯文本**（逐页讲过的内容压成的那份摘要：小节 + 每页的标题/重点/式子），
+     回一段 JSON。**两张卡共用这一条路和这一份输入**，靠表单里的 `kind` 分：
+       · `kind` 空 / `'docsum'` → 提纲（骨架/脉络/必记/易错/核心式子/自测）；
+       · `kind` = `'rules'`     → 做题须知（单位与符号 / 口径 / 最容易错的）。
+     ★ 为什么是**同一条路**而不是各开一条：两者的输入**一模一样**（同一份摘要）、
+       错误话术、日志形状、debug 字段全都一样；各开一条就是同一段代码抄两遍，
+       而"改了一处忘了另一处"在服务端这一类路上是最贵的（它没有编译期检查）。
+       前端那边也是**一次摘要、连着发两个 kind**（见 doc-read.js 的 readSummary）。
+     ★ 和 /api/structure 同一个形状（**纯文本、不发图**），理由也是同一条：
+       这一趟的定义就是"只能拿前面讲过的东西整理"，所以它和"看一眼图"是两件事，
+       混进 /api/ocr（那个口的契约是"一张图 → 一段字"）会让人以为提纲是看着图写的。
+     ⚠ 这一层**不解析、不校验**它回的 JSON：解析和文案在纯函数里
+       （src/lib/doc-summary.js 的 normalizeSummary / normalizeRules），自检里断言得住。 */
+  if (p === '/api/doc/summary' && req.method === 'POST') {
+    const cfg = await loadConfig(__dirname)
+    if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
+    const body = await readBodyBuffer(req)
+    const ct = req.headers['content-type'] || ''
+    /* ⚠ 这一趟是**文字**，不是文件 —— 前端发的是 multipart 里的一个 `input` 字段
+       （见 src/lib/doc-read.js 的 readSummary：`fd.append('input', ...)`）。
+       千万别写成读 JSON 正文：那会让每一次请求都回「不是合法 JSON」，
+       而界面上看起来就像"提纲这个功能没做"（2026-09-22 自检当场抓到的就是这个）。
+       ★ `|| ''` 兜底：`extractTextPart` 对**没有这一段**的表单回 `null`（见 multipart.js）。 */
+    const input = (extractTextPart(body, ct, 'input') || '').slice(0, 60000)
+    if (!input.trim()) return sendJson(res, 200, { ok: false, kind: 'bad', error: '课件提纲的输入是空的（先让老师把这几页讲一遍）' })
+    /* 要哪一张卡。**认不出的值落到 docsum**（老前端不带这个字段 —— 那时候只有提纲）。
+       ⚠ 别写成"认不出就报错"：老前端、老缓存全是这个形状，那样会把一直能用的路拦掉。 */
+    const wantRules = (extractTextPart(body, ct, 'kind') || '').trim() === 'rules'
+    const mode = wantRules ? 'rules' : 'docsum'
+    const label = wantRules ? '做题须知' : '课件提纲'
+
+    const r = await callProvider(cfg, null, { mode, input, timeoutMs: 90000 })
+    if (!r.ok) {
+      console.log(`  [${label}] 失败（${r.kind}）：${r.error}`)
+      return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
+    }
+    console.log(
+      `  [${label}] 回了 ${String(r.text).length} 个字（输入 ${input.length} 字）` +
+        (r.usage ? `（输入 ${r.usage.prompt}/命中 ${r.usage.cached}，输出 ${r.usage.completion}/思考 ${r.usage.reasoning}）` : '')
+    )
+    return sendJson(res, 200, {
+      ok: true,
+      mode,
+      text: r.text,
+      note: r.note || '',
+      usage: r.usage || null,
+      debug: { chars: input.length, endpoint: cfg.provider === 'simpletex' ? 'simpletex' : cfg.dsBase, requestId: r.requestId },
+    })
+  }
+
+  /* ─────────── 速查（2026-09-28）：上课突然不懂的那个词 ───────────
+     收**纯文本**、回**纯文本**，**不发图** —— 这一趟从头到尾就围着一件事：快。
+
+     为什么单开一个口而不塞进 /api/ocr：那个口的契约是"一张图 → 一段字"，
+     开头的收图检查会因为"没收到图片"把你挡回来；而速查恰恰是**没有图**的一趟 ——
+     不贴图既是它能做到秒级的原因，也是它几乎不花钱的原因（见 MODE_LIMITS.lookup 那一格）。
+     ⇒ 和 /api/doc/summary 同一个形状（都是"纯文本进、纯文本出"），那一整段理由照搬。
+
+     三个字段（都是普通的 multipart 文本字段，不是文件）：
+       · `term`    —— 要查的那个词（可能是猜的，也可能是一整句）；
+       · `line`    —— 它周围的整句话（模型靠它判断到底问的是哪个词）；
+       · `context` —— 这是哪门课哪一章（同一个词在不同课里不是一回事）。
+     ⚠ `term` 空的时候**直接说没有词**，不要留到模型那儿 —— 那样会花一次调用
+        换回一句"你没说是哪个词"。 */
+  if (p === '/api/lookup' && req.method === 'POST') {
+    const cfg = await loadConfig(__dirname)
+    if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
+    const body = await readBodyBuffer(req)
+    const ct = req.headers['content-type'] || ''
+    const term = (extractTextPart(body, ct, 'term') || '').trim().slice(0, 300)
+    if (!term) return sendJson(res, 200, { ok: false, kind: 'bad', error: '没有要查的词（速查要先给一个词）' })
+    const line = (extractTextPart(body, ct, 'line') || '').slice(0, 2000)
+    const context = (extractTextPart(body, ct, 'context') || '').slice(0, 500)
+    /* ★ 超时给 20 秒（对照：课件提纲给 90 秒）。这一趟 thinking 是关掉的、
+       输出也只有四行，正常一两秒就回来了；给长了没有意义 ——
+       超过二十秒的答案，学生早就把目光移回黑板上了。 */
+    const r = await callProvider(cfg, null, { mode: 'lookup', input: lookupInput({ term, line, context }), timeoutMs: 20000 })
+    if (!r.ok) {
+      console.log(`  [速查] 失败（${r.kind}）：${r.error}`)
+      return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
+    }
+    console.log(
+      `  [速查] ${term} → ${String(r.text).length} 个字` +
+        (r.usage ? `（输入 ${r.usage.prompt}/命中 ${r.usage.cached}，输出 ${r.usage.completion}/思考 ${r.usage.reasoning}）` : '')
+    )
+    return sendJson(res, 200, {
+      ok: true,
+      mode: 'lookup',
+      text: r.text,
+      note: r.note || '',
+      usage: r.usage || null,
+      debug: { endpoint: cfg.provider === 'simpletex' ? 'simpletex' : cfg.dsBase, requestId: r.requestId },
+    })
+  }
+
   if (p === '/api/ocr' && req.method === 'POST') {
     const cfg = await loadConfig(__dirname)
     if (!cfg.enabled) return sendJson(res, 200, { ok: false, kind: 'no-key', error: '手写识别被关掉了（设置里可以打开）' })
@@ -653,17 +967,57 @@ async function handleApi(req, res, url) {
       })
     }
     const img = part.data
-    /* 这一次认的是公式还是普通文字还是**整板转录**还是**课件整理**？字段是表单里的 mode。
+    const ct = req.headers['content-type'] || ''
+    /* 这一次认的是公式还是普通文字还是**整板转录**还是**课件整理**还是**框选追问**
+       还是**作业辅导**？字段是表单里的 mode。
        ★ 只认白名单里的那几个值，别的一律当 formula —— 这个接口是给本机页面用的，
-         但"参数没校验"从来不是好习惯。认不出来就走老路，行为可预测。 */
-    const modeRaw = extractTextPart(raw, req.headers['content-type'] || '', 'mode')
-    const mode = modeRaw === 'text' ? 'text' : modeRaw === 'board' ? 'board' : modeRaw === 'doc' ? 'doc' : 'formula'
-    // 只收图片：这是个只给本机前端用的接口，但"顺手当文件上传器"这种事不该发生
-    const magic = img.subarray(0, 4)
-    const isPng = magic[0] === 0x89 && magic[1] === 0x50 && magic[2] === 0x4e && magic[3] === 0x47
-    const isJpg = magic[0] === 0xff && magic[1] === 0xd8 && magic[2] === 0xff
-    if (!isPng && !isJpg) {
-      return sendJson(res, 200, { ok: false, kind: 'bad', error: '收到的不是 PNG/JPEG 图片' })
+         但"参数没校验"从来不是好习惯。认不出来就走老路，行为可预测。
+       ⚠ 它要在**收图之前**读出来：作业辅导多发的那几张图，只有那一趟才收（见下）。 */
+    const modeRaw = extractTextPart(raw, ct, 'mode')
+    const mode =
+      modeRaw === 'text'
+        ? 'text'
+        : modeRaw === 'board'
+          ? 'board'
+          : modeRaw === 'doc'
+            ? 'doc'
+            : modeRaw === 'ask'
+              ? 'ask'
+              : modeRaw === 'homework'
+                ? 'homework'
+                : modeRaw === 'hwask'
+                  ? 'hwask'
+                  : 'formula'
+    /* 第二张图：两条路都会给 ——
+       · 框选追问：框里那一块放大（字段名 `file2`，顺序和提示词里说好的一一对应）；
+       · 作业辅导：作业的**第二页**。
+       服务端从不猜"哪个是哪个"：顺序就是契约（ASK_PROMPT / HOMEWORK_PROMPT 里都写着）。 */
+    const img2Part = secondImagePart(raw, ct)
+    const img2 = img2Part ? img2Part.data : null
+    /* 作业辅导的第 3 页起（`file3`…`fileN`，N = HW_MAX_PAGES —— 那个数只有一处）。
+       ★ 只在那一条路上收：别的一趟多收几张图没有意义，而"顺手多收"会让一次请求的
+         体积不受控 —— 这个口只给本机页面用，但口子就是口子。
+       ★ 作业**追问**（hwask）也要这几页：学生问"答案里那一步为什么"，
+         老师必须还看得见题才能答（见 server-ocr.js 的 HWASK_PROMPT 那段）。
+         它和作业辅导发的是**同一批图**，所以走同一条白名单。 */
+    const extra = []
+    if (mode === 'homework' || mode === 'hwask') {
+      for (let i = 3; i <= HW_MAX_PAGES; i += 1) {
+        const p = extractFilePartNamed(raw, ct, 'file' + i)
+        if (p) extra.push(p.data)
+      }
+    }
+    /* 只收图片：这是个只给本机前端用的接口，但"顺手当文件上传器"这种事不该发生。
+       ⚠ **每一张都要过这一关**（原来只查第一张）：作业辅导的第 2、3 页走的是同一批
+         字段名，只查第一张等于给自己留了一个后门。 */
+    const images = [img, img2, ...extra].filter(Boolean)
+    for (const bytes of images) {
+      const magic = bytes.subarray(0, 4)
+      const isPng = magic[0] === 0x89 && magic[1] === 0x50 && magic[2] === 0x4e && magic[3] === 0x47
+      const isJpg = magic[0] === 0xff && magic[1] === 0xd8 && magic[2] === 0xff
+      if (!isPng && !isJpg) {
+        return sendJson(res, 200, { ok: false, kind: 'bad', error: '收到的不是 PNG/JPEG 图片' })
+      }
     }
 
     /* 整板转录的图大（一整块板）、模型要读的东西多，30 秒常不够 —— 给它 120 秒。
@@ -672,24 +1026,122 @@ async function handleApi(req, res, url) {
        它是一条文字字段，和 mode 一样从 multipart 里读；没有它就走老的 BOARD_PROMPT。
        `page`（2026-09-22）：课件整理要**页码** —— 它落在提示词里（"这一页是第 N 页"），
        模型据此把每条知识点挂到页上。别的一律不读这个字段。 */
-    const linesRaw = extractTextPart(raw, req.headers['content-type'] || '', 'lines')
-    const pageRaw = Number(extractTextPart(raw, req.headers['content-type'] || '', 'page')) || 0
-    const timeoutMs = mode === 'board' ? 120000 : mode === 'doc' ? 90000 : 30000
-    const r = await callProvider(cfg, img, { mode, timeoutMs, lines: linesRaw || '', page: pageRaw })
+    const linesRaw = extractTextPart(raw, ct, 'lines')
+    const pageRaw = Number(extractTextPart(raw, ct, 'page')) || 0
+    /* 框选追问那两个字段（2026-09-22）：`question` 是学生这一次问的那句话，
+       `history` 是小窗里**前面几轮**的对话（JSON 字符串）。两个都只有那一趟读。
+       ⚠ 解析/夹取在 server-ocr.js 的 `parseAskHistory` —— 那是唯一一处
+         "浏览器来的内容直接进提示词"的地方，规矩收在那里才测得着。
+       ★ 作业辅导也用 `question`：那里面装的是**学生说的那句话**（"第 12 页第 3 题"），
+         两趟的语义是同一条（"用户说的那句话"），所以共用一个字段是对的。 */
+    const questionRaw = extractTextPart(raw, ct, 'question') || ''
+    const historyRaw = extractTextPart(raw, ct, 'history') || ''
+    /* ★ 读「前面几轮」的**两趟**：框选追问，和作业追问（hwask）——
+       后者要把"第一趟的题目 + 老师给的答案"接到对话里（见 server-ocr.js 的 HWASK_PROMPT）。
+       作业辅导那一趟本身不带历史（它是第一趟），所以它不在这一行里。 */
+    const history = mode === 'ask' || mode === 'hwask' ? parseAskHistory(historyRaw) : []
+    /* 作业辅导的**讲义**（这节课讲过的东西，由 src/lib/homework.js 的 collectKnowledge
+       拼好再发过来；板上一张讲义卡都没有时它是空串）。字段名 `knowledge`，只有那一趟读。
+       ⚠ 夹一刀上限：这是"浏览器来的内容直接进提示词"的第二个地方（第一个是 history）——
+         一份讲义撑死几万字，而"不发上限"等于把这个口变成一台免费的翻译机。
+       ★★ 必须带 `|| ''` 兜底（2026-09-22 用户"想让他帮我做题，但是却报错"）：
+         `extractTextPart` 对**没有这一段**的表单回 `null`（见 src/lib/multipart.js），
+         而板上一张讲解卡都没有时前端**根本不发这一段** ——
+         `null.slice(...)` 当场抛 "Cannot read properties of null (reading 'slice')"，
+         那串英文就这么原样弹在作业辅导面板上。
+         缺一段 = 空讲义，不是错误：和上面 question / history 两条同一条规矩。 */
+    const knowledgeRaw =
+      mode === 'homework' ? (extractTextPart(raw, ct, 'knowledge') || '').slice(0, 60000) : ''
+    /* 作业辅导的另一种选题法（2026-09-22，用户要的"圈住题号"）：`picked=1` =
+       他是**用框把题圈住的**。那时候发过来的两张图是"整页（红框标出他圈的地方）+
+       红框里放大"（和「框选追问」同一套，连画的都是同一份代码），
+       提示词里那段说法也跟着换（见 server-ocr.js 的 `homeworkPickBlock`）。
+       ★ 值只认 `'1'`：和 mode 一样，认不出来的当没有 —— 老前端不传这个字段时
+         走的还是"打字说第几页第几题"那条路，行为可预测。 */
+    const picked = mode === 'homework' && extractTextPart(raw, ct, 'picked') === '1'
+    /* 追问没有多轮的**服务端**状态：每一次请求自带全部上下文（图 + 对话）。
+       超时给 90 秒：它要读两张图、还要写一段 120~300 字的回答 ——
+       和课件整理一个档（那个也是一页一图 + 一段长回话）。
+       ★ 作业辅导给 120 秒：它一次最多三页图、还要一段讲义，回话又是**每题**一段解析
+         （一道大题 600 字，几道题就是两三千字）—— 90 秒不够稳。
+       ★ 作业追问（hwask）也给它 120 秒：它同样要读那几页图，历史里还压着第一趟
+         那几道题的答案 —— 按 90 秒那档会时不时在"想得久一点"的时候被掐掉。 */
+    const timeoutMs =
+      mode === 'board' || mode === 'homework' || mode === 'hwask'
+        ? 120000
+        : mode === 'doc' || mode === 'ask'
+          ? 90000
+          : 30000
+    const r = await callProvider(cfg, img, {
+      mode,
+      timeoutMs,
+      lines: linesRaw || '',
+      page: pageRaw,
+      question: questionRaw,
+      history,
+      image2: img2,
+      /* 一页一张图那两趟（作业辅导 / 作业追问）走这个数组；
+         框选追问那两张走 image/image2。
+         归一在 server-ocr.js 的 `imgs` 一处（那边才是"这一趟发了几张"的家）。 */
+      images,
+      input: knowledgeRaw,
+      picked,
+    })
     if (!r.ok) {
       console.log(`  [手写识别] 失败（${r.kind}）：${r.error}`)
       return sendJson(res, 200, { ok: false, kind: r.kind, error: r.error, httpStatus: r.httpStatus })
     }
-    if (mode === 'text' || mode === 'board' || mode === 'doc') {
-      const who = mode === 'board' ? '整板转录' : mode === 'doc' ? '课件整理' : '手写美化'
-      console.log(`  [${who}]${mode === 'doc' ? `（第 ${pageRaw} 页）` : ''} 回了：${String(r.text).slice(0, 70).replace(/\n/g, ' ⏎ ')}`)
+    if (
+      mode === 'text' ||
+      mode === 'board' ||
+      mode === 'doc' ||
+      mode === 'ask' ||
+      mode === 'homework' ||
+      mode === 'hwask'
+    ) {
+      const who =
+        mode === 'board'
+          ? '整板转录'
+          : mode === 'doc'
+            ? '课件整理'
+            : mode === 'ask'
+              ? '框选追问'
+              : mode === 'homework'
+                ? '作业辅导'
+                : mode === 'hwask'
+                  ? '作业追问'
+                  : '手写美化'
+      console.log(
+        `  [${who}]${mode === 'doc' ? `（第 ${pageRaw} 页）` : ''}${
+          mode === 'homework' ? `（${images.length} 页图 + ${knowledgeRaw.length} 字讲义）` : ''
+        }${
+          mode === 'hwask'
+            ? `（${images.length} 页图 + 前面 ${history.length} 条对话）`
+            : ''
+        }${r.usage ? `（输入 ${r.usage.prompt}/命中 ${r.usage.cached}，输出 ${r.usage.completion}/思考 ${r.usage.reasoning}）` : ''} 回了：${String(r.text).slice(0, 70).replace(/\n/g, ' ⏎ ')}`
+      )
       return sendJson(res, 200, {
         ok: true,
         mode,
         text: r.text,
         conf: r.conf,
         note: r.note || '',
-        debug: { bytes: img.length, endpoint: cfg.provider === 'simpletex' ? (cfg.turbo ? 'turbo' : 'standard') : cfg.dsBase, requestId: r.requestId },
+        /* ★ 这一趟花了多少（2026-09-22 加的）：服务端从上游 usage 读出来再转给界面 ——
+           `usageOf` 那一段解释了为什么非要有这个数（在这之前整个仓库一次都没读过它，
+           于是"改了之后是不是更省了"只能靠感觉）。读不出来是 null，不是零账。 */
+        usage: r.usage || null,
+        debug: {
+          /* 每张图各自的字节数和**一共发了几张** —— 框选追问那条自检要读它
+             （"第二张裁图到底有没有发出去"只有这里说得清），
+             作业辅导那条自检读的是同一个数（"三页是不是都发出去了"）。 */
+          bytes: img.length,
+          bytes2: img2 ? img2.length : 0,
+          images: images.length,
+          turns: history.length,
+          knowledge: knowledgeRaw.length,
+          endpoint: cfg.provider === 'simpletex' ? (cfg.turbo ? 'turbo' : 'standard') : cfg.dsBase,
+          requestId: r.requestId,
+        },
       })
     }
     console.log(`  [手写识别] 认出：${r.latex.slice(0, 70)}${r.conf != null ? '（置信度 ' + r.conf + '）' : ''}`)
@@ -722,8 +1174,91 @@ async function handleApi(req, res, url) {
     }
   }
 
-  /* 下发资料本体：pdf.js 按这个地址拉整份文件来渲染页面。
-     路径只认 `.资料/xxx.pdf`（isDocPath + resolveInData 两道闸，跟别的接口一样硬）。 */
+  /* 这份资料**是 PPT 转来的吗**（`GET /api/doc/origin?path=.资料/xxx.pdf`）。
+     `data/.资料/` 里留着同名原件（`xxx.pptx`）就是 —— PPT 上传时原件是特意留下的
+     （见 server-docs.js 那段"以后还要改课件"）。
+     ★ 谁要问这个：**作业辅导**。用户手上常常只有讲课的 PPT，而作业在书上 ——
+       他挑中一份 PPT 转来的资料时，界面要能说那句"这份是讲课的课件，作业多半在书上，
+       把作业所在的 PDF 也传上来"（见 HomeworkBox.jsx）。不知道来历就说不出这句话。 */
+  if (p === '/api/doc/origin' && req.method === 'GET') {
+    const rel = safeDecode(url.searchParams.get('path') || '')
+    if (!isDocPath(rel)) return sendJson(res, 400, { error: '非法资料路径' })
+    return sendJson(res, 200, { ok: true, ...(await docOrigin(DATA_DIR, rel)) })
+  }
+
+  /* ── 讲稿缓存（2026-09-23）：课件整理读出来的每一页，在盘上也留一份 ──
+        `data/.资料/.已读/<课件名>/p<页号>.json`。为什么要有它、以及三条纪律，
+        全在 server-docs.js 的「讲稿缓存」那一节（改之前先看那边）。
+
+        GET    ?path=…&flavor=…        → 整份 `{ pages: { "12": { text, at } } }`
+        PUT    ?path=…&page=12         → 写这一页（body 是 JSON `{ flavor, text }`）
+        DELETE ?path=…                 → 这一份课件的讲稿全忘掉（换口径重来 / 按了重读）
+        DELETE ?path=…&pages=1,2,3     → **只**忘这几页（「讲这几页」= 重读这几页；
+                                          别的页的讲稿是花真钱买来的，不该被顺手带走）
+
+     ★ 前端那份 localStorage **还在**，也不是重复：它是"这个窗口里最快的一层"，
+       盘上这份是"清了浏览器数据、换了电脑之后还认得"的那一层。读的顺序是
+       内存 → localStorage → 盘上（见 doc-read.js 的 cacheGet）。
+     ⚠ 路径那道闸和别的资料接口一样硬：只认 `isDocPath`（`.资料/xxx.pdf|png…`），
+       落哪儿由服务端算出来 —— 客户端**给不了**一个目录名。 */
+  if (p === '/api/docread' && (req.method === 'GET' || req.method === 'PUT' || req.method === 'DELETE')) {
+    const rel = safeDecode(url.searchParams.get('path') || '')
+    if (!isDocPath(rel)) return sendJson(res, 400, { error: '非法资料路径' })
+    if (req.method === 'GET') {
+      const flavor = String(url.searchParams.get('flavor') || '')
+      if (!flavor) return sendJson(res, 400, { error: '缺 flavor（提示词口径）—— 不知道口径就没法判断哪些老稿还算数' })
+      return sendJson(res, 200, { ok: true, ...(await readDeckPages(DATA_DIR, rel, flavor)) })
+    }
+    if (req.method === 'PUT') {
+      const page = Number(url.searchParams.get('page'))
+      if (!Number.isFinite(page) || page < 1) return sendJson(res, 400, { error: '页码不对' })
+      let o = null
+      try {
+        o = JSON.parse((await readBody(req)) || '{}')
+      } catch {
+        return sendJson(res, 400, { error: '讲稿不是合法 JSON' })
+      }
+      const flavor = String((o && o.flavor) || '')
+      const text = String((o && o.text) || '')
+      if (!flavor || !text.trim()) return sendJson(res, 400, { error: '缺 flavor 或正文（空讲稿不值得存）' })
+      /* 一页讲稿撑死几 KB，给个宽松的口子挡"顺手当代理"就够。 */
+      if (text.length > 200000) return sendJson(res, 400, { error: '这一页的讲稿太大了' })
+      try {
+        await writeDeckPage(DATA_DIR, rel, page, flavor, text)
+        return sendJson(res, 200, { ok: true })
+      } catch (e) {
+        return sendJson(res, 400, { error: String(e && e.message ? e.message : e) })
+      }
+    }
+    /* DELETE：带 `pages=1,2,3` 就只忘这几页（「讲这几页」= 重读这几页）；
+       带 `page` 就只忘那一页（「重新读这一页」）；都不带才整份忘掉。
+       ⚠ 三者都只删 `p<数字>.json`（见 server-docs.js 那条"删的是谁的"）。
+       ⚠ `pages` 拿不到一个合法页号时**一律当"没给"**（不能退化成整份清 ——
+          那会把几十页花钱买来的讲稿删光，而调用方只是页码写错了）。 */
+    const many = url.searchParams.get('pages')
+    if (many != null && many !== '') {
+      const nums = String(many)
+        .split(',')
+        .map((x) => Number(String(x).trim()))
+        .filter((n) => Number.isFinite(n) && n >= 1)
+      if (nums.length) {
+        let removed = 0
+        for (const n of nums) removed += ((await forgetDeckPage(DATA_DIR, rel, n)) || {}).removed || 0
+        return sendJson(res, 200, { ok: true, removed })
+      }
+    }
+    const one = url.searchParams.get('page')
+    if (one != null && one !== '') {
+      return sendJson(res, 200, { ok: true, ...(await forgetDeckPage(DATA_DIR, rel, one)) })
+    }
+    return sendJson(res, 200, { ok: true, ...(await forgetDeckPages(DATA_DIR, rel)) })
+  }
+
+  /* 下发资料本体：pdf.js 按这个地址拉整份 PDF 来渲染页面，图片资料则是那张图本身。
+     路径只认 `.资料/xxx.pdf|png|jpg…`（isDocPath + resolveInData 两道闸，跟别的接口一样硬）。
+     ★ Content-Type 照后缀给（表在 server-docs.js 的 DOC_MIME）：pdf.js 认的是 `application/pdf`，
+       图片则必须**照它自己的类型发** —— 一张 PNG 被说成 PDF，`<img>` 是加载不出来的，
+       而资料层那一趟取图正好是 `<img>` 在取。 */
   const dm = p.match(/^\/api\/doc\/file\/(.+)$/)
   if (dm && req.method === 'GET') {
     const rel = safeDecode(dm[1])
@@ -733,7 +1268,7 @@ async function handleApi(req, res, url) {
     const s = await statOf(abs)
     if (!s) return sendJson(res, 404, { error: '这份资料不在了（可能被移走或删掉了）' })
     return send(res, 200, await fsp.readFile(abs), {
-      'Content-Type': 'application/pdf',
+      'Content-Type': DOC_MIME[docExtOf(rel)] || 'application/octet-stream',
       'Cache-Control': 'public, max-age=31536000, immutable',
     })
   }

@@ -84,6 +84,54 @@ export function extractFilePart(buf, contentType) {
 }
 
 /**
+ * 从 multipart 请求体里抠出**某一个名字**的文件部分（`file2` 这种）。
+ *
+ * ── 为什么要有它（2026-09-22，「框选追问」）─────────────────────────────
+ * 那一趟要发**两张图**：整页（带红框）+ 框里那一块放大。同名的两个 `file` 字段
+ * 在 FormData 里是合法的，但 `extractFilePart` 只交第一个 —— 想拿第二个就得有
+ * 一把按名字找的钥匙（`extractTextPart` 那一族只管文本，读不了二进制）。
+ *
+ * ⚠ 和上面两个一样：全程在 Buffer 上按字节找边界，**绝不**先把 body 转成字符串
+ *   （PNG/JPEG 里有非法字节，转一次这张图就废了，而且不报错）。
+ * ⚠ 找不到就返回 null —— 调用方（那一趟）退回单图，而不是报错：
+ *   "少一张图"该降级成"上下文少一点"，不该让整个问题问不出去。
+ */
+export function extractFilePartNamed(buf, contentType, name) {
+  const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(String(contentType || ''))
+  if (!m) return null
+  const boundary = '--' + (m[1] || m[2]).trim()
+  const bBuf = Buffer.from(boundary, 'utf8')
+  const want = String(name || '')
+  if (!want) return null
+
+  let pos = buf.indexOf(bBuf)
+  while (pos >= 0) {
+    const headStart = pos + bBuf.length
+    const headEnd = buf.indexOf('\r\n\r\n', headStart)
+    if (headEnd < 0) return null
+    const header = buf.subarray(headStart, headEnd).toString('utf8')
+
+    const dataStart = headEnd + 4
+    const next = buf.indexOf(bBuf, dataStart)
+    if (next < 0) return null
+    let dataEnd = next
+    if (buf[dataEnd - 2] === 0x0d && buf[dataEnd - 1] === 0x0a) dataEnd -= 2
+
+    const nameMatch = /name="([^"]*)"/i.exec(header)
+    const fileMatch = /filename="([^"]*)"/i.exec(header)
+    if ((fileMatch || nameMatch) && nameMatch && nameMatch[1] === want && dataEnd > dataStart) {
+      return {
+        name: nameMatch[1],
+        filename: fileMatch ? fileMatch[1] : '',
+        data: buf.subarray(dataStart, dataEnd),
+      }
+    }
+    pos = next
+  }
+  return null
+}
+
+/**
  * 从 multipart 请求体里抠出**一个文本字段**（不是文件）。
  *
  * 为什么需要它：`/api/ocr` 除了那张图，还要知道"这次认的是公式还是普通文字"
@@ -93,6 +141,15 @@ export function extractFilePart(buf, contentType) {
  *
  * ⚠ 和 extractFilePart 一样，全程在 Buffer 上按字节找边界。文本这一段最后才
  *    toString('utf8')，绝不提前把整个 body（里面躺着 PNG）转成字符串。
+ *
+ * ★★ 契约：**没有这个字段时回 `null`，不是空串**（下面四处 `return null`）。
+ *    所以每个调用方都得自己兜底，写法是 `extractTextPart(...) || ''`。
+ *    2026-09-22 用户报的 `Cannot read properties of null (reading 'slice')` 就是
+ *    `server.js` 里 `knowledge` 那一条漏了兜底 —— 而"板上一张讲解卡都没有"时
+ *    前端**根本不发那一段**，于是 `null.slice(...)` 当场抛。
+ *    这是**故意**的：分得清"没这一段"和"这一段是空的"，调用方才有得选。
+ *    守卫：`check-ocr-server.js`（这里回 null）+ `check-homework.js` 第 ⑦ 节
+ *    （照着 server.js 的读法兜底一遍，外加源码扫描不许再出现 `.方法(` 直连）。
  */
 export function extractTextPart(buf, contentType, name) {
   const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(String(contentType || ''))

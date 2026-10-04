@@ -257,6 +257,66 @@ const fails = await withBoard(
       return m ? { tx: parseFloat(m[1]), ty: parseFloat(m[2]), k: parseFloat(m[3]) } : null
     }
 
+    console.log('\n[0] 手势期间卡片层是被收着的，停手之后必须自己回来（2026-09-21 第十一刀）')
+    /* 为什么这条要有（它是这一族检查的**前提**，所以放在最前面）：
+       手势期间把卡片层 `display:none` 是**故意的**（第十刀：卡片可见那一路每帧要
+       白花 ~15ms 的样式失效，见 README 第 58 条）。但"停手之后卡片必须回来"
+       曾经是个真 bug 的风险点（原来的收尾挂在 rAF 上，后台标签页里 rAF 是停的 ——
+       切出去再切回来卡片层就一直是藏着的，屏幕上像"卡片没了"）。
+       现在的实现是 `GEST_LINGER_MS`（停手 200ms）之后用 setTimeout 放回来，
+       而且**不能是一帧就放**（真人滚轮是一阵一阵的，一帧就放＝每串之间闪一下）。
+       判据两条：拖动中必须是 `display:none`；松手之后必须自己变回可见
+       （用 `until` 等事实，不猜毫秒数）。 */
+    {
+      const spot0 = await ev(`window.__pan.paperSpot()`)
+      if (!spot0) {
+        bad('[0] 纸上找不到可落手的点 —— 这一条没验成')
+      } else {
+        const tx0 = await ev(`parseFloat(document.querySelector('.bd-world').dataset.liveTx)`)
+        await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: spot0.x, y: spot0.y, button: 'middle', buttons: 4, clickCount: 1 })
+        await s.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: spot0.x + 60, y: spot0.y + 40, button: 'middle', buttons: 4 })
+        const during = await ev(`(() => {
+          const cw = document.querySelector('.bd-cardworld')
+          const tx = parseFloat(document.querySelector('.bd-world').dataset.liveTx)
+          return { display: getComputedStyle(cw).display, tx }
+        })()`)
+        await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: spot0.x + 60, y: spot0.y + 40, button: 'middle', buttons: 0 })
+        if (during.tx === tx0) {
+          bad('[0] 这一拖没推动视图（live-tx 没变）—— 闸有没有上是量不出来的，这条不算数')
+        } else if (during.display === 'none') {
+          ok('拖动过程中卡片层收着（display:none）—— 屏幕刷新率让给这一件事')
+        } else {
+          bad(`拖动过程中卡片层没被收起来（display:${during.display}）—— 那个闸没上到 DOM 上`)
+        }
+        const back = await until(
+          () => ev(`(() => {
+            const cw = document.querySelector('.bd-cardworld')
+            const c = document.querySelector('.bd-card')
+            const r = c ? c.getBoundingClientRect() : null
+            return getComputedStyle(cw).display !== 'none' && r && r.width > 0 ? 'back' : null
+          })()`),
+          { what: '松手之后卡片层自己回到布局里', timeout: 3000 }
+        )
+        if (back.ok) ok(`松手 ${back.waited}ms 后卡片层自己回来了（而且是**看得见**的：卡片矩形有宽度）`)
+        else bad('松手之后卡片层一直藏着 —— 屏幕上就是"卡片没了"（看 markGesticulating 那条定时器）')
+      }
+    }
+
+    /* ★★★ 下面这一节量的是**补正**，所以先把那个"手势闸"**摘掉**：
+       闸开着的时候卡片层是 `display:none`，`getBoundingClientRect()` 全是 0 ——
+       于是"卡片相对墨迹偏了多少"量到的是"整张卡都不见了"，报出来的数字很大很吓人，
+       而真正的补正其实是对的（第一版没摘闸，判据五就这么红了两条）。
+       摘的是**这一层 CSS**，不是应用逻辑：`display:block` 让补正照旧挂在
+       `.bd-world` 上，只是卡片留在布局里能被量到。
+       ⚠ 闸本身有没有上、会不会回来，由上面 [0] 单独管 —— 两件事分开验。 */
+    await ev(`(() => {
+      const st = document.createElement('style')
+      st.id = 'zz-pan-gate-off'
+      st.textContent = '.bd.gesting .bd-cardworld { display: block !important; }'
+      document.head.appendChild(st)
+      return 1
+    })()`)
+
     console.log('\n[1] 手势进行中：卡片层上挂着补正，而且两条路算出的 s/t 必须一致')
     {
       const spot = await ev(`window.__pan.paperSpot()`)
@@ -448,17 +508,43 @@ const fails = await withBoard(
       if (!/transform/.test(st)) ok('inline style 里已经没有 transform 了（是移除，不是写 none，少一个合成层）')
       else bad('inline style 里还留着 transform：' + JSON.stringify(st))
 
-      /* 归零之后，卡片的位置还得和它声明的 left/top 对得上（补正不能留下暗账）。 */
+      /* 归零之后，卡片还得**正好坐在它自己的世界坐标 × 它自己那条 transform** 上
+         （补正不能留下暗账）。
+
+         ★ 2026-09-21（第十一刀）判据换过一次，换的原因值得记：
+           老判据比的是 `卡片矩形 − (舞台原点 + 卡片 style.left)` —— 那是**屏幕坐标
+           时代**的算法（那时 `left` 就是屏幕位置，补正只有一份暗账能藏）。
+           第九刀把卡片改成世界坐标渲染之后，`style.left` 是**世界像素**，
+           这个差恒等于 `x×s + tx`（实测 245,116），它**必然红** ——
+           而红了没人看，正是那个性能回归溜过去的原因之一（README 第 58 条）。
+           新的判据更贴"这条断言本来想问什么"：**卡片实际在屏幕哪儿**
+           （浏览器布局算出来的）必须等于 **世界坐标 × `.bd-cardworld` 上那条 transform**。
+           补正要是没清干净（它挂在 `.bd-world` 上），这个等式当场不成立。
+           ⚠ 那条 transform 的 s/t 从**卡片的容器**上读 —— 和墨迹那条路
+             （`data-xform`）是两条独立的路，"两条路算出同一个映射"由判据五管。 */
       const got = await ev(`(() => {
-        const st = document.querySelector('.bd-stagewrap')
-        const sr = st.getBoundingClientRect()
-        return [...document.querySelectorAll('.bd-card')].map((c) => {
-          const cr = c.getBoundingClientRect()
-          return { dx: cr.left - (sr.left + parseFloat(c.style.left)), dy: cr.top - (sr.top + parseFloat(c.style.top)) }
-        })
+        const sr = document.querySelector('.bd-stagewrap').getBoundingClientRect()
+        const cw = document.querySelector('.bd-cardworld')
+        const m = /translate\\(\\s*([-\\d.eE]+)px[,\\s]+([-\\d.eE]+)px\\s*\\)\\s*scale\\(\\s*([-\\d.eE]+)\\s*\\)/.exec(cw.style.transform || '')
+        if (!m) return { err: '读不出 .bd-cardworld 的 transform：' + JSON.stringify(cw.style.transform || '') }
+        const s = parseFloat(m[3]), tx = parseFloat(m[1]), ty = parseFloat(m[2])
+        return {
+          s, tx, ty,
+          cards: [...document.querySelectorAll('.bd-card')].map((c, i) => {
+            const r = c.getBoundingClientRect()
+            const wx = parseFloat(c.style.left), wy = parseFloat(c.style.top)
+            return {
+              dx: r.left - (sr.left + wx * s + tx),
+              dy: r.top - (sr.top + wy * s + ty),
+              worldX: wx, worldY: wy,
+            }
+          }),
+        }
       })()`)
-      const badBox = got.filter((g) => !near(g.dx, 0, 0.6) || !near(g.dy, 0, 0.6))
-      if (!got.length) bad('归零之后找不到卡片')
+      const gotCards = (got && got.cards) || []
+      const badBox = gotCards.filter((g) => !near(g.dx, 0, 0.6) || !near(g.dy, 0, 0.6))
+      if (got && got.err) bad('归零之后量不出卡片基准：' + got.err)
+      else if (!gotCards.length) bad('归零之后找不到卡片')
       else if (!badBox.length) {
         /* 用循环算最大差，别用 `Math.max(...got.map(...))` —— Math.max 收的是**数字**，
            而这里传进去的是一堆数组（`g.dx`/`g.dy` 两个一组），它会把数组转成 NaN。
@@ -466,10 +552,13 @@ const fails = await withBoard(
            真正的原因不是 g 没定义，是模板字符串里那个 `${...}` 里嵌套了反引号，
            把模板字符串提前截断了 —— 两个坑叠在一起。 */
         let worstBox = 0
-        for (const g of got) worstBox = Math.max(worstBox, Math.abs(g.dx), Math.abs(g.dy))
-        ok(`补正归零后，${got.length} 张卡都正好坐在 left/top 说的位置上（最大差 ${worstBox.toFixed(2)}px）`)
+        for (const g of gotCards) worstBox = Math.max(worstBox, Math.abs(g.dx), Math.abs(g.dy))
+        ok(
+          `补正归零后，${gotCards.length} 张卡都正好坐在"世界坐标 × .bd-cardworld 的 transform"上` +
+          `（最大差 ${worstBox.toFixed(2)}px，视图 s=${got.s.toFixed(3)} tx=${got.tx.toFixed(1)}）`
+        )
       } else {
-        bad(`归零之后还有卡片对不上 left/top：${JSON.stringify(badBox)} —— 补正留了暗账`)
+        bad(`归零之后还有卡片对不上它自己那条 transform：${JSON.stringify(badBox)} —— 补正留了暗账`)
       }
     }
 
@@ -494,12 +583,20 @@ const fails = await withBoard(
         } else {
           bad(`拖动和卡片的位移对不上：期望 (−120, −90)，实际 (${dx.toFixed(1)}, ${dy.toFixed(1)}) —— 这就是"相对滑动"`)
         }
-        /* 顺便验"数据里也真的动了"：left/top 是 React 那一份，它得跟上。
-           跟不上 = 补正会一直替它扛着一份差（那就是长期偏移了）。 */
-        if (near(afterLeft - beforeLeft, -120, 2.5)) {
-          ok(`卡片自己的 left 也真的跟着走了（${beforeLeft} → ${afterLeft}）`)
+        /* ★ 2026-09-21（第十一刀）：这条老判据写的是"卡片自己的 left 要跟着平移走"，
+           而第九刀之后卡片那两行是**世界坐标** —— 平移只改 `.bd-cardworld` 那一层的
+           transform，卡片自己的 left/top **一动都不该动**。
+           老判据在世界坐标下必然红（实测 400 → 400），而它红了没人看，
+           正是那个性能回归溜过去的原因之一（见 README 第 58 条）。
+           换成现在这条不变式：**世界坐标不许被平移碰**，而且它必须就是夹具里那个数。
+           "屏幕上的位移"由上面那条断言兜着（卡片跟着墨迹走同样的距离）。 */
+        if (near(afterLeft - beforeLeft, 0, 0.01) && near(afterLeft, CARDS[0].x, 0.01)) {
+          ok(`卡片自己的 left 是世界坐标：平移没碰它（${beforeLeft} → ${afterLeft}，就是夹具里的 ${CARDS[0].x}）`)
         } else {
-          bad(`卡片自己的 left 没跟上（${beforeLeft} → ${afterLeft}）—— 差被长期挂在补正上了`)
+          bad(
+            `卡片自己的 left 不该被平移改动：${beforeLeft} → ${afterLeft}（期望一直是 ${CARDS[0].x}）` +
+            ' —— 要么有人把"世界 → 屏幕"又抄了一份到卡片自己身上，要么差被长期挂在补正上了'
+          )
         }
         const w = await until(() => ev(`window.__pan.corr() === '' ? 'clean' : null`), {
           what: '这次拖动之后补正也归零', timeout: 3000,

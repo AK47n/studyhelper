@@ -22,6 +22,8 @@
  *   [9] 解开 → 手柄回来，拖得动了
  *   [10] 文件里只有那张卡带 "locked": true（别的卡不多这个字段）
  *   [11] 重开一次 → 它还是锁着的
+ *   [12] 放大画布之后角上那颗 × 的布局盒还是 22×22、屏幕上大小恒定、且点得到
+ *        （用户报的「点击白板删除按钮没有用」的回归闸）
  *
  * 自己起服务（5202）和 headless Edge（9232），跑完都收掉；
  * 只碰自己造的夹具板 board-zz-lockcheck.md（跑完删）。
@@ -315,8 +317,161 @@ console.log('\n[10] 重开一次：它还是锁着的')
   }
 }
 
-/* ═════════════════ 11. 页面里不许有 JS 报错 ═════════════════ */
-console.log('\n[11] 整个流程跑下来，页面里没有任何 JS 报错')
+/* ═════════════════ 11. ★ 手柄不随画布缩放放大（2026-09-21 用户报的）═════════════
+ *
+ * 用户原话：「点击白板删除按钮没有用」。
+ *
+ * 病根不在"点了没反应"，而在**那颗 × 跑到画布外面去了**：
+ *   卡片上那几颗手柄（× / 缩放柄 / 📌）的宽高和贴边偏移写的是卡内长度，
+ *   而卡片活在 `.bd-cardworld` 那一层里，那层挂着 `transform: scale(s)`
+ *   （s = 视图缩放）。于是写死的 `22px` 在屏幕上变成 `22×s`、
+ *   "贴边往外露 10px"变成 `10×s`。
+ *   `.bd-stagewrap` 是 `overflow: hidden` —— 露在外面的那一块被裁掉，
+ *   而"卡片边缘之外"落点是画布/工具条，于是它既看不见也点不到。
+ *
+ * ★ 为什么这一条**必须**在这里（真浏览器 + 真鼠标）：
+ *   "某颗按钮点不点得到"只有浏览器的命中测试说了算。`dispatchEvent` 合成事件
+ *   直接投给元素、绕过命中测试 —— 用它测，这个 bug 会一路绿灯（README 第 11 条）。
+ *
+ * ★ 判据特意用 **`offsetWidth`（布局宽）而不是 getBoundingClientRect**：
+ *   这里是"尺寸有没有被缩放污染"的唯一读数，两条断言各管一半：
+ *     · 放大前后**相等** → 尺寸没被祖先那把 scale 乘过；
+ *     · 而且**等于 22**（它本来的数）→ 补偿缩放没有偷偷算进尺寸里。
+ *   只比"相等"是不够的：两边一起错成 7 也相等（第一版就是这样，
+ *   把 1/s 乘进 width，屏幕上恒定但布局盒缩到 7×7 —— 能点的区域跟着缩水）。
+ *   现在的修法是 `zoom: 1/s`：它缩放的是渲染，**不改布局盒**，22 永远是 22。
+ *   （`getBoundingClientRect` 是含变换的视觉宽，两种写法下都会变，分不出来。）
+ *
+ * ⚠ 这一步会缩放画布。它在整个脚本的最末尾（后面只剩"有没有 JS 报错"），
+ *   而且**跑完把视图装回屏幕**（Ctrl+0 那条路就是 fitView）——
+ *   不给后面的断言留"上一节改过的状态"（README：那种前提是颗雷）。 */
+console.log('\n[11] ★ 角上那几颗手柄的尺寸不随画布缩放变大（× 得一直点得到）')
+{
+  /* 先把卡解开并选中（前两节把它锁上又重开过）。 */
+  const st0 = await readCard(first)
+  if (st0 && st0.locked && st0.pinCx) {
+    await s.mouse(st0.pinCx, st0.pinCy)
+    await sleep(300)
+  }
+  let sc = await readCard(first)
+  if (!sc.on && sc.cx) {
+    await s.mouse(sc.cx, sc.cy)
+    await sleep(300)
+    sc = await readCard(first)
+  }
+
+  /* 量"手柄的布局尺寸"和"它在画布里的可见比例 + 命中"。
+     ⚠ 整个表达式在模板字符串里：注释里一个反引号都不能有。 */
+  const probeHandles = () => s.eval(`(() => {
+    const card = document.querySelector('.bd-card[data-card-id=' + ${JSON.stringify(JSON.stringify(first))} + ']')
+    if (!card) return null
+    const st = document.querySelector('.bd-stagewrap').getBoundingClientRect()
+    const world = document.querySelector('.bd-cardworld')
+    const m = /scale\\(([-\\d.]+)\\)/.exec(world ? (world.style.transform || '') : '')
+    const out = { viewScale: m ? parseFloat(m[1]) : null, handles: [] }
+    for (const [name, sel] of [['del', '.bd-card-del'], ['resize', '.bd-card-resize'], ['pin', '.bd-card-pin']]) {
+      const el = card.querySelector(sel)
+      if (!el) { out.handles.push({ name, present: false }); continue }
+      const r = el.getBoundingClientRect()
+      const cx = Math.round((r.left + r.right) / 2), cy = Math.round((r.top + r.bottom) / 2)
+      const hit = document.elementFromPoint(cx, cy)
+      const visW = Math.max(0, Math.min(r.right, st.right) - Math.max(r.left, st.left))
+      const visH = Math.max(0, Math.min(r.bottom, st.bottom) - Math.max(r.top, st.top))
+      out.handles.push({
+        name, present: true,
+        layoutW: el.offsetWidth, layoutH: el.offsetHeight,
+        screenW: Math.round(r.width),
+        visPct: r.width && r.height ? Math.round((visW * visH) / (r.width * r.height) * 100) : 0,
+        hitSelf: hit === el,
+        hit: hit ? String(hit.className || hit.tagName) : 'null',
+      })
+    }
+    return out
+  })()`)
+
+  const z0 = await probeHandles()
+  if (!z0) {
+    bad('读不到夹具那张卡 —— 这一节没验成')
+  } else {
+    const del0 = z0.handles.find((x) => x.name === 'del')
+    if (del0 && del0.present) {
+      if (del0.hitSelf && del0.visPct >= 99) ok(`默认缩放（s=${z0.viewScale}）下 × 100% 可见且点得到`)
+      else bad(`默认缩放下 × 就点不到（可见 ${del0.visPct}%，命中 ${del0.hit}）`)
+    }
+
+    /* ── 放大两档画布：手柄的**布局宽**必须纹丝不动 ── */
+    for (let i = 0; i < 4; i++) {
+      await s.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: 700, y: 400, deltaX: 0, deltaY: -120 })
+      await sleep(140)
+    }
+    await sleep(400)
+    /* 缩放之后卡片可能被挪出视野 —— 重新选中它，好让手柄在 DOM 里 */
+    const back = await s.eval(`(() => {
+      const card = document.querySelector('.bd-card[data-card-id=' + ${JSON.stringify(JSON.stringify(first))} + ']')
+      if (!card) return null
+      const r = card.getBoundingClientRect()
+      return { cx: Math.round((r.left + r.right) / 2), cy: Math.round((r.top + r.bottom) / 2), w: Math.round(r.width) }
+    })()`)
+    if (back) { await s.mouse(back.cx, back.cy); await sleep(320) }
+
+    const z1 = await probeHandles()
+    const del1 = z1 && z1.handles.find((x) => x.name === 'del')
+    if (!z1 || !del1 || !del1.present) {
+      bad(`放大之后 × 不在 DOM 里（这一节的断言没跑到）`)
+    } else {
+      if (z1.viewScale > z0.viewScale + 0.4) {
+        ok(`画布真的放大了（s ${z0.viewScale} → ${z1.viewScale}）`)
+      } else {
+        bad(`滚了 4 下滚轮画布没放大（s 还是 ${z1.viewScale}）—— 这一节的前提没成立`)
+      }
+      /* ★ 核心断言：**布局盒**不随缩放涨。
+         它必须是"这颗按钮在这儿、多大"的唯一答案 —— 屏幕上恒定但布局盒被缩掉
+         （第一版把 1/s 乘进 width 就是这个样子，实测 s=3.1 时 offsetWidth 只剩 7）
+         等于把"能点的区域"和"看着的圆"拆成两个数，框选/贴边全按那个错的算。 */
+      if (del1.layoutW === del0.layoutW && del1.layoutH === del0.layoutH) {
+        ok(`× 的**布局**尺寸没被缩放乘过（${del0.layoutW}×${del0.layoutH} → ${del1.layoutW}×${del1.layoutH}）`)
+      } else {
+        bad(`× 的布局尺寸随画布缩放变了（${del0.layoutW}×${del0.layoutH} → ${del1.layoutW}×${del1.layoutH}）—— 尺寸得只在一个地方说，不能一半在布局盒、一半在补偿缩放`)
+      }
+      /* ★ 布局盒还得是那颗按钮本来的大小（22×22）。
+         单比 z0/z1 相等是不够的：两边一起错成 7 也相等。 */
+      if (del1.layoutW === 22 && del1.layoutH === 22) {
+        ok(`× 的布局盒就是 22×22（没有被任何补偿缩放改小）`)
+      } else {
+        bad(`× 的布局盒量出来是 ${del1.layoutW}×${del1.layoutH}，不是 22×22 —— 补偿缩放被算进了尺寸里`)
+      }
+      /* ★ 屏幕尺寸也应当恒定（这正是"恒定的手柄"该有的样子）。 */
+      if (Math.abs(del1.screenW - del0.screenW) <= 2) {
+        ok(`× 的**屏幕**尺寸也恒定（${del0.screenW}px → ${del1.screenW}px）`)
+      } else {
+        bad(`× 的屏幕尺寸随缩放变了（${del0.screenW}px → ${del1.screenW}px）—— 手柄应该是一颗固定大小的按钮`)
+      }
+      /* ★ 缩放之后它照样得点得到（这是用户报的那件事本身）。 */
+      if (del1.hitSelf && del1.visPct >= 99) {
+        ok(`放大之后 × 仍然 100% 可见、点得到（可见 ${del1.visPct}%）`)
+      } else {
+        bad(`放大之后 × 点不到（可见 ${del1.visPct}%，命中 ${del1.hit}）—— 用户报的就是这个`)
+      }
+    }
+
+    /* 收尾：把视图装回屏幕，别给后面留"我改过的状态"。
+       ⚠ ⤢ 那颗按钮没有 data 钩子（它只是个 `.bd-t.icon`），所以按 title 找 ——
+         自检里按文案找元素是脆的，所以**找不到就跳过**（收尾失败不该报红：
+         这一节要断言的东西上面已经断言完了）。 */
+    const fitted = await s.eval(`(() => {
+      const b = [...document.querySelectorAll('.bd-tools .bd-t')].find((x) => /装回屏幕/.test(x.title || ''))
+      if (!b) return false
+      b.click()
+      return true
+    })()`)
+    await sleep(400)
+    if (fitted) ok('收尾：点了「⤢ 装回屏幕」，视图复位（不给后面的节留我改过的状态）')
+    else console.log('  （提示：没找到「⤢ 装回屏幕」那颗按钮，视图停在放大状态 —— 本节后面只剩报错检查）')
+  }
+}
+
+/* ═════════════════ 12. 页面里不许有 JS 报错 ═════════════════ */
+console.log('\n[12] 整个流程跑下来，页面里没有任何 JS 报错')
 if (!s.exceptions.length) ok('没有报错 —— "处理器抛异常"和"处理器没跑"在屏幕上是同一个样子，所以这条是兜底')
 else bad(`页面里有 ${s.exceptions.length} 条报错：` + s.exceptions.slice(0, 3).join(' ｜ '))
 })

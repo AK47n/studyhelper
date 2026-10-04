@@ -3,6 +3,10 @@ import { relationCurve } from '../lib/geometry.js'
 /* 关系的词表在 link-kinds.js（board.js 不再转发）。 */
 import { LINK_DELETE, LINK_KINDS } from '../lib/link-kinds.js'
 import { applyViewTo, viewTransformAttr, worldLenToScreen, worldRectToScreen, worldToScreen } from '../lib/view.js'
+/* 「？问这里」那颗按钮上的字只有一处（src/lib/followup.js）—— 自检按它找按钮。 */
+import { ASK_BUTTON } from '../lib/followup.js'
+/* 「✎ 做这道题」那颗按钮上的字 —— 只有一处（和工具条那颗分开，理由见 homework.js）。 */
+import { HW_INK_BUTTON } from '../lib/homework.js'
 import { drawStroke } from '../lib/ink.js'
 import { shapeHandlePoints } from '../lib/shape-object.js'
 /* 资料层（PDF/PPT 的页面）：铺在墨迹和连线**底下**的背景层，
@@ -42,7 +46,16 @@ const INKACTS_GAP = 12
 export default function BoardCanvas({
   sceneRef, liveRef, view, size, strokes, relations, cardById, cardsForInk,
   eraserAt, onPointerDown, onPointerMove, onPointerUp,
-  lasso, inkBox, inkHasStrokes = false, onDeleteInk, onBeautifyInk, onFormulaInk, onCopyInk, inkFrame = null, onKeepFrame, onDissolveFrame,
+  lasso, inkBox, inkHasStrokes = false, onDeleteInk, onBeautifyInk, onFormulaInk, onCopyInk, onPasteInk, inkFrame = null, onKeepFrame, onDissolveFrame,
+  /* ★ 「框选追问」（2026-09-22）：`askPage` = 圈住的这一块落在课件的第几页
+     （0 = 不在任何一页上，那颗按钮就是灰的），`askRegionBox` = 小窗开着时
+     画在板上那一圈高亮（世界坐标 `{box, page}`）。
+     ⚠ "哪一页"是在 Board.jsx 里算的（ask-region.js 的纯函数），这里只消费 ——
+       和 `shapeHits` 同一条分工：**价值判断住在 lib / Board，画布只管画**。 */
+  askPage = 0, onAskInk, askRegionBox = null,
+  /* ★ 「✎ 做这道题」（2026-09-22，作业辅导）：和上面那一族共用 `askPage` ——
+     都是"你圈的这一块落在课件的第几页"。那个数非零才点得动。 */
+  onHomeworkInk,
   /* 常用形状规整（见 lib/shapes.js）：`shapeHits` 是"框住的笔里认出哪些形状"，
      非空才显示「◯ 规整」那颗 —— 「认不出来就不出现」是这一族的铁律，
      而判"认不认得出"的地方在 shapes.js，这里只消费结果。 */
@@ -59,6 +72,7 @@ export default function BoardCanvas({
        它们钉在包围框四角上，屏幕右缘和关系面板（z-index 20）会盖住右边那两个。 */
   pickTarget = null, onPickScale, onPickRotate,
   links = [], selLink = null, linkPick = null, onPickLink, onApplyLink, onLinkHover,
+  onVetoCond, onSpecCond, onClearCond,
   /* 板框（见 ADR-0001）：`frames` 是 [{frame, box}]（box 是按成员现算的框线，世界坐标）。 */
   frames = [], frameEditId = null, selectedFrameId = null,
   onFrameSelect, onFrameDragStart, onFrameDrag, onFrameDragEnd, onFrameEdit, onFrameTitle, onFrameEditClose,
@@ -290,6 +304,15 @@ export default function BoardCanvas({
         />
       )}
 
+      {/* ★ 「正在问这里」的那一圈高亮（2026-09-22，框选追问）。
+          为什么和上面那个 lasso 分开：lasso 是**正在拖**的那个框（松手就没），
+          这个是"小窗开着的时候，你圈的是哪一块"—— 它要在整个问答期间留着，
+          而且位置跟着视野走（`worldRectToScreen`）。有了它，"小窗里讲的是哪儿"
+          在板上一直看得见，不用回头猜（课件上圈过的地方很多，一次课下来会忘）。 */}
+      {askRegionBox && (
+        <div className="bd-askmark" data-ask-mark={askRegionBox.page || 0} style={worldRectToScreen(askRegionBox.box, view)} />
+      )}
+
       {/* 框选出来的那组墨迹：一个虚线包围框 + 「美化」和「删除」两个按钮。
           用笔的人不一定腾得出手按 Delete 键，也不一定够得到工具条，
           所以这两个动作必须放在手边。
@@ -406,6 +429,62 @@ export default function BoardCanvas({
                 ◯ 规整{shapeHits.length > 1 ? ` ${shapeHits.length}` : ` ${shapeHits[0].label}`}
               </button>
             )}
+            {/* ★★ 「？问这里」（2026-09-22，框选追问）：圈住课件上的哪一块就问哪一块。
+                用户原话：「直接用框选，框中的地方是有疑问的地方并且可以询问这是为什么」。
+                ★ 为什么**排在「规整」和「复制」之间**：左半排是"把这一块换个样子"
+                  （公式 / 美化 / 规整），右半排是"把它带走或干掉"（复制 / 删除）。
+                  追问属于**左边那一族的下面**：它也不改这一块，但它要拿这一块去问人 ——
+                  和「公式」「美化」一样是"对内容做点什么"，只是产出不落在板上。
+                ★ 为什么它**不像「规整」那样条件出现**：追问是这个功能存在的理由，
+                  用户会来找它。找不到按钮比按下去得到一句解释更让人困惑。
+                  所以它一直在，只是**没圈到课件页面时是灰的**（`disabled` + title 说清楚）——
+                  这和「规整」那条"认不出来就不出现"不冲突：那条管的是"应用有没有认出东西"，
+                  这一条管的是"你圈的地方有没有资格问"，后者是用户能自己修正的动作。 */}
+            <button
+              className="bd-inkask"
+              data-ink-ask={askPage || 0}
+              data-tool="askink"
+              disabled={!askPage}
+              onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+              onClick={(e) => {
+                e.stopPropagation()
+                onAskInk?.()
+              }}
+              title={
+                askPage
+                  ? `问这一页（第 ${askPage} 页）为什么：把圈住的这一块和整页一起发给 AI，答案浮在页边，不动板上的东西`
+                  : '框选追问：先在**课件页面上**圈住有疑问的那一块（或者圈住某一页旁边的讲解卡 —— 问的就是它在讲的那一页），再点这里'
+              }
+            >
+              {ASK_BUTTON}
+            </button>
+            {/* ★★ 「✎ 做这道题」（2026-09-22，作业辅导的第二个入口）：
+                圈住作业页上的**题号** → 点它 → 那一道题就交给老师做（每题一份答案 + 解析）。
+                用户原话：「选题目允许靠用户圈住题号来实现」。
+                ★ 和「？问这里」**挨着放**：两颗都是"拿圈住的这一块去问人"，
+                  区别只在问什么 —— 那一颗问"这是为什么"，这一颗说"做这道题"。
+                ★ 它和工具条那颗走的是**同一个** `openHomework`（见 Board.jsx）——
+                  两条入口各写一份判断的话，"什么情况下能圈题"一定会有一处漏掉。
+                ★ 灰不灰的判据和追问共用 `askPage`（都要求框里有课件页面）：
+                  没圈到页面上时带进去的框对不上任何一页，"做这道题"也就无从谈起。 */}
+            <button
+              className="bd-inkhw"
+              data-ink-hw={askPage || 0}
+              data-tool="hwink"
+              disabled={!askPage}
+              onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+              onClick={(e) => {
+                e.stopPropagation()
+                onHomeworkInk?.()
+              }}
+              title={
+                askPage
+                  ? `做第 ${askPage} 页上你圈住的这道题：把它和整页一起发给老师，每题一份答案 + 解析（答案浮在窗里，不动板上的东西）`
+                  : '作业辅导：先在**课件页面上**圈住要做的那道题（多半是题号），再点这里；也可以直接点工具条上那颗自己写页码'
+              }
+            >
+              {HW_INK_BUTTON}
+            </button>
             {/* ★ 复制（2026-09-18）。放在「美化」和「删除」之间：
                 它不是"改造这一块"，而是"把这一块带走"—— 和右边那个删除一样是
                 对整块的操作，但它比删除安全，所以排在删除**前面**（误按的代价差很多）。
@@ -421,6 +500,28 @@ export default function BoardCanvas({
               title="复制这一块（也能按 Ctrl+C）—— 切到别的白板按 Ctrl+V 贴上去"
             >
               ⧉ 复制
+            </button>
+            {/* ★★ 「⧉ 粘贴」（2026-09-23，用户报的 Surface 场景）。
+                用户原话：「加一个方便黏贴的，现在复制框选即可复制，但是黏贴需要 ctrl+v，
+                这对于 surface 来说要去接一个外置键盘才方便，我们不希望额外引入这个键盘，
+                采用其他方式比如价格按钮」。
+                ★ 位置就是"紧挨着复制"：复制完选区还框着、这一排还在眼前，
+                  "顺手把刚带走的那块贴回来"最顺的就是这儿。
+                  工具条上还有一颗（给**切到另一块板**用的 —— 那时候没有选区、
+                  这一排根本不出现）；两颗和 Ctrl+V 共用同一个 `pasteSel`。
+                ★ 和「⧉ 复制」同色（.bd-inkpaste 用同一族的青）—— 那一排的读法是
+                  "同色 = 一对"（见 styles.css 里这三种颜色的分工）。
+                ★ 不置灰：剪贴板里有没有东西只有点下去才知道。 */}
+            <button
+              className="bd-inkpaste"
+              onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+              onClick={(e) => {
+                e.stopPropagation()
+                onPasteInk?.()
+              }}
+              title="把刚才复制的那一块贴到**你现在看着的地方**（不用按 Ctrl+V）—— 贴出来的是新的一份，原来那块不动"
+            >
+              ⧉ 粘贴
             </button>
             <button
               className="bd-inkdel"
@@ -499,6 +600,26 @@ export default function BoardCanvas({
                     ⇄
                   </button>
                 )}
+                {/* 「这个条件不算 / 条件就是它 / 改回按位置读」三颗（2026-09-24 从关系面板请回，
+                    新家是框住这条线时这排动作；clear 是 veto 的回头路）： */}
+                <button
+                  className="bd-linkchip"
+                  onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+                  onClick={(e) => { e.stopPropagation(); onVetoCond?.(selLink) }}
+                  title="这个条件不算：忽略这条线旁边的字/卡（Ctrl+Z 能退回）"
+                >不算</button>
+                <button
+                  className="bd-linkchip"
+                  onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+                  onClick={(e) => { e.stopPropagation(); onSpecCond?.(selLink) }}
+                  title="条件就是它：先框住要当条件的那张卡或那笔，再点这里（Ctrl+Z 能退回）"
+                >就是它</button>
+                <button
+                  className="bd-linkchip"
+                  onPointerDown={(e) => { e.stopPropagation(); e.preventDefault() }}
+                  onClick={(e) => { e.stopPropagation(); onClearCond?.(selLink) }}
+                  title="改回按位置读：清掉手动指定，重新用线旁边的字/卡（Ctrl+Z 能退回）"
+                >改回</button>
                 {/* 「删掉这条连接」（2026-09-17 第二刀，见 ADR-0001）：
                     它顶掉了从前那个「不算连接」。框住那条线 = "我就是要动这一条"，
                     所以这颗按钮在这儿比在别处都顺手。 */}

@@ -25,8 +25,11 @@
   --ease: cubic-bezier(0.25, 0.6, 0.3, 1);
 
   /* ---- 字号阶梯：改 --s 一个数，整个界面跟着放大/缩小 ---- */
-  /* 界面上有个 A- / A+ 按钮会改这个值，也存进 localStorage */
-  --s: 1.25;
+  /* 界面上有个 A- / A+ 按钮会改这个值，也存进 localStorage。
+     ⚠ 这里这个数是**首屏那一瞬间**用的（JS 挂载后会用 localStorage 里的值盖掉它）——
+        所以它要跟 `App.jsx` 的 `SCALE_DEFAULT` 保持一致，不然打开会先大一下再缩回去。
+        2026-09-22 两者一起从 1.25 改成 0.95（用户：「下面的功能框大小初始为95％」）。 */
+  --s: 0.95;
   --fs-content: calc(16px * var(--s)); /* 正文、节点标题：要读的东西 */
   --fs-editor: calc(15px * var(--s)); /* 原文编辑区 */
   --fs-ui: calc(13.5px * var(--s)); /* 面板、按钮、列表 */
@@ -107,7 +110,10 @@ code, kbd { font-family: var(--mono); }
 .side-title {
   font-size: var(--fs-meta); color: var(--dim2); letter-spacing: 0.6px;
   padding: 4px 6px;
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center;
+  /* ⚠ 不能用 space-between：加了折叠箭头之后这一行有三个孩子
+     （caret · 标题 · 动作按钮），space-between 会把**标题挤到正中间**。
+     右对齐交给 `.title-acts` 自己的 margin-left:auto。 */
   gap: 6px;
   border: 1px solid transparent; border-radius: 8px;
   /* 标题那几个字不许折行 —— 折在中间（"我的一课一 / 页"）比挤一点难看多了。
@@ -115,6 +121,13 @@ code, kbd { font-family: var(--mono); }
   flex-wrap: wrap;
 }
 .title-label { white-space: nowrap; }
+/* ★ 标题行 = 这一整块的**开关**（2026-09-28「每一层都能收起」）：
+   它长得仍然像标题（淡色小字），但整行可点、也 Tab 得到 ——
+   和树里目录行同一个手势（▾/▸ + 点行）。行尾那两颗「＋」会自己拦冒泡，
+   点它们不会顺手把这一块折上。 */
+.side-title { cursor: pointer; user-select: none; }
+.side-title:focus-visible { border-color: var(--acc); outline: none; }
+.side-folded-hint { font-size: var(--fs-meta); padding: 2px 6px; }
 /* 顶部这一行 = **根目录**的放置目标（拖回根上），所以它也要有"被拖到"的样子 */
 .side-title.drop { background: var(--hov); border-color: var(--acc); }
 .title-acts { display: flex; gap: 4px; flex: none; margin-left: auto; white-space: nowrap; }
@@ -198,6 +211,14 @@ code, kbd { font-family: var(--mono); }
    比 ⤳ 宽不少 —— 一行的动作区会跟着变宽，但只在鼠标上来时才显示。 */
 .rowbtn.exp { color: #7ba7dc; padding: 1px 6px; }
 .rowbtn.exp:hover { background: var(--hov); color: #cfe6ff; }
+/* ★ 「删除」（2026-09-21）。和「导出」同理：它是个**词**，不是一眼认得的符号，
+   所以在两个符号中间得看得出来是件独立的事。
+   ⚠ 给一点暖红（不是刺眼的纯红）：这一行里最危险的那颗，**要看得出来**，
+     但不能红到"每次划过这一行都在喊"。悬停时才满上 —— 那一下才是"我要按它了"。
+   ⚠ 别退回 `display:none`（划过才显示）：这一行的动作区是 `.filerow:hover` 才出来的，
+     那颗按钮在里面本来就已经"划过才看得见" —— 再藏一层就等于"得先猜到有这条路"。 */
+.rowbtn.del { color: #b5767a; padding: 1px 6px; }
+.rowbtn.del:hover { background: rgba(200, 84, 84, 0.16); color: #ff9a9a; }
 /* 就地改名的输入框：**占 fname 那一格**（flex: 1，和它替换掉的那个 span 同一个位置），
    所以点下去那一行除了"名字变成可编辑的"以外什么都不动 —— 树不会跳。 */
 .renameinput {
@@ -461,6 +482,18 @@ kbd {
   color: #cdd6e6;
   /* 不设 z-index：和 textarea 同层叠上下文，按 DOM 顺序压在上面 */
   pointer-events: none; /* 点击穿透到 textarea，保住原生光标和选择 */
+}
+
+/* 长文件里一屏之外的那几块（见 SourceEditor.jsx 文件头那一节）。
+   ★ 块的排版必须和 textarea **逐字相同** —— 字体、行高、可用宽度、折行规则，
+   一条不一样，折行点就不同，块高就不同，整篇越往下错得越多。
+   所以这里的 padding / margin / box-sizing 是对着 .hl-line 抄的（同样的用意：
+   底色能比文字宽 3px，但文字的可用宽度必须和 textarea 分毫不差）。 */
+.hl-chunk.text {
+  box-sizing: content-box;
+  padding: 0 3px;
+  margin: 0 -3px;
+  white-space: pre-wrap;
 }
 
 .hl-line {
@@ -790,6 +823,12 @@ kbd {
 /* 从底下轻轻浮上来。keyframe 里必须带着 translateX(-50%)：
    那是水平居中的定位本身，动画把它挤掉，条会先跳到左边再归位 */
 @keyframes toastin { from { opacity: 0; transform: translate(-50%, 10px); } }
+/* ★ 只说话的那类提示（`toast-pass`）：**不接管点击**（2026-09-28 实测）。
+   它 `bottom: 26px` 正好压在工具条那排按钮上，而提示一出就是好几秒 ——
+   那几秒里工具条上被它盖住的按钮全点不动（"点了没反应"，而且屏幕上看不出为什么）。
+   这类提示会自动消失、本来就不用点 ⇒ 让指针从它身上漏下去。
+   ⚠ **带动作的那类不许加**：它要留着让人点那颗按钮（导出→打开文件夹那一条）。 */
+.toast-pass { pointer-events: none; }
 .toast.ok { border-color: #1d4a36; color: #bdf0d7; }
 .toast.warn { border-color: #453316; color: #ffe0b0; }
 .toast.err { border-color: #5a2a24; color: #ffc9c0; }
@@ -1158,6 +1197,51 @@ kbd {
 }
 .bd-docpage canvas { display: block; width: 100%; height: 100%; }
 
+/* ── 页码角标（2026-09-23）：贴在每一页的**左上角外面**（页眉那条空白上）─────
+   为什么要它：整份课件铺上来之后**每张白纸长得都一样**，想找"刚讲的那页"
+   只能靠眼力数。课件整理窗口里写着"第 7 页"，板上得对得上号。
+   ★★ 位置：**挂在页面左上角外面**（`translateY(-100%)` 抬到页边之上），
+     不是压在页面上。第一版就是压在角上的（`left:0;top:0`），截图一看就发现
+     它正盖在标题区上 —— 课件多半在左上角打标题，那是**最不该盖的一块**。
+     抬到页边之外只占页与页之间那条缝（`DOC_PAGE_GAP`=20 世界单位），正文一个像素不遮。
+   ★★ 但**光抬上去会撞上资料的把手条**：`.bd-docbar` 也是"挂在第一页左上角上方"
+     （同样 `translateY(-100%)`），而且它是**不透明的白底**。实测两者屏幕盒都是
+     `[618,87,·,22]` —— 第 1 页的页码被把手条整个盖住，`elementFromPoint`
+     回的是 `bd-docbar-ico`（第 1 页那个数字**根本看不见**）。
+     ⇒ 所以再往**左**让开一整个条子的宽度：`right: 100%`（挂到页边**外侧**）。
+       挤到资料左边那条空白上，和把手条再也不碰面。
+     ⚠ 别改成"往右挪"：往右就是往页面上挪，等于把刚解决的问题换回来。
+     ⚠ 资料左边可能压着别的东西（卡片/板框）—— 但角标只是**认页用的提示**，
+       被压住顶多"看不见"，而压在页面上是"**盖住正文**"，两者坏处不对称。
+   ★★ `zoom: var(--ck-inv)` 抵消祖先 `.bd-docworld` 的 `scale(s)`：
+     不抵消的话，放大时页码跟着变大、缩小时小到看不见 —— 屏幕字号和缩放绑死。
+     （同一套手法见上面 `.bd-card-del` 那一大段；`--bd-world-s` 由 DocLayer.jsx
+       写在 `.bd-docworld` 的 style 上 —— 资料层是另一棵子树，继承不到卡片层那份。）
+     ⚠ 抵消用 `zoom`，**不是**把 1/s 乘进 width/height：后者布局盒一起缩，
+       数字会跟着变小（`zoom` 之后布局盒是写死的那些 px）。
+     ⚠ `right: 100%` 是**世界长度**的偏移 —— 它跟着祖先的 scale 走（正好，因为
+       它要贴着页边）；而 `zoom` 锁住的是**自己的尺寸**。两件事各管各的，别混。
+        实测（check-doc [2b]）：放大前后角标屏幕盒 **21×22 一点没变**。
+   ★ 不吃指针（资料层整层 `pointer-events: none` 那条规矩不能让页码破口子）：
+     往页码上落笔照样是写字 —— `check-doc` 的 [2b] 钉着这一条。 */
+.bd-docno {
+  position: absolute; top: 0;
+  /* 挂到页边**外侧**（左边），躲开同样挂在页顶上方的资料把手条。 */
+  right: 100%;
+  transform: translateY(-100%);
+  /* 视图缩放的倒数 —— 和 .bd-card-del 一族同一条口径（兜底 1 也一起带着）。 */
+  --ck-inv: calc(1 / var(--bd-world-s, 1));
+  zoom: var(--ck-inv);
+  pointer-events: none;
+  padding: 2px 7px;
+  font-size: 12px; line-height: 1.5;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: #fff; background: rgba(40, 48, 66, 0.78);
+  border-radius: 4px 4px 0 0;
+  /* 不加阴影：白纸上够清楚，而且几十上百页各带一层合成是白给的开销。 */
+}
+
 /* 资料的把手条：挂在第一页的左上角上方（translateY(-100%)），和板框的标题把手
    一个路子。它住在 .bd-world（z6）里、在收事件层（z5）**上面**，所以点得到；
    条上拖动 = 整份资料挪位置，✕ = 移掉。页面本身永远不吃指针。 */
@@ -1233,6 +1317,52 @@ kbd {
   transform-origin: 0 0;
 }
 
+/* ── 卡片层：世界坐标 + 一层视图变换（2026-09-21 第九刀，见 README 第 58 条）──
+   卡片自己只写**世界坐标**（`left: card.x`、`width: card.w`），
+   "世界 → 屏幕"这一份**只在这一层写一次**（transform 由 Board.jsx 的
+   `cardWorldStyle` 给，origin 0 0）。
+
+   ★ 为什么这么改：从前卡片逐张按屏幕坐标摆，缩放时 213 张卡每张改 6 个属性
+     → 浏览器对 3 万个 DOM 节点**全量重排**。实测用户那张 213 张卡的板：
+     30 次滚轮花 7.4 秒，其中 **4.0 秒是纯 layout**（54%）。
+     改成"一层 transform"之后，缩放只改这一行 → 走合成层，**一次 layout 都不做**。
+     ⚠ 老注释（2026-09-15 那段）警告的"绝对定位元素的 translate 相对包含块算、
+       .bd-stagewrap 在页面里是偏的"是**另一个错**：那次是**每张卡各写一次**
+       translate（14 处手抄）。现在只在**一个** origin: 0 0 的容器上写一次，
+       相对的和 canvas 的 ctx.setTransform 是同一个原点 —— 唯一的一份。
+
+   ★ z-index 仍然归 .bd-world 管（所以这一层**不设** z-index，保持 auto）：
+     卡片要压过 .bd-hit(5)，而"正 z-index 的元素排在 z-index:auto 的定位元素后面"
+     —— 这一层要是自己写了 z-index，就会掉到收事件层下面，卡片当场点不到
+     （见 .bd-world 上面那一大段说明）。 */
+.bd-cardworld {
+  position: absolute; left: 0; top: 0; width: 0; height: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+/* ── 手势期间把卡片层**从布局里摘掉**（2026-09-21 第十刀，见 README 第 58 条）
+   类挂在一屏只渲染一次的 .bd 上（`gesting` state），on/off 的代价是零 ——
+   它不动 3 万个节点里任何一个。
+
+   ★ 为什么"世界坐标 + 一层 transform"还不够（2026-09-21 复量的一版数字，
+     探针 `npm run perf:cost` / `perf:zoom`）：卡片可见那一路，60 帧缩放要
+     **RecalcStyle 941ms、帧中位 50ms**；把这一层 `display:none` 掉 →
+     **RecalcStyle 35ms、帧中位 16.7ms（满帧）**。那笔样式失效的代价与
+     **卡片子树的规模成正比**（3 张卡的小板同一个动作只要 22ms），
+     而它**不是**滚动条、也不是 `overflow` 造成的（那两样都逐个摘过量过，读数不动）。
+
+   ★ 代价说清楚：手势那零点几秒里**看不见卡片**（看得见的是课件、墨迹、连线）。
+     这是用户 2026-09-21 报的那个手感（"放大缩小的时候有点卡"）的解法 ——
+     拿"看得见卡"换"每一下都跟手"。
+     ⚠ 但"什么时候放回来"**必须是停手 200ms 之后**（Board.jsx 的 `GEST_LINGER_MS`），
+       不能是"最后一个事件之后一帧"：真人滚轮是一阵一阵的（实测串间隔 140ms），
+       一帧就放回来的话，每一串之间卡片闪一下（实测 2 秒里收放 10~11 次），
+       而"收/放"本身要全量重排一次 —— 净收益是负的，只换来屏幕上闪。
+   ⚠ 别改成 `visibility: hidden` / `opacity: 0`：那两个**照样参与布局**，
+     layout 一点都省不掉（要的就是 display:none 的"退出几何"）。 */
+.bd.gesting .bd-cardworld { display: none; }
+
 /* ★ 「跟着视野走」的那几层（两层 canvas + 两层 SVG）—— 补正也贴在它们身上。
    属性由 BoardCanvas 自己声明（`data-view-follow`），Board.jsx 按它一次找齐：
    这样"漏掉哪一层"不靠人记得，改成"谁跟视野走谁自己声明"。
@@ -1304,6 +1434,34 @@ kbd {
 
 .bd-card-empty { color: #a3aab8; font-size: calc(13px * var(--s) * var(--bd-card-scale, 1)); }
 .bd-note { white-space: pre-wrap; word-break: break-word; }
+
+/* ── 讲义卡（`rich: true`，见 src/lib/rich.js）：段落 + 列表 + 行内公式 ──
+   为什么另开一套：普通文字卡是**纯文本**（手写笔记不该被当 Markdown 渲染），
+   而老师讲解里夹着式子（`$e^{j\omega_0 t}$`）—— 生 LaTeX 学生看不懂，要排出来。
+   ⚠ 这些规则**渲染和量尺寸共用**（量尺寸的台子里用的是同一个类名 .bd-note.rich）：
+     这边改了行距/边距，那边量出来的数也跟着变 —— 那正是我们要的（两边永远同一套）。
+   ⚠ `white-space: pre-wrap` 在这里要关掉：段落是由 <p> 排的，
+     留着 pre-wrap 会把 richHtml 里的换行符也画出来（多出一堆空行）。 */
+.bd-note.rich { white-space: normal; }
+.bd-note.rich .bd-rich-p { margin: 0 0 0.5em; }
+.bd-note.rich .bd-rich-p:first-child { font-weight: 600; } /* 第一段是标题（"第 N 页 · 讲解"） */
+.bd-note.rich .bd-rich-p:last-child,
+.bd-note.rich .bd-rich-ul:last-child,
+.bd-note.rich .bd-rich-tex:last-child { margin-bottom: 0; }
+.bd-note.rich .bd-rich-ul { margin: 0 0 0.5em; padding-left: 1.15em; }
+.bd-note.rich .bd-rich-ul li { margin: 0.08em 0; }
+.bd-note.rich .bd-rich-tex { margin: 0.35em 0 0.6em; overflow-x: auto; }
+/* ★ 列表项里"摆开看"的式子（`- $$式子$$ —— 说明` —— 提纲卡正是这个形状）：
+   它没有 `.bd-rich-tex` 那层壳（得留在 `<li>` 里，"—— 说明"才跟得住），
+   所以"长式子不许把卡片撑破"这条要单独写一遍。
+   渲染那边的来历见 `src/lib/rich.js` 的 `splitDisplay`。 */
+.bd-note.rich li .katex-display { overflow-x: auto; overflow-y: hidden; }
+/* `**…**`（提纲卡那几个小标题："骨架 / 必记 / 核心式子"）。600 = 和第一段标题同一档，
+   **不用 700**：中文的 bold 在这字号下太重，压得住正文就够了。 */
+.bd-note.rich strong { font-weight: 600; }
+.bd-note.rich .bd-rich-raw { font-size: 0.92em; }
+/* 行内公式跟着正文走：KaTeX 默认会把它撑大一点点，这里收一收，免得一行只有几个字。 */
+.bd-note.rich .katex { font-size: 1.02em; }
 /* ★ 公式卡**不画横向滚动条**：`overflow-x: auto` 留着（"内容有没有被裁"这条硬判据
    靠 `scrollWidth > clientWidth` 读，见 card-fit.js 的 spillPx），但那条滚动条不占位、
    也不画出来。
@@ -1342,19 +1500,77 @@ kbd {
      根子是"插入之后卡片一直保持选中、点空白也不取消"，
      于是那个 × 永远戳在那儿等着被误点。现在：不选中就一个手柄都不显示。
    ★ 平时半透明、指上去才实心：它的位置固定，靠"看着不那么显眼"少挨几下误点。 */
-.bd-card-del, .bd-card-resize, .bd-card-pin {
+/* ★★ 这四颗手柄的**尺寸和贴边偏移都和"当前视觉倍率"解耦**（2026-09-21 修的，
+   第二版改用 `zoom` —— 第一版的写法见下面那段，别再改回去）。
+ *
+ * 起因（用户报的「点击白板删除按钮没有用」）：
+ *   这组按钮原来是 `right:-10px; top:-10px; width:22px` 这样写死的。
+ *   它们是卡片上的绝对定位子元素，而整张卡片活在 `.bd-cardworld` 那一层里，
+ *   那层挂着 `transform: scale(s)`（s = 视图缩放，见 Board.jsx 的 cardWorldStyle）。
+ *   于是卡上写死的 22px 在屏幕上变成 `22×s`，"贴边往外露 10px"变成 `10×s`。
+ *
+ *   平时没事（s 通常 1~2，越界几像素而已）。
+ *   ★ 但卡片靠到画布边缘时就不行了：`.bd-stagewrap` 是 `overflow: hidden`，
+ *     露在外面的那一块被裁掉，而"卡片边缘之外"本来就是空的（落点是画布/工具条），
+ *     于是这一点既看不见也点不到 —— 实测（真浏览器，卡片贴画布右边沿）：
+ *       · 界面字号档 1.6 → × 可见 95%；缩放柄和 📌 落到工具条底下
+ *       · 界面字号档 2.0 → × 可见 **0%**，`elementFromPoint` 回 null
+ *     也就是说 **卡片越靠边这排手柄越点不到**，而屏幕上它看着还在那儿
+ *     （被裁掉一半，你分不清是"被裁了"还是"本来就这样"）。
+ *     字号档之所以牵动它：`--s` 把卡片里的字撑大 → 卡片变宽 → 右边缘越过画布。
+ *
+ * 怎么修：`--bd-world-s` 是 Board.jsx 写在 `.bd-cardworld` 上的**那一层的缩放**
+ *   （和 `transform: scale(s)` 里的 s 是同一个数）。这里取它的倒数当 `--ck-inv`，
+ *   用手柄自己那颗 `zoom` 抵消掉 —— 手柄的屏幕大小和贴边量与缩放解耦。
+ *
+ * ⚠ 用 `--bd-world-s` 而**不是** `--bd-card-scale`：后者只含卡片自己的倍率 k
+ *   （拖右下角缩放柄改的那个，默认 1），不含视图缩放 —— 拿它当分母等于没修
+ *   （第一版就是这么写错的）。
+ *
+ * ★★ 抵消的手法是 `zoom: var(--ck-inv)`，**不是**把 1/s 乘进 width/height（2026-09-21 第二版）。
+ *   第一版写成 `width: calc(22px * var(--ck-inv))`：屏幕上确实恒定了（22px 一直没变），
+ *   但那只对了一半 —— **布局盒也跟着缩**，实测 s=3.1 时 `offsetWidth` 只剩 7×7。
+ *   两个后果：
+ *     · 框选/命中/贴边留白全都按 7px 那个盒子算，屏幕上看着是 22px 的圆，
+ *       能点的区域只有圆心那一小块；
+ *     · `offsetWidth` 这个读数就再也不能代表"它多大"了 —— 谁拿它做几何都得先问一句
+ *       "这里有没有补偿缩放"。尺寸这件事被拆成两个口径，是最难查的那种。
+ *   `zoom` 是**把整个子树的渲染一起缩放**，而且缩放发生在祖先 `scale(s)` **之前**：
+ *   最终屏幕长度 = 子元素长度 × s × zoom = 22px × s × (1/s) ✓，而布局盒仍是写死的 22px。
+ *   ⚠ 这是给"放大后手柄跑到视口外点不到"做的**补偿缩放**：zoom ≤ 1 所以不会变模糊，
+ *     渲染时是 22px 的小圆，栅格化在缩放后的尺度上做。
+ *   ⚠ 手柄只在**选中时**存在（最多两三颗），这条 zoom 不会带来成百上千个合成层的开销 ——
+ *     和第九刀那条"别逐卡写 transform"是两件事（那是 213 张卡 × 每帧）。
+ * ⚠ 别改用 `transform: scale(1/s)`：那会把圆角、描边、阴影一起缩放（它们已经在 s 里被放过一次），
+ *   而且会让"点得到"依赖合成层的命中，这个仓库为这件事栽过（见 BoardCanvas 里 `.bd-hit` 那一大段）。
+ * ⚠ 图标字号本来乘的是 `var(--s)`（界面字号档）—— 那个**要留着**：
+ *   界面调大时手柄图标跟着大是对的，它和"画布缩放"是两件不同的事。
+ *   （`zoom` 之后它也跟着被除了一次，屏幕上的最终值仍是 `15px * --s`，正是本来的意图。）
+ *
+ * ⚠⚠ 这一族**只管住了手柄尺寸那一半**。另一半是"整张卡片没装进画布"——
+ *   工具条浮在画布上、`fitView` 又不知道 `--s`，字号档大时卡片本身就越界。
+ *   那一半在 Board.jsx 的 `fitForView`（按字号档折算 + 扣掉工具条占的高度）。
+ *   两半都没修的话，表现一模一样：屏幕上看得见那颗 ×，点下去 elementFromPoint 回 null。 */
+.bd-card-del, .bd-card-resize, .bd-card-pin, .bd-card-ask {
   position: absolute; border-radius: 50%; border: 1px solid #d5dae4; background: #fff; color: #666;
   line-height: 1; cursor: pointer; padding: 0; opacity: 0.55; transition: opacity 0.12s;
+  /* 视图缩放的倒数 —— 抵消祖先 `.bd-cardworld` 的 scale(s)，手柄的**屏幕大小恒定**。
+     兜底 1：万一这一族被渲染到 `.bd-cardworld` 外面（比如自检单独挂一个卡），
+     没有这个变量也不会整颗按钮塌成 0 尺寸。 */
+  --ck-inv: calc(1 / var(--bd-world-s, 1));
+  zoom: var(--ck-inv);
 }
-.bd-card-del:hover, .bd-card-resize:hover, .bd-card-pin:hover { opacity: 1; }
+.bd-card-del:hover, .bd-card-resize:hover, .bd-card-pin:hover, .bd-card-ask:hover { opacity: 1; }
 .bd-card-del {
-  right: -10px; top: -10px; width: 22px; height: 22px;
+  right: -10px; top: -10px;
+  width: 22px; height: 22px;
   font-size: calc(15px * var(--s));
 }
 .bd-card-del:hover { background: #ffeceb; color: #c92a2a; border-color: #f2b8b5; }
 /* 缩放柄：右下角。用 nwse 光标（对角拉伸），和它的动作对上。 */
 .bd-card-resize {
-  right: -9px; bottom: -9px; width: 18px; height: 18px;
+  right: -9px; bottom: -9px;
+  width: 18px; height: 18px;
   cursor: nwse-resize; color: #2f6fd0; font-size: calc(11px * var(--s));
   display: flex; align-items: center; justify-content: center;
 }
@@ -1378,13 +1594,32 @@ kbd {
    ⚠ 按钮必须显式写 pointer-events: auto。父元素 none 时子元素不会自动恢复 ——
      漏了这一条的表现是"钉住了就再也解不开"，而屏幕上看不出任何异常。 */
 .bd-card-pin {
-  left: -10px; bottom: -10px; width: 22px; height: 22px;
+  left: -10px; bottom: -10px;
+  width: 22px; height: 22px;
   font-size: calc(12px * var(--s));
   display: flex; align-items: center; justify-content: center;
   pointer-events: auto;
 }
 .bd-card-pin.on { opacity: 0.95; border-color: #e0d3a6; background: #fffbe9; }
 .bd-card-pin:hover { background: #eef3ff; border-color: #a9c4ee; }
+
+/* ---------- 「◎ 问我圈的是哪一块」（2026-09-22，ADR-0006）----------
+   只有「留到板上」留下的**答案卡**才有这颗（卡片带 `ask` 字段）。
+   点一下在板上亮出当时圈的那一块，再点收起 —— 高亮那一圈复用 `.bd-askmark`。
+   ★ 位置紧跟 📌 右边（`left: 16px`）：那一带是**锁定卡片上唯一还能点的地方**
+     （锁定 = 整张卡 pointer-events: none，只有这几颗按钮自己 auto），
+     所以不能把它摆到卡片另一头去。
+   ★ 亮着的时候给个实心的样式（`.on`）：那是一个**状态**，不是一次点击 ——
+     屏幕上只有一圈红框的话，你分不清"它亮着"还是"刚才那一下没反应"。 */
+.bd-card-ask {
+  left: 16px; bottom: -10px;
+  width: 22px; height: 22px;
+  font-size: calc(13px * var(--s));
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: auto;
+}
+.bd-card-ask.on { opacity: 1; border-color: #e2a3a3; background: #fff5f5; color: #c92a2a; }
+.bd-card-ask:hover { background: #eef3ff; border-color: #a9c4ee; color: #2f6fd0; }
 
 /* 锁定后的卡片：**不收任何指针事件**（除了上面那颗 📌）。
    视觉上给一点暗示就行 —— 别把卡片弄丑，它不是坏掉了。 */
@@ -1462,6 +1697,445 @@ kbd {
   border: 1.5px dashed #2f6fd0; border-radius: 6px;
   background: rgba(47, 111, 208, 0.07);
 }
+
+/* ══════════════ 框选追问：页边那个问答小窗（2026-09-22）══════════════
+ *
+ * 用户原话：「加一个可以在页边快速追问这页里面哪个地方是为什么，或者更加智能一点
+ * 直接用框选，框中的地方是有疑问的地方并且可以询问这是为什么」。
+ *
+ * 三件事决定了这一段的写法：
+ *   ① 它**不是**弹层（没有遮罩、不锁住画布）：`position: absolute` 挂在 .bd 里，
+ *      你照样能平移、缩放、甚至再框一块地方（那种时候它会自己收掉，见 Board.jsx）。
+ *      所以这里没有 inset:0 的背板 —— 和 `.ask`（询问框，z-index 300、全屏遮罩）
+ *      是两族东西。
+ *   ② z-index 30：高过底部工具条（20）和选区那一排（12），低过询问框（300）——
+ *      它是"看板时浮着的一张纸条"，不是必须回应的对话框。
+ *   ③ 字号跟着 --s（界面字号档）走，和工具条、卡片同一条规矩：
+ *      用户把 A+ 按大了，这个窗里的字也得跟着大，不然读起来是两个世界。
+ *
+ * ⚠ 它是**浅色**的（白底深字），不像工具条那样深色：这个小窗里装的是**要读的一段话**
+ *   （120~300 字 + 可能夹着公式），而深底浅字读长文比浅底深字累得多。
+ *   公式（KaTeX）在浅底上也才是它平时那个样子。 */
+.bd-ask {
+  position: absolute; z-index: 30; width: calc(366px * var(--s) / 1.25);
+  display: flex; flex-direction: column;
+  background: #fbfcfe; color: #1b1d22;
+  border: 1px solid #c9d3e2; border-radius: 12px;
+  box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
+  overflow: hidden;
+  font-size: calc(13px * var(--s));
+}
+.bd-ask-head {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 9px; background: #eef3fb; border-bottom: 1px solid #d7e0ee;
+  cursor: grab; user-select: none;
+}
+.bd-ask-head:active { cursor: grabbing; }
+.bd-ask-ico {
+  flex: none; width: 1.5em; height: 1.5em; border-radius: 50%;
+  background: #2f6fd0; color: #fff; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; font-size: 0.92em;
+}
+.bd-ask-title { flex: 1; min-width: 0; font-weight: 600; color: #22314a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-ask-x {
+  flex: none; border: 1px solid transparent; background: transparent; color: #5b6b85;
+  border-radius: 7px; padding: 1px 7px; cursor: pointer; font: inherit; line-height: 1.5;
+}
+.bd-ask-x:hover { background: #fff; border-color: #b9c6da; color: #c92a2a; }
+
+.bd-ask-list {
+  padding: 9px 10px 4px; overflow-y: auto;
+  max-height: calc(46vh); min-height: 74px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.bd-ask-empty { color: #66748c; line-height: 1.75; }
+/* 「我问的那句」——靠右的小气泡，和老师的回答分得开（一行里就能看出谁在说话）。 */
+.bd-ask-me {
+  align-self: flex-end; max-width: 88%;
+  background: #2f6fd0; color: #fff;
+  padding: 5px 10px; border-radius: 11px 11px 3px 11px;
+  line-height: 1.65; word-break: break-word; white-space: pre-wrap;
+}
+/* 「老师说的」——正文按讲义那一套排（rich.js 的 richHtml：段落 / 列表 / 公式），
+   所以这里的子元素规则和 `.bd-note.rich` 那一族是同一份口味的浅色版。 */
+.bd-ask-say {
+  align-self: stretch; max-width: 100%;
+  background: #fff; border: 1px solid #e0e7f1; border-radius: 11px 11px 11px 3px;
+  padding: 7px 10px; line-height: 1.8; word-break: break-word;
+}
+.bd-ask-say.pending { color: #7d8aa1; font-style: normal; }
+.bd-ask-say .bd-rich-p { margin: 0 0 0.5em; }
+.bd-ask-say .bd-rich-p:last-child,
+.bd-ask-say .bd-rich-ul:last-child,
+.bd-ask-say .bd-rich-tex:last-child { margin-bottom: 0; }
+.bd-ask-say .bd-rich-ul { margin: 0 0 0.5em; padding-left: 1.15em; }
+.bd-ask-say .bd-rich-ul li { margin: 0.08em 0; }
+/* 独立成行的公式：窗比卡片窄，长式子会顶出去 —— 允许它自己横向滚（和 `.bd-tex` 同一条）。 */
+.bd-ask-say .bd-rich-tex { margin: 0.35em 0 0.6em; overflow-x: auto; }
+/* 和 `.bd-note.rich strong` 同一条（`**…**`，600 不是 700）。 */
+.bd-ask-say strong { font-weight: 600; }
+.bd-ask-say .bd-rich-raw { font-family: var(--mono); font-size: 0.92em; color: #b03030; }
+.bd-ask-say .katex { font-size: 1.04em; }
+
+/* 「⬇ 留到板上」那一排（2026-09-22，ADR-0006）：挂在**每一条回答下面** ——
+   位置就是"留到这儿"的意思（留下的是从第一问到这一轮的整段问答）。
+   ★ 靠右对齐、比正文矮一档：它是"这条不错，留下来"的一个小动作，
+     不该和正文抢注意力（一次课下来这里会出现好几颗）。 */
+.bd-ask-keeprow { display: flex; justify-content: flex-end; align-items: baseline; gap: 8px; margin: -4px 0 2px; }
+/* 这一答花了多少（2026-09-22）：和「留到板上」同一排的最左边，**最不抢眼**那一档 ——
+   它是回头看账用的（"接着问"重发那两张图到底贵不贵，这一行回答）。
+   抢在按钮前面自动占位，所以按钮仍然靠右。 */
+.bd-ask-usage { margin-right: auto; color: #8b97ad; font-size: calc(11px * var(--s)); }
+
+.bd-ask-err {
+  display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+  background: #fff4f4; border: 1px solid #f3c2c2; color: #a4242b;
+  border-radius: 9px; padding: 6px 9px; line-height: 1.7;
+}
+.bd-ask-retry {
+  border: 1px solid #e3a7a7; background: #fff; color: #a4242b;
+  border-radius: 7px; padding: 1px 8px; cursor: pointer; font: inherit; flex: none;
+}
+.bd-ask-retry:hover { background: #ffecec; }
+
+.bd-ask-in { display: flex; align-items: flex-end; gap: 7px; padding: 7px 10px 3px; border-top: 1px solid #e6ecf5; }
+.bd-ask-ta {
+  flex: 1; min-width: 0; resize: none; font: inherit; line-height: 1.6;
+  border: 1px solid #cdd8e8; border-radius: 9px; padding: 6px 8px;
+  background: #fff; color: #1b1d22;
+}
+.bd-ask-ta:focus { outline: none; border-color: #7ba7e6; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.14); }
+.bd-ask-btns { flex: none; }
+.bd-ask-btn {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 9px; padding: 6px 12px; cursor: pointer; font: inherit; white-space: nowrap;
+}
+.bd-ask-btn:hover { background: #eef3fb; }
+.bd-ask-btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; font-weight: 600; }
+.bd-ask-btn.primary:hover { background: #3b7fe0; }
+.bd-ask-btn:disabled { opacity: 0.5; cursor: default; }
+.bd-ask-foot { padding: 4px 10px 8px; color: #7d8aa1; font-size: 0.9em; line-height: 1.5; }
+
+/* 「正在问这一块」的高亮：小窗开着的时候，你圈的是哪儿在板上一直看得见
+   （一次课下来圈过很多地方，回头一定会忘）。
+   ★ 和 `.bd-inkbox`（虚线蓝、框住的那一撮）分开画：那个是"可以动它"，
+     这个是"正在说它"—— 一虚一实、一蓝一红，两件事在屏幕上不该长得一样。 */
+.bd-askmark {
+  position: absolute; pointer-events: none; z-index: 11;
+  border: 2px solid #e03131; border-radius: 3px;
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85), 0 0 0 3px rgba(224, 49, 49, 0.22);
+}
+
+/* ══════════ 作业辅导那个窗口（2026-09-22）══════════
+ *
+ * ── 它和 `.bd-ask`（框选追问）是什么关系 ────────────────────────────────
+ * 同一族：都浮在板上、都不写进板文件、关掉就散。所以配色、圆角、阴影、
+ * 字号跟 `--s` 走这几条全都照抄那边 —— 它们是"同一类东西"，长得不一样才怪。
+ *
+ * ── 它比那个小窗宽，而且**大得多** ──────────────────────────────────────
+ * 追问是"问一句、答一段"（366px 够）；这一趟装的是**每道题的题干 + 答案 + 解析**
+ * （一道大题六百字，还有式子），而且用户要**边看边做题**。所以：
+ *   · 宽 520（再宽就盖住半个画布了）；
+ *   · 高给到 78vh，**内容自己滚**（`.bd-hw-body`）—— 头和脚钉住，
+ *     "开始做"那颗按钮永远在手指底下，不用滚到底去找它；
+ *   · 定位在**右上角**（不是跟着选区走：它不是从选区开的）。
+ *     ⚠ 和 `.bd-ask` 同一个理由不能用 left/top：拖动是靠 `transform` 叠上去的，
+ *       位置本身（right/top）由 CSS 定 —— 关掉再开一定回到右上角，不会飘到上次拖去的地方。
+ *
+ * ── 为什么是浅色 ────────────────────────────────────────────────────────
+ * 同上：这里装的是**要读的长文**（答案 + 解析），深底浅字读长文比浅底深字累得多，
+ * 公式（KaTeX）也只有在浅底上才是它平时那个样子。 */
+.bd-hw {
+  position: absolute; z-index: 30; top: 14px; right: 18px;
+  width: calc(520px * var(--s) / 1.25);
+  max-width: calc(100% - 36px);
+  max-height: 78vh;
+  display: flex; flex-direction: column;
+  background: #fbfcfe; color: #1b1d22;
+  border: 1px solid #c9d3e2; border-radius: 12px;
+  box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
+  overflow: hidden;
+  font-size: calc(13px * var(--s));
+}
+.bd-hw-head {
+  display: flex; align-items: center; gap: 7px; flex: none;
+  padding: 7px 9px; background: #eef3fb; border-bottom: 1px solid #d7e0ee;
+  cursor: grab; user-select: none;
+}
+.bd-hw-head:active { cursor: grabbing; }
+.bd-hw-ico {
+  flex: none; width: 1.5em; height: 1.5em; border-radius: 6px;
+  background: #2f6fd0; color: #fff; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; font-size: 0.92em;
+}
+.bd-hw-title { flex: 1; min-width: 0; font-weight: 600; color: #22314a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bd-hw-x {
+  flex: none; border: 1px solid transparent; background: transparent; color: #5b6b85;
+  border-radius: 7px; padding: 1px 7px; cursor: pointer; font: inherit; line-height: 1.5;
+}
+.bd-hw-x:hover { background: #fff; border-color: #b9c6da; color: #c92a2a; }
+
+.bd-hw-body { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 11px 2px; }
+
+/* 一节 = 用户要回答的一个问题（哪一份 / 哪几题 / 带不带讲义）。
+   节与节之间一条细线：这个窗里有三件事，不分开就会读成一整段。 */
+.bd-hw-sec { padding: 9px 0; border-bottom: 1px solid #e9eef6; }
+.bd-hw-sec:last-child { border-bottom: none; }
+.bd-hw-lbl { font-weight: 600; color: #22314a; margin-bottom: 6px; }
+
+/* ── 作业在哪一份里：板上那几份资料，一颗一份 ── */
+.bd-hw-docs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 7px; }
+.bd-hw-doc {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  border: 1px solid #cdd8e8; background: #fff; color: #2b3a52;
+  border-radius: 9px; padding: 4px 9px; cursor: pointer; font: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bd-hw-doc:hover { background: #eef3fb; }
+.bd-hw-doc.on { border-color: #2f6fd0; background: #e8f0fd; color: #1b4c96; font-weight: 600; }
+.bd-hw-pages { flex: none; color: #7d8aa1; font-size: 0.88em; font-weight: 400; }
+
+.bd-hw-btn {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 9px; padding: 6px 12px; cursor: pointer; font: inherit; white-space: nowrap;
+}
+.bd-hw-btn:hover { background: #eef3fb; }
+.bd-hw-btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; font-weight: 600; }
+.bd-hw-btn.primary:hover { background: #3b7fe0; }
+.bd-hw-btn.ghost { border-style: dashed; color: #46586f; }
+.bd-hw-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 提醒（"这份是讲课的 PPT，作业一般在书上"）—— 用户点名要的那句话，得看得见。 */
+.bd-hw-warn {
+  margin-top: 7px; background: #fff8e6; border: 1px solid #f0d79a; color: #8a5a00;
+  border-radius: 9px; padding: 6px 9px; line-height: 1.7;
+}
+
+/* ── 圈选题那一行（"你圈的是第 2 页上那一块"）──
+   它是一个**状态说明**，不是要他填的东西，所以和下面那个输入框长得不一样
+   （暖色底 + 左边一颗"红框"小标签，和发给模型的那张图上画的红框是同一个记号）。 */
+.bd-hw-picked {
+  background: #fff1e6; border: 1px solid #f0c9a8; color: #8a4b00;
+  border-radius: 9px; padding: 6px 9px; line-height: 1.7; margin-bottom: 6px;
+}
+.bd-hw-pickmark {
+  display: inline-block; font-size: 0.86em; font-weight: 600;
+  background: #d9480f; color: #fff; border-radius: 4px; padding: 0 5px; margin-right: 5px;
+}
+.bd-hw-link {
+  border: 0; background: transparent; color: #2f6fd0; text-decoration: underline;
+  cursor: pointer; font: inherit; padding: 0 2px;
+}
+/* ══ 「这本书有几百页，我只要那几页」那个小窗（DocPagePicker，2026-09-21）══
+ * 它只有一行字要问（写页码），所以比作业辅导那个窗矮得多 ——
+ * 位置同样在右上角，样式跟着那一族走（浅底、同一颗蓝按钮），别自己再开一套皮肤。 */
+.bd-slice {
+  position: absolute; z-index: 31; top: 14px; right: 18px;
+  width: calc(430px * var(--s) / 1.25); max-width: calc(100% - 36px);
+  background: #fbfcfe; color: #1b1d22;
+  border: 1px solid #c9d3e2; border-radius: 12px;
+  box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
+  overflow: hidden; font-size: calc(13px * var(--s));
+}
+.bd-slice-head {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 9px; background: #eef3fb; border-bottom: 1px solid #d7e0ee;
+}
+.bd-slice-ico {
+  flex: none; width: 1.5em; height: 1.5em; border-radius: 6px;
+  background: #2f6fd0; color: #fff; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; font-size: 0.92em;
+}
+.bd-slice-title {
+  flex: 1; min-width: 0; font-weight: 600; color: #22314a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bd-slice-x {
+  flex: none; border: 1px solid transparent; background: transparent; color: #5b6b85;
+  border-radius: 7px; padding: 1px 7px; cursor: pointer; font: inherit; line-height: 1.5;
+}
+.bd-slice-x:hover { background: #fff; border-color: #b9c6da; color: #c92a2a; }
+
+.bd-slice-body { padding: 10px 12px 12px; }
+.bd-slice-lbl { font-weight: 600; color: #22314a; margin-bottom: 7px; line-height: 1.6; }
+.bd-slice-in {
+  width: 100%; box-sizing: border-box; font: inherit; line-height: 1.6;
+  border: 1px solid #cdd8e8; border-radius: 9px; padding: 6px 8px;
+  background: #fff; color: #1b1d22;
+}
+.bd-slice-in:focus { outline: none; border-color: #7ba7e6; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.14); }
+.bd-slice-hint { margin-top: 6px; color: #5b6b85; line-height: 1.6; }
+.bd-slice-hint.bad { color: #a4242b; }
+.bd-slice-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.bd-slice-btn {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 8px; padding: 4px 11px; cursor: pointer; font: inherit;
+}
+.bd-slice-btn:hover { background: #eef3fb; }
+.bd-slice-btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; font-weight: 600; }
+.bd-slice-btn.primary:hover { background: #3b7fe0; }
+.bd-slice-btn.ghost { border-style: dashed; color: #46586f; }
+.bd-slice-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ── 预览那几页（2026-09-21）──────────────────────────────────────────────
+ * 他写的是"书上第 322 页"，可 PDF 的第 322 页常常不是那一页（封面没算进页码）——
+ * 所以在抽出来之前，先把那几页画给他看一眼。缩略图点一下放大到读得清书角的页码。 */
+.bd-slice-prev { margin-top: 9px; border-top: 1px dashed #d7e0ee; padding-top: 8px; }
+.bd-slice-prevhead {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  color: #46586f; font-weight: 600;
+}
+.bd-slice-prevacts { display: flex; gap: 4px; }
+.bd-slice-mini {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 7px; padding: 1px 8px; cursor: pointer; font: inherit; line-height: 1.5;
+}
+.bd-slice-mini:hover:not(:disabled) { background: #eef3fb; }
+.bd-slice-mini:disabled { opacity: 0.4; cursor: default; }
+.bd-slice-thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.bd-slice-thumb {
+  position: relative; width: 118px; box-sizing: border-box; overflow: hidden;
+  border: 1px solid #cdd8e8; background: #fff; border-radius: 8px;
+  padding: 3px 3px 2px; cursor: pointer; font: inherit; color: #46586f; text-align: center;
+}
+.bd-slice-thumb canvas { display: block; width: 100%; height: auto; background: #fff; }
+/* 旁边那一页（可能是真要的那一页）画成虚线、淡一点：它是"要不要换成它"，
+   不是"已经挑中的"。 */
+.bd-slice-thumb.near { opacity: 0.62; border-style: dashed; }
+.bd-slice-thumb.near:hover { opacity: 1; }
+.bd-slice-thumblbl { display: block; font-size: 0.92em; color: #5b6b85; margin-top: 3px; }
+.bd-slice-thumbbad { display: block; font-size: 0.92em; color: #a4242b; padding: 10px 0; }
+.bd-slice-prevmore { margin-top: 6px; color: #7b8aa3; }
+/* 放大那一层：缩略图上看不清书角印的页码，看得清才叫"确认过"。 */
+.bd-slice-zoom {
+  position: fixed; inset: 0; z-index: 60; background: rgba(16, 24, 40, 0.5);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.bd-slice-zoominner {
+  background: #fbfcfe; border: 1px solid #c9d3e2; border-radius: 12px;
+  padding: 10px 12px 12px; max-width: min(820px, 92vw); max-height: 92vh; overflow: auto;
+  box-shadow: 0 18px 50px rgba(16, 24, 40, 0.4);
+}
+.bd-slice-zoomhead {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-weight: 600; color: #22314a; margin-bottom: 8px;
+}
+.bd-slice-thumb.big { width: 100%; border: 0; padding: 0; cursor: default; }
+.bd-slice-zoomacts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
+.bd-hw-link:hover { color: #1b4c96; }
+
+.bd-hw-ta {
+  width: 100%; box-sizing: border-box; resize: vertical; font: inherit; line-height: 1.6;
+  border: 1px solid #cdd8e8; border-radius: 9px; padding: 6px 8px;
+  background: #fff; color: #1b1d22;
+}
+.bd-hw-ta:focus { outline: none; border-color: #7ba7e6; box-shadow: 0 0 0 3px rgba(47, 111, 208, 0.14); }
+.bd-hw-read { margin-top: 5px; color: #5b6b85; line-height: 1.6; }
+.bd-hw-read.bad { color: #a4242b; }
+
+.bd-hw-know { color: #2b3a52; line-height: 1.7; }
+.bd-hw-none { color: #7d8aa1; line-height: 1.7; }
+.bd-hw-select {
+  margin-top: 6px; max-width: 100%; font: inherit; color: #2b3a52;
+  border: 1px solid #cdd8e8; border-radius: 8px; padding: 3px 6px; background: #fff;
+}
+
+/* ── 结果 ── */
+.bd-hw-out { display: flex; flex-direction: column; gap: 9px; }
+.bd-hw-busy { display: flex; align-items: center; gap: 8px; color: #2f6fd0; line-height: 1.7; }
+.bd-hw-stop {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 7px; padding: 1px 8px; cursor: pointer; font: inherit; flex: none;
+}
+.bd-hw-stop:hover { background: #eef3fb; }
+.bd-hw-err {
+  display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+  background: #fff4f4; border: 1px solid #f3c2c2; color: #a4242b;
+  border-radius: 9px; padding: 6px 9px; line-height: 1.7;
+}
+.bd-hw-retry {
+  border: 1px solid #e3a7a7; background: #fff; color: #a4242b;
+  border-radius: 7px; padding: 1px 8px; cursor: pointer; font: inherit; flex: none;
+}
+.bd-hw-retry:hover { background: #ffecec; }
+.bd-hw-drop { color: #8a5a00; background: #fff8e6; border: 1px solid #f0d79a; border-radius: 8px; padding: 4px 8px; line-height: 1.6; }
+.bd-hw-empty { color: #5b6b85; line-height: 1.75; }
+
+/* 一道题 = 一小块：题号 / 题干 / 答案 / 解析。
+   ★ 答案和解析**各带一个小标签**：这两样必须一眼分得开 ——
+     混在一起的话，学生复习时会把自己推的过程当成标准答案抄。 */
+.bd-hw-prob { background: #fff; border: 1px solid #e0e7f1; border-radius: 11px; padding: 8px 10px; }
+.bd-hw-probhead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.bd-hw-no { font-weight: 700; color: #1b4c96; }
+.bd-hw-pg { color: #7d8aa1; font-size: 0.9em; }
+.bd-hw-q { color: #33445e; line-height: 1.75; padding-bottom: 6px; border-bottom: 1px dashed #e0e7f1; margin-bottom: 6px; }
+.bd-hw-ans, .bd-hw-exp { margin-top: 6px; }
+.bd-hw-tag {
+  display: inline-block; font-size: 0.88em; font-weight: 600;
+  border-radius: 5px; padding: 0 6px; margin-bottom: 3px;
+}
+.bd-hw-ans .bd-hw-tag { background: #e6f4ea; color: #1c7a3e; border: 1px solid #bfe3cb; }
+.bd-hw-exp .bd-hw-tag { background: #eef3fb; color: #2b5fa8; border: 1px solid #cfdff5; }
+.bd-hw-rich { line-height: 1.8; word-break: break-word; }
+/* 正文按讲义那一套排（rich.js）—— 和 `.bd-ask-say` 逐条对齐，两处各排一套的话
+   公式在一边排得出来、另一边是原样文字。 */
+.bd-hw-rich .bd-rich-p { margin: 0 0 0.5em; }
+.bd-hw-rich .bd-rich-p:last-child,
+.bd-hw-rich .bd-rich-ul:last-child,
+.bd-hw-rich .bd-rich-tex:last-child { margin-bottom: 0; }
+.bd-hw-rich .bd-rich-ul { margin: 0 0 0.5em; padding-left: 1.15em; }
+.bd-hw-rich .bd-rich-ul li { margin: 0.08em 0; }
+.bd-hw-rich .bd-rich-tex { margin: 0.35em 0 0.6em; overflow-x: auto; }
+/* 同上：`**…**` 用 600（和卡片那一侧同一档）。 */
+.bd-hw-rich strong { font-weight: 600; }
+.bd-hw-rich .bd-rich-raw { font-family: var(--mono); font-size: 0.92em; color: #b03030; }
+.bd-hw-rich .katex { font-size: 1.04em; }
+
+/* 「⬇ 留到板上」（2026-09-22，ADR-0006）：一道题一颗，钉在那道题那一块的右下角。
+   ★ 不做成"划过才出现"：用笔的人没有 hover（这一族从头到尾是"手在屏幕上"）。
+   ★ 留下之后那颗按钮换成一行字（`✓ 已在板上`）——**不隐藏**：
+     位置留着，你才知道"这一道我留过了"（隐藏的话，再点一次会落第二张卡）。 */
+.bd-hw-keeprow { display: flex; justify-content: flex-end; margin-top: 7px; }
+.bd-hw-keep, .bd-ask-keep {
+  border: 1px solid #c2cfe2; background: #fff; color: #2b3a52;
+  border-radius: 8px; padding: 3px 9px; cursor: pointer; font: inherit;
+  font-size: calc(12px * var(--s)); line-height: 1.4; white-space: nowrap;
+}
+.bd-hw-keep:hover, .bd-ask-keep:hover { background: #eef3fb; border-color: #a9c4ee; }
+.bd-hw-kept, .bd-ask-kept { color: #1c7a3e; font-size: calc(12px * var(--s)); line-height: 1.4; }
+
+/* ── 追问（2026-09-22）：一道题下面「💬 继续问」 + 已经问过的那几轮 ──────────
+   ★ 和「留到板上」同一族的位置感：贴着**那道题**的下沿，不另开一块。
+     分成两块的话，"我在问哪道题"就得靠记忆了。
+   ★ 对话用**两条边线**分"我问 / 老师答"（不靠头像、不靠气泡）——
+     这一族的窗口本来就窄，气泡一进来正文就没地方了。 */
+.bd-hw-ask { margin-top: 7px; border-top: 1px dashed #e2e9f4; padding-top: 7px; }
+.bd-hw-turns { display: flex; flex-direction: column; gap: 6px; margin-bottom: 7px; }
+.bd-hw-turn { border-left: 2px solid #cfdff5; padding: 1px 0 1px 8px; }
+.bd-hw-turn.me { border-left-color: #c2cfe2; }
+.bd-hw-who {
+  display: inline-block; font-size: calc(11px * var(--s)); line-height: 1.4;
+  color: #5b6b85; font-weight: 600; margin-bottom: 2px;
+}
+.bd-hw-turn:not(.me) .bd-hw-who { color: #2b5fa8; }
+.bd-hw-said { color: #22314a; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.bd-hw-thinking { color: #7d8aa1; line-height: 1.7; }
+.bd-hw-terr {
+  display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+  color: #a4242b; line-height: 1.7;
+}
+.bd-hw-askrow { display: flex; align-items: flex-end; gap: 7px; }
+.bd-hw-askrow .bd-hw-ta.sm { flex: 1 1 auto; min-width: 0; resize: none; }
+.bd-hw-btn.sm { padding: 3px 9px; font-size: calc(12px * var(--s)); line-height: 1.4; white-space: nowrap; }
+.bd-hw-askrow .bd-hw-btn.primary.sm { flex: none; }
+
+.bd-hw-foot {
+  flex: none; display: flex; align-items: center; gap: 9px;
+  padding: 8px 11px; border-top: 1px solid #e6ecf5; background: #f7f9fd;
+}
+.bd-hw-hint { color: #7d8aa1; font-size: 0.9em; line-height: 1.5; min-width: 0; }
+
 /* 框选之后浮出来的那排动作（美化 / 删除）。
    ★ 整排钉在包围框**上方**（translateY(-100%)），不用去量按钮自己的宽高。
      为什么不做成"美化在框下面、删除在框右上角"那种各占一角：
@@ -1472,7 +2146,7 @@ kbd {
   position: absolute; z-index: 12; transform: translateY(-100%);
   display: flex; align-items: flex-end; gap: 6px; white-space: nowrap;
 }
-.bd-inkdel, .bd-inkfmt, .bd-inkformula, .bd-inkcopy, .bd-inkgroup {
+.bd-inkdel, .bd-inkfmt, .bd-inkformula, .bd-inkcopy, .bd-inkpaste, .bd-inkgroup, .bd-inkask, .bd-inkhw {
   border: 0; color: #fff; border-radius: 8px;
   padding: 5px 10px; cursor: pointer; white-space: nowrap;
   font-size: calc(12px * var(--s)); line-height: 1.2;
@@ -1489,9 +2163,32 @@ kbd {
      误按删除要把东西找回来（Ctrl+Z 或者没了）。视觉重量该跟着代价走。 */
 .bd-inkcopy { background: #0e7490; }
 .bd-inkcopy:hover { background: #1189a8; }
+/* ★ 粘贴：**和复制同色**（2026-09-23）。那一排的读法是"同色 = 一对"——
+   而这两颗确实是一对（带走 / 放回来，走的是同一个剪贴板）。
+   为什么不再给它一个新颜色：这一排已经九颗了，再多一族颜色就只剩混乱。
+   ★ 位置就在「⧉ 复制」右边一格，所以"同色 + 挨着"= 一眼看出来是一对。 */
+.bd-inkpaste { background: #0e7490; }
+.bd-inkpaste:hover { background: #1189a8; }
 /* 固定/拆开一块：中性的灰蓝 —— 它不是"把手写变成卡"，是"这一坨算多大"那条线。 */
 .bd-inkgroup { background: #3a4457; }
 .bd-inkgroup:hover { background: #4a566d; }
+/* 「？问这里」：橙红色 —— 和这一排里别的颜色都分得开（蓝删除 / 绿美化 / 紫公式 /
+   青复制 / 灰板框），而它确实是另一件事：前面几颗都是"对板上这一块做点什么"，
+   只有它把这一块**发出去问人**。橙红在深色底上也够亮（不会像深色按钮那样沉下去）。
+   ★ `disabled` 那一条：没圈到课件页面时它是灰的 —— 但**不隐藏**，
+     因为"追问"是这个功能存在的理由，用户会来找它（见 BoardCanvas 里那段说明）。 */
+.bd-inkask { background: #d9480f; }
+.bd-inkask:hover { background: #e8590c; }
+.bd-inkask:disabled { background: #8a8f98; opacity: 0.55; box-shadow: none; cursor: default; }
+/* 「✎ 做这道题」（2026-09-22，作业辅导的第二个入口）：**和追问同一个颜色**。
+   有意的 —— 它俩是同一件事的两面（都是"把圈住的这一块发给老师"），
+   区别只在问什么（那一颗问"为什么"，这一颗说"做这道题"）。
+   颜色分开的话，这排按钮会变成六种颜色六个意思，而它们本来只有三族：
+   改造这一块（公式 / 美化 / 规整）、带走这一块（复制 / 删除）、**发出去问人**（这两颗）。
+   ★ 挨着排、同色，读起来就是"这两颗是一对"。 */
+.bd-inkhw { background: #d9480f; }
+.bd-inkhw:hover { background: #e8590c; }
+.bd-inkhw:disabled { background: #8a8f98; opacity: 0.55; box-shadow: none; cursor: default; }
 
 /* ★ 规整形状（见 lib/shapes.js）——**描边、不填色**，是这一排里唯一这样的。
    两个理由，都是有意的：
@@ -1589,7 +2286,11 @@ kbd {
    ★ 整层 pointer-events: none —— 只有顶上那颗名字收事件（那是唯一的把手）。
      不这样的话，你在框里写字、框卡片时会一直撞在框线上。
    ★ 它在 .bd-world 里、卡片**前面**（DOM 顺序靠前就画在下面）：
-     框是区域的记号，不该盖住里面的内容。 */
+     框是区域的记号，不该盖住里面的内容。
+   ★ 但有**一颗例外**：顶上那颗标题小按钮（.bd-frame-t / .bd-frame-in）必须
+     比卡片高一层（z-index）—— 不然一张卡压在标题条上，这个框就**永远点不到**
+     （关系面板删掉之后，标题是选中/拖动/改名的唯一把手）。只抬这一颗，框线本身
+     仍是 pointer-events:none、仍在卡片下面，框里写字不受影响。 */
 .bd-framelayer {
   position: absolute; left: 0; top: 0; width: 0; height: 0;
   pointer-events: none;
@@ -1614,6 +2315,9 @@ kbd {
    框里是你随时要写东西的地盘，标题压在上面就永远在挡路。 */
 .bd-frame-t {
   position: absolute; left: -2px; bottom: 100%; margin-bottom: calc(3px * var(--s));
+  /* ★ z-index 7 > 卡片（.bd-card 是 z-index:auto）：标题被卡压住时也点得到。
+     只抬这一颗，框线（.bd-frame）仍在卡片下面。 */
+  z-index: 7;
   pointer-events: auto; cursor: grab;
   display: inline-flex; align-items: center; gap: 4px;
   background: rgba(255, 255, 255, 0.94); color: #4a566d;
@@ -1631,6 +2335,8 @@ kbd {
 .bd-frame-ico { opacity: 0.75; }
 .bd-frame-in {
   position: absolute; left: -2px; bottom: 100%; margin-bottom: calc(3px * var(--s));
+  /* 改名输入框同样要骑在卡片上面（和 .bd-frame-t 同一颗把手）。 */
+  z-index: 7;
   width: max(160px, 100%);
   background: #fff; color: var(--fg);
   border: 1px solid rgba(47, 111, 208, 0.7); border-radius: 999px;
@@ -1829,12 +2535,72 @@ kbd {
   background: rgba(255, 255, 255, 0.92); border: 1px dashed #cdd3de; border-radius: 16px;
   padding: 24px 28px; color: #3b4354; box-shadow: 0 8px 28px rgba(20, 24, 33, 0.07);
 }
-.bd-hint-t { font-size: calc(20px * var(--s)); font-weight: 600; margin-bottom: 8px; color: #1b1d22; }
+.bd-hint-t { font-size: calc(20px * var(--s)); font-weight: 600; margin-bottom: 12px; color: #1b1d22; }
 .bd-hint-s { font-size: calc(13.5px * var(--s)); line-height: 1.7; color: #5a6478; }
 .bd-hint-row { display: flex; gap: 10px; justify-content: center; margin: 14px 0 10px; }
+/* 四行「想做什么 → 那一步」（2026-09-26 重写空板提示：原来三段长句，第一眼抓不住重点） */
+.bd-hint-list { display: flex; flex-direction: column; gap: 7px; text-align: left; margin: 0 auto 12px; width: fit-content; max-width: 100%; }
+.bd-hint-item { display: flex; align-items: baseline; gap: 10px; font-size: calc(13.5px * var(--s)); color: #3b4354; }
+.bd-hint-item b { flex: 0 0 auto; color: #1b1d22; }
+.bd-hint-more { font-size: calc(12px * var(--s)); color: #8a93a6; border-top: 1px dashed #d8dde6; padding-top: 9px; }
+.bd-hint-more b { color: #2f6fd0; }
 .bd-hint .btn { background: #fff; border: 1px solid #ccd2dd; color: #2b3242; }
 .bd-hint .btn:hover { background: #f2f5fa; }
 .bd-hint .btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+
+/* ---------- 「⋯ 更多」菜单（2026-09-26 工具条收纳）----------
+   为什么收：1440 档窗口上工具条挤成两行、每行从画布啃 34px（见 .bd-tools 的警告）。
+   收进来的是低频四件套（插入/整理/作业/收成）+ 画布缩放 + 全屏 + 字号 + 背景；
+   常驻在手上的是工具/颜色/粗细/认一族/撤销重做粘贴。
+   ⚠ 三条实现纪律写在 BoardBar.jsx「更多菜单」那段（常驻 DOM / 真点要先开 / 别用 fixed）：
+   · **常驻 DOM**：closed 态只是 display:none —— 自检的 `elem.click()` 照样触发；
+   · **absolute 不是 fixed**：.bd-tools 有 backdrop-filter，fixed 后代的包含块会被劫持
+     （公式架影子卡那个坑）；
+   · 弹层 z-index 30：高过工具条自己（22 的容器里再抬一层），低过询问框（300）。 */
+.bd-morewrap { position: relative; display: flex; }
+.bd-more-pop {
+  display: none; position: absolute; right: 0; bottom: calc(100% + 8px);
+  width: max-content; min-width: 240px; z-index: 30;
+  background: rgba(22, 26, 34, 0.97); backdrop-filter: blur(10px);
+  border: 1px solid #2e3646; border-radius: 12px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25), 0 16px 44px rgba(0, 0, 0, 0.35);
+  padding: 8px; color: #c9d2e2; font-size: calc(12.5px * var(--s));
+}
+.bd-more-pop.open { display: flex; flex-direction: column; gap: 3px; }
+.bd-more-h { font-size: calc(10.5px * var(--s)); color: #7d8698; padding: 6px 8px 2px; }
+.bd-more-pop .bd-t { display: block; width: 100%; text-align: left; border-radius: 7px; padding: 7px 9px; }
+.bd-more-pop .bd-t:disabled { opacity: 0.55; }
+.bd-more-row { display: flex; align-items: center; gap: 4px; padding: 3px 4px; }
+.bd-more-label { flex: 0 0 auto; width: 34px; color: #8b95a8; font-size: calc(11px * var(--s)); }
+/* busy 时「⋯」给个小记号 —— 任务在菜单里跑着，条上不能一点动静都没有 */
+.bd-t.busy::after { content: '•'; color: #e8a13c; margin-left: 3px; }
+
+/* ---------- 「?」帮助浮层（2026-09-26）----------
+   手势 / 快捷键 / 功能入口对照。为"Surface 上没有 hover，title 提示等于不存在"补的说明书。
+   z-index 300：和询问框一族同级 —— 它也是"盖住一切、看完就走"的那类。 */
+.bd-help-back {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(16, 24, 40, 0.5);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.bd-help {
+  background: #fff; border-radius: 16px; box-shadow: 0 18px 60px rgba(20, 24, 33, 0.35);
+  width: min(880px, 100%); max-height: 86vh; overflow: auto;
+  padding: 20px 24px 16px; color: #3b4354; font-size: calc(13px * var(--s));
+}
+.bd-help-h { display: flex; align-items: center; margin-bottom: 12px; }
+.bd-help-h span { font-size: calc(17px * var(--s)); font-weight: 600; color: #1b1d22; }
+.bd-help-x {
+  margin-left: auto; background: transparent; border: 0; cursor: pointer;
+  color: #8a93a6; font-size: calc(20px * var(--s)); line-height: 1; padding: 2px 6px;
+}
+.bd-help-x:hover { color: #1b1d22; }
+.bd-help-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 4px 26px; }
+.bd-help h3 { font-size: calc(12px * var(--s)); color: #2f6fd0; margin: 6px 0 8px; }
+.bd-help-row { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; }
+.bd-help-row dt { flex: 0 0 auto; white-space: nowrap; font-weight: 600; color: #1b1d22; }
+.bd-help-row dd { margin: 0; color: #5a6478; }
+.bd-help-foot { margin-top: 14px; border-top: 1px dashed #d8dde6; padding-top: 9px; font-size: calc(11.5px * var(--s)); color: #8a93a6; }
 
 /* ---------- 工具条：贴着画布底边的一条 ----------
    三种摆法（A 右栏 / B 全屏浮层 / C 左列）2026-09-19 一起删掉了 ——
@@ -2096,6 +2862,10 @@ kbd {
   border: 1px solid #2e3646; border-radius: 8px; padding: 6px 10px; font: inherit;
 }
 .dkr-range:focus { outline: 1px solid #4b87e0; }
+/* 「📄 换一份文件…」推到这一行的**最右边**：它和前面那几个不是一件事 ——
+   那些是"整理哪几页"，它是"整理哪一份"（2026-09-20 起，板上没课件时那颗
+   「✧ 课件整理」开的就是选文件那个框，这份是窗口里的第二个口子）。 */
+.dkr-pickrow .dkr-pickfile { margin-left: auto; }
 /* 一摞页码按钮：49 页的课件要能一眼扫完，所以是一格一格的方按钮、自动折行。
    ★ 这一摞只是"微调"用的（挑三五页）；几十页那条路是上面那个区间输入 ——
      用户原话里"往往是几十页这个数量级"，点 30 下不是人干的事。 */
@@ -2128,7 +2898,17 @@ kbd {
   background: #1e2637; border: 1px solid #33405a; color: #9fc0f0;
 }
 .dkr-err { color: #ff9b8a; font-size: calc(12px * var(--s)); }
+/* 这一趟花掉的 token（进度旁边那一行小字）。**故意做得不抢眼**：
+   它是"回头看账"用的，不是每次都要读的东西。 */
+.dkr-usage {
+  color: #8b97ad; font-size: calc(11.5px * var(--s));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%;
+}
 .dkr-retry { font-size: calc(11.5px * var(--s)); padding: 2px 8px; margin-left: auto; }
+/* 「⤓ 用上次那份」（2026-09-23）：紧跟在「↻ 重讲这一页」右边。
+   ⚠ 别给它 `margin-left: auto` —— 那是重讲那颗的（把它推到行尾用），
+     两颗都 auto 的话它们会被推到两头去。 */
+.dkr-reuse { font-size: calc(11.5px * var(--s)); padding: 2px 8px; }
 /* 发给模型的那张图（和 DocPage 显示的是同一套渲染，只是档位不同） */
 .dkr-img {
   background: #fbfbf9; border: 1px solid #2e3646; border-radius: 8px;
@@ -2180,6 +2960,24 @@ kbd {
 .dkr-goset { margin-left: 9px; font-size: calc(11.5px * var(--s)); padding: 2px 9px; }
 .dkr-acts { padding: 10px 16px; border-top: 1px solid #232a37; }
 
+/* ── 整节课的提纲那一块（2026-09-22）──
+   它是**一份课件一张卡**，不是"某一页的东西"，所以：
+   · 不吃上面那个两栏网格（图 + 字）—— 它没有图，占满整宽；
+   · 底色比逐页那些块**亮一点点**（#1e2430 vs #131820 那一族），一眼看得出
+     "这是另一层的产物"，不是第 N 页的讲解被排到这儿来了。 */
+.dkr-sum {
+  display: block; /* 覆盖 .dkr-pgblk 的 grid —— 它没有左边那张图 */
+  border: 1px solid #33405a; border-radius: 10px;
+  background: #1e2430; padding: 10px 12px 12px;
+}
+/* 生成中/没生成时那一句说明（空着会显得像坏了） */
+.dkr-sumhint { margin-top: 8px; line-height: 1.6; }
+.dkr-sumone { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+/* 提纲的正文（六段结构）比讲解长得多，给个舒服的行高和等宽不出格的折行 */
+.dkr-sumone .dkr-b { line-height: 1.7; }
+/* 「重新生成提纲」那颗按钮：和「↻ 重讲这一页」同一族，占住右端 */
+.dkr-sum .dkr-retry { margin-left: auto; }
+
 
 /* ── 资料条上那颗「✧ 整理」（2026-09-22）──
    和 ✕ 并排住在资料条右端。板上有几份课件时，它就是"就整理我这一份"的答案
@@ -2194,6 +2992,115 @@ kbd {
   padding: 0 calc(7px * var(--s)); white-space: nowrap;
 }
 .bd-docbar-r:hover { border-color: rgba(47, 111, 208, 0.7); color: #2f6fd0; }
+
+/* ═══════════ 速查小窗（2026-09-28）：上课突然不懂的那个词 ═══════════
+ *
+ * 视觉语言照 `.bd-hw`（同一族的浮层：浅底、12px 圆角、同一条投影），
+ * 但**明显更窄**（380 vs 520）—— 它们装的东西不一样：
+ *   · 作业那个窗装的是"要读的长文"（答案 + 解析），宽一点一行能多放字；
+ *   · 速查装的是"瞄一眼就该走"的几行，窄块更像便签，而且它常常要停在
+ *     课件的字旁边（盖住的越少越好）。
+ *
+ * ⚠ `left / top` 是 JS 给的（`.bd-look` 上那个 style）—— 它要出现在**点的那个字旁边**，
+ *   位置本身没有固定可以在 CSS 里写的答案。CSS 只负责"别跑到屏幕外"这事
+ *   （`max-width` + JS 那边用 chipPlacement 夹过一遍）。 */
+.bd-look {
+  position: absolute; z-index: 40;
+  width: calc(380px * var(--s) / 1.25);
+  max-width: calc(100% - 36px);
+  max-height: 74vh;
+  display: flex; flex-direction: column;
+  background: #fbfcfe; color: #1b1d22;
+  border: 1px solid #c9d3e2; border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(16, 24, 40, 0.2);
+  overflow: hidden;
+  font-size: calc(13px * var(--s));
+}
+.bd-look-head {
+  display: flex; align-items: center; gap: 7px; flex: none;
+  padding: 6px 9px; background: #eef3fb; border-bottom: 1px solid #d7e0ee;
+  cursor: grab; user-select: none;
+}
+.bd-look-head:active { cursor: grabbing; }
+.bd-look-ico { flex: none; font-size: calc(13px * var(--s)); opacity: 0.75; }
+.bd-look-title {
+  flex: 1; min-width: 0; font-weight: 600; color: #22314a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bd-look-x {
+  flex: none; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px;
+  background: transparent; color: #61708a; font-family: inherit;
+  font-size: calc(12px * var(--s)); line-height: 1.7; padding: 0 calc(6px * var(--s));
+}
+.bd-look-x:hover { background: #fff; border-color: #b9c6da; color: #c92a2a; }
+
+/* 词那一排：输入框 + 「查」按钮。
+   ⚠ 这里是**输入框**，不是 `.bd-hw-body` 那种只读的行 —— 它是给用户**改**的
+     （见 QuickLook.jsx 文件头第 ② 条：机器挑出来的词常常不是用户要问的那个）。 */
+.bd-look-in { flex: none; display: flex; gap: 6px; padding: 8px 9px 0; }
+.bd-look-ta {
+  flex: 1; min-width: 0;
+  border: 1px solid #c9d3e2; border-radius: 8px;
+  background: #fff; color: #1b1d22; font-family: inherit;
+  font-size: calc(13px * var(--s)); font-weight: 600;
+  padding: calc(5px * var(--s)) calc(8px * var(--s));
+}
+.bd-look-ta:focus { outline: none; border-color: #2f6fd0; box-shadow: 0 0 0 2px rgba(47, 111, 208, 0.16); }
+.bd-look-go {
+  flex: none; cursor: pointer;
+  border: 1px solid #2f6fd0; border-radius: 8px;
+  background: #2f6fd0; color: #fff; font-family: inherit;
+  font-size: calc(13px * var(--s)); font-weight: 600;
+  padding: 0 calc(11px * var(--s)); white-space: nowrap;
+}
+.bd-look-go:hover:not(:disabled) { background: #3b7fe0; }
+.bd-look-go:disabled { opacity: 0.45; cursor: default; }
+
+.bd-look-body { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 11px 9px; }
+.bd-look-dim { color: #7d8aa1; padding: 6px 0 8px; }
+
+.bd-look-say { line-height: 1.72; padding-bottom: 2px; }
+.bd-look-eg { display: flex; gap: 7px; padding-top: 7px; border-top: 1px solid #e9eef6; line-height: 1.7; }
+.bd-look-near { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; padding-top: 8px; }
+/* 「例」「近」那两个字：它们是**标签**、不是正文 —— 别让它们连着解释被当成一句读。 */
+.bd-look-k { flex: none; color: #7d8aa1; font-size: calc(11px * var(--s)); font-weight: 600; padding-top: 2px; }
+.bd-look-chip {
+  flex: none; cursor: pointer;
+  border: 1px solid #c9d3e2; border-radius: 999px;
+  background: #fff; color: #2f5ba7; font-family: inherit;
+  font-size: calc(12px * var(--s)); line-height: 1.8; padding: 0 calc(8px * var(--s));
+}
+.bd-look-chip:hover { background: #eef3fb; border-color: #9fb6dc; }
+
+.bd-look-err {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  color: #b3261e; padding: 7px 0 2px; line-height: 1.6;
+}
+.bd-look-retry {
+  cursor: pointer; flex: none;
+  border: 1px solid #c9d3e2; border-radius: 7px;
+  background: #fff; color: #2f5ba7; font-family: inherit;
+  font-size: calc(12px * var(--s)); line-height: 1.7; padding: 0 calc(7px * var(--s));
+}
+.bd-look-retry:hover { background: #eef3fb; border-color: #9fb6dc; }
+
+.bd-look-foot {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  /* ⚠ 和左边同宽的 padding 不行：`.bd-look-body` 已经是内容区，这里要在既定布局下顶到底。 */
+  margin-top: 9px; padding-top: 8px; border-top: 1px solid #e9eef6;
+}
+.bd-look-keep {
+  cursor: pointer;
+  border: 1px solid #c9d3e2; border-radius: 7px;
+  background: #fff; color: #2f5ba7; font-family: inherit;
+  font-size: calc(12px * var(--s)); font-weight: 600; line-height: 1.8; padding: 0 calc(9px * var(--s));
+}
+.bd-look-keep:hover { background: #eef3fb; border-color: #9fb6dc; }
+.bd-look-kept { color: #2c7a4b; font-weight: 600; font-size: calc(12px * var(--s)); }
+/* 「上次查过的 / 花了多少」：它只用来告诉你这一趟花钱了没有、花了多少，
+   不该抢过答案本身 —— 所以字最小、颜色最淡、还被推到最右边。 */
+.bd-look-usage { margin-left: auto; color: #8d99ad; font-size: calc(11px * var(--s)); white-space: nowrap; }
 
 
 

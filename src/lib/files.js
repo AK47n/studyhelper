@@ -24,7 +24,8 @@
  *   · 这个 module 只管两件事：**这一层（目录）叫什么**，以及**打开哪一个**。
  *
  * ── interface ─────────────────────────────────────────────────────────────
- *   createFileApi({ fetch }) → { list, get, put, create, mkdir, move }   ← data/ 的读写（URL 只在这一处）
+ *   createFileApi({ fetch }) → { list, get, put, create, mkdir, move, remove, … }
+ *                              ← data/ 的读写（URL 只在这一处）
  *   planStartup({ files, want }) → 下面几种 step 之一（纯函数：
  *     { step: 'seed', why }                        data/ 一个文件都没有 → 先放样板，再重新 plan
  *     { step: 'open', name, force, why }           打开这一个（name 是相对路径）
@@ -137,6 +138,14 @@ export function createFileApi({ fetch: f = fetch } = {}) {
     create: (name, text) => post('/api/new', { name, text }),
     mkdir: (dir) => post('/api/mkdir', { path: dir }),
     move: (from, to) => post('/api/move', { from, to }),
+    /* 删一个文件 / 一整层（→ **回收站**，不是直接没了）。
+       ⚠ `force` 只对**里面有东西的目录**有意义：不带它服务端会回 409 +
+       `{ code: 'not-empty', count, samples }`，调用方拿那个数去问用户一句
+       （"里面还有 6 样，一起删？"）—— 这不是多绕一圈，是"删一整层可能一次带走
+       几十张板"和"删一个文件"本来就该有不一样的代价。
+       ★ 服务端在**送不进回收站**时会回 500 + `code: 'no-recycle'`（东西还在原地），
+         绝不退化成 `fs.rm` —— 前端照常把这句 `error` 摆给用户看就行。 */
+    remove: (path, { force = false } = {}) => post('/api/delete', { path, force }),
     /* 导出一条笔记（→ 一个能发出去的 .html）。`fonts` 是浏览器量出来的
        公式字体清单（见 lib/fonts.js）—— 服务端没有 canvas，量不了。 */
     exportNote: (name, { title = '', fonts = '' } = {}) => post('/api/export', { name, title, fonts }),

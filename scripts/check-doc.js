@@ -1,4 +1,4 @@
-﻿/* 资料（PDF/PPT 铺上画布）的真浏览器自检。盯住五条用户真正在意的：
+/* 资料（PDF/PPT 铺上画布）的真浏览器自检。盯住五条用户真正在意的：
  *   ① 板文件里写了 docs，打开后页面上真的有那一层（data-docs / data-doc-page）；
  *   ② 页面**真的渲染出来了**（像素证明：资料页里那块深灰矩形要在屏幕上读得到）；
  *   ③ ★ **笔能写在资料上**（这是整个功能的立身之本）：用笔划一道，
@@ -195,6 +195,140 @@ const fails = await withBoard(
       else bad('页面中心一片白（' + JSON.stringify(px) + '）—— 画了 canvas 但没上屏（层叠/变换有问题）')
     }
 
+    console.log('\n[2b] ★ 页码角标：每页角上写着"第几页"，而且**大小不跟着缩放变**（2026-09-23）')
+    {
+      /* 为什么单列这一节：整份课件铺上来是**一片长得一样的白纸**，
+         想找"刚讲的那页"只能靠眼力数。而页码住在 `.bd-docworld` 里，
+         那一层挂着 `scale(view.s)` —— 不抵消的话放大它跟着变大、缩小它看不见。
+         ★ 所以判据有**两条**，缺一条都验不出真问题：
+           ① 每页角上都**有**那个字，而且**写的是它自己的页号**（不是都写 1）；
+           ② 屏幕上它的大小**在缩放前后一样**（22px 那条手柄的教训：只比"相等"
+              不够，两边一起错也相等 —— 得钉一个具体值）。 */
+      const badge = await s.eval(`(() => {
+        const pages = [...document.querySelectorAll('.bd-docpage')]
+        if (!pages.length) return null
+        const rows = pages.map((p) => {
+          const b = p.querySelector('.bd-docno')
+          if (!b) return { page: p.getAttribute('data-doc-page'), missing: true }
+          const r = b.getBoundingClientRect()
+          const pr = p.getBoundingClientRect()
+          const cs = getComputedStyle(b)
+          const cx = Math.round(r.left + r.width / 2)
+          const cy = Math.round(r.top + r.height / 2)
+          return {
+            page: p.getAttribute('data-doc-page'),
+            text: (b.textContent || '').trim(),
+            w: Math.round(r.width), h: Math.round(r.height),
+            font: cs.fontSize,
+            /* ★ 它**不许压在页面矩形上** —— 课件多半在左上角打标题，
+               角标压上去就是盖正文（第一版正是压着的，截图当场看出来）。 */
+            overlapsPage: r.right > pr.left + 0.5 && r.top < pr.bottom && r.bottom > pr.top,
+            /* ★ 它中心那一点最上面是谁 —— 该穿到收事件层（资料层不吃指针那条规矩）。 */
+            topAt: (document.elementFromPoint(cx, cy) || {}).className || '(null)',
+            /* 它必须**不吃指针**（CSS 口径，和上面"穿到哪一层"互为佐证） */
+            pe: cs.pointerEvents,
+          }
+        })
+        return { n: pages.length, rows }
+      })()`)
+      if (!badge) bad('板上一个 .bd-docpage 都没有 —— 这一节验不下去（夹具没铺上？）')
+      else {
+        const withBadge = badge.rows.filter((r) => !r.missing)
+        if (withBadge.length === badge.n) ok(`每一页角上都有一个页码角标（${badge.n} 页都有）`)
+        else bad(`有 ${badge.n - withBadge.length} 页没有页码角标（页号：${JSON.stringify(badge.rows.filter((r) => r.missing).map((r) => r.page))}）`)
+        /* ① 写的是**它自己的**页号（"都写 1"这种错要抓得住） */
+        const wrong = withBadge.filter((r) => r.text !== String(r.page))
+        if (withBadge.length && !wrong.length) {
+          ok(`★ 角标写的是**它自己那一页**的页号（${withBadge.map((r) => r.text).join('、')}）`)
+        } else if (wrong.length) {
+          bad(`角标写错了页号：页 ${wrong.map((r) => r.page).join('/')} 上分别写着 ${wrong.map((r) => JSON.stringify(r.text)).join('/')}`)
+        }
+        /* 它不吃指针（资料层那条规矩不能被页码破口子）：
+           两条一起看 —— CSS 写着 none，而且中心那一点真穿到收事件层。
+           ⚠ 判据**不能是"那一点必须回 .bd-hit"**：角标挂在页面**外面**，
+             第 1 页那个往左挂出去之后可能整个落在收事件层**之外**（视口外/画布外），
+             `elementFromPoint` 回 `null` 是**正常的**（那儿本来就没有可写的地方）。
+             真正要保证的是"**它没有挡在能写字的地方前面**" ——
+             所以 `null` 和 `bd-hit` 都算通过，只有"回的是别的元素"才算挡住了。 */
+        const eating = withBadge.filter((r) => r.pe !== 'none')
+        /* ⚠ 空判定要认**那个哨兵字符串**：eval 里把 `null` 写成 `'(null)'` 了（不然
+           `||` 那一步会把它吞掉），所以这里不能只判"空" —— 得把哨兵一起排除。 */
+        const blocking = withBadge.filter(
+          (r) => r.topAt && r.topAt !== '(null)' && !String(r.topAt).includes('bd-hit')
+        )
+        if (withBadge.length && !eating.length && !blocking.length) {
+          ok('★ 页码不吃指针（CSS 是 none，落点要么穿到收事件层、要么在画布外 —— 从没挡住过笔）')
+        } else if (eating.length) {
+          bad(`有 ${eating.length} 个页码在吃指针（pointer-events=${eating[0].pe}）—— 会挡住笔`)
+        } else {
+          bad(`页码挡住了落点：中心 elementFromPoint 回的是 ${JSON.stringify(blocking.map((r) => ({ page: r.page, el: r.topAt })))} —— 那儿本来能写字`)
+        }
+        /* ★ 不压在页面上（压上去就是盖正文 —— 第一版真犯过） */
+        const covering = withBadge.filter((r) => r.overlapsPage)
+        if (withBadge.length && !covering.length) ok('★ 角标挂在**页面外面**（一条正文都没盖住）')
+        else if (covering.length) bad(`有 ${covering.length} 个角标压在页面上 —— 会盖住课件正文（页 ${covering.map((r) => r.page).join('/')}）`)
+        /* ★★ 也不许被**资料的把手条**盖住（2026-09-23 修的第二处）：
+             把手条同样是"挂在第一页左上角上方"（`translateY(-100%)`），而且是不透明白底。
+             两者都挂页顶上方时屏幕盒完全重合 ⇒ **第 1 页那个数字根本看不见**。
+             光看"元素在不在 DOM 里"是抓不到这个的 —— 必须问 `elementFromPoint`。 */
+        const hidden = await s.eval('(() => {' +
+          'const out = [];' +
+          'document.querySelectorAll(".bd-docpage").forEach((p) => {' +
+          '  const b = p.querySelector(".bd-docno");' +
+          '  if (!b) return;' +
+          '  const r = b.getBoundingClientRect();' +
+          '  if (!r.width || !r.height) { out.push(p.getAttribute("data-doc-page")); return; }' +
+          '  const el = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));' +
+          /* 判据是"那一点上压着的是不是资料把手条"，不是"是不是角标自己" ——
+             `pointer-events:none` 的元素本来就不该是 elementFromPoint 的结果。 */
+          '  if (el && /bd-docbar/.test(el.className || "")) out.push(p.getAttribute("data-doc-page"));' +
+          '});' +
+          'return out;' +
+          '})()')
+        if (!hidden || !hidden.length) ok('★ 角标没被资料的把手条盖住（每个都露在能看见的地方）')
+        else bad(`有 ${hidden.length} 页的角标被资料把手条盖住了（页 ${hidden.join('/')}）—— 那个数字等于没标`)
+
+        /* ② 缩放前后**屏幕尺寸不变**（那颗 22px 手柄的教训：得钉具体值，不能只比相等） */
+        const before = withBadge.length ? { w: withBadge[0].w, h: withBadge[0].h, font: withBadge[0].font } : null
+        if (before) {
+          /* 真点一次缩放（走工具条那颗"＋"），让 `view.s` 真的变 —— 直接改 DOM 是假验 */
+          const z = await s.eval(`(() => {
+            const b = document.querySelector('button[title^="画布放大"]')
+            if (!b) return null
+            const r = b.getBoundingClientRect()
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+          })()`)
+          if (!z) bad('找不到"放大"那颗按钮 —— 缩放不变这条验不了')
+          else {
+            await s.mouse(z.x, z.y)
+            await s.mouse(z.x, z.y)
+            /* 等缩放真的落到 DOM 上（别用 sleep —— 这里没引它，而且等条件比等时间准）。 */
+            await until(async () => ((await s.eval(`!!document.querySelector('.bd-docpage .bd-docno')`)) ? 1 : undefined), { timeout: 2000 })
+            const after = await s.eval(`(() => {
+              const b = document.querySelector('.bd-docpage .bd-docno')
+              if (!b) return null
+              const r = b.getBoundingClientRect()
+              return { w: Math.round(r.width), h: Math.round(r.height), font: getComputedStyle(b).fontSize,
+                       s: getComputedStyle(document.querySelector('.bd-docworld')).getPropertyValue('--bd-world-s') }
+            })()`)
+            if (!after) bad('缩放之后页码角标不见了')
+            else if (after.w === before.w && after.h === before.h) {
+              ok(`★ 放大之后页码的**屏幕大小一点没变**（${before.w}×${before.h} → ${after.w}×${after.h}，世界缩放 --bd-world-s 已经是 ${String(after.s).trim()}）`)
+            } else {
+              bad(`放大之后页码跟着变大了：${before.w}×${before.h} → ${after.w}×${after.h}（--bd-world-s=${String(after.s).trim()}）—— 抵消没生效`)
+            }
+            /* 把缩放还原，别把后面的节带偏 */
+            const fit = await s.eval(`(() => {
+              const b = document.querySelector('button[title^="把所有内容装回屏幕"]')
+              if (!b) return false
+              b.click(); return true
+            })()`)
+            if (!fit) bad('没找到"装回屏幕"那颗按钮 —— 缩放没还原，后面的节可能被带偏')
+          }
+        }
+      }
+    }
+
     console.log('\n[3] ★ 笔能写在资料上（注释不需要新机制）')
     {
       const spot = await s.eval(`(() => {
@@ -302,14 +436,29 @@ const fails = await withBoard(
       const up = await fetch(app + '/api/doc/upload', { method: 'POST', headers: { 'Content-Type': mp.contentType }, body: mp.body }).then((r) => r.json())
       const UP_PDF = path.join(DATA, '.资料', 'zz-doc-upload.pdf')
       after(() => {
-        try {
-          fs.rmSync(UP_PDF, { force: true })
-        } catch {}
+        for (const n of ['zz-doc-upload.pdf', 'zz-doc-upload-again.pdf', 'zz-doc-upload 2.pdf']) {
+          try {
+            fs.rmSync(path.join(DATA, '.资料', n), { force: true })
+          } catch {}
+        }
       })
       if (up && up.ok && up.path === '.资料/zz-doc-upload.pdf') ok(`上传落盘成功（${up.path}）`)
       else bad('上传接口没回 ok：' + JSON.stringify(up))
       if (fs.existsSync(UP_PDF) && fs.readFileSync(UP_PDF).equals(pdf)) ok('盘上那份和发出去的字节一致')
       else bad('落盘的 PDF 和上传的不一致')
+      /* ★ 同一份文件收第二次：**认得出是同一份、盘上不许多一份**（2026-09-20）。
+         为什么这条值得单列：课件整理那条路现在可以不先把课件插到板上（点「✧ 课件整理」
+         直接选文件），于是"同一份 PDF 选第二次"成了家常便饭。多存一份的代价不只是磁盘 ——
+         `doc-read.js` 的缓存键是"路径 + 页号"，路径一变，读过的几十页**全要再花一次钱**。
+         ⚠ 第二次故意用一个**不一样的文件名**：认的是内容，不是名字。 */
+      const mp2 = buildMultipart([{ name: 'file', filename: 'zz-doc-upload-again.pdf', type: 'application/pdf', data: pdf }])
+      const up2 = await fetch(app + '/api/doc/upload', { method: 'POST', headers: { 'Content-Type': mp2.contentType }, body: mp2.body }).then((r) => r.json())
+      if (up2 && up2.ok && up2.path === '.资料/zz-doc-upload.pdf' && up2.duplicate === true) {
+        ok('★ 同一份文件再传一次 → 认出是同一份（回到 ' + up2.path + '，duplicate）')
+      } else bad('同一份文件被当成了新的一份：' + JSON.stringify(up2))
+      const extra = fs.existsSync(path.join(DATA, '.资料', 'zz-doc-upload-again.pdf'))
+      if (!extra) ok('盘上没有多出第二份（名字不同、内容一样照样认得出来）')
+      else bad('data/.资料/ 里多存了一份 zz-doc-upload-again.pdf')
       /* 下发：整份文件原样回来（pdf.js 就靠这个地址拉文件）。 */
       const down = await fetch(app + '/api/doc/file/' + encodeURIComponent('.资料/zz-doc-upload.pdf'))
       const buf = Buffer.from(await down.arrayBuffer())

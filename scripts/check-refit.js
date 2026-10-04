@@ -283,6 +283,58 @@ const fails = await withBoard(
     if (!s.errors().length) ok('整个流程跑下来，页面里没有任何 JS 报错')
     else bad(`页面里有 ${s.errors().length} 条报错：` + s.errors().slice(0, 3).join(' ｜ '))
 
+    console.log('\n[5] ★ 拟合器必须**安静下来**：一帧都不许再量（2026-09-21「越修越卡」那一刀）')
+    /* 为什么单开一条、以及为什么它必须在这张夹具上量：
+     *   第九刀把卡片改成世界坐标渲染（`width: card.w`，缩放交给 `.bd-cardworld` 那一层
+     *   transform）。而 `offsetWidth` **不受祖先 transform 影响** —— 于是 DOM 读数从
+     *   "屏幕像素"变成了"世界像素"，可拟合器还在按屏幕像素比（`wantW = card.w × s`）。
+     *   两边只在 **s=1** 时相等：别的档位每一张卡每一帧都判 'stale' → 下一帧再来 →
+     *   **永远不停**，而每一趟都要 `querySelector` + `getComputedStyle` + 写一次
+     *   `width: max-content` 再读回来（写后读 = 强制布局）。
+     *   用户那张板实测：什么都不干，1 秒改 2625 次 data-fit，125 张卡卡在 'stale'。
+     *
+     *   ⚠⚠ 这一条**必须**在视野 s≠1 的板上量：s=1 时那个错的比较式恰好成立，
+     *      同一份夹具在 s=1 下永远绿 —— 这正是它当初从 [1]~[4] 底下溜过去的原因
+     *      （另开一张"装不进屏幕"的夹具，见下面那条 bad 的分支）。
+     *   判据是**页面事实**：data-fit 是拟合器每跑一趟、每张卡写一次的东西。 */
+    {
+      if (Math.abs(view - 1) < 0.01) {
+        bad(`夹具的视野 s=${view.toFixed(3)} ≈ 1 —— 这一条在 s=1 时天生绿，量不出东西：夹具要改成"装不进屏幕"的规模`)
+      } else {
+        ok(`夹具的视野 s=${view.toFixed(3)}（≠1，正是"世界像素 vs 屏幕像素"会分叉的那一档）`)
+      }
+      await s.eval(`(() => {
+        window.__zzFit = 0
+        window.__zzFitMO = new MutationObserver((recs) => { window.__zzFit += recs.length })
+        window.__zzFitMO.observe(document.querySelector('.bd-stagewrap'), {
+          subtree: true, attributes: true, attributeFilter: ['data-fit'],
+        })
+        return 1
+      })()`)
+      await sleep(1200)
+      const writes = await s.eval(`(() => { const n = window.__zzFit; window.__zzFit = 0; return n })()`)
+      const fits = await s.eval(`(() => {
+        const out = {}
+        for (const el of document.querySelectorAll('[data-card-id]')) {
+          let j = null
+          try { j = JSON.parse(el.dataset.fit || 'null') } catch (e) {}
+          const k = j ? j.state : '(没有 data-fit)'
+          out[k] = (out[k] || 0) + 1
+        }
+        return out
+      })()`)
+      console.log(`      静置 1200ms：data-fit 被改写 ${writes} 次；各卡自报的状态 ${JSON.stringify(fits)}`)
+      if (writes === 0) ok('★ 拟合器安静（静置期间一次都没重量）—— 没有"每帧全板重排"那种空转')
+      else bad(
+        `★ 拟合器在**空转**：静置 1200ms 里重量了 ${writes} 次。` +
+        '多半是"DOM 读数"和"判定用的期望值"量纲不一致（世界像素 vs 屏幕像素）→ 永远 stale。' +
+        '看 card-fit.js 的 fitPass 里那条宽度判据，以及 sampleCardForFit 采的是哪一档。'
+      )
+      const stale = (fits.stale || 0) + (fits['gave-up'] || 0)
+      if (!stale) ok(`没有一张卡停在 stale / gave-up（${JSON.stringify(fits)}）`)
+      else bad(`有 ${stale} 张卡停在 stale / gave-up：${JSON.stringify(fits)} —— 它既没贴合内容，也没人知道`)
+    }
+
     /* 夹具板的名字归 withBoard 管（跑完删）；这里只是把"它确实是自检自己造的"说清楚 */
     if (/board-zz-refit\.md$/.test(board.path)) ok('夹具板是自检自己造的：' + board.name)
   }

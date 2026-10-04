@@ -149,7 +149,7 @@ if (await portBusy()) {
         const f = list.files[0] || {}
         eq(f.name, NESTED, 'list 里 name 是**整条相对路径**')
         eq(f.folder, '大物/电磁学', 'list 里 folder 是它所在的那一层')
-        eq(f.title, 'board-第一章', 'title 只剩最后一段（左栏那一行显示的字）')
+        eq(f.title, '第一章', 'title 只剩最后一段，**且白板的 board- 前缀也去掉了**（左栏那一行显示的字，2026-09-23 用户要求）')
         eq(list.folders, ['大物', '大物/电磁学'], '目录列表两层都报出来了（顺序钉死：浅的在前）')
       }
 

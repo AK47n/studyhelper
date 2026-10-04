@@ -27,7 +27,7 @@ import { SEED_BOARD_NAME, boardPath, createFileApi, planStartup, splitTitlePath 
 /* data/ 里的路径（分层）：拆 / 拼 / 摆成左栏那棵树 —— 规矩在 paths.js 里，这里只用。
    ⚠ 一条都不能手写：`'a' + '/' + b` 这种看着没事，但根目录那一层拼出来是 `/b`，
      树里就多出一个空名字的节点（真踩过）。 */
-import { ancestors, baseName, buildFolderTree, EXPORT_DIR, isRenamed, joinPath, layerNeeds, levels, parentPath, pathTitle, pruneTree, uniqueRelName } from './lib/paths.js'
+import { ancestors, baseName, buildFolderTree, EXPORT_DIR, isRenamed, isUnder, joinPath, layerNeeds, levels, parentPath, pathTitle, pruneTree, uniqueRelName } from './lib/paths.js'
 /* 「这份笔记用到了哪几种公式字体」—— 读浏览器那本账（document.fonts），
    服务端没有 canvas 量不了。量不出来就空着，导出照做（见 lib/fonts.js）。 */
 import { detectLoadedFamilies } from './lib/fonts.js'
@@ -161,6 +161,52 @@ const ASK = {
     cancel: '留着别切',
     danger: true,
   },
+  /* ── 删除（2026-09-21）──────────────────────────────────────────────────
+   * 两条问话，因为"删掉的东西有多少"是两件事：
+   *   `delete-file`   —— 删一个文件（板或笔记）。一句话说清删的是哪个。
+   *   `delete-folder` —— 删一整层。**必须把里面有几样东西说出来**（`note`），
+   *                     因为一次可能带走几十张板，而按钮只是行尾滑过去点一下。
+   *
+   * ★ 为什么还要问一句：分层能建出来就得能拆掉（分错的那一层不能永远挂在树里），
+   *   但"删除"和"改名"不一样 —— 改错了再改回来，删错了要翻回收站。
+   *   ★ 东西是**进回收站**的（服务端 `/api/delete` 的闸），这一点要写在框里：
+   *     用户知道"翻得回来"才敢点，否则他会去资源管理器里手工删 —— 那更危险。
+   *
+   * ⚠⚠ 这两条**必须是 `choices` 型的问话，不能是带输入框的普通问话**
+   *     （2026-09-21 踩的，自检报出来是"点了删除没反应"）：
+   *     第一版我把它们写成了 `{ label: null, ok: '删除', note: true }` —— 看着挺对，
+   *     但 `label: null` 只是**不画那一行标题字**，输入框照画（见下面 render 里那两条
+   *     `!Array.isArray(spec.choices) &&`）。于是：
+   *       ① 框里凭空多出一个输入框（问"删掉这个文件？"却要你打字，很怪）；
+   *       ② `required: true` + 空输入框 → `canOk` 是 false → **确认键是灰的、点不动**。
+   *          报出来是"删完盘上还在"，看着像删除功能坏了，其实是那一下根本没发出去。
+   *     ⇒ 删除是一条**选择**（删 / 算了），没有第三个答案，也不该有输入框。
+   *       `choices` 那一条路本来就有：没有输入框、没有 submit 按钮，
+   *       回车也提交不了（要真按到那颗 danger 键才算）—— 正是删除该有的手感。
+   *
+   * ⚠ 选项顺序：**"算了"排在前面**（第一条是默认的那条，回车走它）——
+   *   和 `note-overwrite` 一个道理：不会弄丢东西的那条永远在前。
+   *   删除这条路"回车 = 删掉"是最不该发生的一件事。 */
+  'delete-file': {
+    title: '删掉这个文件？',
+    hint: '会送进回收站（不是永久删）—— 想找回来就去系统的回收站里翻。',
+    label: null,
+    note: true,
+    choices: [
+      { id: 'cancel', label: '算了，留着' },
+      { id: 'del', label: '删掉它', hint: '送进回收站', danger: true },
+    ],
+  },
+  'delete-folder': {
+    title: '删掉这一层？',
+    hint: '连同里面的东西一起送进回收站（不是永久删）—— 想找回来就去系统的回收站里翻。',
+    label: null,
+    note: true,
+    choices: [
+      { id: 'cancel', label: '算了，留着' },
+      { id: 'del', label: '一起删掉', hint: '这一层和里面的东西都进回收站', danger: true },
+    ],
+  },
 }
 
   /* 白板的新建得先问一下"这一课叫什么" —— 板子里有标题，
@@ -234,10 +280,31 @@ async function createSeedBoard({ refresh, flash }) {
 const SCALE_MIN = 0.9
 const SCALE_MAX = 2.0
 const SCALE_STEP = 0.05
-const SCALE_DEFAULT = 1.25
+/* 默认档（2026-09-22 从 1.25 改成 0.95 —— 用户：「下面的功能框大小初始为95％」，
+   说的是屏幕底下那条工具条，而它的大小就是这个档）。
+   ⚠ 改这个数**只对新用户生效** —— 读过一次盘就有值了，见 `readScale` 那段迁移。 */
+const SCALE_DEFAULT = 0.95
+/* 换默认档之前那个值。`readScale` 拿它认"这条记录只是被动存下来的默认值，不是他选的"。 */
+const SCALE_OLD_DEFAULT = 1.25
 const SCALE_KEY = 'studyhelper.scale'
+/* "默认档搬过一次家"的标记 —— 只搬一次，见 `readScale`。 */
+const SCALE_MOVED_KEY = 'studyhelper.scale.moved-95'
 /* 左栏哪几层展开着。同样是"我怎么看"，存 localStorage，不进板文件。 */
 const TREE_KEY = 'studyhelper.tree'
+/* 左栏**每块标题**收起没有（2026-09-28，用户原话：「左侧标题栏目中每一层都能收起」）。
+ * 「我的一课一页 / 我的总结笔记」和「枢纽」这两块大标题原来点不动 —— 目录层能折
+ * （树里那个 ▾），可块级标题不能，东西一多整栏就得一直滚。
+ * 同样是"我怎么看"的那一族：存 localStorage、不进板文件。
+ * 值是 `{files, hubs}` —— true = 收着。默认全展开（第一次打开什么都看得见）。 */
+const SIDE_FOLD_KEY = 'studyhelper.sidefold'
+function readSideFold() {
+  try {
+    const o = JSON.parse(localStorage.getItem(SIDE_FOLD_KEY) || '{}')
+    return { files: !!o.files, hubs: !!o.hubs }
+  } catch {
+    return { files: false, hubs: false }
+  }
+}
 
 /* ── 整板转录那一条的参数（2026-09-19，第 3 步之后收在这里）──────────────
  * 为什么提成模块常量：**缓存键要用 flavor，请求要用同一套参数** —— 两处各写一份
@@ -269,10 +336,29 @@ function readExpanded() {
   }
 }
 
+/* 打开时用哪个字号档。
+ *
+ * ── 为什么要"搬一次家"（2026-09-22 换默认档时踩到的）────────────────────
+ * `--s` 的**持久化是无条件的**：挂载后那个 effect 每次都把当前档写回 localStorage。
+ * 于是"从来没碰过字号"的人盘上也躺着一条记录 —— 默认档从 125% 改成 95% 之后，
+ * 光改 `SCALE_DEFAULT` 对他**一点用都没有**：读盘读到 1.25，打开还是 125%，
+ * 看起来就像"改了没生效"（这类"改了却看不出变化"的账，README 里记着好几条）。
+ *
+ * ★ 但也不能无脑把存过的值清掉：他**特意**调过的档位是他选的，不该被我们改掉。
+ *   所以只搬一次，判据是"存的正好是**旧默认值**"：
+ *     · 存的 = 1.25 且还没搬过 → 当成"没选过"，用新默认，并立起标记；
+ *     · 别的任何值（0.9~2.0 里他自己调的）→ 一个字不动；
+ *     · 标记立起来之后 → 一律照他存的来（哪怕他又手动调回 125%）。
+ *   代价如实写下来：**特意调成 125%** 的人会被当成"没选过"改掉一次
+ *   （他和"从没调过"在盘上长得一模一样，区分不了）。这一条只发生一次。 */
 function readScale() {
   try {
     const s = Number(localStorage.getItem(SCALE_KEY))
-    return Number.isFinite(s) && s > 0 ? clampScale(s) : SCALE_DEFAULT
+    if (!Number.isFinite(s) || s <= 0) return SCALE_DEFAULT
+    const moved = localStorage.getItem(SCALE_MOVED_KEY) === '1'
+    if (!moved) localStorage.setItem(SCALE_MOVED_KEY, '1')
+    if (!moved && s === SCALE_OLD_DEFAULT) return SCALE_DEFAULT
+    return clampScale(s)
   } catch {
     return SCALE_DEFAULT
   }
@@ -481,8 +567,9 @@ function Ask({ spec, value, multiline, where, layers, extra, onDone }) {
 function TreeRows({ node, depth, ctx }) {
   const {
     isOpen, toggleDir, open, current, isBoard, dropDir, setDropDir,
-    onDragStart, onDragOverDir, onDropDir, newBoardHere, newFolderIn,
+    onDragStart, onDragOverDir, onDropDir, newBoardHere, newFolderIn, newBoardFile,
     canRename, renaming, doRename, sayWhyNot, startRename, openWithGuard, exportNote, justMade,
+    deleteNode,
   } = ctx
   const pad = { paddingLeft: 6 + depth * 12 }
   /* 改名的动作（文件行行尾、目录行行尾两颗按钮都走它）—— 各写一遍的话，
@@ -618,6 +705,27 @@ function TreeRows({ node, depth, ctx }) {
                   >
                     改名
                   </button>
+                  {/* ★ 删除也**飘**在这一组里（2026-09-21）。为什么不常显：
+                      和「＋分层」「改名」一样 —— 三个词常显会把目录名挤成省略号，
+                      而"删掉这一层"比那两颗更少用（一个月一次？）。
+                      ⚠ `deleteNode(d.path, { dir: true })`：**必须显式说是目录**。
+                        不传的话它会按"文件"那条问话问（"删掉这个文件？"）——
+                        而这里删的可能是一整层，问话和实际做的事情对不上。
+                      ⚠ 和改名不同，删除**不经过** `canRename` 那道闸：
+                        笔记为什么不能改名是"路径被引用着"（那是另一趟整理），
+                        而删掉一条笔记不需要同时改任何引用 —— 那本来就是"引用的
+                        另一头不在了"，和改名不是一件事。 */}
+                  <button
+                    className="rowbtn del"
+                    data-act="del"
+                    title={'删掉这一层（连同里面的东西）—— 会进回收站'}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      deleteNode(d.path, { dir: true })
+                    }}
+                  >
+                    删除
+                  </button>
                 </span>
               </span>
             </div>
@@ -648,8 +756,24 @@ function TreeRows({ node, depth, ctx }) {
           }}
         >
           {depth > 0 && (
+            /* ★ 这颗按钮**必须**从 `ctx` 拿动作函数（2026-09-22 修的 bug）。
+               ⚠ 它从前写的是 `newBoardFile(parentPath(f.name))` —— 直接引用 App 里
+                 那个函数。看着很自然（同文件、同一个词），但 `TreeRows` 是**模块级
+                 组件**、`newBoardFile` 只活在 `App` 的函数作用域里，两者毫不相干：
+                 这个名字在 TreeRows 里根本不存在。点下去抛
+                 `ReferenceError: newBoardFile is not defined`，界面上一动都不动 ——
+                 用户看到的就是**「这个加号点了没用」**（原话）。
+               ⚠ 为什么一路没被发现：`check:sidetree` 的 ⑧ 只验了**目录行**那两颗
+                 （`＋白板`/`＋分层`，它们走 `ctx` 是对的），文件行这颗**零覆盖**；
+                 而纯逻辑自检（check-board）根本不渲染组件。CDP 的合成点击照点不误
+                 （它不看返回值），于是"点击"这件事看着是成功的。
+               ⇒ 同一条规矩：**TreeRows 里出现的每一个动作，都得经 `ctx` 进来**
+                 （看上面的解构那一行），别图省事用外层的名字。
+               ⚠ 判据按 `data-act="plus-here"` 认，不按"左边第一颗 / 文字是＋"——
+                 位置判据会在长出新按钮之后失效（见行尾那两颗的注释）。 */
             <button
               className="rowbtn plus"
+              data-act="plus-here"
               title={'在「' + parentPath(f.name) + '」这层新建'}
               onClick={(e) => {
                 e.stopPropagation()
@@ -693,6 +817,22 @@ function TreeRows({ node, depth, ctx }) {
             >
               改名
             </button>
+            {/* ★ 删除（2026-09-21）。和「改名」一样常显（划过这一行就看得见）——
+                理由同那颗「＋」：藏起来的动作 = "得先猜到有这条路"。
+                而删除是**整理时的另一只手**：能建能改，就得知不知道能删。
+                ⚠ 笔记也走它（`deleteNode` 里那条注释说了为什么笔记能删不能改名）。
+                ⚠ 没传 `dir` → 问的是"删掉这个文件？"，不是"删掉这一层？" */}
+            <button
+              className="rowbtn del"
+              data-act="del"
+              title={'删掉它（送进回收站，不是永久删）'}
+              onClick={(e) => {
+                e.stopPropagation()
+                deleteNode(f.name)
+              }}
+            >
+              删除
+            </button>
           </span>
         </div>
       ))}
@@ -709,8 +849,13 @@ export default function App() {
   const [files, setFiles] = useState([])
   /* `data/` 里的目录（相对路径，和 files[].name 同一套口径）。左栏那棵树 = 这两个拼出来。 */
   const [folders, setFolders] = useState([])
-  /* 哪几层是展开的。`null` = **从没动过** → 全展开：第一次打开就看见自己分的那几层，
-     比"一片折起来的箭头"友好；动过一次之后就是你上次留下的样子。
+  /* 哪几层是展开的。`null` = **从没动过** → 全部收起：只留最上面那一层（几个目录名），
+     左栏不再拖成一根长条（2026-09-30 用户：「默认左边白板树收起至最高级不然一长条」）。
+     从前这里是"没动过就全展开"，理由是"第一次打开就看见自己分的那几层" ——
+     但分了几层之后，全展开意味着每一次打开都要在几十行里找自己要的那张板，
+     而**目录名本身就是索引**：先看见"大物"，点开才是"电磁感应"。
+     动过一次之后就是你上次留下的样子，这个不变。
+     ⚠ 默认收起 ≠ 看不见当前这张板：打开/新建深处的板时 `expandTo` 会把它那一支展开。
      存 localStorage —— 这是"我怎么看这个目录"，不是笔记内容，不该进任何 .md
      （和纸面存档一条道理）。 */
   const [expanded, setExpanded] = useState(readExpanded)
@@ -803,23 +948,35 @@ export default function App() {
     }
   }, [expanded])
 
-  /* 某一层现在展开着吗。`expanded === null` 表示用户还没动过 → 全展开。 */
+  /* 块级标题收起没有：**无条件写盘**（和 expanded 的"没动过不写"不同 ——
+     这里的默认就是全展开，写下的 `{files:false}` 和"没动过"是同一个意思，不怕写）。 */
+  const [sideFold, setSideFold] = useState(readSideFold)
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDE_FOLD_KEY, JSON.stringify(sideFold))
+    } catch {
+      /* 存不了就算了 */
+    }
+  }, [sideFold])
+  const toggleSideFold = useCallback((k) => setSideFold((s) => ({ ...s, [k]: !s[k] })), [])
+
+  /* 某一层现在展开着吗。`expanded === null` 表示用户还没动过 → **全部收起**（见上面那条注）。 */
   const isOpen = useCallback(
-    (p) => (expanded ? expanded.has(p) : true),
+    (p) => (expanded ? expanded.has(p) : false),
     [expanded]
   )
 
   /* 展开某一层（连带它上面的每一层）—— 建完东西 / 打开一张深处的板时用，
      不然"新建成功"了却看不见那一行，看着像没建成。
-     ⚠ 默认全展开时（`expanded === null`）本来就是展开的，直接原样返回 ——
-       这时候要是"物化"成一份 Set，等于替用户把每一层都点开了，之后就再也不会自动展开新层。 */
+     ⚠ 默认现在是**全收起**，所以这里**必须物化**（从空的一份开始加这一支）：
+       要是照从前那样"没动过就原样返回"，点开某一层会毫无反应（判据仍是 null = 收起），
+       而那一支就永远展不开了。物化只加这一支，其余各层照旧收着。 */
   const expandTo = useCallback(
     (p) => {
       const add = p == null ? [] : levels(String(p))
       if (!add.length) return
       setExpanded((prev) => {
-        if (!prev) return prev
-        const next = new Set(prev)
+        const next = new Set(prev || [])
         let changed = false
         for (const d of add) {
           if (!next.has(d)) {
@@ -836,14 +993,16 @@ export default function App() {
   const toggleDir = useCallback(
     (p) => {
       setExpanded((prev) => {
-        // 第一次动手：先把"当前这份目录清单"物化成 Set（= 现在这个样子），再翻这一层
-        const next = new Set(prev || folders)
+        // 第一次动手：从"现在这个样子"物化成一份 Set，再翻这一层。
+        // ⚠ 默认全收起 ⇒ 物化的起点是**空集**（从前是 `folders`，那时默认全展开）。
+        //   写成 `folders` 的后果：点开一层 → 顺手把**所有**层都记成展开 → 长条又回来了。
+        const next = new Set(prev || [])
         if (next.has(p)) next.delete(p)
         else next.add(p)
         return next
       })
     },
-    [folders]
+    [] // 不再用 folders（物化起点是空集），少一个依赖 = 少一次重建
   )
 
   // 打字时 text 立刻更新（编辑区/着色层要跟手），但解析整棵树 + 重渲染预览
@@ -1730,6 +1889,111 @@ export default function App() {
     return r.to
   }
 
+  /* ── 删掉一个文件 / 一整层（左栏行尾那颗「删除」，2026-09-21）──────────────
+   *
+   * 为什么要有它：分层能建出来就得能**拆掉**。分错的那一层（打错一个字的
+   * `大务`、试验完的 `zz-`）不能永远挂在树里 —— 那是这个仓库里"只建不拆"的老病。
+   *
+   * 三件事按顺序，缺一件都是"看起来删了"：
+   *   ① **问一句**（`ask`）。判据是"删的是几样东西"：一个文件是一句话，
+   *      一整层得把里面有几样说出来（`ask(..., { extra })` 摆进框里）。
+   *      带东西的层要**点两次**才删得掉（第一次点删除按钮 = 回 409 拿到数量，
+   *      第二次才是带 `force` 的那一下）—— 这个中间态是服务端定的，见 /api/delete。
+   *   ② 真删（`api.remove`），失败就把服务端那句话原样摆出来（**别自己编一句**：
+   *      它区分得出"回收站不收"和"路径非法"，而这两件事用户该做的动作不一样）。
+   *   ③ **收尾三件**：刷新左栏 / 把打开着的那张的安排做好（下面单独说）/ 提示一句。
+   *
+   * ★ `current` 被删掉了怎么办（这一步最容易漏，漏了下场很惨）：
+   *     打开着的那张被删之后，`current` 还指着一条**不存在的路径** ——
+   *     而白板是**自动存盘**的，下一次落笔就会拿着那个旧路径把文件**重新建出来**
+   *     （用户会看到"我明明删了，它又回来了"，而那次写盘的内容是画布上残留的旧内容）。
+   *     `relocate` 早就懂这件事（改名那条路踩过同一个坑），所以这里必须同样处理。
+   *   ⇒ 删完 `current` 开在新的一张板上；**一张板都不剩**就什么都不打开（空着，
+   *     不要把笔记顶上来 —— 白板模式里"没有板"是个正常状态，启动那条路
+   *     `planStartup` 会补，这里补等于替用户做决定）。
+   *
+   * ⚠ 笔记（非板）这边**只做删除，不做"正在编辑的那份"的收尾**：笔记是 Ctrl+S
+   *   手动存的，`dirty` 那套守卫在 `openWithGuard` 里，这里不越权。
+   */
+  async function deleteNode(path, { dir = false } = {}) {
+    if (!path) return
+    /* ①′ 先问一句。目录那条的 `extra` 在这一步还**不知道**（要问服务端），
+       所以第一次点「删除」就是"发一次不带 force 的请求"——
+       回来的 409 里带着 `count` / `samples`，拿它去问。
+       ★ 为什么不先 `/api/list` 数一遍：那要前端重算一棵树（`countIn` 就在手边，
+         但目录里可能有点开头的目录 —— 服务端**跳过它们**，前端照着算会多算）。
+         "数字由**要删东西的那一方**给"是这个仓库里一贯的分工。 */
+    const first = await api.remove(path, { force: false })
+    if (first.error && first.code !== 'not-empty') return flash(first.error, 'err')
+
+    if (first.code === 'not-empty') {
+      const n = Number(first.count) || 0
+      const names = (first.samples || []).join('、')
+      const more = n > (first.samples || []).length ? ` 等 ${n} 样` : ''
+      const yes = await ask('delete-folder', {
+        extra: `「${path}」里还有 ${n} 样东西${names ? '（' + names + more + '）' : ''}`,
+      })
+      /* ⚠ 判据是 `'del'`，不是"真值"：这两条问话走的是 `choices` 那条路，
+         交回来的是**选项的 id** —— 而两个选项都非空（`'cancel'` / `'del'`），
+         所以 `if (!yes) return` 会把"算了"也当成"删"。 */
+      if (yes !== 'del') return
+      const second = await api.remove(path, { force: true })
+      if (second.error) return flash(second.error, 'err')
+    } else {
+      const yes = await ask(dir ? 'delete-folder' : 'delete-file', {
+        extra: dir ? `这一层是空的：${path}` : path,
+      })
+      if (yes !== 'del') return
+      /* ⚠ 上面那次"探一下"已经把**空的**东西删掉了（服务端对空目录直接删，不要求 force）。
+         所以走到这里只有两种可能：
+           ① 文件那边 `first` 已经成功了 —— 不用再发一次；
+           ② 空的目录也一样删掉了。
+         判据就是 `first.ok`：**成了就别再发**（第二次会回 404"已经不在了"，
+         而用户看到的是"删了却说它不在"这种自相矛盾的话）。 */
+      if (!first.ok) {
+        const r = await api.remove(path, { force: true })
+        if (r.error) return flash(r.error, 'err')
+      }
+    }
+
+    /* ② 收尾：先把"打开着的那张被删了"处理掉，再刷新列表。
+       ⚠ 顺序不能反：`openNext` 要读**删完之后**的列表。 */
+    await settleAfterDelete(path)
+    flash('已删掉：' + path + '（在回收站里）')
+  }
+
+  /* 删完之后把"打开的是哪一张"安排明白（见 deleteNode 那段 ③）。
+     抽成一个小函数是因为它有两条互斥的路，而两条都容易漏：
+       · 删的是**当前打开的** → 必须换一张（不然自动保存会把刚删的又建回来）；
+       · 删的是**它所在的那一层**（`current` 在那层底下）→ 同样是"当前打开的没了"。
+     判据用 `isUnder`（paths.js 的规矩），别手写 `startsWith(p + '/')` ——
+     根那一层拼出来是 `/`，而根永远不该进来（服务端已经拒了），这里只需要正确。 */
+  async function settleAfterDelete(path) {
+    const gone = !!current && (current === path || isUnder(current, path))
+    const list = await api.list().catch(() => null)
+    applyList(list)
+    if (!gone) return
+    const rest = ((list && list.files) || []).filter((f) => isBoardName(f.name))
+    if (rest.length) {
+      await open(rest[0].name, { force: true })
+      flash('刚才打开的就是它，替你换到了：' + rest[0].name)
+      return
+    }
+    /* 一张板都不剩：**什么都不打开**。不补空板（那是启动那条路的事），
+       也不把笔记顶上来 —— 顶上来就变成"我删了张白板，它给我开了个笔记"。
+       ⚠ 但得把编辑区清干净：`current` 留着的话，那条 2500ms 的磁盘轮询
+         （见下面那个 effect）会一直去问一个不存在的文件。 */
+    setCurrent(null)
+    boardTextRef.current = ''
+    setText('')
+    setDerivedText('')
+    setDirty(false)
+    setSelectedId(null)
+    setDiskMtime(0)
+    if (taRef.current) taRef.current.value = ''
+    flash('删掉了，现在一张白板都没有了 —— 点上面的「＋ 白板」建一张', 'warn')
+  }
+
   /* ★ 改名**只做一件事**：换最后那一段。分层靠拖拽和「移到别处」，
      所以这里永远不需要用户打一条路径，也就永远不会打错一条路径。
      （从前那个"写完整路径"的 prompt 是改名、移动、打字三件事挤在一个框里 ——
@@ -1917,6 +2181,12 @@ export default function App() {
     onDropDir,
     newBoardHere,
     newFolderIn,
+    /* ★ 文件行左边那颗「＋」走它（"放进我所在的这一层"）。**必须挂在这儿** ——
+       见 App.jsx:744 那颗按钮的注释：它从前直接引用 `newBoardFile`，而
+       `newBoardFile` 只活在 App 的作用域里，于是在 TreeRows（模块级组件）里
+       是个**没定义的标识符**：点下去抛 `ReferenceError`，界面上什么都不发生
+       （"点了没反应"）。这颗按钮当时没有任何自检覆盖，所以一路绿灯 —— 2026-09-22 修的。 */
+    newBoardFile,
     canRename,
     renaming,
     startRename,
@@ -1924,6 +2194,7 @@ export default function App() {
     sayWhyNot,
     exportNote,
     justMade,
+    deleteNode,
   }
 
   return (
@@ -1958,21 +2229,37 @@ export default function App() {
         </div>
 
         <div className="side-sec">
-          {/* 这一行本身就是**根目录**的放置目标：把一行拖到这儿 = 挪回根上。
-              一个目录里没有"上层"可以拖，所以根上必须有这么一块地方。 */}
+          {/* ★ 这一行现在**自己就是开关**（2026-09-28，用户原话：
+              「左侧标题栏目中每一层都能收起」）—— 目录层早就能折（树里的 ▾），
+              可"我的一课一页"这一大块原来收不起来，板和资料一多整栏就得一直滚。
+              收下的是**这一块的正文**（树 + 空板提示），标题行本身留着 ——
+              不然收起之后连"这儿本来有什么"都看不出来了。
+              ⚠ 行尾那两颗「＋」必须 stopPropagation：它们是"新建"，
+              点它们不该顺手把这一块折上。 */}
           <div
             className={'side-title' + (dropDir === '' ? ' drop' : '')}
+            role="button"
+            tabIndex={0}
+            onClick={() => toggleSideFold('files')}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                toggleSideFold('files')
+              }
+            }}
+            title={sideFold.files ? '展开这一栏' : '收起这一栏'}
             onDragOver={(e) => onDragOverDir(e, '')}
             onDragLeave={() => setDropDir(null)}
             onDrop={(e) => onDropDir(e, '')}
           >
+            <span className="caret">{sideFold.files ? '▸' : '▾'}</span>
             <span className="title-label">{isBoard ? '我的一课一页' : '我的总结笔记'}</span>
             {/* 白板这一行右边只有"新建"：改名在**行上**（点名字那一格就地改）——
                 这里再放一个全局的「改名」按钮，就得先回答"改哪一个"，
                 而"哪一个"在树里本来就看得见。笔记不用在这儿改名（见 canRename，
                 它要连引用一起改，是另一趟整理）。 */}
             <span className="title-acts">
-              <button className="mini" onClick={() => (isBoard ? newBoardFile() : newNote())} title={'新建一张' + (isBoard ? '白板' : '笔记') + '（名字里带 / 就是分层）'}>
+              <button className="mini" onClick={(e) => { e.stopPropagation(); isBoard ? newBoardFile() : newNote() }} title={'新建一张' + (isBoard ? '白板' : '笔记') + '（名字里带 / 就是分层）'}>
                 ＋ {isBoard ? '白板' : '笔记'}
               </button>
               {/* ★ 顶栏这一颗 = 在**根目录**里开一层。
@@ -1980,35 +2267,64 @@ export default function App() {
                   目录行的「▣」上 —— 那一颗更准（你点的那一行就是位置），
                   所以这一颗不再假装"在某一层里"：它明说是根，想往深处开就去点那一行。
                   留着它是因为根上必须先有第一层 —— 不然新用户没法开头。 */}
-              <button className="mini" onClick={newFolder} title="在根目录里新建一层（想开在某一层里面，就去点那一行的「▣」）">
+              <button className="mini" onClick={(e) => { e.stopPropagation(); newFolder() }} title="在根目录里新建一层（想开在某一层里面，就去点那一行的「▣」）">
                 ＋ 分层
               </button>
             </span>
           </div>
-          <div className="filelist">
-            <TreeRows node={shown} depth={0} ctx={treeCtx} />
-            {isEmpty && (
-              <div className="dim pad">{isBoard ? '还没有白板，点「＋ 白板」' : '还没有笔记'}</div>
-            )}
-          </div>
+          {/* 收起时不渲染正文（而不是 CSS 藏起来）：树里那些行、以及行上的
+              「justmade 滚进视野」那套 ref 都不该为一个看不见的区块工作。
+              ⚠ 标题行还是根目录的拖放落点（收着也能把一行拖回根上）。 */}
+          {!sideFold.files && (
+            <div className="filelist">
+              <TreeRows node={shown} depth={0} ctx={treeCtx} />
+              {isEmpty && (
+                <div className="dim pad">{isBoard ? '还没有白板，点「＋ 白板」' : '还没有笔记'}</div>
+              )}
+            </div>
+          )}
+          {sideFold.files && !isEmpty && (
+            <div className="dim pad side-folded-hint">{countIn(shown)} 样收在里面（板和层一起数）</div>
+          )}
         </div>
 
         {!isBoard && (
           <div className="side-sec">
-            <div className="side-title">枢纽（被引最多）</div>
-            {hubs.map((n) => (
-              <button key={n.id} className="hubrow" onClick={() => setSelectedId(n.id)}>
-                <span className="hub-name">{cleanName(renderTitle(n))}</span>
-                <span className={'heatbar h' + Math.min(doc.refCount.get(n.id) || 0, 5)}>
-                  {'▮'.repeat(Math.min(doc.refCount.get(n.id) || 0, 5))}
-                </span>
-              </button>
-            ))}
-            {hubs.length === 0 && <div className="dim pad">还没有连线</div>}
-            {islandCount > 0 && (
-              <div className="island-note">
-                有 <b>{islandCount}</b> 个量没人用到（孤岛）
-              </div>
+            {/* ★ 这一块标题同样可收（2026-09-28「每一层都能收起」）：
+                笔记模式下枢纽列表可能很长，收起来和上面那块是同一套做法。 */}
+            <div
+              className="side-title"
+              role="button"
+              tabIndex={0}
+              onClick={() => toggleSideFold('hubs')}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  toggleSideFold('hubs')
+                }
+              }}
+              title={sideFold.hubs ? '展开这一栏' : '收起这一栏'}
+            >
+              <span className="caret">{sideFold.hubs ? '▸' : '▾'}</span>
+              <span className="title-label">枢纽（被引最多）</span>
+            </div>
+            {!sideFold.hubs && (
+              <>
+                {hubs.map((n) => (
+                  <button key={n.id} className="hubrow" onClick={() => setSelectedId(n.id)}>
+                    <span className="hub-name">{cleanName(renderTitle(n))}</span>
+                    <span className={'heatbar h' + Math.min(doc.refCount.get(n.id) || 0, 5)}>
+                      {'▮'.repeat(Math.min(doc.refCount.get(n.id) || 0, 5))}
+                    </span>
+                  </button>
+                ))}
+                {hubs.length === 0 && <div className="dim pad">还没有连线</div>}
+                {islandCount > 0 && (
+                  <div className="island-note">
+                    有 <b>{islandCount}</b> 个量没人用到（孤岛）
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -2122,7 +2438,7 @@ export default function App() {
               <button
                 className="zoom-val"
                 onClick={() => setScale(SCALE_DEFAULT)}
-                title="点一下回到 125%"
+                title={'点一下回到默认 ' + Math.round(SCALE_DEFAULT * 100) + '%'}
               >
                 {Math.round(scale * 100)}%
               </button>
@@ -2227,7 +2543,12 @@ export default function App() {
         />
       )}
       {toast && (
-        <div className={'toast ' + toast.kind}>
+        /* ⚠ `toast-pass`：**只说话的那类提示不挡点击**（2026-09-28 实测抓到）。
+           它是 `position: fixed; bottom: 26px` —— 正好压在**工具条按钮**上，
+           而它默认自己会接管那一块的指针 ⇒ 出现过"提示还在的那几秒里点工具条没反应"。
+           这类提示本来就不用点（会自动消失），让它透明地从按钮上方掠过。
+           ⚠ 带动作的那类**不能**加：它要留着让人点那颗按钮，不然那颗按钮永远点不到。 */
+        <div className={'toast ' + toast.kind + (toast.act ? '' : ' toast-pass')}>
           <span className="toast-msg">{toast.msg}</span>
           {/* 带动作的提示**不会自己消失**（见 flash 的说明）——
               要让人有机会点那颗按钮。点完就关掉，免得留着一个已经做过的事。 */}

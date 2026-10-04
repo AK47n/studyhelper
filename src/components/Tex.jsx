@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react'
-import katex from 'katex'
+import { katexHtml } from '../lib/renderMath.js'
 
 /* 把 LaTeX 渲染成好看的公式。
  *
@@ -9,15 +9,15 @@ import katex from 'katex'
  *
  * 渲染不了怎么办：把原文摆出来。**宁可丑，不可丢** —— 这条规矩和 lib/formula.js 一致。
  * 识别服务回一句半截的 LaTeX 时，你要能看见它到底回了什么，而不是一个空白卡片。
+ *
+ * ★ 排式子一律走 `renderMath.js` 的 `katexHtml`（**全仓只有那一处调 katex**，
+ *   而且带缓存 —— 同一个式子重挂载、重渲染都不重排）。参数照旧写在这儿。
  */
 export function Tex({ tex, block }) {
-  const html = useMemo(() => {
-    try {
-      return katex.renderToString(tex, { throwOnError: false, displayMode: !!block, strict: false, trust: false })
-    } catch {
-      return null
-    }
-  }, [tex, block])
+  const html = useMemo(
+    () => katexHtml(tex, { throwOnError: false, displayMode: !!block, strict: false, trust: false }),
+    [tex, block]
+  )
   if (html == null) return <span className="bd-tex-bad">{tex}</span>
   return <span className="bd-tex-in" dangerouslySetInnerHTML={{ __html: html }} />
 }
@@ -27,10 +27,5 @@ export function Tex({ tex, block }) {
    不然会出现"检查说能、显示却是红字"这种自相矛盾。 */
 export function canRender(tex) {
   if (!tex || !String(tex).trim()) return false
-  try {
-    katex.renderToString(tex, { throwOnError: true, strict: false, trust: false })
-    return true
-  } catch {
-    return false
-  }
+  return katexHtml(tex, { throwOnError: true, strict: false, trust: false }) !== null
 }

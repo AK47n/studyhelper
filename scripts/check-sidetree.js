@@ -11,6 +11,9 @@
  *   收之前一律过 `LEGAL_FIXTURE` 这个名字闸（"删的是谁的"那个判据）。
  *   用户 `data/` 里原有的东西一个字节都不动（withBoard 的守卫会报红）。
  *   ★ ⑧ 那一节（"点出来的分层"）还会再造两张板，它们的名字也在同一个闸下面。
+ *   ★ ⑧′（文件行左边那颗「＋」，2026-09-22）建的那一张也在 `大物` 里，同样一并收掉。
+ *   ★ ⑩（删除，2026-09-21）造的靶子也在 `zz-sidetree/` 底下（`大物/zz-sidetree-del层/`），
+ *     由上面那个 rmSync 一并收掉 —— **它是自检自己删掉的**，收尾那次 rmSync 是双保险。
  *
  * ⚠ 拖拽那一段用的是**合成的 DragEvent**，不是 CDP 的真拖放：CDP 没有
  *   HTML5 拖放事件（`Input.dispatchDragEvent` 要 intercept，和真手指那条路不是一回事）。
@@ -29,7 +32,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { LEGAL_FIXTURE, DATA, withBoard } from './lib/board-check.js'
+import { LEGAL_FIXTURE, DATA, ROOT, withBoard } from './lib/board-check.js'
 import { newBoard, serializeBoardDocument } from '../src/lib/board.js'
 
 const MINE = 'zz-sidetree'
@@ -37,6 +40,17 @@ const DEEP = `${MINE}/大物/电磁学/board-zz-sidetree-deep.md`
 /* ⑧ 造的那两张板（点「＋」点出来的）—— 名字同样带 zz-，收尾按同一个名字闸删 */
 const MADE_BOARD = `${MINE}/大物/board-zz-sidetree-click.md`
 const MADE_LAYER = `${MINE}/大物/zz-sidetree-click层`
+/* ⑧′ 文件行左边那颗「＋」的靶子：
+   ★ **它自己造一行**，不借 ⑧ 的路（2026-09-22 踩的）。
+     第一版这里用的是 `DEEP`（`大物/电磁学/board-zz-sidetree-deep.md`）—— 那一行在
+     ④′ 就被**就地改名**了、⑥ 又被**拖到根上**了，走到 ⑧′ 时它早就不在原来的层里。
+     报出来是"找不到深处那张板那一行"，看着像树坏了，其实是**这一节借了别人的状态**。
+     本仓库的账上记着同一条：「断言的前提若是"上一节留下的状态"，就是颗雷」。
+     ⇒ 自己造：`大物/` 下面摆一张（`大物` 此时肯定还在，⑧ 刚往里面建过东西）。 */
+const ROW_IN = `${MINE}/大物/board-zz-sidetree-rowin.md`
+const ROW_BOARD = `${MINE}/大物/board-zz-sidetree-rowclick.md`
+/* ⑨′ 那条源码扫描要读的源头（`TreeRows` 和 `App` 的分界就在这个文件里） */
+const ROOT_SRC = path.join(ROOT, 'src')
 /* 造出来的那张板的内容：一张空板（名字里带 zz- 是为了跑完能按名字闸删掉） */
 const SEED = serializeBoardDocument(newBoard('自检的一层'))
 
@@ -104,6 +118,49 @@ const fails = await withBoard(
     const find = (p) => list.find((r) => r.path === p)
     const DALU = `${MINE}/大物`
     const DENG = `${MINE}/大物/电磁学`
+
+    /* ②′ 默认**收起到最高一级**（2026-09-30 用户：「默认左边白板树收起至最高级不然一长条」）。
+     * 从前默认全展开，分了几层之后左栏就拖成一根长条，每次打开都要在几十行里找板。
+     * 现在第一次打开只看见最上面那一层，深处的东西**自己点开**。
+     * ⚠ 判据是"深处那几行**不在**列表里"（不是"缩进为 0"）——
+     *   对着全展开的实现，这两条断言当场会红，正是它该有的样子。 */
+    if (find(MINE)) ok(`默认收起：最上面那一层还在（${MINE}）`)
+    else bad(`默认收起后连顶层都找不到了：${MINE}` + JSON.stringify(list))
+    if (!find(DALU) && !find(DENG) && !find(DEEP)) {
+      ok('默认收起：第二层往下全收着（左栏不再是一根长条）')
+    } else bad('默认没收起来（深处那几行还在）：' + JSON.stringify([find(DALU), find(DENG), find(DEEP)]))
+
+    /* 下面那些"缩进/折叠"的断言要在**展开状态下**验 —— 所以先把这一支点开。
+       真鼠标点 + elementFromPoint 命中它自己（和 ④ 同一条纪律）：
+       `elem.click()` 绕过命中测试，会绿在"其实被别的东西盖着"的实现上。 */
+    const clickDir = async (p) => {
+      const box = await s.eval(`(() => {
+        for (const el of document.querySelectorAll('.filelist .folderrow')) {
+          if (el.getAttribute('title') === ${JSON.stringify(p)}) {
+            el.scrollIntoView({ block: 'center' })
+            const r = el.getBoundingClientRect()
+            const x = Math.round(r.left + 30)
+            const y = Math.round(r.top + r.height / 2)
+            const hit = document.elementFromPoint(x, y)
+            return { x, y, hitSelf: !!(hit && hit.closest('.folderrow') === el) }
+          }
+        }
+        return null
+      })()`)
+      if (!box || !box.hitSelf) {
+        bad('默认收起后点不开这一层：' + p + ' ' + JSON.stringify(box))
+        return
+      }
+      await s.mouse(box.x, box.y)
+      await s.sleep(250)
+    }
+    await clickDir(MINE)
+    await clickDir(DALU)
+    await clickDir(DENG)
+    list = await rows()
+    if (find(DENG)) ok('点开顶层 → 深处那几层出来了（收起只是默认，不是锁死）')
+    else bad('点开了却还是看不见深处：' + JSON.stringify(list))
+
     if (find(MINE)) ok(`左栏出现了那一层：${MINE}`)
     else bad(`左栏没有 ${MINE}（树没摆出来？）：` + JSON.stringify(list))
     if (find(DALU) && find(DALU).depth === 1) ok('第二层缩进 1 档（12px）')
@@ -114,10 +171,12 @@ const fails = await withBoard(
       ok('深处的板摆在自己的那一层里（缩进 3 档）')
     } else bad('那张板没摆对：' + JSON.stringify(find(DEEP)))
 
-    /* ③ 默认全展开：第一次打开（localStorage 里什么都没有）就该看得见里面的东西 */
+    /* ③ "没动过"这件事**不写进 localStorage**：写了就等于"我把每一层都手工点过"，
+       以后再新建一层就不会跟着默认走了（新建以"没动过"为准）。
+       ⚠ 这一条**必须在上面点开那几下之后**读：点过之后 localStorage 里应该有东西。 */
     const stored = await s.eval(`localStorage.getItem('studyhelper.tree')`)
-    if (stored === null) ok('还没动过展开状态 → localStorage 里是空的（默认全展开）')
-    else bad('一进来就写死了展开状态：' + stored)
+    if (stored && stored.includes('大物')) ok('点开过的那几层记进了 localStorage')
+    else bad('点开了却没记住：' + stored)
 
     /* ④ 点一下目录行 → 折起来；再点一下 → 展开（真鼠标点，不是 dispatchEvent）
        ⚠ 定位按 `title` 属性里的**完整路径**（`DENG`），不按名字 ——
@@ -174,6 +233,82 @@ const fails = await withBoard(
       else bad('点第二下没展开')
     }
 
+    /* ④″ 块级标题也能收起这一块（2026-09-28，用户原话：
+       「左侧标题栏目中每一层都能收起」）。
+       目录层早就能折（上面 ④ 验的就是它），可「我的一课一页」这一大块原来
+       点不动 —— 板和资料一多整栏就得一直滚。这一节验三条：
+         (a) 点标题行 → 树收起来、箭头变 ▸、记进 localStorage（`studyhelper.sidefold`）；
+         (b) 行尾那颗「＋ 白板」**不许**顺手把这一块折上（stopPropagation）——
+             它是"新建"，点它不该有第二个效果；因为这一条要点真的按钮，
+             会把"新建"的询问框带出来，所以验完就把框取消掉（点它的取消那颗）；
+         (c) 再点标题行 → 树回来。
+       ⚠ 和 ④ 同一条纪律：真鼠标点 + `elementFromPoint` 命中它自己。
+       ⚠ 量坐标时**避开行尾按钮区**：点的是标题文字那一段（x = 左缘 + 26）。 */
+    const titleBox = () =>
+      s.eval(`(() => {
+        const el = document.querySelector('.side-sec .side-title')
+        if (!el) return null
+        el.scrollIntoView({ block: 'nearest' })
+        const r = el.getBoundingClientRect()
+        const x = Math.round(r.left + 26)
+        const y = Math.round(r.top + r.height / 2)
+        const hit = document.elementFromPoint(x, y)
+        return { x, y, caret: (el.querySelector('.caret') || {}).textContent || '', hitSelf: !!(hit && hit.closest('.side-title') === el) }
+      })()`)
+    {
+      const tb = await titleBox()
+      if (!tb) bad('左栏找不到块级标题行')
+      else {
+        if (tb.hitSelf) ok('块级标题行点得到（elementFromPoint 命中它自己）')
+        else bad('要点的坐标上不是标题行 —— 它多半被盖住了')
+        if (tb.caret === '▾') ok('块级标题默认展开着（箭头 ▾）')
+        else bad('块级标题默认应该是展开的，箭头是：' + tb.caret)
+
+        /* (a) 点一下 → 收起 */
+        await s.mouse(tb.x, tb.y)
+        const folded = await s.eval(`(() => ({ list: !!document.querySelector('.filelist'), caret: (document.querySelector('.side-sec .side-title .caret') || {}).textContent || '' }))()`)
+        if (!folded.list && folded.caret === '▸') ok('★ 点标题行 → 这一整块收起来了（树不见了、箭头 ▸）')
+        else bad('点标题行没把这一块收起来：' + JSON.stringify(folded))
+        const sf = await s.eval(`localStorage.getItem('studyhelper.sidefold')`)
+        if (sf && sf.includes('"files":true')) ok('收起这件事记在 localStorage 里（studyhelper.sidefold）')
+        else bad('块级折叠没记住：' + sf)
+        const hint = await s.eval(`((document.querySelector('.side-folded-hint') || {}).textContent || '').trim()`)
+        if (hint) ok('收起来之后留着一句「' + hint + '」（不然看不出这儿本来有什么）')
+        else bad('收起后没有留下提示行')
+
+        /* (c) 再点一下 → 展开。
+           ⚠ 必须在点「＋」**之前**做：(b) 那条要数 `.filelist` 还在不在，
+             折着的时候它本来就不在 —— 顺序错了会冤枉 stopPropagation。 */
+        const tb2 = (await titleBox()) || tb
+        await s.mouse(tb2.x, tb2.y)
+        const unfolded2 = await s.eval(`!!document.querySelector('.filelist')`)
+        if (unfolded2) ok('再点标题行 → 又展开了')
+        else bad('点第二下没展开')
+
+        /* (b) 行尾那颗「＋ 白板」不许冒泡成"折叠"。
+             ⚠ 点它会把"新建"询问框带出来 —— 验完就点取消收掉，别污染后面的节。 */
+        const btnBox = await s.eval(`(() => {
+          const el = document.querySelector('.side-sec .side-title .mini')
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+        })()`)
+        if (!btnBox) bad('标题行上找不到「＋」按钮')
+        else {
+          await s.mouse(btnBox.x, btnBox.y)
+          const stillThere = await s.eval(`!!document.querySelector('.filelist')`)
+          const askUp = await s.eval(`!!document.querySelector('.askwrap')`)
+          if (stillThere && askUp) ok('★ 点「＋」只开了新建的框，**没有**顺手把这一块折上（stopPropagation 站住了）')
+          else if (!stillThere) bad('点「＋」把这一块折叠了 —— 新建按钮的点击冒泡到标题上了')
+          else bad('点「＋」既没开框也没折叠（按钮坏了？）')
+          if (askUp) {
+            await s.eval(`(() => { const b = document.querySelector('.askwrap .btn'); if (b) b.click(); return 1 })()`)
+            await until(async () => (!(await s.eval(`!!document.querySelector('.askwrap')`)) ? 'gone' : undefined), { what: '把新建的框收掉' })
+          }
+        }
+      }
+    }
+
     /* ④′ 改名分两步验（**顺序**是有讲究的，见下面每条的理由）：
      *   (a) 点**名字那一格** → 必须**打开**那张板（2026-09-21 起的规矩：整行随便点都打开）。
      *       为什么这一条必须最先做：它是这次改动的全部理由 —— 用户原话
@@ -189,12 +324,19 @@ const fails = await withBoard(
      *   ⚠ (a) 会把夹具换成深处那张板（点名字 = 打开），(b) 又改的是**同一条**的名字，
      *     所以 (a)(b) 中间要回到夹具（`open()`），不然 ⑤ 打开的就是另一张了。 */
     const NEWNAME = 'board-zz-sidetree-renamed'
+    /* ★ 打给用户看的那一串 = 盘上名字**去掉 board- 前缀**（2026-09-23 起）。
+       两个概念在这儿必须分开，混了必然红一条：
+         · `NEWNAME`   —— **盘上的文件名**，带前缀（`boardPath` 加的，见 ⑧ 那段）
+         · `NEW_TITLE` —— **左栏那一格显示的字**（`pathTitle` 去掉的）
+       下面凡是 `.fname` / `.renameinput` 的判据都用 `NEW_TITLE`，
+       凡是拼路径、`/api/list` 里 `name` 的判据都用 `NEWNAME`。 */
+    const NEW_TITLE = 'zz-sidetree-renamed'
     {
       /* ── (a) 点名字那一格 = 打开 ───────────────────────────────── */
       const nameBox = await s.eval(`(() => {
         for (const el of document.querySelectorAll('.filelist .filerow')) {
           const cell = el.querySelector('.fname')
-          if (cell && cell.textContent === 'board-zz-sidetree-deep') {
+          if (cell && cell.textContent === 'zz-sidetree-deep') {
             /* ★ 先把它**滚进视野**（2026-09-21 修）：
                这一行在树的最深处，而左栏是可滚动的一列 —— 板一多，它就落到
                滚动条下面、被底部那一栏（.side-foot，"数据在 data/ 目录"那一块）盖住。
@@ -240,7 +382,7 @@ const fails = await withBoard(
       const rowBox = await s.eval(`(() => {
         for (const el of document.querySelectorAll('.filelist .filerow')) {
           const cell = el.querySelector('.fname')
-          if (cell && cell.textContent === 'board-zz-sidetree-deep') {
+          if (cell && cell.textContent === 'zz-sidetree-deep') {
             cell.scrollIntoView({ block: 'center' })
             const r = el.getBoundingClientRect()
             return { x: Math.round(r.left + 40), y: Math.round(r.top + r.height / 2) }
@@ -257,7 +399,7 @@ const fails = await withBoard(
         const btn = await s.eval(`(() => {
           for (const el of document.querySelectorAll('.filelist .filerow')) {
             const cell = el.querySelector('.fname')
-            if (!cell || cell.textContent !== 'board-zz-sidetree-deep') continue
+            if (!cell || cell.textContent !== 'zz-sidetree-deep') continue
             const b = el.querySelector('[data-act="rename"]')
             if (!b) return { missing: true }
             const r = b.getBoundingClientRect()
@@ -279,7 +421,7 @@ const fails = await withBoard(
           const inputUp = await until(
             async () => {
               const v = await s.eval(`(document.querySelector('.filelist .renameinput') || {}).value`)
-              return v === 'board-zz-sidetree-deep' ? v : undefined
+              return v === 'zz-sidetree-deep' ? v : undefined
             },
             { what: '点「改名」之后名字那一格变成了输入框' }
           )
@@ -320,7 +462,7 @@ const fails = await withBoard(
     const hit = await s.eval(`(() => {
       for (const el of document.querySelectorAll('.filelist .filerow')) {
         const cell = el.querySelector('.fname')
-        if (cell && cell.textContent === ${JSON.stringify(NEWNAME)}) {
+        if (cell && cell.textContent === ${JSON.stringify(NEW_TITLE)}) {
           const r = el.getBoundingClientRect()
           const cellR = cell.getBoundingClientRect()
           /* 点**名字右边那一段空白**（fmeta 和名字之间），离名字格远一点 ——
@@ -686,11 +828,443 @@ const fails = await withBoard(
       }
     }
 
+    /* ⑧′ ★ 文件行**左边**那颗「＋」：放进我所在的这一层（2026-09-22 修的 bug）。
+     *
+     * 为什么单独一节 —— 它和 ⑧ 那两颗是**不同的按钮、走不同的路**：
+     *   ⑧：目录行行尾的「＋白板」/「＋分层」，位置由**你点的那一行**决定，走 ctx；
+     *   ⑧′：**文件行**左边那颗，位置由**这一行自己的归属**（`parentPath(f.name)`）决定。
+     * 而它从 2026-09-18 长出来到 2026-09-22，**一行覆盖都没有** —— 于是下面这件事
+     * 一路绿灯地存在着：
+     *
+     * ── 那个 bug（用户原话：「这个加号点了没用啊」）────────────────────────
+     * 那颗按钮写的是 `onClick={() => newBoardFile(parentPath(f.name))}` ——
+     * 直接引用 `App` 里的函数。看着很自然（同文件、同一个词），但 `TreeRows` 是
+     * **模块级组件**（`function TreeRows({ node, depth, ctx })`），`newBoardFile` 只活在
+     * `App` 的函数作用域里，两者毫不相干 —— 这个名字在 TreeRows 里**根本不存在**。
+     * 点下去的真相是 `ReferenceError: newBoardFile is not defined`（产品包里也是，
+     * 因为 ESM 模块天生是严格模式），**界面上一动都不动**：不弹框、不报错、
+     * 不 toast —— 看起来就是"这颗按钮是死的"。
+     * ⇒ 修法：和它旁边两颗一样**从 `ctx` 进来**（`treeCtx` 里补 `newBoardFile`）。
+     *
+     * ── 为什么这一节必须量三样，缺一样这个 bug 就还会回来 ────────────────
+     *   ① **真的弹出了那条问话**（`new-board`）。这是最直接的判据：bug 状态下它不弹。
+     *      ⚠ 不能只看"点了之后没报错"：抛异常在合成点击里**看不出来**
+     *        （CDP 不看返回值），所以"点击成功"和"点击抛了"长得一模一样。
+     *   ② 框里那排层**默认选中你所在的这一层**（`MINE/大物`）——
+     *      文件行这颗按钮全部的意思就是"放进我所在的这一层"，选错了层
+     *      和"建到别处"是同一种错（和 ⑧ 一样，正常是在根上）。
+     *   ③ 打字 + 回车之后**盘上真的多出那一张、而且就在那一层里**。
+     *      判据落盘上（`/api/list`），外加一条反证：凡是不在 `MINE/` 底下的都算泄漏
+     *      —— 只看界面的话，"建到根上了但树摆错了"和"建对了"长得一模一样（⑧ 的血）。
+     *
+     * ⚠ 按钮按 `data-act="plus-here"` 认。为什么不按"这一行左边第一颗"+：
+     *   位置判据会在长出新按钮之后失效（行尾那两颗的注释里写过同一句话）。
+     */
+    {
+      /* ★ 先自己造靶子：`大物/` 下面一张板 —— 那颗「＋」只在 depth>0 时渲染，
+         而"在目录里"正是它和顶栏那颗「＋ 白板」的全部区别。
+         ⚠ 不借 DEEP：见文件头 ROW_IN 的说明（那一行走到这儿已经改名 + 被拖走了）。 */
+      const seedRow = await s.eval(`fetch('/api/new', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: ${JSON.stringify(ROW_IN)}, text: ${JSON.stringify(SEED)} }),
+      }).then((r) => r.json())`)
+      if (seedRow && seedRow.ok) ok('造好 ⑧′ 的靶子：' + ROW_IN)
+      else bad('⑧′ 的靶子造不出来（/api/new）：' + JSON.stringify(seedRow))
+      await open({ settle: 1000 })
+
+      const rowBox = await s.eval(`(() => {
+        for (const el of document.querySelectorAll('.filelist .filerow')) {
+          if (el.getAttribute('title') !== ${JSON.stringify(ROW_IN)}) continue
+          /* ★ 先滚进视野再量（这一节的教训和 ④ / ⑩ 是同一条）：
+             它在树的最深处，左栏一长它就落到滚动条下面、被底部那一栏盖住 ——
+             而 getBoundingClientRect 照样给得出坐标，点下去落到别人身上，
+             报出来却是"点了没反应"（正是这一节要验的那个症状，会认错凶手）。 */
+          el.scrollIntoView({ block: 'center' })
+          const b = el.querySelector('[data-act="plus-here"]')
+          if (!b) return { missing: true }
+          const cs = getComputedStyle(b)
+          const r = b.getBoundingClientRect()
+          const x = Math.round(r.left + r.width / 2)
+          const y = Math.round(r.top + r.height / 2)
+          const hit = document.elementFromPoint(x, y)
+          return {
+            x, y, w: Math.round(r.width), h: Math.round(r.height),
+            disp: cs.display, vis: cs.visibility, op: cs.opacity,
+            same: !!(hit && (hit === b || b.contains(hit))),
+            hit: hit ? String(hit.className) : null,
+          }
+        }
+        return null
+      })()`)
+      if (!rowBox) bad('找不到 ⑧′ 的靶子那一行（' + ROW_IN + '）—— 那颗「＋」也就无从谈起（左栏现在是：' + JSON.stringify((await rows()).filter((r) => r.path.startsWith(MINE))) + '）')
+      else if (rowBox.missing) {
+        bad('文件行左边没有那颗「＋」（`data-act="plus-here"`）—— 它就是"放进我所在的这一层"唯一的入口')
+      } else {
+        /* ① 看得见、点得到（合成点击严格按命中测试走，所以这两条缺一不可） */
+        if (rowBox.w > 0 && rowBox.disp !== 'none' && rowBox.vis !== 'hidden' && Number(rowBox.op) > 0 && rowBox.same) {
+          ok(`文件行左边那颗「＋」看得见、点得到（${rowBox.w}×${rowBox.h}，elementFromPoint 命中的就是它）`)
+        } else {
+          bad(`文件行那颗「＋」点不到：rect ${rowBox.w}×${rowBox.h}，那一点上是「${rowBox.hit}」`)
+        }
+
+        /* ② 点它 → 必须**弹出那条问话**。bug 状态下这一条就是红的
+              （ReferenceError 让 onClick 当场中断，什么都不发生）。 */
+        await s.mouse(rowBox.x, rowBox.y)
+        const up = await until(
+          async () => {
+            const v = await s.eval(`(() => {
+              const b = document.querySelector('.askwrap .ask')
+              if (!b) return null
+              const t = (b.querySelector('.ask-title') || {}).textContent || ''
+              if (!t) return null
+              const on = b.querySelector('.ask-layer.on')
+              return {
+                title: t,
+                where: (b.querySelector('.ask-where') || {}).textContent || '',
+                picked: on ? on.textContent.trim() : null,
+                chips: [...b.querySelectorAll('.ask-layer')].map((x) => x.textContent.trim()),
+                focused: document.activeElement === b.querySelector('.ask-input'),
+              }
+            })()`)
+            return v || undefined
+          },
+          { what: '点文件行那颗「＋」→ 询问框弹出来了' }
+        )
+        if (!up.ok) {
+          bad(
+            '★ 点了文件行那颗「＋」，询问框没弹出来 —— 界面上一动都没动。' +
+              '先看页面报错（多半是 `newBoardFile is not defined`：TreeRows 是模块级组件，' +
+              '拿不到 App 作用域里的名字，动作必须从 ctx 进来）。' +
+              '当前有没有遮罩：' + JSON.stringify(await s.eval(`!!document.querySelector('.askwrap')`))
+          )
+        } else {
+          const v = up.value
+          ok('点文件行那颗「＋」→ 弹的是应用自己的框（' + v.title + '）')
+          if (v.title === '新建白板') ok('  …而且问的是"新建白板"（不是"分层"，也不是"删掉"）')
+          else bad('  …问话不对，应当是「新建白板」：' + JSON.stringify(v.title))
+          /* ★ 这一条是这颗按钮的**全部意思**：位置 = 这一行**所在的层**。
+             这里它必须默认选中 `MINE/大物`（**不是**根目录，也不是 ⑧ 那一节的落点）。 */
+          if (v.picked === `${MINE}/大物`) {
+            ok(`框里那排层默认选中「${v.picked}」= 这张板所在的层（"放进我这一层"）`)
+          } else {
+            bad('框里默认选中的层不对（应当是 ' + MINE + '/大物，即这一行所在的层）：' + JSON.stringify({ picked: v.picked, where: v.where }))
+          }
+          if (v.focused) ok('输入框自动聚焦（不用再点一下才能打字）')
+          else bad('输入框没拿到焦点 —— 得先点一下才能打字')
+
+          /* ③ 打字 + 回车 → 落到**那一层里**。
+             ⚠ 打的是光名字，不带 board- 前缀（前缀只有 boardPath 一处说了算，见 ⑧）。 */
+          await s.eval(`(() => { const i = document.querySelector('.askwrap .ask-input'); i.focus(); i.select(); return true })()`)
+          await s.send('Input.insertText', { text: 'zz-sidetree-rowclick' })
+          await s.key('Enter', 'Enter', 13)
+          const landed = await until(
+            async () => {
+              const l = await s.eval(`fetch('/api/list').then((x) => x.json()).then((d) => d.files.map((f) => f.name))`)
+              return l && l.includes(ROW_BOARD) ? l : undefined
+            },
+            { what: '盘上真的多出那一张板，而且就在这一行所在的层里' }
+          )
+          if (landed.ok) {
+            ok('打字 + 回车 → 盘上多出 ' + ROW_BOARD + '（**在这一行所在的层里**，不在根上）')
+          } else {
+            bad(
+              '板没落到 ' + ROW_BOARD + '。盘上现在：' +
+                JSON.stringify(await s.eval(`fetch('/api/list').then((x) => x.json()).then((d) => d.files.map((f) => f.name))`))
+            )
+          }
+          /* 反证：凡是不在 MINE/ 底下的都算泄漏 —— 尤其不许落到**用户自己的** `大物/`
+             （2026-09-18 真的发生过：点错了行，垃圾板建进了用户的文件夹）。 */
+          const leak = await s.eval(`fetch('/api/list').then((x) => x.json()).then((d) =>
+            d.files.map((f) => f.name).filter((n) => n.endsWith('board-zz-sidetree-rowclick.md') && !n.startsWith(${JSON.stringify(MINE)} + '/')))`)
+          if (!leak.length) ok('  …而且没跑到夹具那一层外面（"这一行所在的层"真的生效了）')
+          else bad('★ 建到夹具外面去了：' + JSON.stringify(leak) + ' —— 这一行算出来的层不对')
+          /* 建完顺手打开它（和 ⑧ 一样："建好并打开"） */
+          const opened = await until(
+            async () => {
+              const f = await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)
+              return f === ROW_BOARD ? f : undefined
+            },
+            { what: '建完顺手打开了它' }
+          )
+          if (opened.ok) ok('建完顺手打开了它（顶栏 = ' + opened.value + '）')
+          else bad('建完没打开它，顶栏是：' + (await s.eval(`((document.querySelector('.bd-file') || {}).textContent || '').trim()`)))
+        }
+      }
+
+      /* ★ 把靶子在磁盘上清干净（**不是**为了图省事，是为了 ⑩）。
+         `after` 里那个 `rmSync(MINE)` 跑在**全部**断言之后，所以如果这一节之后
+         还留着打开着的 `ROW_BOARD`（或刚建的那张），⑩ 在 `MINE/大物/` 底下
+         做目录操作时，用户窗口那边可能正拿着这个路径自动存盘 → 盘上又长回来一份
+         → withBoard 的守卫看见"data/ 变了"。这里是**自检自己造的东西**，
+         按同一个名字闸删，和收尾那段一个道理。 */
+      for (const rel of [ROW_BOARD, ROW_IN]) {
+        const base = path.basename(rel)
+        if (!LEGAL_FIXTURE.test(base)) continue
+        try {
+          fs.rmSync(path.join(DATA, rel), { force: true })
+        } catch {}
+      }
+    }
+
+    /* ⑩ ★ 删掉一层（2026-09-21）：点行尾那颗「删除」→ 确认 → **盘上真没了**。
+     *
+     * 为什么这一节必须是**真浏览器**：前面那节（⑧）验的是"怎么建"，这一节验"怎么拆"——
+     * 而删除这条路真正危险的地方全在**接线**上，不在数据模型里：
+     *   · 那颗按钮在不在、点不点得到（它是 `.rare` 里飘着的一颗，hover 才出来）；
+     *   · 它发出去的到底是**哪一层**（按名字认行会点错 —— 见 ⑧ 开头那段血）；
+     *   · 空目录会不会被"少点一次"悄悄删掉；
+     *   · **带东西的目录要点两次**（第一次只拿到 `count`，第二次才带 `force`）——
+     *     这个中间态是服务端定的，前端接不上就成了"点了没反应"。
+     * 这几条在 check-board 的 [6u-2]（纯逻辑）和 check-storage（真写盘）里都验不到。
+     *
+     * ⚠ 判据落在**盘上**（`/api/list` 里那一层没了），不能只看左栏 ——
+     *   只看界面的话，"删掉了"和"树没刷新、但它其实还在"长得一模一样。
+     *
+     * ── 用谁当靶子 ────────────────────────────────────────────────────
+     * 专造一层 `zz-sidetree/大物/zz-sidetree-del层`，里面放一张板。
+     * 为什么不去删 ⑧ 造的那些：⑧ 的结果是后面几节的**前提**（左栏里得有那些行），
+     * 删了它们后面就全断了；而且"带东西的目录"这一种靶子本来就得单独造。
+     * 收尾靠 `MINE` 那一层整个 rmSync（`after` 里那个）—— 这里造的东西全在它底下。
+     */
+    {
+      const DEL_DIR = `${MINE}/大物/zz-sidetree-del层`
+      const DEL_BOARD = `${DEL_DIR}/board-zz-sidetree-del.md`
+
+      /* 造靶子：走 `/api/new`（它会把中间几层一起建出来）—— 这一步和界面无关，
+         要的只是"盘上有这么一个带东西的层"。 */
+      const made = await s.eval(`fetch('/api/new', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: ${JSON.stringify(DEL_BOARD)}, text: ${JSON.stringify(SEED)} }),
+      }).then((r) => r.json())`)
+      if (made && made.ok) ok('造好一个"带东西的层"当靶子：' + DEL_BOARD)
+      else bad('靶子造不出来（/api/new）：' + JSON.stringify(made))
+      await open({ settle: 900 })
+
+      /* ① 那一行上有「删除」这颗按钮**且点得到**。
+         它和「＋分层」「改名」一样是**飘着**的（`.rare`，hover 才出来）——
+         所以必须先真的把鼠标移上去再量，不然拿到的是 0×0 的 rect。
+         ⚠ 用 `s.hover()`（它只把指针移过去、**不按**），别拿 `s.mouse()` 当 hover 用 ——
+           那个是"按 + 松"，顺手就把这一行点开了（目录行点一下 = 折起来）。
+         ⚠ 也别自己 `s.send('Input.dispatchMouseEvent', { pointerType: 'mouse' })`：
+             实测那样发出来**不触发 CSS `:hover`**（`.rare` 的 display 还是 none，
+             而同一行的「＋分层」也是 0×0 —— 那颗是早就在、一直绿的按钮，
+             所以那一刻量到的 0×0 是**没 hover 上**，不是"这颗按钮坏了"。
+             这个仓库里已经有 `hover()` 这个帮手，别重新发明一遍。） */
+      const hoverRow = async (full) => {
+        const pt = await s.eval(`(() => {
+          for (const el of document.querySelectorAll('.filelist .folderrow')) {
+            if (el.getAttribute('title') !== ${JSON.stringify(full)}) continue
+            /* ★ 先把它**滚进视野**再量坐标。
+               ⚠ 这一条是量出 0×0 的真正原因（2026-09-21 踩的）：
+                 这一层在树里是**第三层**（zz-sidetree/大物/zz-sidetree-del层），
+                 左栏板一多它就落到滚动条下面、或者被底部那一栏盖住 ——
+                 而 getBoundingClientRect **照样给得出坐标**（屏幕外的元素也有 rect）。
+                 于是 hover 落在一个"看得见但不是它"的地方，.rare 当然没出来，
+                 报出来却是"那颗「删除」是 0×0"，看着像按钮坏了。
+                 上下文那一节（④ / ④′）量之前都会滚动，人要看这一行也会先滚过去。
+               ⚠ 判据仍然是 elementFromPoint（下面那条）——"rect 在那儿"不等于"抓得到"。
+               ⚠⚠ 这段注释里**不许出现反引号**：它是模板字面量的一部分，
+                 写一个就把字符串截断了（报出来是一句 missing ) after argument list，
+                  位置看着完全无关 —— 这个坑本仓库已经踩过两次了）。 */
+            el.scrollIntoView({ block: 'center' })
+            const r = el.getBoundingClientRect()
+            return { x: Math.round(r.left + 30), y: Math.round(r.top + r.height / 2) }
+          }
+          return null
+        })()`)
+        if (!pt) return null
+        await s.hover(pt.x, pt.y)
+        return s.eval(`(() => {
+          for (const el of document.querySelectorAll('.filelist .folderrow')) {
+            if (el.getAttribute('title') !== ${JSON.stringify(full)}) continue
+            const b = el.querySelector('[data-act="del"]')
+            if (!b) return { missing: true }
+            const r = b.getBoundingClientRect()
+            if (!r.width) {
+              return {
+                zero: true,
+                rare: (() => { const x = el.querySelector('.rare'); return x ? getComputedStyle(x).display : null })(),
+                rowTop: Math.round(el.getBoundingClientRect().top),
+                viewH: window.innerHeight,
+              }
+            }
+            const x = Math.round(r.left + r.width / 2)
+            const y = Math.round(r.top + r.height / 2)
+            const hit = document.elementFromPoint(x, y)
+            return { x, y, w: Math.round(r.width), hit: hit ? String(hit.className) : null, same: hit === b }
+          }
+          return null
+        })()`)
+      }
+
+      const del = await hoverRow(DEL_DIR)
+      if (!del) bad('左栏里找不到要删的那一层（' + DEL_DIR + '）')
+      else if (del.missing) bad('目录行尾没有「删除」这颗按钮 —— 分层能建不能拆，等于"分错了只能一直挂着"')
+      else if (del.zero) bad('那颗「删除」是 0×0（hover 过了还是没出来？）')
+      else {
+        if (del.same) ok(`悬停这一层之后，行尾那颗「删除」**看得见、点得到**（${del.w}px，elementFromPoint 命中的就是它）`)
+        else bad(`那颗「删除」那一点上命中的是「${del.hit}」—— 看得见、抓不住`)
+
+        /* ② 点它 → 弹出的是**应用自己的**确认框，而且是"删掉这一层"那条问话
+              （不是"删掉这个文件"—— 按钮传错 `dir` 就会问错，而两句问话长得极像）。 */
+        await s.mouse(del.x, del.y)
+        const ask1 = await until(
+          async () => {
+            const v = await s.eval(`(() => {
+              const b = document.querySelector('.askwrap .ask')
+              if (!b) return null
+              const t = (b.querySelector('.ask-title') || {}).textContent || ''
+              if (!t) return null
+              const choices = [...b.querySelectorAll('.ask-choice')].map((x) => ({
+                label: ((x.querySelector('b') || {}).textContent || '').trim(),
+                danger: x.classList.contains('danger'),
+              }))
+              return {
+                title: t,
+                note: (b.querySelector('.ask-note') || {}).textContent || '',
+                hasInput: !!b.querySelector('.ask-input'),
+                choices,
+              }
+            })()`)
+            return v || undefined
+          },
+          { what: '删除的确认框弹出来了' }
+        )
+        if (!ask1.ok) {
+          bad('点了「删除」没弹出确认框：' + JSON.stringify(await s.eval(`!!document.querySelector('.askwrap')`)))
+        } else {
+          const v = ask1.value
+          /* ⚠ 判据是"问的是**层**"，不是"弹了框就行"：
+             `deleteNode(path)` 不传 `{ dir: true }` 就会走 `delete-file`，
+             标题变成"删掉这个文件？"—— 而这里是**一整层**。 */
+          if (/这一层/.test(v.title)) ok('点「删除」→ 问的是"删掉这一层？"（' + v.title + '）—— 目录那一颗没接成"删文件"')
+          else bad('目录行的「删除」问错话了（应当是"删掉这一层？"）：' + JSON.stringify(v.title))
+          /* ★ 这一条是这一节的灵魂：**里面有几样东西要说出来**。
+             不说的话，用户点的是"记录里那一行"，删掉的可能是几十张板 ——
+             而框里只写一句"确定吗？"。`note` 是服务端回 409 时给的 `count`/`samples`，
+             所以这一行字同时证明了"那次探一下的请求真的发出去了、也真的按 `code` 认了"。 */
+          if (/还有|空的/.test(v.note)) ok('框里写出了这一层里有什么（' + v.note + '）')
+          else bad('框里没说这一层里有多少东西 —— 一次可能删掉几十张板，光问"确定吗"不够：' + JSON.stringify(v.note))
+          /* ⚠ 这两条是 2026-09-21 第一次跑时**真出错**的地方，留着当判据：
+             删除必须是一条 `choices` 问话 —— 没有输入框、两颗选择键。
+             写成"带输入框的普通问话"（`label: null` + `ok: '删除'`）会同时坏两件事：
+               ① 框里凭空多一个输入框；
+               ② `required: true` + 空输入框 → 确认键是灰的 → **点不动、什么都没发生**，
+                  而报出来是"删完盘上还在"，看着像服务端坏了。 */
+          if (!v.hasInput) ok('这条问话没有输入框（删除是一条选择，不是要你打字）')
+          else bad('删除的确认框里长了输入框 —— `label: null` 只是不画标题，输入框照画；该走 `choices`')
+          if (v.choices.length === 2) ok('两颗选择键：' + v.choices.map((c) => c.label).join(' / '))
+          else bad('选择键不是两颗：' + JSON.stringify(v.choices))
+          /* ★ "算了"排在前面 = 回车走它（不会弄丢东西的那条永远在前，见 note-overwrite） */
+          if (v.choices[0] && /算了/.test(v.choices[0].label)) ok('第一颗是「算了」—— 回车不会把东西删掉')
+          else bad('第一颗不是"算了"（回车会落在删除上）：' + JSON.stringify(v.choices))
+          if (v.choices.some((c) => c.danger)) ok('删除那一颗标了 danger（和别的动作看得出不一样）')
+          else bad('删除那颗没标 danger：' + JSON.stringify(v.choices))
+
+          /* ③ 点「一起删掉」→ **盘上那一层真没了**，而且里面那张板也没了。
+                ⚠ 判据落盘上（`/api/list` 的 files + folders 两半都要看）：
+                 只看 folders 的话，"层还在、东西没了"也是绿的。
+               ⚠ 按钮按 `danger` 认，不按"第几颗"—— 位置判据会在多一颗之后失效。 */
+          const okBtn = await s.eval(`(() => {
+            const b = document.querySelector('.askwrap .ask-choice.danger')
+            if (!b) return null
+            const r = b.getBoundingClientRect()
+            const x = Math.round(r.left + r.width / 2)
+            const y = Math.round(r.top + r.height / 2)
+            const hit = document.elementFromPoint(x, y)
+            return { x, y, w: Math.round(r.width), same: !!(hit && hit.closest('.ask-choice') === b) }
+          })()`)
+          if (!okBtn) bad('找不到"删掉"那颗键，删不了')
+          else if (!okBtn.same) bad('"删掉"那颗键点不到（那一点上不是它）')
+          else {
+            ok(`「删掉」那颗键看得见、点得到（${okBtn.w}px）`)
+            await s.mouse(okBtn.x, okBtn.y)
+            const gone = await until(
+              async () => {
+                const d = await s.eval(`fetch('/api/list').then((x) => x.json()).then((v) => ({
+                  files: v.files.map((f) => f.name), folders: v.folders,
+                }))`)
+                if (!d) return undefined
+                const goneBoth = !d.files.includes(DEL_BOARD) && !d.folders.includes(DEL_DIR)
+                return goneBoth ? d : undefined
+              },
+              { what: '盘上那一层和里面那张板都没了' }
+            )
+            if (gone.ok) ok('点「一起删除」→ **盘上那一层真没了**（' + DEL_DIR + '），里面那张板也跟着没了')
+            else {
+              const now = await s.eval(`fetch('/api/list').then((x) => x.json()).then((v) => ({ files: v.files.map((f) => f.name).filter((n) => n.includes('zz-sidetree-del')), folders: v.folders.filter((n) => n.includes('zz-sidetree-del')) }))`)
+              bad('删完盘上还在：' + JSON.stringify(now))
+            }
+            /* 安全的那一半：**别的层一个都不能少** —— 删一层最可怕的错是"多删了"。
+               查的是我们夹具那一层外面还有没有 `zz-` 的东西被误删（withBoard 的守卫
+               另外会检查用户的 data/ 有没有被动）。 */
+            const still = await s.eval(`fetch('/api/list').then((x) => x.json()).then((v) =>
+              v.files.map((f) => f.name).filter((n) => n.includes('zz-sidetree-del')))`)
+            if (!still.length) ok('  …而且只删了这一层（盘上再没有 zz-sidetree-del 的东西）')
+            else bad('  删完还剩：' + JSON.stringify(still))
+            /* 左栏跟着刷新（不刷新的话，那一行还杵在那儿 —— 点一下就是 404） */
+            const left = await until(
+              async () => {
+                const l = await rows()
+                return l.some((r) => r.path === DEL_DIR) ? undefined : l
+              },
+              { what: '左栏里那一行也消失了' }
+            )
+            if (left.ok) ok('左栏跟着刷新了（那一行从树里消失了）')
+            else bad('盘上删了，左栏还留着那一行：' + JSON.stringify((await rows()).filter((r) => r.path.includes('zz-sidetree-del'))))
+          }
+        }
+      }
+    }
+
     /* ⑨ 页面上不该有任何报错 */
     const errs = s.errors()
     if (!errs.length) ok('页面里没有 JS 报错')
     else bad('页面报错：' + errs.join(' | '))
+
+    /* ⑨′ ★ 源码扫描：TreeRows 里的动作**不许**直接引用 App 作用域的名字。
+     *
+     * 为什么光有 ⑧′ 不够：⑧′ 是**行为**判据，它证明"这颗按钮现在能动"，
+     * 但证明不了"下一个人加的下一个类似按钮不会又踩同一个坑"。
+     * 而这一类 bug 的形状非常固定，且**编译期查不出来**：
+     *   `TreeRows` 是模块级组件，`App` 里的函数（newBoardFile / newNote / …）
+     *   在它里面是不存在的标识符 —— 只有点下去的那一刻才炸，而且炸在合成点击里
+     *   是**看不见**的（CDP 不看返回值）。用户 2026-09-22 报的正是这个。
+     * ⇒ 这里直接对 `src/App.jsx` 的源码做一次扫描，把"已知的坑"钉死：
+     *     ① `function TreeRows` 到 `export default function App` 之间，
+     *        **不许出现**任何 `App` 里才有的动作名（`APP_ONLY`）；
+     *     ② 每个真的用到的动作名，都必须出现在 `treeCtx` 那一段里
+     *        （= 它是**从 ctx 进来**的，不是凭空引用外层的）。
+     * ⚠ 判据是"**在组件里出现的名字都要经 ctx**"，不是"某一行长什么样" ——
+     *   将来把 TreeRows 拆成两个文件，这条会**报红**（那时它该跟着搬家）。
+     */
+    {
+      const appSrc = fs.readFileSync(path.join(ROOT_SRC, 'App.jsx'), 'utf8')
+      const a = appSrc.indexOf('function TreeRows(')
+      const b = appSrc.indexOf('export default function App()')
+      if (a < 0 || b < 0 || b < a) {
+        bad('找不到 TreeRows / App 的分界（源码结构变了？）—— 这条扫描失效了，得跟着改')
+      } else {
+        const body = appSrc.slice(a, b)
+        /* App 里定义、而 TreeRows 拿不到的那些动作（目前就这一个踩过）。
+           ★ 加名字的规矩：**只往这里加真的踩过的**，不把 App 里所有函数都搬进来 ——
+             清单越长越像"抄了一遍源码"，改一次就得跟着改两处。 */
+        const APP_ONLY = ['newBoardFile']
+        const used = APP_ONLY.filter((n) => new RegExp('\\b' + n + '\\b').test(body))
+        const ctxBlock = appSrc.slice(appSrc.indexOf('const treeCtx = {'), appSrc.indexOf('const treeCtx = {') + 900)
+        const leaked = used.filter((n) => !new RegExp('\\b' + n + '\\b').test(ctxBlock))
+        if (!used.length) ok('TreeRows 里没有直接引用 App 作用域的动作（' + APP_ONLY.join('/') + '）')
+        else if (!leaked.length) ok('TreeRows 里用到的 ' + used.join('/') + ' 都**从 ctx 进来**了（不会再有"点了没反应"）')
+        else bad('★ TreeRows 里直接引用了 App 作用域的东西（' + leaked.join('/') + '）—— 点下去会抛 ReferenceError、界面上一动都不动。动作必须挂进 treeCtx')
+      }
+
+      /* ⑨″ 同一类坑的另一面：文件行那颗「＋」必须有个稳定的 `data-act`。
+         没有它，自检只能按"左边第一颗 / 文字是＋"认 —— 而位置判据会在长出新按钮
+         之后失效（本仓库已经栽过：`data-act` 这套就是为那件事长出来的）。 */
+      const rowPlus = /data-act="plus-here"/.test(appSrc)
+      if (rowPlus) ok('文件行那颗「＋」带 `data-act="plus-here"`（自检按它认，不按第几颗）')
+      else bad('文件行那颗「＋」没有 `data-act` —— 自检只能靠位置认它，长出新按钮就会失灵')
+    }
   }
 )
-
 process.exitCode = fails ? 1 : 0

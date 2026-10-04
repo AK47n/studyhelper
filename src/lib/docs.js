@@ -1,7 +1,7 @@
 /* 白板上的「资料」：一份 PDF（或转成 PDF 的 PPT）铺在画布上，注释照常写。
  *
  * ── 它是什么、不是什么 ─────────────────────────────────────────────────
- * 一份资料 = 一个 `docs` 数组里的节点：**指向 `data/.资料/` 里一个 .pdf 的引用**
+ * 一份资料 = 一个 `docs` 数组里的节点：**指向 `data/.资料/` 里一个 .pdf（或一张图片）的引用**
  * + 摆在世界坐标的哪个位置（x/y/w）。每一页按 PDF 本来的宽高比排成一竖条，
  * 页面矩形**是 `x/y/w/pages` 的函数**（pageRects），不单独存坐标 ——
  * 和板框"框线是成员的函数"是同一条设计纪律：只有一份真相，其余现算。
@@ -36,14 +36,40 @@ export const DOC_DEFAULT_W = 720
 /** 资料节点 id 的前缀（卡片 f/n、笔迹 s、板框 fr，资料就轮到 doc）。 */
 export const DOC_ID_PREFIX = 'doc'
 
-/** 这一串是不是一个合法的资料引用：`.资料/<文件名>.pdf`，就两层，多一层都不要。 */
+/** 一份资料可以是**两种东西**：一份 PDF（多页、矢量）或一张**图片**（截图/拍照，一图就是一页）。
+ *  ★ 图片这条是 2026-09-21 为用户那句"为了做几道题传一本 PDF 太费事"开的。
+ *    题目常常只要一张图就够：截图、手机拍一道题、从电子书里裁一小块。
+ *    而一张图在这里走的**完全是 PDF 那条路** —— 一样是 docs 里的一个节点、
+ *    一样靠 pages 表定尺寸、一样能被圈起来问、一样进追问 / 作业辅导 / 课件整理。
+ *    区别只有一处：`renderDocPage` 里那条 branch（见 doc-pages.js）。
+ *  ⚠ 别为图新开一种节点：**多一种形状 = 每个读它的地方都要再问一句"你是不是图"** ——
+ *    那正是最难受的一类账。 */
+const DOC_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp']
+
+/** 后缀（小写带点：`.pdf` / `.png`；认不出就给 `''`）。后缀的大小写是认的。 */
+export function docExtOf(p) {
+  const s = String(p == null ? '' : p)
+  const i = s.lastIndexOf('.')
+  return i < 0 ? '' : s.slice(i).toLowerCase()
+}
+
+/** 这一份是不是**图片**资料（一张截图 / 一张照片 = 一页）。
+ *  它就是"这一份资料不是 PDF" —— 渲染层只有这一处需要知道两者的区别。 */
+export function isImageDoc(p) {
+  return DOC_IMAGE_EXTS.includes(docExtOf(p))
+}
+
+/** 这一串是不是一个合法的资料引用：`.资料/<文件名>.pdf` 或 `.资料/<文件名>.png`，就两层，多一层都不要。
+ *  ⚠ 它同时是**服务端的安检查**（`/api/doc/file` 的路径闸）—— 放开的后缀必须在这张白名单里，
+ *    别的地方不许再认一遍。 */
 export function isDocPath(p) {
   const s = String(p == null ? '' : p)
   if (!s.startsWith(DOC_DIR + '/')) return false
   const segs = s.split('/')
   if (segs.length !== 2) return false
   if (!segs[1] || /[/\\]/.test(segs[1])) return false
-  return /\.pdf$/i.test(segs[1])
+  const ext = docExtOf(segs[1])
+  return ext === '.pdf' || DOC_IMAGE_EXTS.includes(ext)
 }
 
 /** 缺 id 时的兜底（板文件里不该发生 —— 我们插进去的都带 id；手改文件删了就补一个）。 */
@@ -59,19 +85,30 @@ export function pageWorldH(doc, pw, ph) {
   return (w * phN) / pwN
 }
 
+/** 一页后面**额外**留多少（世界像素）。板文件里那些手写/老版本的值都从这儿过一道。
+ *  ★ `pageGaps` 是给"老师讲解"那一版用的：一页的讲解常常比这一页还高，那就把**下面
+ *    那一页推开**，让"页面 + 它两侧的讲解"永远对齐（见 doc-cards.js 的 projectDeck）。
+ *    没有这个字段的板（老文件、没整理过的资料）行为和以前**一模一样**。 */
+export function extraPageGap(v) {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.min(20000, Math.round(n)) : 0
+}
+
 /** 一份资料的每一页摆在世界坐标的哪里：[{x,y,w,h}, ...]（页序不变）。
- *  ★ 这是 x/y/w/pages 的**唯一**算处 —— 渲染、fitView、拖动命中的"这份资料多大"
+ *  ★ 这是 x/y/w/pages/pageGaps 的**唯一**算处 —— 渲染、fitView、拖动命中的"这份资料多大"
  *    全从这儿拿，谁都不许自己再算一份（同一个矩形两处各算一遍的账，这个仓库记了十几条）。 */
 export function pageRects(doc) {
   if (!doc || !Array.isArray(doc.pages)) return []
   const x = Number(doc.x) || 0
   const w = Number(doc.w) > 0 ? Number(doc.w) : DOC_DEFAULT_W
+  const gaps = Array.isArray(doc.pageGaps) ? doc.pageGaps : []
   const out = []
   let y = Number(doc.y) || 0
-  for (const [pw, ph] of doc.pages) {
+  for (let i = 0; i < doc.pages.length; i += 1) {
+    const [pw, ph] = doc.pages[i]
     const h = pageWorldH(doc, pw, ph)
     out.push({ x, y, w, h })
-    y += h + DOC_PAGE_GAP
+    y += h + DOC_PAGE_GAP + extraPageGap(gaps[i])
   }
   return out
 }
@@ -100,6 +137,17 @@ export function normalizeDoc(d) {
     .filter(Boolean)
   if (!pages.length) return null
   const w = Number(d.w)
+  /* 每一页后面额外留的空（"老师讲解"整理的产物，见 `extraPageGap`）：
+     全 0 / 长度对不上就当没有 —— 这个字段**只在真有时才写进板文件**，
+     所以老文件和没整理过的资料一个字节都不变。 */
+  const rawGaps = []
+  {
+    /* ⚠ 别写成 `.map(...)`：`projectDeck` 交回来的是个**稀疏数组**（只有整理过的那几页有值），
+       map 会把空洞原样带过去，写进文件就成了 `[null, 370]` —— 难看而且下次读回来还得再兜一次。 */
+    const src = Array.isArray(d.pageGaps) ? d.pageGaps : []
+    for (let i = 0; i < pages.length; i += 1) rawGaps.push(extraPageGap(src[i]))
+  }
+  const gaps = rawGaps.some((g) => g > 0) ? rawGaps : null
   return {
     id: typeof d.id === 'string' && d.id ? d.id : fallbackId(),
     path,
@@ -110,6 +158,7 @@ export function normalizeDoc(d) {
     /* 宽度有上下限：太窄读不了，太宽霸板（和卡片 CARD_MAX_W 同一条理由）。 */
     w: Math.min(4000, Math.max(80, Number.isFinite(w) && w > 0 ? w : DOC_DEFAULT_W)),
     pages,
+    ...(gaps ? { pageGaps: gaps } : {}),
   }
 }
 
@@ -141,5 +190,8 @@ export function serializeDoc(d) {
     y: r1(n.y),
     w: r1(n.w),
     pages: n.pages.map(([a, b]) => [r2(a), r2(b)]),
+    /* 末尾那串 0 不写：最后一页后面留多少没人看得见（那是"下一页"的地）。
+       于是"没整理过"的资料在这里少一个字段，和以前写出来的一模一样。 */
+    ...(n.pageGaps && n.pageGaps.slice(0, -1).some((g) => g > 0) ? { pageGaps: n.pageGaps.map((g) => r1(g)) } : {}),
   }
 }

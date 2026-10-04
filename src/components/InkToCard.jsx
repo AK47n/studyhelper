@@ -20,9 +20,11 @@ import { canRender, Tex } from './Tex.jsx'
  * 这条路的诉求恰好相反：**已经写了一堆，想让它变整齐**。
  * 但底线一样：卡片落在你圈的那块笔迹正上方。
  * ★ 卡片**不去盖**那几笔手写（2026-09-16 用户定的：「不用盖住，
- *   就让框贴合公式和字就行」）：它只按认出来的内容定大小，所以你的手写会露在周围。
- *   不想要那几笔，就勾面板上那个"顺便把原来的手写擦掉"——
- *   而"随时能改回手写"这条没变：不勾擦除，笔迹一个字节都不会少。
+ *   就让框贴合公式和字就行」）：它只按认出来的内容定大小，所以那几笔会露在周围。
+ * ★★ **默认把那几笔擦掉**（2026-09-22 用户改的：「美化字迹与公式卡默认是放置时
+ *   都是自动擦除原有字迹的」）：既然内容已经抄进卡片、卡片又不盖它，
+ *   那几笔就是**废墨**了，留着只会让"这一块哪个才是我要的"变糊。
+ *   想留着原笔迹就**去掉面板上那个勾**（两种都是一次 Ctrl+Z 全能退）。
  *
  * ── 会发什么出去，写在界面上 ──
  * "会发一张 320×180 的图"用的是描述函数（不是事后才知道）。
@@ -34,7 +36,15 @@ export default function InkToCard({ mode = 'text', strokes, onInsert, onClose, o
   const [result, setResult] = useState(null)
   const [draft, setDraft] = useState('') // 文字模式 = 文字本身；公式模式 = 你随手写的那串（src）
   const [font, setFont] = useState(DEFAULT_CARD_FONT)
-  const [erase, setErase] = useState(false)
+  /* ★★ **默认擦掉原笔迹**（用户 2026-09-22：「美化字迹与公式卡默认是放置时都是自动擦除
+     原有字迹的」）。在这之前默认是**不擦**，理由是"随时能改回手写"（见文件头那段）。
+     用户看过实际效果之后改的这条 —— 想清楚他为什么改：认完字、卡片落上去之后，
+     底下的手写**就是废墨**了（内容已经抄进卡片，而且卡片的尺寸是按**内容**量的、
+     根本不盖那几笔），留着它只会让"这一块到底哪个才是我要的"变糊。
+     所以现在的默认是"卡片上去 = 那一块收拾干净"，想留着原笔迹就**去掉这个勾**。
+     ⚠ 这条改动**不动**"落点"和"卡片大小"那两条规矩：卡片仍然只贴合自己的内容、
+       不盖笔迹；擦除只是把废墨收走（`insertFromInk` 那边是同一次 commit，一次 Ctrl+Z 全回来）。 */
+  const [erase, setErase] = useState(true)
   const [status, setStatus] = useState(null)
 
   const list = useMemo(() => (strokes || []).filter((s) => s && s.points && s.points.length >= 3), [strokes])
@@ -252,7 +262,7 @@ export default function InkToCard({ mode = 'text', strokes, onInsert, onClose, o
 
               <label className="bp-check">
                 <input type="checkbox" checked={erase} onChange={(e) => setErase(e.target.checked)} />
-                顺便把原来的手写擦掉（卡片只贴着认出来的字，不会盖住那几笔；Ctrl+Z 能撤销）
+                把原来的手写擦掉（**默认**；去掉这个勾就留着那几笔 —— Ctrl+Z 两种都能退）
               </label>
               <div className="wp-res-acts">
                 <span className="dim small">放上去之后还能双击进卡片继续改</span>

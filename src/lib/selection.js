@@ -16,7 +16,7 @@
  *   一起删掉 —— 那个口子的前提是"形状判读会猜错"，而形状判读整族已经删了（ADR-0001）。
  *
  * ── interface ─────────────────────────────────────────────────────────────
- *   readSelection(board, ids, links, cardIds) → {
+ *   readSelection(board, ids, links, cardIds, focusBox) → {
  *     ids, cards, count, empty, strokes, box,
  *     link,     // 框里**正好一条**连接线时是那条连接（改词那排的入口），否则 null
  *     frame,    // 框住的这些笔**正好就是**某个板框吗（是 → 浮层给「拆开这个框」）
@@ -89,7 +89,7 @@ export function pickBox(strokes, cards) {
   return box
 }
 
-export function readSelection(board, ids, links = [], cardIds = []) {
+export function readSelection(board, ids, links = [], cardIds = [], focusBox = null) {
   const set = asSet(ids)
   const cset = asSet(cardIds)
   const strokes = set.size ? (board.strokes || []).filter((s) => set.has(s.id)) : []
@@ -128,7 +128,15 @@ export function readSelection(board, ids, links = [], cardIds = []) {
     empty: set.size === 0 && cset.size === 0,
     strokes,
     cards,
-    box: pickBox(strokes, cards),
+    /* ★ `box` 有两种来源（2026-09-21）：
+     *   ① 框里有东西 → 现算（`pickBox`：笔的包围盒 ∪ 卡片可视外接框）—— 老行为；
+     *   ② 框里**什么都没有** → 用焦点里存着的那个矩形（`focusBox`）。
+     *   ② 存在的理由：用户圈住的是**课件上的一块**，框里本来就没有笔、没有卡片
+     *   （原话：「我框选的肯定是 ppt 上的一部分或者解说卡片啊，我不可能框选我自己的字迹」）。
+     *   没有它，"我圈了哪一块"就丢了，屏幕上的虚线框也是空的、「？问这里」也就永远是灰的。
+     *   ⚠ 只在**空**的时候用 `focusBox`：框里有东西时 `pickBox` 才是准的
+     *     （它把卡片的旋转/缩放外接框也并进来，比那个手拖的矩形更贴"看起来圈住了什么"）。 */
+    box: pickBox(strokes, cards) || focusBox || null,
     link,
     frame,
   }

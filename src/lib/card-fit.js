@@ -22,27 +22,35 @@
  * interface：
  *   fitPass(sample, opts)                     量一趟（纯函数）
  *     sample —— 调用方采好的**同一瞬间**的读数（见下），或者 { state: 'missing' | 'gone' | 'wait' }
- *        { state: 'ok', card, s, domW, bodyH, padX, padY, naturalW?, spillPx?, texClientW? }
- *        · card      这张卡现在的数据（要用它的 w / h / scale / x）
- *        · s         视图缩放（屏幕 = 世界 × s + t 里的 s）
- *        · domW      卡片现在的**屏幕宽度** —— 动尺子之前先拿它和数据里那个宽度对一次
- *        · bodyH     **内容**（.bd-card-body）的屏幕高度，不是卡片自己的
+ *        { state: 'ok', card, domW, bodyH, padX, padY, naturalW?, spillPx?, texClientW? }
+ *        · card      这张卡现在的数据（要用它的 w / h / x）
+ *        · domW      卡片现在的宽度 —— 动尺子之前先拿它和数据里那个宽度对一次
+ *        · bodyH     **内容**（.bd-card-body）的高度，不是卡片自己的
  *                    （卡片的 min-height 就是 h，量它等于量自己）
- *        · padX/padY 这张卡左右/上下的内边距 + 边框（屏幕像素，从 computed style 读）
+ *        · padX/padY 这张卡左右/上下的内边距 + 边框（从 computed style 读）
  *        · naturalW  内容的**自然宽度**（临时放开成 max-content 量的）
  *        · spillPx / texClientW  溢出量（scrollWidth − clientWidth）和它当时的 clientWidth
  *        opts.fitWidth=false 时不量宽度，后三个可以不给。
  *     → { state: 'gone' | 'missing' | 'wait' | 'stale' | 'done' | 'commit', w, h, need, needH, patch? }
  *       'commit' 时 patch 就是要写进那张卡的字段（含 keepCenterX 那一下的 x）
- *   createCardFitter({ sample, commit, frame, later, report, maxTries })
+ *   createCardFitter({ sample, commit, frame, later, report, maxTries, maxStale })
  *     · sample(cardId, { fitWidth }) → 上面的 sample（**唯一的 DOM 依赖**）
  *     · commit(cardId, patch)        → 把尺寸写进板（Board.jsx 走它那个 commit）
  *     · frame(fn) / later(fn, ms)    → 下一帧 / 稍后再来一趟（注入，好在自检里把握节奏）
+ *     · maxTries / maxStale          → "量不稳" / "DOM 一直没跟上"各自的重试上限（帧 / 趟）
  *     · read()                       → 现在这一版板（"把所有公式卡排上"要用它）
  *     · fontsReady()                 → 字体就绪的承诺（KaTeX 换上去宽度会变一次）
  *     · clearLater(handle)           → 撤销一个 later（默认 clearTimeout）
  *     · report(card, info)           → 诊断：把这一趟量到了什么记在 data-fit 上（自检读它）
  *     → { notify, queue, queueFormulaRefits, kick, clear, run, size }
+ *
+ *   ★★ 量纲：这一族里每一个长度都是**世界像素**（2026-09-21 第十一刀）。
+ *     卡片的 DOM 读数和 `card.w/h` 必须**同档**，`s`（视图缩放）一个字都不许进来。
+ *     为什么曾经不是、为什么那会要命 —— 见 fitPass 里那条宽度判据的长注释。
+ *     一句话：第九刀把卡片改成"世界坐标渲染 + 一层 transform"之后，
+ *     `offsetWidth` 就不再带 s 了（它本来也不受祖先 transform 影响），
+ *     而这段策略还在按屏幕像素乘 s —— 于是**每一张卡每一帧**都判 'stale'。
+ *
  *   notify({ reason })  ★ 这条政策的**唯一入口**（2026-09-17 架构 review 候选 6）：
  *     'load'（换文件 / 重载：清队 + 排上所有公式卡）· 'board-changed'（板变了：防抖
  *     `FIT_IDLE_MS` 之后再排）· 'editing-ended'（退出编辑：之前挂起的那张再来一趟）·
@@ -51,7 +59,6 @@
  */
 
 import { cardHeightFromContent, cardWidthFromContent } from './board.js'
-import { combinedScale, worldLenToScreen } from './view.js'
 
 /* 门槛与节奏 —— 只在**这一处**定，别在调用方写死。
    · ONCE：一次性拟合（刚插进来那张卡），量多准写多准。
@@ -65,6 +72,10 @@ export const FIT_TOL_ONCE = 0.6
 export const FIT_TOL_AUTO = 1.5
 export const FIT_STABLE_EPS = 1
 export const FIT_MAX_TRIES = 12
+/* "DOM 一直没跟上"的**上限**（帧数）。见 createCardFitter 里那条重试。
+   60 帧 ≈ 1 秒：紧接着提交的那一两帧本来就该是 'stale'，而"永远 stale"是病
+   （量纲一错就是它 —— 每帧全板重量，实测空转 1 秒 2625 次）。 */
+export const FIT_MAX_STALE = 60
 export const FIT_LATER_MS = 150
 /* 板子**安静下来**多久才算安静（"板变了"那条路要防抖一下再量）。
    400ms 的用意：它比"存盘 700ms"短，所以屏幕上先贴合、再落盘；
@@ -72,7 +83,7 @@ export const FIT_LATER_MS = 150
    ⚠ 这个数以前住在 Board.jsx（`REFIT_IDLE_MS` + 那个 setTimeout），2026-09-17（候选 6）
      跟着政策一起搬进来了 —— "什么时候算安静"是这一族的知识，不是调用方的。 */
 export const FIT_IDLE_MS = 400
-/* DOM 上的宽度和数据里的宽度差多少算"还没跟上"（屏幕像素）。
+/* DOM 上的宽度和数据里的宽度差多少算"还没跟上"（**世界像素**）。
    高度不一样没关系 —— 写的是 min-height，布局尺寸只由宽度决定。 */
 export const FIT_STALE_PX = 1
 
@@ -85,23 +96,32 @@ export function fitPass(sample, opts = {}) {
 
   const card = sample.card
   if (!card) return { state: 'gone' }
-  const s = Number(sample.s) || 1
-  const scale = Number(card.scale) || 1
 
   /* ★★ 坑 ①：先确认 DOM 上这张卡的宽度**已经是数据里的宽度**，再动尺子。
      宽度那一条改完要等 React 重渲染，而"量尺寸"可能在同一帧里被叫第二次
      （几处调用点都会排上 rAF）—— 那时候量到的是**上一次渲染的世界**：
      宽度还是旧的，文字就还是折成旧行数，高度会被算错并钉死。
      对不上就返回 'stale'，下一帧再来。
-     （同族的记法：**提交完不能立刻再量 —— 你量的是上一次渲染的世界。**） */
-  /* 这张卡的屏幕宽度 —— 走 view.js 那条"带倍率的世界长度"，
-     别在这里手写 `card.w * s * scale`（渲染那一处也是同一个调用，口径只有一处）。 */
-  const wantW = worldLenToScreen(card.w, combinedScale(s, scale))
+     （同族的记法：**提交完不能立刻再量 —— 你量的是上一次渲染的世界。**）
+
+     ⚠⚠ 这条判据的两边**必须同档**（2026-09-21 第十一刀，用户那句"越修越卡"）：
+         `domW` 是 `offsetWidth` 采来的，而**祖先的 transform 不影响 offsetWidth** ——
+         卡片自从按世界坐标渲染（`width: card.w`，缩放交给 .bd-cardworld 那一层）之后，
+         它量到的就是**世界像素**。这里要是还按 `card.w × s × k`（屏幕像素）去比，
+         两边只在 s×k = 1 时相等：别的档位**每一张卡每一帧**都判 stale →
+         下一帧再来 → **永远不停**，而每一趟都要 querySelector + getComputedStyle +
+         写一次 `width: max-content` 再读回来（写后读 = 强制布局）。
+         用户那张板实测：什么都不干，1 秒改 2625 次 data-fit 的其实是这一行；
+         屏幕上就是"缩放一顿一顿的"，而且越修越卡（见 README 第 58 条）。
+         ★ 所以：这里**不许**出现 s / scale / worldLenToScreen —— 世界像素进、世界像素出。
+           自检钉着这条不变式：check-board.js 的 [6l] ⑪（换个 s，结论必须一样）。 */
+  const wantW = Number(card.w) || 0
   const domW = Number(sample.domW) || 0
   if (Math.abs(domW - wantW) > FIT_STALE_PX) return { state: 'stale', wantW, domW }
 
-  /* 高度：内容多高 + 上下内边距边框，除以（视图缩放 × 卡片倍率）→ 世界坐标的 h。 */
-  const h = cardHeightFromContent(sample.bodyH, { s, scale, padPx: sample.padY })
+  /* 高度：内容多高 + 上下内边距边框，**就是**世界坐标的 h（不再除以 s × k，
+     读数和 card 本来就在同一档里 —— 见上面那条）。 */
+  const h = cardHeightFromContent(sample.bodyH, { padPx: sample.padY })
 
   let w = card.w
   let need = h
@@ -110,7 +130,7 @@ export function fitPass(sample, opts = {}) {
        字体没就绪时 max-content 可能偏小，而溢出量（scrollWidth − clientWidth）任何情况下都准。 */
     const spill = Number(sample.spillPx) || 0
     const needPx = Math.max(Number(sample.naturalW) || 0, spill ? (Number(sample.texClientW) || 0) + spill : 0)
-    w = cardWidthFromContent(needPx, { s, scale, padPx: sample.padX })
+    w = cardWidthFromContent(needPx, { padPx: sample.padX })
     need = needPx
   }
 
@@ -125,7 +145,7 @@ export function fitPass(sample, opts = {}) {
 
 /* 量尺寸的队列 + 稳定性/重试策略。所有外部动作（读 DOM、提交、调度）都是注入的。 */
 export function createCardFitter({
-  sample, commit, frame, later, report, maxTries = FIT_MAX_TRIES,
+  sample, commit, frame, later, report, maxTries = FIT_MAX_TRIES, maxStale = FIT_MAX_STALE,
   read, fontsReady, clearLater, idleMs = FIT_IDLE_MS,
 } = {}) {
   const pending = new Map()
@@ -154,6 +174,21 @@ export function createCardFitter({
         continue
       }
       if (r.state === 'missing' || r.state === 'stale') {
+        /* ★★ 坑 ⑪（2026-09-21 第十一刀）：这两个状态是**下一帧再来**的意思 ——
+           而"下一帧再来的重试"从前**没有上限**。量纲一旦错（DOM 读数是世界像素、
+           判据拿屏幕像素比），每一张卡每一帧都是 stale，于是拟合器变成一台
+           每帧把全板卡片重量一遍的机器：用户那张板空转 1 秒 2625 次 data-fit。
+           屏幕上完全看不出来 —— 只是"缩放一顿一顿的"。
+           所以：重试有头，到头**出队**并把这件事写进 data-fit（state: 'gave-up'）。
+           ⚠ 咽下去比报出来更坏：屏幕上"卡片尺寸不对"和"拟合器放弃了"长得一模一样。 */
+        opts.stale = (opts.stale || 0) + 1
+        if (opts.stale >= maxStale) {
+          if (report && snap && snap.card) {
+            report(snap.card, { state: 'gave-up', tries: opts.tries || 0, stale: opts.stale, w: r.w, h: r.h, need: Math.round((r.need || 0) * 10) / 10 })
+          }
+          pending.delete(id)
+          continue
+        }
         retryFrame = true // 还没挂上 / DOM 还没跟上上一次提交 —— 下一帧再来
         continue
       }

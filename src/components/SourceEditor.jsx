@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import katex from 'katex'
+import { katexHtml } from '../lib/renderMath.js'
 /* FIELD_KEYS 只有一份，定义在 parse.js（格式的唯一权威）。
    曾经这里也抄了一份：加字段时漏改一边，着色层就会和解析器打架
    —— 解析器认了字段，颜色却还是普通正文，看起来像"没生效"。 */
@@ -43,6 +43,28 @@ const RE_ITEM = /^(\s*)-\s+(\S.*)$/
    scripts/tail-compare.js 盯着"两层总高必须相等"。 */
 const LH_MULT = 1.95 // = styles.css 里的 --src-lh
 const CARET_WIDTH = 2
+
+/* ── 长文件：只把看得见的那几行画成"着色行" ────────────────────────────
+ * 为什么要有这一档（2026-10-01，用户：「点笔记与点白板这个切换…卡了一下得要 1，2 秒」）：
+ *   编辑区原来**整篇逐行画**。实测一次切换：`.hl-line` 50073 个 + span 50074 个
+ *   = body 里 10 万个节点 —— 界面 1.1 秒才换过去，之后还有 2.0 秒的排版长任务。
+ *   而**真正看得见的只有 30 行**。所以超过 VIRT_MIN_ROWS 行的文件改成"分块"：
+ *     · 每 CHUNK_ROWS 行一块；看得见的块（IntersectionObserver 判定）照旧逐行画；
+ *     · 看不见的块用**整块原文**撑着 —— 排版参数（字体 / 行高 / 可用宽度 / 折行规则）
+ *       和 textarea 逐字相同，所以折行点、每一行的位置、总高全都一样，
+ *       两层仍然对齐（scripts/check-srcvirt.js 盯着这条底线）。
+ *   低于这个行数**完全走老路**：真实笔记（几百行）本来也没必要分块，
+ *   而那一档的行为必须一个字节都不变。 */
+const CHUNK_ROWS = 250
+const VIRT_MIN_ROWS = 2000
+
+/** 一行的"宽度单位"：半角算 1、全角（CJK 及全角标点）算 2。
+    只用来判断"这一行放不放得下"，够用就行 —— 逐行 measureText 太贵。 */
+function rowUnits(line) {
+  let u = 0
+  for (let i = 0; i < line.length; i++) u += line.charCodeAt(i) > 0x2e7f ? 2 : 1
+  return u
+}
 
 const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])
 
@@ -132,6 +154,17 @@ export function lineIndexAt(lines, pos) {
   return 0
 }
 
+/* 光标字符偏移 → 行号（**按原文数换行**，不整篇切行）。
+   为什么不能继续用 `buildLines(el.value)`：那是整篇重新做一遍正则 + 建 5 万个对象，
+   长文件里每敲一个键、每移一次光标都要付一次（实测整篇 21ms 起跳，加上对象分配远不止）。
+   数到光标那一个字符就够了 —— 光标在文件末尾时也就几十万次比较，一次不到 1ms。 */
+export function lineNoAt(value, pos) {
+  const end = Math.min(pos, value.length)
+  let n = 0
+  for (let i = 0; i < end; i++) if (value.charCodeAt(i) === 10) n++
+  return n
+}
+
 /** 只给"光标所在这一行"做公式渲染预览 */
 export function linePreview(lineText) {
   const DEC = '\u0002'
@@ -142,12 +175,8 @@ export function linePreview(lineText) {
     if (ci % 2 === 1) {
       const latex = chunk.replaceAll(DEC, '$')
       if (!latex.trim()) return
-      let html = null
-      try {
-        html = katex.renderToString(latex, { throwOnError: false, displayMode: false, output: 'html' })
-      } catch {
-        html = null
-      }
+      /* ★ 走 `renderMath.js` 那一份（带缓存：翻页来回切，式子不重排）。 */
+      const html = katexHtml(latex, { throwOnError: false, displayMode: false, output: 'html' })
       parts.push({ type: 'math', latex, html })
     } else {
       const plain = chunk.replaceAll(DEC, '$').trim()
@@ -252,16 +281,204 @@ export default function SourceEditor({
   const [focused, setFocused] = useState(false)
   const [caret, setCaret] = useState(null)
   const [fontRatios, setFontRatios] = useState(null)
+  /* 长文件里"哪几块正看着"（IntersectionObserver 填的）。短文件一直是 null。 */
+  const [visChunks, setVisChunks] = useState(null)
 
-  const lines = useMemo(() => buildLines(text ?? ''), [text])
+  /* 行的两个来源（见文件头「长文件」那一节）：
+       · 短文件：整篇切好（`buildLines`），老样子一行不差；
+       · 长文件：只留原文 + 每行起始偏移，着色**按需**算（见 getRow）。 */
+  const rawLines = useMemo(() => String(text ?? '').split('\n'), [text])
+  const starts = useMemo(() => {
+    const out = new Array(rawLines.length)
+    let off = 0
+    for (let i = 0; i < rawLines.length; i++) {
+      out[i] = off
+      off += rawLines[i].length + 1
+    }
+    return out
+  }, [rawLines])
+  const virtual = rawLines.length > VIRT_MIN_ROWS
+  const lines = useMemo(() => (virtual ? null : buildLines(text ?? '')), [text, virtual])
+  const rowCount = lines ? lines.length : rawLines.length
+
+  /** 取第 i 行（长文件下现算这一行的着色 —— 一行的正则，几微秒） */
+  const getRow = useCallback(
+    (i) => {
+      if (lines) return lines[i]
+      const raw = rawLines[i]
+      if (raw === undefined) return null
+      const { html, kind, fieldKey } = highlightLine(raw)
+      return { i, text: raw, html, kind, fieldKey, start: starts[i] }
+    },
+    [lines, rawLines, starts]
+  )
+
+  /* ---- 一屏放得下多少字（只用来判断"这一行会不会折行"）---- */
+  const measureCtx = useRef(null)
+
+  /** textarea 内容的可用宽度（= 它 clientWidth 减左右内边距）。折行模拟要用。 */
+  const availWidth = useCallback(() => {
+    const el = textareaRef.current
+    if (!el) return 0
+    const cs = window.getComputedStyle(el)
+    return el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+  }, [textareaRef])
+
+  /** 一屏最多能放多少个"宽度单位"（canvas 只量一次半角字宽，不逐行量 ——
+      5 万行逐行 measureText 是几十万次调用，比排版本身还贵） */
+  const availUnits = useCallback(() => {
+    const el = textareaRef.current
+    if (!el) return 0
+    const w = availWidth()
+    if (!(w > 0)) return 0
+    if (!measureCtx.current) measureCtx.current = document.createElement('canvas').getContext('2d')
+    const ctx = measureCtx.current
+    const cs = window.getComputedStyle(el)
+    ctx.font = `${parseFloat(cs.fontSize) || 19.4}px ${cs.fontFamily}`
+    const mw = ctx.measureText('M').width
+    return mw > 0 ? Math.floor(w / mw) : 0
+  }, [availWidth, textareaRef])
+
+  /* ★ 分块要等 textarea 挂载完再算一次：第一次渲染时 `textareaRef.current` 还是 null，
+     `availUnits()` 量不到宽度（返回 0）→ 所有块都会被当成"会折行"（保守那一档），
+     于是整篇又排一遍 —— 白优化。挂载好之后重算，才拿得到真正的宽度。 */
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+
+  /* 分块（只长文件用）。★ 块文本**按块缓存**：打字时只有光标那一块的内容真变了，
+     其余块复用**同一个字符串对象** —— React 认引用相同就不会去动那些 DOM，
+     于是敲一个键不会被迫把整篇重排一遍。 */
+  const chunkCache = useRef(new Map())
+  const chunks = useMemo(() => {
+    if (!virtual) return null
+    const cap = availUnits()
+    const out = []
+    for (let a = 0; a < rawLines.length; a += CHUNK_ROWS) {
+      const k = a / CHUNK_ROWS
+      const b = Math.min(a + CHUNK_ROWS, rawLines.length)
+      const s = rawLines.slice(a, b).join('\n')
+      const prev = chunkCache.current.get(k)
+      const t = prev === s ? prev : s
+      chunkCache.current.set(k, t)
+      /* 这块里有没有"放不下、会折行"的行 —— 有的话就不能用「行数 × 行高」占位
+         （占位算不出折行多出来的那些高度），只能把原文交给浏览器排。
+         量不出宽度（`cap === 0`，比如还没挂载）就一律按"会折行"处理：慢一点，但不会错。 */
+      let wrap = cap <= 0
+      if (!wrap) {
+        for (let i = a; i < b; i++) {
+          if (rowUnits(rawLines[i]) > cap) {
+            wrap = true
+            break
+          }
+        }
+      }
+      out.push({ k, a, b, text: t, wrap })
+    }
+    return out
+  }, [virtual, rawLines, availUnits, fontSizePx, mounted])
+
+  /* 一行的真实高度（**量出来的**，不用 baseFont × 1.95 去算）。
+     为什么必须量：浏览器把行盒高度取整到 1/64px，5 万行各自取整之后累加出来的总高，
+     和"行数 × 算出来的行高"能差出几千 px —— 而着色层和 textarea 必须一层不差。
+     ★ 量法必须是**已经画出来的相邻两行**：这一档里"看不见的块"就是靠「行数 × 行高」
+     撑着的，行高差 0.06px，5 万行就差出 3000px（实测：错 3405px）。
+     试过塞一个空行探针进去量 —— 量出来 28.7477，而真实行是 28.6875（探针所处的
+     字体/样式时机和真实行不一致）。所以只信真实行。 */
+  const [lineH, setLineH] = useState(0)
+  /* 占位块用的行高（`0` = 还没量，先拿 baseFont 推的那个顶着）。
+     ★ 它 = 真实行高 + 残差/行，是**一次算准**的，不是一轮轮迭代出来的 ——
+       迭代那版实测抖出 107 次布局（两个 effect 互相推翻对方的基准）。 */
+  const [placeLineH, setPlaceLineH] = useState(0)
+  useEffect(() => {
+    if (!virtual) return
+    const host = innerRef.current
+    if (!host) return
+    let best = 0
+    /* 只在"不会折行、而且正被逐行画着"的块里量 —— 折行块的高度掺了折行，不能拿来当行高 */
+    for (const blk of host.querySelectorAll('.hl-chunk[data-wrap="0"].rows')) {
+      const ls = blk.querySelectorAll('.hl-line')
+      if (ls.length < 2) continue
+      const i0 = Number(ls[0].dataset.i)
+      const i1 = Number(ls[ls.length - 1].dataset.i)
+      const d = ls[ls.length - 1].getBoundingClientRect().top - ls[0].getBoundingClientRect().top
+      if (i1 > i0 && d > 0) {
+        best = d / (i1 - i0)
+        break
+      }
+    }
+    if (best > 0 && Math.abs(best - lineH) > 0.005) setLineH(best)
+    /* ⚠ 依赖里**不能**写 `fontFamily`：它是下面才定义的（TDZ，实测整页白屏）。
+       字号变化由 fontSizePx 带着走；字体晚到那一趟由下面 fonts.ready 补一次。 */
+  }, [virtual, lineH, visChunks, activeLine, fontSizePx, text])
+
+  /* 字体晚到（webfont 异步加载）会让行高变一次 —— 加载完再量一遍，
+     不然会一直用着加载前那个行高（实测错位就是从这儿来的）。 */
+  useEffect(() => {
+    if (!virtual || typeof document === 'undefined' || !document.fonts) return
+    let alive = true
+    document.fonts.ready.then(() => {
+      if (alive) setLineH(0) // 归零 = 逼上面那个 effect 重量
+    })
+    return () => {
+      alive = false
+    }
+  }, [virtual])
+
+  /* 哪几块看得见 —— 交给浏览器判（IntersectionObserver），**不自己算滚动位置**。
+     为什么不自己算：块有多高取决于折行，只有浏览器排完版才知道；自己估就等于
+     重新踩一遍"用假设代替测量"（这个文件里光标那一段记着三次）。 */
+  const chunkEls = useRef(new Map())
+  const activeChunkRef = useRef(0)
+  useEffect(() => {
+    activeChunkRef.current = Math.floor(activeLine / CHUNK_ROWS)
+  }, [activeLine])
+  useEffect(() => {
+    if (!virtual || !chunks) return
+    const root = scrollRef.current
+    if (!root || typeof IntersectionObserver === 'undefined') return
+    const io = new IntersectionObserver(
+      (entries) => {
+        setVisChunks((prev) => {
+          const next = new Set(prev || [])
+          let changed = false
+          for (const e of entries) {
+            const k = Number(e.target.dataset.k)
+            if (!Number.isFinite(k)) continue
+            if (e.isIntersecting) {
+              if (!next.has(k)) {
+                next.add(k)
+                changed = true
+              }
+            } else if (next.has(k) && k !== activeChunkRef.current) {
+              /* 光标所在那一块不加不减 —— 它随时要量光标、要高亮 */
+              next.delete(k)
+              changed = true
+            }
+          }
+          return changed ? next : prev
+        })
+      },
+      /* 上下各多留 320px：滚到之前就画好，别让人看见"没着色的一块" */
+      { root, rootMargin: '320px 0px' }
+    )
+    /* 文件变短时，多出来的块已经不在 DOM 里了 —— 别再盯着它们 */
+    for (const k of [...chunkEls.current.keys()]) {
+      if (k >= chunks.length) chunkEls.current.delete(k)
+    }
+    for (const el of chunkEls.current.values()) io.observe(el)
+    return () => io.disconnect()
+  }, [virtual, chunks])
 
   const baseFont = useMemo(() => {
     const el = textareaRef.current
     if (!el) return 19.4
     const v = parseFloat(window.getComputedStyle(el).fontSize)
     return Number.isFinite(v) ? v : 19.4
+    /* ★ `mounted` 必须在这儿：第一次渲染时 textarea 还没挂上，`el` 是 null，
+       量出来的就是兜底的 19.4 —— 而长文件那一档的"行高"是从它推出来的，
+       19.4 × 1.95 和真实的 14.7 × 1.95 差着一倍，整篇会错出几十万 px。 */
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines, fontSizePx, textareaRef])
+  }, [lines, rawLines, fontSizePx, textareaRef, mounted])
 
   const fontFamily = useMemo(() => {
     const el = textareaRef.current
@@ -289,8 +506,7 @@ export default function SourceEditor({
   const syncActive = useCallback(() => {
     const el = textareaRef.current
     if (!el) return
-    const ls = buildLines(el.value)
-    setActiveLine(lineIndexAt(ls, el.selectionStart ?? 0))
+    setActiveLine(lineNoAt(el.value, el.selectionStart ?? 0))
   }, [textareaRef])
 
   /* ---- 自绘光标（接管所有行）----
@@ -300,15 +516,6 @@ export default function SourceEditor({
        标题 29.06px  → 原生光标仍高 34、顶在 2px，而标题字形顶在 11px（差约 9px）
      textarea 的字形本来就被着色层盖住了，所以干脆连光标也自己画：
      高度取该行字体的 content area，纵向居中在行盒里，横向用 canvas 量。 */
-  const measureCtx = useRef(null)
-
-  /** textarea 内容的可用宽度（= 它 clientWidth 减左右内边距）。折行模拟要用。 */
-  const availWidth = useCallback(() => {
-    const el = textareaRef.current
-    if (!el) return 0
-    const cs = window.getComputedStyle(el)
-    return el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
-  }, [textareaRef])
 
   /* 自绘光标的横向位置：**用 Range 量真实字形**，不做任何宽度推算。
 
@@ -319,9 +526,10 @@ export default function SourceEditor({
      现在：在渲染出来的文本节点里定位第 col 个字符，用 Range 拿它的真实字形矩形，
      光标的 x 就是该字符左边界、纵向就是该字符所在的视觉行。
      和文字同一个坐标系，零假设。 */
-  const measureCaretX = useCallback((lineIdx, colInRow) => {
+  const measureCaretX = useCallback(
+    (lineIdx, colInRow) => {
     const lineEl = document.querySelector(`.hl-line[data-i="${lineIdx}"]`)
-    const row = lines[lineIdx]
+    const row = getRow(lineIdx)
     if (!lineEl || !row) return null
     const txtEl = lineEl.querySelector('.hl-txt')
     if (!txtEl) return null
@@ -372,7 +580,9 @@ export default function SourceEditor({
       visualLine = Math.max(0, Math.round((rel - (lineH - r.height) / 2) / lineH))
     }
     return { x: Math.max(0, x), visualLine }
-  }, [baseFont, lines])
+    },
+    [baseFont, getRow]
+  )
 
   const updateCaret = useCallback(() => {
     const el = textareaRef.current
@@ -380,14 +590,16 @@ export default function SourceEditor({
       setCaret(null)
       return
     }
-    const ls = buildLines(el.value)
-    const li = lineIndexAt(ls, el.selectionStart ?? 0)
-    const row = ls[li]
-    if (!row) {
+    const pos = el.selectionStart ?? 0
+    const li = lineNoAt(el.value, pos)
+    const start = el.value.lastIndexOf('\n', pos - 1) + 1
+    let end = el.value.indexOf('\n', pos)
+    if (end < 0) end = el.value.length
+    if (start > pos) {
       setCaret(null)
       return
     }
-    const col = Math.max(0, (el.selectionStart ?? 0) - row.start)
+    const col = pos - start
     const m = measureCaretX(li, col)
     // 量不到真实字形时（非浏览器环境）就退回原生光标，宁可不画也不要画错
     if (!m) {
@@ -412,7 +624,7 @@ export default function SourceEditor({
 
   useEffect(() => {
     updateCaret()
-  }, [lines, fontSizePx, fontRatios, updateCaret])
+  }, [text, fontSizePx, fontRatios, updateCaret])
 
   /* textarea 自己不滚动，所以必须把它的高度撑到和内容一样高。
      内容一变（开文件、打字、字号变化）就得重设。 */
@@ -426,7 +638,7 @@ export default function SourceEditor({
 
   useEffect(() => {
     fitHeight()
-  }, [lines, fontSizePx, fitHeight])
+  }, [text, fontSizePx, fitHeight])
 
   /* 挂载时，自己把 text 灌进 textarea。
      ── 为什么非要有这一句 ──
@@ -455,32 +667,40 @@ export default function SourceEditor({
     return () => ro.disconnect()
   }, [fitHeight, textareaRef])
 
-  // 外部请求跳行
+  /* 外部请求跳行。★ 滚动**不在这儿做**，挂个 pending 交给下面那个 effect：
+     长文件里目标行所在的那一块可能还没画出来（IntersectionObserver 刚把它标成可见），
+     此刻 DOM 里没有那个 `.hl-line`，量出来的 rect 是假的 —— 同步滚就会滚错地方。 */
+  const pendingReveal = useRef(null)
   useEffect(() => {
     if (!jumpRef) return
     jumpRef.current = (line) => {
       const el = textareaRef.current
       if (!el) return
-      const ls = buildLines(el.value)
-      const target = ls[Math.max(0, Math.min(line, ls.length - 1))]
-      if (!target) return
-      const end = target.start + target.text.length
+      const i = Math.max(0, Math.min(line, rowCount - 1))
+      const st = starts[i] ?? 0
+      const len = (rawLines[i] || '').length
       el.focus()
-      el.setSelectionRange(target.start, end)
-      setActiveLine(target.i)
-      onSelectNode && onSelectNode(target.i)
-      // 滚动容器里把这行带到中间
-      const rowEl = document.querySelector(`.hl-line[data-i="${target.i}"]`)
-      const sc = scrollRef.current
-      if (rowEl && sc) {
-        const sRect = sc.getBoundingClientRect()
-        const rRect = rowEl.getBoundingClientRect()
-        sc.scrollTop += rRect.top - sRect.top - (sc.clientHeight - rRect.height) / 2
-      }
+      el.setSelectionRange(st, st + len)
+      setActiveLine(i)
+      onSelectNode && onSelectNode(i)
+      pendingReveal.current = i
       updateCaret()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lines, onSelectNode, updateCaret])
+  }, [rowCount, starts, rawLines, onSelectNode, updateCaret])
+
+  useEffect(() => {
+    const i = pendingReveal.current
+    if (i == null) return
+    const rowEl = document.querySelector(`.hl-line[data-i="${i}"]`)
+    if (!rowEl) return // 那一块还没画出来 —— 等下一次（activeLine / visChunks 变了会再跑）
+    pendingReveal.current = null
+    const sc = scrollRef.current
+    if (!sc) return
+    const sRect = sc.getBoundingClientRect()
+    const rRect = rowEl.getBoundingClientRect()
+    sc.scrollTop += rRect.top - sRect.top - (sc.clientHeight - rRect.height) / 2
+  }, [activeLine, visChunks, rowCount])
 
   function handleClick(e) {
     editing.onClick()
@@ -496,7 +716,7 @@ export default function SourceEditor({
       // 点公式胶囊：把光标放进这段公式里，方便直接改
       const el = textareaRef.current
       const rowEl = tok.closest('.hl-line')
-      const row = rowEl ? lines[Number(rowEl.dataset.i)] : null
+      const row = rowEl ? getRow(Number(rowEl.dataset.i)) : null
       if (el && row) {
         const col = row.text.indexOf(tok.textContent)
         const pos = row.start + (col === -1 ? 0 : Math.min(col + 1, row.text.length))
@@ -509,8 +729,12 @@ export default function SourceEditor({
     refreshAll()
   }
 
-  const active = lines[activeLine]
-  const preview = useMemo(() => (active ? linePreview(active.text) : { parts: [], formulaCount: 0 }), [active])
+  const active = getRow(activeLine)
+  const activeText = active ? active.text : ''
+  const preview = useMemo(
+    () => (activeText ? linePreview(activeText) : { parts: [], formulaCount: 0 }),
+    [activeText]
+  )
   const activeLineHeight = activeLine === undefined ? baseFont * LH_MULT : lineHeightOf(activeLine)
 
   // 光标移动时把它带进视野（自绘光标 + 原生都不越界）
@@ -520,50 +744,139 @@ export default function SourceEditor({
     revealInScroller(scrollRef.current, rowEl)
   }, [activeLine, focused, caret?.key])
 
+  /* 还没量到（比如刚挂载那一帧）就用字号推一个，量到了就用量的 */
+  const baseLineHpx = lineH > 0 ? lineH : baseFont * LH_MULT
+
+  /* ★ 残差补偿：浏览器把**每一行**的行盒高度各自取整到 1/64px，取出来的整行数乘回去
+     和 textarea 排出来的总高差一点点（实测 5 万行差约 30px —— 看着小，可它全堆在末尾，
+     滚到底的时候着色层就比文字差出将近一行）。
+     修法不是去猜浏览器怎么取整，而是**量一次总高、把差摊回每一行**：
+       行高 = 量到的行高 + 残差 ÷ 占位块的总行数
+     残差随行数线性累积，所以线性摊回去正好抵消（末尾对上了，中间也不走偏）。 */
+  const phRows = useMemo(() => {
+    if (!chunks) return 0
+    let n = 0
+    for (const c of chunks) if (!c.wrap) n += c.b - c.a
+    return n
+  }, [chunks])
+  const lineHpx = placeLineH > 0 ? placeLineH : baseLineHpx
+
+  /* ★ 占位块该用多高的行高：**一次算准**。
+     浏览器把**每一行**的行盒高度各自取整到 1/64px，所以"真实行高 × 行数"和
+     textarea 排出来的总高差一点点（实测 5 万行差约 30px —— 看着小，可它全堆在末尾，
+     滚到底的时候着色层就比文字差出将近一行）。
+     不去猜浏览器怎么取整，而是把"除占位块以外"的高度量出来，剩下的按行数均分：
+       占位行高 = (textarea 内容高 − 其它块实测高) ÷ 占位行数
+     ⚠ 只能一次算准，**不能**写成一个"差多少补多少"的迭代：那两个量会互相推翻对方的
+       基准，实测抖出 107 次布局（每次都是整篇重排，比不优化还慢）。 */
+  useEffect(() => {
+    if (!virtual) return
+    const inner = innerRef.current
+    const ta = textareaRef.current
+    if (!inner || !ta) return
+    const blks = [...inner.querySelectorAll('.hl-chunk')]
+    if (!blks.length) return
+    let other = 0
+    let placeRows = 0
+    for (const b of blks) {
+      const isPlace = b.dataset.wrap === '0' && !b.classList.contains('rows')
+      if (isPlace) placeRows += Number(b.dataset.rows) || 0
+      else other += b.getBoundingClientRect().height
+    }
+    if (placeRows <= 0) return
+    const cs = window.getComputedStyle(ta)
+    const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)
+    const x = (ta.scrollHeight - pad - other) / placeRows
+    if (x > 1 && Math.abs(x - placeLineH) > 0.0005) setPlaceLineH(x)
+  }, [virtual, placeLineH, lineH, visChunks, chunks, text, fontSizePx])
+
+  /* 一行。**两种画法共用这一个**（短文件整篇画 / 长文件只画看得见的块）——
+     改着色、自绘光标、行内公式预览都只改这里，别去改下面那两个分支。 */
+  const renderLine = (l) => {
+    if (!l) return null
+    return (
+      <div
+        key={l.i}
+        data-i={l.i}
+        className={
+          'hl-line' +
+          (l.i === activeLine ? ' active' : '') +
+          (l.kind.startsWith('h') ? ' head lv' + l.kind.slice(1) : '') +
+          (l.fieldKey ? ' field k-' + l.fieldKey : '')
+        }
+      >
+        <span className="hl-txt" dangerouslySetInnerHTML={{ __html: l.html || '&nbsp;' }} />
+        {caret && caret.line === l.i && (
+          <span
+            key={caret.key}
+            className={'caret' + (focused ? ' on' : '')}
+            style={{ left: `${caret.x}px`, top: `${caret.top}px`, height: `${caret.height}px`, width: `${CARET_WIDTH}px` }}
+          />
+        )}
+        {l.i === activeLine && preview.formulaCount > 0 && (
+          <span className="line-preview" style={{ top: `${-activeLineHeight - 8}px` }}>
+            {preview.parts.map((p, i) =>
+              p.type === 'math' ? (
+                p.html ? (
+                  <span key={i} className="math" dangerouslySetInnerHTML={{ __html: p.html }} />
+                ) : (
+                  <span key={i} className="math-bad">
+                    {p.latex}
+                  </span>
+                )
+              ) : (
+                <span key={i} className="lp-text">
+                  {p.text}
+                </span>
+              )
+            )}
+          </span>
+        )}
+      </div>
+    )
+  }
+
+  /** 一块里那几行（只有长文件、而且这一块正被看着的时候才走它） */
+  const renderChunkRows = (c) => {
+    const out = []
+    for (let i = c.a; i < c.b; i++) out.push(renderLine(getRow(i)))
+    return out
+  }
+
   return (
     <div className="srcwrap">
       <div className={'srcscroll' + (focused ? ' focused' : '') + (diag ? ' diag' : '')} ref={scrollRef}>
         <div className="hl-inner" ref={innerRef}>
-          {lines.map((l) => (
-            <div
-              key={l.i}
-              data-i={l.i}
-              className={
-                'hl-line' +
-                (l.i === activeLine ? ' active' : '') +
-                (l.kind.startsWith('h') ? ' head lv' + l.kind.slice(1) : '') +
-                (l.fieldKey ? ' field k-' + l.fieldKey : '')
-              }
-            >
-              <span className="hl-txt" dangerouslySetInnerHTML={{ __html: l.html || '&nbsp;' }} />
-              {caret && caret.line === l.i && (
-                <span
-                  key={caret.key}
-                  className={'caret' + (focused ? ' on' : '')}
-                  style={{ left: `${caret.x}px`, top: `${caret.top}px`, height: `${caret.height}px`, width: `${CARET_WIDTH}px` }}
-                />
-              )}
-              {l.i === activeLine && preview.formulaCount > 0 && (
-                <span className="line-preview" style={{ top: `${-activeLineHeight - 8}px` }}>
-                  {preview.parts.map((p, i) =>
-                    p.type === 'math' ? (
-                      p.html ? (
-                        <span key={i} className="math" dangerouslySetInnerHTML={{ __html: p.html }} />
-                      ) : (
-                        <span key={i} className="math-bad">
-                          {p.latex}
-                        </span>
-                      )
-                    ) : (
-                      <span key={i} className="lp-text">
-                        {p.text}
-                      </span>
-                    )
-                  )}
-                </span>
-              )}
-            </div>
-          ))}
+          {virtual
+            ? chunks.map((c) => {
+                /* 看得见 = 浏览器说它在视野里，**或者**光标正在这一块里
+                   （那一块随时要量光标、要画高亮，不能是块没着色的原文） */
+                const show = c.k === Math.floor(activeLine / CHUNK_ROWS) || !!(visChunks && visChunks.has(c.k))
+                /* 看不见的块有两种撑法（见 chunks 里 `wrap` 那段说明）：
+                     · 会折行的块 —— 只能把原文交出去，让浏览器排（慢，但高度是准的）；
+                     · 不折行的块 —— 行数 × 实测行高，一个空盒子就够，浏览器**不用排它**。 */
+                const plain = !show && !c.wrap
+                return (
+                  <div
+                    key={c.k}
+                    data-k={c.k}
+                    data-wrap={c.wrap ? '1' : '0'}
+                    data-rows={c.b - c.a}
+                    ref={(el) => {
+                      if (el) chunkEls.current.set(c.k, el)
+                      else chunkEls.current.delete(c.k)
+                    }}
+                    /* ★ `.text` 那一档（= 把原文整块交给浏览器排）才需要左右那 3px 的
+                       补偿；逐行画的块由每一行自己去补，**块上再补一次行宽就少 6px**，
+                       折行点跟着变 —— 两层立刻错开。 */
+                    className={'hl-chunk' + (show ? ' rows' : plain ? '' : ' text')}
+                    style={plain ? { height: (c.b - c.a) * lineHpx } : undefined}
+                  >
+                    {show ? renderChunkRows(c) : plain ? null : c.text}
+                  </div>
+                )
+              })
+            : lines.map((l) => renderLine(l))}
         </div>
 
         {/* textarea 自己不滚动：高度由 JS 撑到和内容一样高，滚动交给 .srcscroll */}
@@ -598,7 +911,7 @@ export default function SourceEditor({
 
       <div className="srcfoot">
         <span className="dim small">
-          第 {activeLine + 1} / {lines.length} 行
+          第 {activeLine + 1} / {rowCount} 行
           {active?.kind?.startsWith('h') ? ` · ${active.kind.slice(1)} 级标题` : ''}
           {active?.fieldKey ? ` · 字段「${active.fieldKey}」` : ''}
         </span>

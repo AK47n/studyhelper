@@ -12,7 +12,17 @@
  * scripts/lib/board-check.js 的 withBoard 里。从前它只起浏览器、**指望着 5177 上
  * 已经有个应用在跑** —— 那是条没写出来的前提（跑不起来时报的是"没有 A− 按钮"）。
  */
+import fs from 'node:fs'
 import { withBoard } from './lib/board-check.js'
+
+/* 默认档**从源码里读**，不在这儿再写一遍 ——
+   写死一个数的话，哪天默认档一改（2026-09-22 就从 1.25 改成了 0.95），
+   这两条断言会红，而红得莫名其妙：报的是"点百分比没复位"，
+   看着像功能坏了，其实是自检自己过期了。 */
+const APP_SRC = fs.readFileSync('src/App.jsx', 'utf8')
+const DEFAULT_M = /const SCALE_DEFAULT = ([\d.]+)/.exec(APP_SRC)
+const DEFAULT_S = DEFAULT_M ? Number(DEFAULT_M[1]) : NaN
+if (!Number.isFinite(DEFAULT_S)) console.log('  ⚠ 没从 App.jsx 里读到 SCALE_DEFAULT —— 下面那两条复位断言会变成猜谜')
 
 const fails = await withBoard({ tag: 'zoomcheck', port: 5206, cdpPort: 9236 }, async ({ s, open, ok, bad }) => {
 /* ── 下面整段原来是顶层代码，挪进 withBoard 的回调里；缩进没动（少几百行假 diff）── */
@@ -21,8 +31,10 @@ const ev = (expr) => s.eval(expr)
 const send = s.send.bind(s)
 const sleep = (ms) => s.sleep(ms)
 
-// 每次都从默认值开始，免得受上次（localStorage 记着）影响
-await ev(`(() => { localStorage.removeItem('studyhelper.scale'); return 1 })()`)
+// 每次都从默认值开始，免得受上次（localStorage 记着）影响。
+// ⚠ 那条"默认档搬过家"的标记也要一起清掉（App.jsx 的 `SCALE_MOVED_KEY`）——
+//   不清的话，先跑一次自检立起了标记，之后再改默认档这段就测不出迁移那一步了。
+await ev(`(() => { localStorage.removeItem('studyhelper.scale'); localStorage.removeItem('studyhelper.scale.moved-95'); return 1 })()`)
 await open()
 
 const readS = () => ev(`getComputedStyle(document.documentElement).getPropertyValue('--s').trim()`)
@@ -90,8 +102,8 @@ console.log('\n[2] 点 A+ 真的变大、点 A− 真的变小')
   await clickSel('.bd-t.zoomish')
   await sleep(300)
   const sBack = parseFloat(await readS())
-  if (Math.abs(sBack - 1.25) < 1e-6) ok(`点百分比回到默认 ${sBack}`)
-  else bad(`点百分比没回到 125%，现在是 ${sBack}`)
+  if (Math.abs(sBack - DEFAULT_S) < 1e-6) ok(`点百分比回到默认 ${sBack}`)
+  else bad(`点百分比没回到默认 ${DEFAULT_S}，现在是 ${sBack}`)
 }
 
 console.log('\n[3] 左栏那个入口也得是双向的')
@@ -119,8 +131,8 @@ console.log('\n[3] 左栏那个入口也得是双向的')
   await clickSel('.side-zoom-val')
   await sleep(250)
   const back = parseFloat(await readS())
-  if (Math.abs(back - 1.25) < 1e-6) ok('左栏百分比按钮能复位到 125%')
-  else bad('左栏百分比按钮没复位：' + back)
+  if (Math.abs(back - DEFAULT_S) < 1e-6) ok(`左栏百分比按钮能复位到默认 ${DEFAULT_S}`)
+  else bad(`左栏百分比按钮没复位：${back}（期望 ${DEFAULT_S}）`)
 }
 
 console.log('\n[4] 键盘也能两个方向（Ctrl+Shift+加号/减号）')

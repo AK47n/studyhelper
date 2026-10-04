@@ -30,6 +30,9 @@ import { toFlat } from './geometry.js'
 import { baseName } from './paths.js'
 /* 资料（铺在画布上的 PDF，见 docs.js 的文件头）：读写都过它那一份 normalize。 */
 import { normalizeDocs, serializeDoc } from './docs.js'
+/* 「这一问落在课件的哪一块」（卡片的 `ask`，见 ADR-0006）：规范化只有 ask-region.js 那一份 ——
+   它本来就是"哪一页、页内哪一块"这件事的家。 */
+import { normalizeAsk, serializeAsk } from './ask-region.js'
 
 export const BOARD_VERSION = 4
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
@@ -121,8 +124,8 @@ export function nextCardScale(card, k) {
  *   「不用盖住，就让框贴合公式和字就行」）—— 上一版是"卡片底色不透明、正好把丑字盖住"，
  *   于是卡片的宽高里混进了一份"至少要有你圈的那块那么大"；笔迹一被擦掉、
  *   或者你只是想让它收一收，那份尺寸就变成一片莫名其妙的留白。
- *   现在两件事分开：卡片只管**贴合自己的内容**；不想要那几笔手写了，
- *   面板上那个勾（"顺便把原来的手写擦掉"）就是唯一的说法。
+ *   现在两件事分开：卡片只管**贴合自己的内容**；那几笔手写**默认擦掉**
+ *   （2026-09-22 用户定的；面板上那个勾去掉就留着 —— 见 InkToCard.jsx 的 `erase`）。
  *
  * ★ 字号按卡片里的 15px（见 styles.css 的 .bd-card）估，一行装得下几个字。
  *   用 [...str] 而不是 str.length 数字符：中文没事，但 emoji / 生僻字在
@@ -160,7 +163,18 @@ export function textCardRect(box, text) {
 
 /* 内容渲染出来多高 → 卡片的 h 该是多少（世界坐标）。
    传进来的 px 是**内容**（.bd-card-body）的高度，`padPx` 是这张卡上下内边距 + 边框
-   （屏幕像素，从 computed style 读），除以视图缩放和卡片倍率就是世界高度。
+   （从 computed style 读），除以视图缩放和卡片倍率就是世界高度。
+
+   ★★ 量纲配对（2026-09-21 第十一刀，用户那句"越修越卡"）：`px` 和 `s`/`scale`
+      必须**同一档**，两个口径都对、混起来就错：
+        · 卡片按**屏幕坐标**渲染的那条路（doc-cards.js 的 measureCard：它自己在屏幕外
+          造一张 `--bd-card-scale: s` 的卡来量）→ 传屏幕像素，**带** `s`；
+        · 卡片按**世界坐标**渲染的那条路（card-fit.js 的 fitPass：板上的真卡片，
+          `width: card.w`、缩放由 `.bd-cardworld` 的 transform 给）→ 传世界像素，
+          **不带** `s`（那里的 DOM 读数天然不带祖先的 transform）。
+      第九刀改的正是第二条路的渲染方式，而它当时还在按第一条路传参 ——
+      于是 `h` 被多除了一次 s，而且宽度那条判据永远不等（详见 card-fit.js 的 fitPass）。
+
    ★ 为什么量内容、而不是量卡片自己：卡片的 min-height 就是 h ——
      量卡片等于量它自己，96 的卡量出来永远还是 96，底下的空白永远消不掉。
      内容高度只跟宽度和字号有关、跟 h 无关，所以这个换算不会来回振荡
@@ -597,6 +611,42 @@ function normalizeCard(c) {
        认 "true" / 1 这种字符串和数字是不行的 —— 手改文件写个 "false"
        会变成"固定的"，而用户以为自己是解开。严格判 true，别的一律当没固定。 */
     locked: c.locked === true,
+    /* 讲义卡（见 rich.js）：正文按"段落 + 列表 + 行内公式"渲染，而不是纯文本。
+       和 locked 同一条判据：**严格 true 才算**，别的一律当普通文字卡 ——
+       手改文件写个 "false" 不该让一张手写笔记突然被当 Markdown 渲染。 */
+    rich: c.rich === true,
+    /* ★ 「这张是整节课的提纲」（课件整理第二趟的产出，见 doc-summary.js / Board.jsx 的
+       placeDeckCards）。**出处记在这个独立字段上，不动 `kind`** ——
+       板层的 `kind` 只管"画成什么形状"（公式 / 文字），只有两种，
+       而提纲就是一张文字卡，画法一个字都不差。`ink` 已经是同一个先例
+       （出处写在另一个字段上，不新造 kind，见 CONTEXT.md）。
+       ⚠ 它必须**显式列在这儿**：这一层是白名单，没列到字段在**写出去时就被丢掉**，
+       读回来自然是 undefined —— 表现是"文件里看不出哪张是提纲"，
+       而界面上一切正常（卡片照画、不报错）。和 rich / locked 同一条判据：严格 true。 */
+    sum: c.sum === true,
+    /* ★ 「这张是做题须知」（`rules`，2026-09-22 加的 —— 和 `sum` 是**同一个套路**的第二例，
+       见 doc-summary.js 的 RULES_KIND / Board.jsx 的 placeDeckCards）。
+       它和提纲是**两张卡**（提纲 = 形状，给学生复习；须知 = 口径，给做题那一趟看），
+       所以**各记各的字段**、不合并成一个"是整节课的东西"：
+       两者的去处不同（`collectKnowledge` 对须知要特殊对待，见 homework.js）。
+       ⚠ 同样必须**显式列在这儿**（白名单，没列到写出去就丢 —— 上面 `sum` 那句的理由）。 */
+    rules: c.rules === true,
+    /* ★ 「这张是「留到板上」落下来的答案卡」（`answer`，2026-09-24 加的 —— 和 `sum`/`rules`
+       **同一个套路**的第三例）。为什么非要有这个字段：答案卡是一张 `rich: true` 的文字卡，
+       而 `homework.js` 的 `isLessonCard` 判"算不算这节课的知识"用的正是「note + rich」——
+       于是上一题的答案会被当成"讲过的东西"喂给下一题（模型抄自己），
+       表现是"第二题的答案里混着第一题的解法"。板层 kind 只有 note/formula，
+       所以出处照样写在独立字段上，由 `isLessonCard` 明说排除。
+       ⚠ 同样必须**显式列在这儿**（白名单，没列到字段写出去时就被丢）。 */
+    answer: c.answer === true,
+    /* 「这一问落在课件的哪一块」（`ask`，见 ADR-0006）：**只有知道自己在讲第几页的卡才有**
+       —— 「留到板上」落下来的那两张（追问的答案、作业的答案，带 `region`），
+       以及课件整理贴上去的讲解卡（只带 `page`：它讲的是那一页，没被圈过哪一块）。
+       ⚠ 讲解卡这一份不是装饰：它摆在页面**旁边**，圈住它时「？问这里」全靠它认出页号。
+       认不出、或者缺页号 → null（不硬凑半个空壳）。规矩在 ask-region.js。
+       ★ 它是**出处**不是引用：资料从板上移掉之后这个字段照旧留着（"这张卡当时
+         问的是那份课件"是历史事实），界面那边认不出资料时说一句人话。 */
+    ask: normalizeAsk(c.ask),
   }
 }
 
@@ -694,6 +744,29 @@ export function serializeBoardDocument(board) {
          理由同上：老文件不该因为我们加了个功能就在 Git 里整块变脏。
          （"不固定"是绝大多数卡片的状态，写 `locked: false` 出去就是纯噪音。） */
       ...(c.locked === true ? { locked: true } : {}),
+      /* 讲义卡（正文带公式）同理：只有真是讲义卡才写。普通文字卡不写，
+         老文件因此一个字节都不动。 */
+      ...(c.rich === true ? { rich: true } : {}),
+      /* ★ 「这张是整节课的提纲」（`sum`，见 doc-summary.js）：**出处记在这个独立字段上，
+         不动 `kind`**（和 `ask` 一个道理 —— `kind` 是板子层的东西，
+         板子层的 CARD_KINDS 只有 formula/note 两种，多出来的值会被 newCard 夹回去，
+         夹回去就丢了"这张是提纲"这件事）。
+         和 rich / locked 同一条闸：不是提纲的卡一个字节都不多。 */
+      ...(c.sum === true ? { sum: true } : {}),
+      /* ★ 「这张是做题须知」（`rules`）：和 `sum` 同一个套路（出处记在独立字段上，
+         不动 kind）、同一条闸（不是须知卡的卡一个字节都不多）。见上面 normalize 那一段。 */
+      ...(c.rules === true ? { rules: true } : {}),
+      /* ★ 「这张是答案卡」（`answer`）：和 `sum`/`rules` 同一个套路、同一条闸
+         （不是答案卡的卡一个字节都不多，老文件不受影响）。见上面 normalize 那一段。 */
+      ...(c.answer === true ? { answer: true } : {}),
+      /* 「这一问落在课件的哪一块」（`ask`，见 ADR-0006 / ask-region.js）：**只有问出来的卡**
+         才有（「留到板上」落下来的那两张）。没问过的板、手写的卡一个字节都不多 ——
+         和 locked / rich 同一条闸。
+         ★ 出关走 `serializeAsk`（先量化、再按读盘的规矩验一遍），所以"写得出去"的
+           一定"读得回来"，存→读→再存逐字节一致。
+         ⚠ 条件里那两次调用是**故意的**（和上面 `condToWrite` 同一个写法）：这里宁可多算
+           一遍，也不要为了省一次而在 map 里改成一个块 —— 那会把三十多行缩进全动一遍。 */
+      ...(serializeAsk(c.ask) ? { ask: serializeAsk(c.ask) } : {}),
     })),
     /* 板框（见 normalizeFrames）：**只在真有框时才写** —— 老文件、没框过的板一个字节都不多。
        写之前把"已经不在板上的成员"滤掉（这个会话里刚擦掉的那些）：文件里不留尸体。

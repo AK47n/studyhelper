@@ -305,8 +305,51 @@ export class Session {
        ⚠ 它只当证据，别拿它当断言判据（console 文案是给人看的，随时会改）。 */
     this.logs = []
     this.onLog = null
+    /* ★ **CDP 事件**的总口子（默认没人接）：`(method, params) => …`。
+       为什么要它：有些东西在页面上根本量不出来，只能从浏览器这一侧收 ——
+       比如「点了那颗按钮，真弹了选文件那个框吗」（`Page.fileChooserOpened`，
+       见 check-deck 的 [9]）。⚠ 只当**证据**用，它替不了页面上的断言。 */
+    this.onEvent = null
+    /* ★ **原生弹框（`window.confirm` / `alert` / `prompt`）的总闸**（2026-09-23 加的）。
+       为什么必须有它：CDP 里原生框一弹出来，**页面就冻住了** —— 浏览器在等人回答，
+       而我们没有任何人在回答，于是 `Input.dispatchKeyEvent`、`Runtime.evaluate`
+       全部卡死到超时。症状极具迷惑性：报出来是"某个断言等不到"，看着像界面坏了。
+       ⚠ `Page.enable` 本来就在（见下面 `s.send('Page.enable')`），所以事件一定会来 ——
+         少了这一段就是"事件来了没人接"，框永远不关。
+
+       规矩：**默认一律回答"取消"（false）**，理由：
+         · 那些问话（`confirm`）的语义都是"要不要做这件危险事"，**取消 = 什么都不做**，
+           这是唯一能保证"自检不会因为按了确定而做出破坏性动作"的默认；
+         · 自检要验"这个闸拦住了"时，恰恰要的是"点了取消之后界面还是原样"。
+       想验"点确定会怎样"（少见）：临时把 `this.dialogAnswer = true`。
+       ★ `this.dialogs` 是**证据**（收了哪些问话的文案），供断言/报红时说清楚
+         "到底弹了什么" —— 别拿它当断言判据（文案是给人看的，随时会改）。 */
+    this.dialogAnswer = false
+    this.dialogs = []
     ws.addEventListener('message', (ev) => {
       const msg = JSON.parse(ev.data)
+      /* ⚠ `onEvent` 是**单槽**的（谁最后接谁说话）—— check-deck 的 [9] 就整段覆盖过它
+         （为了收 `Page.fileChooserOpened`），覆盖之后**弹框那一段的旁听就没了**。
+         所以这里先把它按下去、紧接着自己收弹框事件，**顺序不能反**：
+         反了的话，[9] 之后任何一个 `confirm` 都只有 `onEvent` 知道、
+         而这个总闸不知道（它不看返回值的）。 */
+      if (msg.method && this.onEvent) {
+        try {
+          this.onEvent(msg.method, msg.params)
+        } catch {}
+      }
+      /* 原生弹框：先记一笔，再**立刻回答**（不回答就冻到超时，见上面那段） */
+      if (msg.method === 'Page.javascriptDialogOpening') {
+        const p = msg.params || {}
+        this.dialogs.push({ type: p.type, message: p.message })
+        try {
+          ws.send(JSON.stringify({
+            id: ++this.id,
+            method: 'Page.handleJavaScriptDialog',
+            params: { accept: !!this.dialogAnswer },
+          }))
+        } catch {}
+      }
       if (msg.method === 'Runtime.exceptionThrown') {
         const d = msg.params.exceptionDetails
         this.exceptions.push((d.exception?.description || d.text || '').split('\n').slice(0, 2).join(' | '))

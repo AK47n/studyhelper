@@ -63,7 +63,7 @@ else ok('五档字号齐全（正文/编辑区/界面/标签/边角）')
 // 4. 各档下编辑区两层实际多大（行高 = 字号 × 1.95，所以跟着缩放）
 const base = { content: 16, editor: 15.5, ui: 13.5, key: 12.5, meta: 11.5, lhMult: 1.95 }
 const table = []
-for (const s of [0.9, 1.0, 1.25, 1.5, 1.75, 2.0]) {
+for (const s of [0.9, 0.95, 1.0, 1.25, 1.5, 1.75, 2.0]) {
   table.push({
     s,
     正文: (base.content * s).toFixed(1),
@@ -82,10 +82,25 @@ for (const r of table) {
   )
 }
 
-// 5. 正文不能小于 16px（这就是用户抱怨的点）
-const atDefault = base.content * 1.25
-if (atDefault < 16) bad(`默认缩放下正文只有 ${atDefault}px，还是太小`)
-else ok(`默认缩放下正文 ${atDefault}px（原来 14px）`)
+/* 5. 默认那一档的正文多大。
+ *
+ * ⚠ 默认档**从源码里读**，别在这儿再写一遍：写死 1.25 的话，
+ *   2026-09-22 把默认档改成 95% 时这条会红 —— 而红得不像话
+ *   （"默认缩放下正文只有 15.2px，还是太小"，可那正是用户**自己选的**档）。
+ *   和 check-zoom.js 里那两条复位断言同一条纪律。
+ *
+ * 底线当年是 16px（"正文不能小于 16px —— 这就是用户抱怨的点"）。
+ * 2026-09-22 用户主动把默认档调到 95%（正文 15.2px，「下面的功能框大小初始为95％」——
+ * 他要的是底下那条工具条小一点，而它的大小就是这个档）。所以底线跟着挪到 15px：
+ * 再小就该有人问一句"是不是手滑了"，而不是让它悄悄变过去。 */
+const APP_SRC = fs.readFileSync('src/App.jsx', 'utf8')
+const DEFAULT_M = /const SCALE_DEFAULT = ([\d.]+)/.exec(APP_SRC)
+const DEFAULT_S = DEFAULT_M ? Number(DEFAULT_M[1]) : NaN
+const MIN_BODY_PX = 15
+const atDefault = base.content * DEFAULT_S
+if (!Number.isFinite(DEFAULT_S)) bad('没从 App.jsx 里读到 SCALE_DEFAULT —— 这条断言没法判了')
+else if (atDefault < MIN_BODY_PX) bad(`默认档 ${DEFAULT_S} 下正文只有 ${atDefault.toFixed(1)}px，小于底线 ${MIN_BODY_PX}px`)
+else ok(`默认档 ${Math.round(DEFAULT_S * 100)}% 下正文 ${atDefault.toFixed(1)}px（底线 ${MIN_BODY_PX}px；当年 1.25 档是 20px）`)
 
 console.log(fails ? `\n有 ${fails} 处问题` : '\n全部通过 ✓')
 process.exit(fails ? 1 : 0)

@@ -1,46 +1,73 @@
-/* 课件整理：把模型读回来的一段 JSON 收成**知识点**，再摆成板上的**卡片**。
+/* 课件整理：把模型读回来的一段 JSON 收成**讲解**，再摆成板上的**卡片**。
  *
  * ── 这条路在整条链路上的位置 ────────────────────────────────────────────
  *   板上的一份资料（PDF/PPT，docs.js）
  *     → 你挑一段页（`DeckReview` 那个窗口里选的）
  *     → 每一页渲染成位图（doc-read.js，pdf.js 那一套和 DocLayer 同源）
- *     → 分批发给视觉模型（server-ocr.js 的 mode:'doc'）
- *     → 回来一段 JSON —— **这个文件把它收成知识点**（normalizeDocExtract）
+ *     → 逐页发给视觉模型（server-ocr.js 的 mode:'doc'）
+ *     → 回来一段 JSON —— **这个文件把它收成"讲解 + 重点 + 公式"**（normalizeDocExtract）
  *     → 你在窗口里校对/删减（DeckReview.jsx）
  *     → 落成板上的卡片（projectDeck，纯函数；写盘由 Board.jsx 做）
  *
- * ── 为什么是"知识点卡"而不是"把 PPT 抄一遍" ─────────────────────────────
- * 用户 2026-09-22 的原话：「整理出来这个 pdf/ppt 这节课的内容……把这个结果贴到白板上，
- * 这样就能让学生不从一个空的白板开始，而是从一个**已经有知识的内容**开始，
- * 写写画画只是加深当中某些点或映像」。
- * 所以卡片是**起点**不是成品：一页提炼 0~4 条（一句标题 + 一两句人话，公式单独成卡），
- * 一节课十来张 —— 留白是留给你写和画的。抄得越全，白板越挤，越回到"对着 PPT 抄"。
+ * ── 产出是"老师讲解"，不是"知识点卡"（2026-09-20 换的）──────────────────
+ * 第一版（2026-09-22）是一页提炼 0~4 条知识点卡，贴成资料右边的一长溜。
+ * 用户看完整份课件之后说：「这样子得出来的这些东西只能说是"可以读"但是完全无法自行理解……
+ * 我们的目的是让这样整理 pdf/PPT 后学生能够在摆脱老师的情况下仍然能够学习」。
+ * 所以现在一页出三样，**贴着这一页**摆（左：重点 + 公式；右：讲解）：
+ *   · `explain` —— 像老师上课那样讲这一页（为什么、符号什么意思、和上一页什么关系）；
+ *   · `points`  —— 3~5 条重点短句（复习扫一眼用的）；
+ *   · `formulas`—— 关键式子，一条一张公式卡。
+ * 一页 = 一个"讲台"：课件页在中间，右边是老师说的话，左边是板书提纲。
  *
  * ── 一条设计纪律：模型只交**内容**，位置和尺寸由本地算 ──────────────────
  * 提示词里**没有** x/y/宽高这一族字段，模型也没机会猜。它回来的是
- * `{ sections, items }`（见 DOC_PROMPT），这个文件做两件事：
+ * `{ page, unit, explain, points, formulas }`（见 DOC_PROMPT），这个文件做两件事：
  *   · `normalizeDocExtract` —— 校验 + 补齐 + 拒绝，**一个字都不编**；
- *   · `projectDeck`         —— 把知识点摆成世界坐标的卡片（尺寸是量出来的，见下）。
+ *   · `projectDeck`         —— 把讲解摆成世界坐标的卡片（尺寸是量出来的，见下）。
  * 和 board-structure.js 那条纪律同源：**能算的绝不问模型，模型只负责"读出来"**。
  *
  * ★ 尺寸不是估的，是**量**出来的（`.bd-card` 的规矩：贴合内容）。
  *   `measureDeck` 用一个藏在屏幕外的真卡片量 —— 和 fitCardSize 量的是同一种 DOM。
  *   ⚠ 它只在浏览器里能跑；这个文件其余的导出全是纯函数（自检里断言得住）。
  *
+ * ── 这个文件还管"另一张也要贴在页边的卡"（2026-09-22 加）──────────────────
+ * 「留到板上」落下来的**答案卡**（追问 / 作业的答案，见 ADR-0006）贴在**同一栏**
+ * （右栏 = 讲解那一栏），所以"这一页这一栏已经占到哪儿了"必须是**一份**判据：
+ * `columnOccupancy` 算它，`projectDeck`（贴讲解）和 `planAnswerCard`（贴答案）都问它。
+ * 各算一份的话，先留答案再整理课件，讲解会**正正压在**答案卡上 —— 而"压住"在板上
+ * 是看不出来的（你得一张张拖开才知道），正是这个文件开头那段最忌讳的东西。
+ *
  * ── 退化：模型没按格式回话时 ────────────────────────────────────────────
  * 和 board-structure.js 一样：**解析不了就报 parse 失败**，不猜、不硬凑。
- * 界面那一侧把它显示成"这一批没读懂"，让你重读那一批 —— 而不是悄悄少几张卡。
+ * 界面那一侧把它显示成"这一页没读懂"，让你重读那一页 —— 而不是悄悄少几张卡。
  */
 import { CARD_MIN_W, DEFAULT_CARD_FONT, TEXT_CARD_MAX_W, cardHeightFromContent, cardWidthFromContent, fontCss } from './board.js'
+import { DOC_PAGE_GAP } from './docs.js'
 import { worldLenToScreen } from './view.js'
+/* 「留到板上」那张答案卡的 kind（见 answer-cards.js）：它也是**讲义卡**（正文里的式子要排出来），
+   所以量尺寸那一趟得按富文本量。单向依赖：那个文件谁都不 import。 */
+import { ANSWER_KIND } from './answer-cards.js'
+/* ★ 单方向：这一份**引** doc-summary，doc-summary 一个字都不引这里。
+   为什么"哪些 kind 算讲义卡"这张表住在它那边：整节课的提纲也是其中一种，
+   而提纲那一半的东西（字段、文案、摆位）都不属于"一页一课"这一套。 */
+import { TEXT_KINDS } from './doc-summary.js'
 
 /* ── 上限（都在这一处，别在调用方散着写）──
  * 为什么要有：模型偶尔会"把整页抄成 20 条"，而白板一次贴 200 张卡就不是"起点"了，
- * 是一场灾难。超了**不静默**：报数给界面，让人知道自己少拿到了什么。 */
-export const MAX_ITEMS_PER_PAGE = 4
-export const MAX_ITEMS_TOTAL = 60
+ * 是一场灾难。超了**不静默**：报数给界面，让人知道自己少拿到了什么。
+ * ★ 2026-09-20 换了产出（老师讲解，见文件头）：一页固定是「讲解 1 + 重点 1 + 公式 ≤4」，
+ *   所以每页的上限从 4 提到 6；总上限跟着从 60 提到 400（49 页的课件 ≈ 150~250 条，
+ *   60 会把整份课件切成四段贴，而这条路的意义就是"一页一页顺着读"）。 */
+export const MAX_ITEMS_PER_PAGE = 6
+export const MAX_ITEMS_TOTAL = 400
 export const MAX_TITLE_CHARS = 60
 export const MAX_BODY_CHARS = 320
+/* 讲解卡那一段可以很长（它就是"老师讲的话"）：900 字 ≈ 400 宽的一栏排 40 行左右。
+   上限只是防疯，不是目标长度 —— 提示词里要的是 200~400 字。 */
+export const MAX_EXPLAIN_CHARS = 900
+export const MAX_POINT_CHARS = 90
+export const MAX_POINTS = 6
+export const MAX_FORMULAS = 4
 export const MAX_UNIT_CHARS = 40
 
 /* 本节这几条也是给量尺寸那一半用的：知识点卡**不是**公式卡也不是从笔迹认出来的卡，
@@ -49,7 +76,7 @@ export const MAX_UNIT_CHARS = 40
 export const NOTE_MIN_W = CARD_MIN_W
 export const NOTE_MAX_W = TEXT_CARD_MAX_W
 
-/* ══════════════════ 一、把模型的话收成知识点 ══════════════════ */
+/* ══════════════════ 一、把模型的话收成"老师讲解" ══════════════════ */
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 
@@ -93,32 +120,47 @@ function tryJson(s) {
   }
 }
 
-/** 一条知识点：**必须有内容**。标题和正文都空 → 丢掉（模型爱回空壳占位）。 */
-function normItem(raw) {
-  if (!isObj(raw)) return null
-  const kind = raw.kind === 'formula' ? 'formula' : 'note'
-  const title = oneLine(cleanText(raw.title, MAX_TITLE_CHARS))
-  const body = cleanText(raw.body, MAX_BODY_CHARS)
-  const tex = String(raw.tex == null ? '' : raw.tex).trim()
-  if (kind === 'formula') {
-    /* 公式卡只有 tex 一个字段（board.js 的 src/tex）—— 没 tex 就不是公式卡，
-       退回文字卡（宁可当一句话，也不要一张空卡）。 */
-    if (!tex) {
-      if (!title && !body) return null
-      return { kind: 'note', title, body }
-    }
-    /* 标题/正文都给公式卡用不上（卡里只有那条式子），丢的时候不报数 —— 那是设计。 */
-    return { kind: 'formula', title: '', body: '', tex: stripTexDelims(tex) }
+/** 一条重点：**必须有内容**。空的丢掉（模型爱回空壳占位）。 */
+function normPointLine(raw) {
+  if (isObj(raw)) {
+    const t = oneLine(cleanText(raw.title != null ? raw.title : raw.body, MAX_POINT_CHARS))
+    return t || ''
   }
-  if (!title && !body) return null
-  return { kind: 'note', title, body }
+  return oneLine(cleanText(raw, MAX_POINT_CHARS))
+}
+
+/** 一串重点 → 重点卡上那一栏文字（每行一个 `- `）。一条都没有 → 空串（不出这张卡）。 */
+export function pointLines(raw) {
+  const list = Array.isArray(raw) ? raw : raw == null || raw === '' ? [] : [raw]
+  const lines = []
+  for (const it of list) {
+    if (lines.length >= MAX_POINTS) break
+    const s = normPointLine(it)
+    if (s) lines.push('- ' + s)
+  }
+  return lines.join('\n')
+}
+
+/** 公式那一栏：字符串数组、`{tex}` 数组、或者一条字符串，都认。 */
+export function formulaList(raw) {
+  const list = Array.isArray(raw) ? raw : raw == null || raw === '' ? [] : [raw]
+  const out = []
+  for (const it of list) {
+    if (out.length >= MAX_FORMULAS) break
+    const tex = stripTexDelims(isObj(it) ? it.tex : it)
+    if (tex) out.push(tex)
+  }
+  return out
 }
 
 /** 公式卡里存的是**不带定界符**的 tex（和 formula.js / ocr.js 同一条规矩）。 */
 export function stripTexDelims(raw) {
   let s = String(raw == null ? '' : raw).trim()
   if (s.startsWith('$$') && s.endsWith('$$') && s.length > 4) s = s.slice(2, -2).trim()
-  else if (s.startsWith('$') && s.endsWith('$') && s.length > 2) s = s.slice(1, -2).trim()
+  /* ⚠ 这里原来是 `slice(1, -2)` —— 把 `$x^2$` 剥成 `x^`（连公式尾巴一起吃掉了）。
+     以前没人发现，是因为老提示词要的是"不带 $ 定界符"；现在模型常常顺手包一层 `$…$`，
+     2026-09-20 的自检当场把它抓出来了。**单 $ 要剥一头一尾**。 */
+  else if (s.startsWith('$') && s.endsWith('$') && s.length > 2) s = s.slice(1, -1).trim()
   s = s.replace(/^\\\[|\\\]$/g, '').replace(/^\\\(|\\\)$/g, '').trim()
   return s
 }
@@ -160,7 +202,23 @@ export function groupBySection(pageList = []) {
 }
 
 /**
- * 模型的一段回话 → 知识点骨架。
+ * 模型的一段回话 → 一页（或几页）的"老师讲解"骨架。
+ *
+ * ── 产出换了（2026-09-20）：从"知识点卡"换成"讲解 + 重点 + 公式" ─────────
+ * 用户看完整份课件整理出来的知识点卡之后说：「只能说是"可以读"，但是完全无法自行理解……
+ * 我们的目的是让这样整理 pdf/PPT 后学生能够在摆脱老师的情况下仍然能够学习」。
+ * 所以一页不再只出 0~4 条提炼，而是出三样：
+ *   · `explain`  右边那张卡：**像老师上课那样讲**（这页要解决什么、每个概念/符号什么
+ *                意思、为什么这么做、和上一页什么关系）；
+ *   · `points`   左边那张卡：3~5 条重点短句（复习扫一眼用的）；
+ *   · `formulas` 左边的公式卡（一条一张，tex 不带定界符）。
+ * 这三种在这条链路上是同一种东西（`items`），只是 `kind` 不同 —— 窗口、量尺寸、
+ * 摆版都照旧按 kind 分派，所以换产出**没有**动那几层。
+ *
+ * ★ 回话形状认两档（**为了一个字段名把整批判失败不划算**）：
+ *     ① `{ page, unit, explain, points: [...], formulas: [...] }`  ← 提示词要的这一档
+ *     ② `{ pages: [ {…①…}, {…①…} ] }`                              ← 它把好几页塞一个回包
+ *   `points` 里给字符串或 `{title, body}` 都认（老形状也吃得下，改提示词时不用同步改这里）。
  *
  * @param {string|object} raw      模型的回话（字符串或已经 parse 好的对象）
  * @param {object} opts
@@ -168,10 +226,11 @@ export function groupBySection(pageList = []) {
  *             第一页（模型报错页号是常事，不能因此把内容丢了）。
  *   · startId id 计数从哪儿起（同一个窗口里多批之间不撞号）
  * @returns {{ ok, sections, items, dropped, notes, nextId }}
- *   `sections[]` = { id, name, pages: [页号…] }
+ *   `sections[]` = { id, name, pages: [页号…] }（这一页开始的小节；空名 = 还在上一节）
  *   `items[]`    = { id, kind, title, body, tex, sectionId, page }
- *   `dropped`    = 因为"没内容 / 重复 / 超上限"丢掉的条数（**要报给用户看**）
- *   `notes[]`    = 给人看的提示（一页太多、页号对不上…）
+ *                 kind = 'explain' | 'points' | 'formula'
+ *   `dropped`    = 因为"没内容 / 超上限"丢掉的条数（**要报给用户看**）
+ *   `notes[]`    = 给人看的提示
  */
 export function normalizeDocExtract(raw, { pages = [], startId = 0 } = {}) {
   const out = { ok: false, sections: [], items: [], dropped: 0, notes: [], nextId: startId }
@@ -181,130 +240,319 @@ export function normalizeDocExtract(raw, { pages = [], startId = 0 } = {}) {
   const known = new Set((pages || []).map((n) => Number(n)))
   const fallbackPage = Number(pages && pages[0]) || 0
 
-  /* 回来的形状有三档，都认 —— **为了一个字段名把整批判失败不划算**，
-   * 因为那个形状里信息一点不少，丢掉的是钱和时间：
-   *   ① `{ page, unit, points: [...] }`               ← 提示词要的就是这个（一页一次调用）
-   *   ② `{ sections: [{ name, items: [...] }] }`      ← 它自作主张按节组织
-   *   ③ `{ pages: [{ page, unit, points: [...] }] }`  ← 它自作主张把好几页塞在一个回包里
-   * ★ 三档的共同点是"**节名 + 一串条目 + 页号**"这三样，`groups` 就是这三样的中间形状
-   *   （`name` 空 = 沿用上一节；`pageHint` 空 = 这一档没带页号，落到这一批的页上）。 */
-  const groups = []
-  if (Array.isArray(obj.sections) && obj.sections.length) {
-    for (const sec of obj.sections) {
-      if (!isObj(sec)) continue
-      const name = oneLine(cleanText(sec.name != null ? sec.name : sec.title, MAX_UNIT_CHARS))
-      const list = Array.isArray(sec.items) ? sec.items : Array.isArray(sec.points) ? sec.points : []
-      groups.push({ name, items: list })
-    }
-  } else if (Array.isArray(obj.pages) && obj.pages.length) {
-    for (const pg of obj.pages) {
-      if (!isObj(pg)) continue
-      const name = oneLine(cleanText(pg.unit != null ? pg.unit : pg.name, MAX_UNIT_CHARS))
-      const list = Array.isArray(pg.points) ? pg.points : Array.isArray(pg.items) ? pg.items : []
-      groups.push({ name, items: list, pageHint: pg.page })
-    }
-  } else if (Array.isArray(obj.points) || Array.isArray(obj.items)) {
-    /* 第一档：这一页就是整个回包（**最常见的一档** —— 提示词要的就是它）。
-       没有 `points` 字段（只有 sections）时才轮到上面那两档。 */
-    const name = oneLine(cleanText(obj.unit != null ? obj.unit : obj.name, MAX_UNIT_CHARS))
-    const list = Array.isArray(obj.points) ? obj.points : obj.items
-    groups.push({ name, items: list, pageHint: obj.page })
-  } else {
-    return out
-  }
+  const groups = Array.isArray(obj.pages) && obj.pages.length ? obj.pages.filter(isObj) : [obj]
+  if (!groups.length) return out
 
   let id = startId
   let seen = 0
-  let cur = null // 现在这一节（名字为空就沿用上一节 —— 提示词里就是这么说的）
+  let cur = null // 现在这一节（unit 为空就沿用上一节 —— 提示词里就是这么说的）
   for (const g of groups) {
-    if (g.name) {
-      cur = { id: 'ds' + (id += 1), name: g.name, pages: [] }
+    const unit = oneLine(cleanText(g.unit != null ? g.unit : g.name, MAX_UNIT_CHARS))
+    if (unit) {
+      cur = { id: 'ds' + (id += 1), name: unit, pages: [] }
       out.sections.push(cur)
     }
-    const pageHint = known.has(Number(g.pageHint)) ? Number(g.pageHint) : null
-    let onThisGroup = 0
-    for (const rawItem of g.items) {
-      if (seen >= MAX_ITEMS_TOTAL) {
-        out.dropped += 1
-        continue
-      }
-      const it = normItem(rawItem)
-      if (!it) {
-        out.dropped += 1
-        continue
-      }
-      onThisGroup += 1
-      if (onThisGroup > MAX_ITEMS_PER_PAGE) {
-        /* 一页超过 4 条：**丢掉**并报数（提示词里写了 0~4，超了就是它没守规矩）。
-           为什么不静默收下：白板的空间是有限的资源，多出来的卡会把板淹掉。 */
-        out.dropped += 1
-        continue
-      }
-      if (!cur) {
-        /* 一条知识点都不在任何一节里（模型没写 name）—— 给它一节"这一批"，
-           不然它在板上没有归属，摆出来是一堆浮着的卡。 */
-        cur = { id: 'ds' + (id += 1), name: '', pages: [] }
-        out.sections.push(cur)
-      }
-      const p = known.has(Number(rawItem && rawItem.page)) ? Number(rawItem.page) : pageHint || fallbackPage
-      if (p && !cur.pages.includes(p)) cur.pages.push(p)
-      out.items.push({
-        id: 'di' + (id += 1),
-        kind: it.kind,
-        title: it.title,
-        body: it.body,
-        tex: it.tex || '',
-        sectionId: cur.id,
-        page: p,
+    if (!cur) {
+      /* 一条都不在任何一节里（模型没写 unit）—— 给它一节"这一批"，
+         不然它在板上没有归属。第一条回话必然走到这里。 */
+      cur = { id: 'ds' + (id += 1), name: '', pages: [] }
+      out.sections.push(cur)
+    }
+    const page = known.has(Number(g.page)) ? Number(g.page) : fallbackPage
+    if (page && !cur.pages.includes(page)) cur.pages.push(page)
+
+    /* 这一页要出的三样，按"右栏（讲解）→ 左栏（重点、公式）"的顺序收。 */
+    const want = []
+    const explain = cleanText(g.explain != null ? g.explain : g.lecture, MAX_EXPLAIN_CHARS)
+    if (explain) {
+      want.push({
+        kind: 'explain',
+        title: unit ? `${unit}（第 ${page} 页）` : `第 ${page} 页 · 讲解`,
+        body: explain,
+        tex: '',
       })
+    }
+    const points = pointLines(g.points != null ? g.points : g.items)
+    if (points) want.push({ kind: 'points', title: `第 ${page} 页 · 重点`, body: points, tex: '' })
+    for (const tex of formulaList(g.formulas != null ? g.formulas : null)) {
+      want.push({ kind: 'formula', title: '', body: '', tex })
+    }
+
+    if (!want.length) {
+      /* 一页什么都没讲出来 = 封面/目录/过渡页，**不是错误**（提示词允许空回话）。
+         不报 dropped（那是"丢掉了东西"），也不出卡。 */
+      out.notes.push(`第 ${page} 页没有可讲的内容（封面/目录/过渡页？）`)
+      continue
+    }
+    for (let i = 0; i < want.length; i += 1) {
+      /* 每页最多 6 条（讲解 1 + 重点 1 + 公式 ≤4，所以正常走不到这个上限）；
+         超了**丢掉并报数**：白板的空间是有限的资源，多出来的卡会把板淹掉。 */
+      if (seen >= MAX_ITEMS_TOTAL || i >= MAX_ITEMS_PER_PAGE) {
+        out.dropped += 1
+        continue
+      }
       seen += 1
+      out.items.push({ id: 'di' + (id += 1), ...want[i], sectionId: cur.id, page })
     }
   }
 
-  /* 空节（有名字、一条知识点都没有）：留着没用 —— 板上一张只有标题的卡不是知识点。
+  /* 空节（有名字、一条都没有）：留着没用 —— 板上一张只有标题的卡不是讲解。
      但**报数**：那说明模型那一节什么都没读出来（可能是转场页），用户该知道。 */
   const used = new Set(out.items.map((x) => x.sectionId))
   const before = out.sections.length
   out.sections = out.sections.filter((s) => used.has(s.id))
-  if (before > out.sections.length) out.notes.push(`有 ${before - out.sections.length} 个小节一条知识点都没读到（多半是转场页）`)
+  if (before > out.sections.length) out.notes.push(`有 ${before - out.sections.length} 个小节一条内容都没读到（多半是转场页）`)
 
   out.nextId = id
   out.ok = out.items.length > 0 || (out.sections.length === 0 && out.dropped === 0)
   return out
 }
 
-/* ══════════════════ 二、知识点 → 板上的卡片 ══════════════════ */
+/* ══════════════════ 二、讲解 → 板上的卡片（贴着每一页摆） ══════════════════ */
 
 /* 摆版的常量 —— 都在这一处。
  * 一栏多宽、一张卡之间留多少，直接决定"贴上去像不像一份讲义"。 */
-export const CARD_GAP_X = 26 // 栏与栏之间
+export const CARD_GAP_X = 26 // 栏与栏之间（这一版按页分栏，留着给别处复用）
 export const CARD_GAP_Y = 18 // 卡与卡之间
-export const HEADING_GAP = 10 // 小节卡和它第一张卡之间
-export const GROUP_GAP = 34 // 上一节最后一张卡和下一节小节卡之间
-export const ORIGIN_GAP = 60 // 资料右边缘和第一栏之间
-/* 小节卡的高度（一行标题 + 内边距）。它是纯标题，量也只值一行。 */
+export const HEADING_GAP = 10
+export const GROUP_GAP = 34
+export const ORIGIN_GAP = 44 // 页面边缘和旁边那一栏之间
 export const HEADING_H = 34
 
-/** 一节的卡片标题（你圈的课件小节名）。空名就没有这张卡 —— 不硬凑"未命名"。 */
+/* ── 「老师讲解」那一版的版面（2026-09-20）────────────────────────────────
+ * 一页的左右两侧各一栏，**贴着这一页**：
+ *   右栏 = 讲解（一张卡：像老师上课那样几段话）；
+ *   左栏 = 重点（一张卡：几行短句）+ 公式（一条一张公式卡）。
+ * ★ 为什么左右分开、而不是像上一版那样在资料右边排成一长溜：这一版要的是
+ *   "翻到哪一页，那一页的讲解就在旁边" —— 学生顺着往下读就是一节课，没老师在也读得下去。
+ * ★ 栏宽**固定** `SIDE_W`，不按内容量：讲解是几段话，按内容量会量成一条又宽又矮的
+ *   长条（上限 TEXT_CARD_MAX_W=560），读起来像一行横幅。固定 400 宽 + 高度由内容定，
+ *   才是"一栏讲义"。量尺寸那一半靠 `measureDeck` 的 `fixedW` 参数。
+ * ★ 公式卡不固定宽（式子有长有短），按量出来的宽度**右对齐**贴在资料左边 ——
+ *   往左长不会啃到页面上。 */
+export const SIDE_W = 400
+export const PAGE_PUSH = 30 // 上一块（栏）的底和下一块之间至少留这么多
+
+/** 一页的左右两栏从哪儿起（世界坐标）。**只有这一处算** —— 摆版和自检都问它。 */
+export function sideColumns(rect, sideW = SIDE_W, gap = ORIGIN_GAP) {
+  return {
+    left: { x: Math.round(rect.x - gap - sideW), y: Math.round(rect.y) },
+    right: { x: Math.round(rect.x + rect.w + gap), y: Math.round(rect.y) },
+  }
+}
+
+/** 一页的卡片标题（你圈的课件小节名）。空名就没有这张卡 —— 不硬凑"未命名"。
+ *  ⚠ 这一版不再单出"小节卡"：小节名写进讲解卡的标题里（见 normalizeDocExtract）。 */
 export function sectionHeading(section) {
   return section && section.name ? section.name : ''
 }
 
+/** 这一页的内容高到 `blockH`（从页顶量起）时，它后面要**额外**留多少空（`pageGaps` 那一格）。
+ *  ★ 这个数**只有这一处**算：`projectDeck`（贴讲解）和 `planAnswerCard`（贴答案卡）都问它 ——
+ *    两条路各写一遍的话，"一页 = 页面 + 它两侧的卡片"这条版面立刻会分叉。
+ *  ★ 只有真的比页面还高才推下一页（`blockH > rectH`）：装得下就一个字节都不动 ——
+ *    否则"整理过的资料"会整体多出一点缝，和没整理过的看起来不一样（假 diff 的来源）。 */
+export function pageGapFor(blockH, rectH) {
+  const h = Number(blockH) || 0
+  const r = Number(rectH) || 0
+  return h > r ? Math.max(0, Math.ceil(h + PAGE_PUSH - (r + DOC_PAGE_GAP))) : 0
+}
+
 /**
- * 把知识点摆成世界坐标的卡片（**纯函数**：给同样的输入，永远摆出同样的版）。
+ * 这一份资料的每一页、左右两栏里**已经有的东西**占到哪儿了（世界坐标的底边）。
+ *
+ * ── 为什么要有它 ────────────────────────────────────────────────────────
+ * 「讲解」和「答案卡」贴在**同一栏**（右栏），而它们是两条路落下来的
+ * （课件整理 / 「留到板上」）。谁后落谁就得知道"这一栏上面已经到哪儿了"：
+ * 各算一份的话，先留一张答案卡再整理这一页，讲解会正正压在它身上 ——
+ * 而"压住"在板上是**看不出来**的（要一张张拖开才知道）。
+ *
+ * ── 一张卡归哪一页、哪一栏（一条口径，两处用）──────────────────────────
+ *   · **归哪一页**：最后一个**不高于它页顶**的那一页（卡片是从页顶往下摆的）——
+ *     和 `homework.js` 的 `spotOfCard` 同一条读法；
+ *   · **归哪一栏**：按卡片的**中心 x** 落在哪一栏的横带里（`sideColumns` 那两栏）。
+ *     按哪一条边判都会漏：讲解卡左对齐、公式卡右对齐，两边的边缘都不齐；
+ *   · 两栏都不在（卡片浮在页面上、或者被拖到很右边）→ 它不占栏，谁都不挡。
+ *
+ * @returns {Array<{left:number|null, right:number|null}>} 下标 = 页号 - 1。
+ *   `null` = 这一栏还空着（**不是 0** —— 资料的 y 可以是负的，0 会被读成"页顶之上还有东西"）。
+ */
+export function columnOccupancy({ rects = [], cards = [], sideW = SIDE_W, gap = ORIGIN_GAP, slack = 20 } = {}) {
+  const list = Array.isArray(rects) ? rects : []
+  const out = list.map(() => ({ left: null, right: null }))
+  if (!list.length) return out
+  for (const c of Array.isArray(cards) ? cards : []) {
+    if (!c) continue
+    const x = Number(c.x) || 0
+    const y = Number(c.y) || 0
+    const w = Number(c.w) > 0 ? Number(c.w) : 0
+    const h = Number(c.h) > 0 ? Number(c.h) : 0
+    let at = -1
+    for (let i = 0; i < list.length; i += 1) {
+      if (y >= (Number(list[i].y) || 0) - slack) at = i
+    }
+    if (at < 0) continue
+    const cols = sideColumns(list[at], sideW, gap)
+    const cx = x + w / 2
+    const side = cx >= cols.right.x && cx <= cols.right.x + sideW ? 'right' : cx >= cols.left.x && cx <= cols.left.x + sideW ? 'left' : ''
+    if (!side) continue
+    const bottom = y + h
+    const had = out[at][side]
+    out[at][side] = had == null ? bottom : Math.max(had, bottom)
+  }
+  return out
+}
+
+/**
+ * 「留到板上」那张卡摆哪儿（**纯函数**，ADR-0006 的决定 ②）。
+ *
+ * 贴在那一页的**右栏**（讲解那一栏），**接在已经有的东西下面**：
+ * 答案和讲解是同一栏里的话（左栏是提纲：重点、公式）。
  *
  * @param {object} arg
- *   · sections / items —— normalizeDocExtract 的产物（items 已经是你筛过的那些）
+ *   · rects / page —— 这一份资料的页面矩形 + 要贴哪一页（1 起）
+ *   · cards        —— 板上现在那些卡片（算"这一栏占到哪儿了"用；`columnOccupancy`）
+ *   · w / h        —— **量出来的**卡片尺寸（世界像素，见 measureDeck）
+ * @returns {{x,y,w,h,pageGap}|null}
+ *   `pageGap` = 这一页该有的 `pageGaps` 值。调用方**只涨不缩**地并进文件
+ *   （和 `placeDeckCards` 同一条账），并和卡片**一次 commit** 写下去 ——
+ *   分两次写的话，中间那一帧卡片和页面对不上。
+ *   null = 这一页不在 rects 里（页号对不上）。
+ */
+export function planAnswerCard({ rects = [], page = 1, cards = [], w = SIDE_W, h = 0, sideW = SIDE_W, originGap = ORIGIN_GAP } = {}) {
+  const n = Math.trunc(Number(page))
+  const rect = (rects || [])[n - 1]
+  if (!rect) return null
+  const occ = columnOccupancy({ rects, cards, sideW, gap: originGap })[n - 1] || null
+  const used = occ ? occ.right : null
+  /* 空栏 → 从页顶起；有东西 → 接在它下面留一道缝。 */
+  const y = used != null ? Math.round(used) + CARD_GAP_Y : Math.round(Number(rect.y) || 0)
+  const x = sideColumns(rect, sideW, originGap).right.x
+  return { x, y, w, h, pageGap: pageGapFor(y + (Number(h) || 0) - (Number(rect.y) || 0), rect.h) }
+}
+
+/**
+ * 两份 `pageGaps` 的差 —— **只留正的**（`pageGaps` 只涨不缩，缩了就不是"多占了空"）。
+ * 下标 = 页号 - 1，和 `pageGaps` 本身对齐。
+ *
+ * ★★ 返回的是**稠密**数组（没涨的格子是 0），长度 = max(两份的长度)。
+ *   为什么不写成"稀疏、没涨的格子不写"（第一版就是那么写的，当场就错了）：
+ *   稀疏数组的 `.length` **不等于页数** —— `[, 418]`（只有第 1 页涨了）的 length 是 1，
+ *   而"总共有几页"这件事调用方必须知道，不然就没法算前缀和
+ *   （第 3 页该挪多少？得知道第 1、2 页各涨了多少）。密度这点开销（一百来个 0）换来
+ *   "length 就是页数"这条能站住的规矩，划算。
+ */
+export function pageGapDeltas(keep = [], was = []) {
+  const a = Array.isArray(keep) ? keep : []
+  const b = Array.isArray(was) ? was : []
+  const n = Math.max(a.length, b.length)
+  const out = new Array(n)
+  for (let i = 0; i < n; i += 1) {
+    const hi = Math.max(0, Number(a[i]) || 0)
+    const lo = Math.max(0, Number(b[i]) || 0)
+    out[i] = hi > lo ? hi - lo : 0
+  }
+  return out
+}
+
+/**
+ * 某些页的 `pageGaps` 涨了 → 把**它们后面那些页上的卡片**一起往下挪同样的量。
+ *
+ * ── 为什么非要有这一步（用户 2026-09-23 报的真 bug）─────────────────────
+ *   「问这里后印上板子会让原本与ppt对齐的卡片错位」。
+ *   `pageGaps[n-1]` 一写大，`pageRects` 就把第 n 页**后面每一页**推下去
+ *   （`docs.js` 那条累加），**可那些页上的卡片是绝对坐标、谁都不会动** ——
+ *   于是页面走了、卡片留在原地，滚下去一看全对不上。
+ *
+ *   算一遍用户那张板的真数（`data/热力学与统计物理/board-近独立粒子地最概然分布.md`）：
+ *     · 第 37 页 `pageGaps[36] = 238`（讲解卡比页面高，把第 38 页推下去 238）；
+ *     · 在第 37 页「留到板上」，答案卡接在讲解卡下面 → 算出来这一页该留 **656**；
+ *     · `planAnswerCard` 那边 `max(238, 656) = 656` ⇒ **增量 418**；
+ *     · 第 38 页被推下去 418px，而它那 5 张卡一个都没动 ⇒ 错位 418。
+ *
+ * ── 判据为什么是卡片自己身上的 `ask.page`（而不是按几何猜）───────────────
+ *   `ask: { doc, page }` 是卡片**自己声明**的出处 —— 讲解 / 重点 / 公式 / 答案卡
+ *   落板时全都带着它（`Board.jsx` 的 `placeDeckCards` / `keepAnswer`），
+ *   而且「？问这里」认"这张卡讲第几页"走的也是同一个字段（`ask-region.js`）。
+ *   ⇒ 这里不再造第二份判据。按几何（卡片落在哪一栏的横带里）也能推，
+ *     但那会把用户**故意拖到别处**的卡一并推走 —— 那是另一种看不懂。
+ *   ⚠ 已知边界：**没有 `ask` 的卡**（用户自己手放、拖到页边的卡）不跟着走 ——
+ *     它们没声明自己是哪一页的，推了反而错。这一条写在这儿，别当漏洞去"修"。
+ *
+ * ★ 和 `projectDeck` 里那个 `shift` 是同一条不变量的两半：
+ *   那个管"**这一次要落**的卡"（边摆边把增量算进去），这个管"**已经在板上**的卡"。
+ *   缺了后一半就会出现上面那个 418 —— 而且是**静默**的（文件里一切正常）。
+ * ★ 挪多少是**按页累加**的（前缀和），不是"一律挪第一个增量"：
+ *   一次操作里可能好几页都涨了（课件整理一批好几页），第 5 页上的卡该挪的是
+ *   第 1~4 页涨的那些之和。⚠ 而**比 deltas 还靠后的页**（比如只涨了第 1 页，
+ *   卡却在第 9 页）该挪的是**全部累计量**，不是 0 —— 第一版这里也写错过一次
+ *   （前缀和数组查不到就当成"没涨"，于是第 3 页以后的卡一张都没动）。
+ *
+ * @param {object} arg
+ *   · cards    板上现有的卡片
+ *   · docPath  这些涨的空是**哪一份资料**的（`ask.doc` 精确比 —— 换过路径就认不出，
+ *              那时候宁可不挪，也不"猜着挪"：挪错是不可逆的版面破坏）
+ *   · deltas   `pageGapDeltas` 那份结果（下标 = 页号 - 1，稠密）
+ * @returns {{ cards: Array, moved: number }} `moved` = 挪了几张（0 = 一个字节都没动，
+ *   **连数组都不换**，免得调用方拿"引用变了"当成"真有东西动了"）。
+ */
+export function shiftLaterPageCards({ cards = [], docPath = '', deltas = null } = {}) {
+  const list = Array.isArray(cards) ? cards : []
+  const path = String(docPath || '')
+  const d = Array.isArray(deltas) ? deltas : []
+  if (!path || !d.length) return { cards: list, moved: 0 }
+  /* 前缀和：`pre[i]` = 前 i 页涨的那些之和。
+     ⇒ 第 k 页上的卡该挪 `pre[k - 1]`；而 k 超出 d 的范围时用 `pre[d.length]`（全部）——
+       "比每一页涨的地方都靠后的页"要被**整笔**推下去，不是不动。 */
+  const pre = [0]
+  for (let i = 0; i < d.length; i += 1) pre.push(pre[i] + (Number(d[i]) || 0))
+  const total = pre[pre.length - 1]
+  if (!total) return { cards: list, moved: 0 }
+  let moved = 0
+  const out = list.map((c) => {
+    if (!c) return c
+    const ask = c.ask
+    if (!ask || ask.doc !== path) return c
+    const k = Math.trunc(Number(ask.page)) || 0
+    if (!(k > 1)) return c
+    const dy = pre[Math.min(k - 1, pre.length - 1)] || 0
+    if (!(dy > 0)) return c
+    moved += 1
+    return { ...c, y: (Number(c.y) || 0) + dy }
+  })
+  if (!moved) return { cards: list, moved: 0 }
+  return { cards: out, moved }
+}
+
+/**
+ * 把讲解摆成世界坐标的卡片（**纯函数**：给同样的输入，永远摆出同样的版）。
+ *
+ * @param {object} arg
+ *   · pages  [{ page, items }] —— 按页号排好的条目（items 已经是你筛过的那些）
  *   · sizes  Map<itemId, {w,h}> 或 { [itemId]: {w,h} } —— measureDeck 量的尺寸。
  *            **缺尺寸的条目会被跳过**（宁可少一张卡，也不要一张按估的尺寸摆下去的卡 ——
  *            估错高度 = 卡片互相压住，而"压住"在板上是看不出来的，得拖开才知道）。
- *   · origin {x,y} —— 从哪儿开始摆。调用方给"资料右边"或"视野中心"。
- *   · columnH 一栏最高多少（世界像素）。超了就开下一栏。
- * @returns {{ cards, placed, skipped, bounds }}
- *   `cards` 每一项 = { itemId, kind, sectionId, x, y, w, h, text?, src?, tex? }
- *   —— 已经是**卡片的内容**（不是知识点），Board.jsx 直接把它喂给 newCard。
+ *   · rects  每一页的世界矩形（`docs.js` 的 `pageRects(doc)`，下标 = 页号 - 1）
+ *   · occupied `columnOccupancy` 的那份结果 —— 这一页两栏里**已经有的东西**（答案卡、
+ *            你自己拖过去的卡）占到哪儿了。**不传 = 老行为**（两栏都从页顶起），
+ *            一个字节都不变。
+ *   · existing 资料里**已经写着的** `pageGaps`（'' / 不传 = 没整理过）。
+ *            ★ 为什么必须传（2026-09-22 修的一个真 bug）：`rects` 是从 `pageRects(doc)`
+ *              来的，**里面已经含着这些空** —— 而下面那个 `shift` 是"自己从头累加一遍"，
+ *              不减去已经含着的部分就等于**加了两遍**。症状是**安安静静**的：
+ *              在一份整理过的课件上再点一次「课件整理」（默认全选，正是最常见的用法），
+ *              第 2 页开始的讲解卡一页比一页低（第 2 页 +370、第 3 页 +740……），
+ *              于是"第 7 页的讲解"贴在"第 5 页"旁边 —— 正是用户当年报的那句话。
+ *              （现场探针：`npm run diag:deckshift`，一步就能看见。）
+ *   · sideW / gap —— 见上面那两个常量
+ * @returns {{ cards, placed, skipped, noRect, bounds }}
+ *   `cards` 每一项 = { itemId, kind, side, page, x, y, w, h, text?, src?, tex? }
+ *   —— 已经是**卡片的内容**（不是条目本身），Board.jsx 直接把它喂给 newCard。
+ *   ⚠ `page`（1 起）是这张卡在讲第几页：落卡那一侧要把它写进卡片的 `ask`，
+ *     不然"圈住讲解卡 → 问这里"认不出该问哪一页（ask-region.js 的第 ② 条路）。
+ *   `noRect` = 没有页面矩形、因而摆不了的页号（资料不在板上 / 页号越界）。
  */
-export function projectDeck({ sections = [], items = [], sizes = null, origin = { x: 0, y: 0 }, columnH = 1500 } = {}) {
+export function projectDeck({ pages = [], sizes = null, rects = [], sideW = SIDE_W, gap = ORIGIN_GAP, occupied = null, existing = null } = {}) {
   const sizeOf = (id) => {
     if (!sizes) return null
     const s = typeof sizes.get === 'function' ? sizes.get(id) : sizes[id]
@@ -317,102 +565,97 @@ export function projectDeck({ sections = [], items = [], sizes = null, origin = 
     return { w: Math.min(NOTE_MAX_W, Math.max(NOTE_MIN_W, w)), h }
   }
 
-  /* ★ 一条知识点挂在哪一节：认 `sectionId` **和** `unitId` 两个字段名。
-     前者是 normalizeDocExtract 的叫法、后者是 groupBySection 的叫法（界面上用的是它）。
-     ⚠ 2026-09-22 自检抓到的第三处真 bug：两个名字各叫各的，于是**每一条都落进 loose**、
-     小节名一个字都不上板 —— 而屏幕上看起来只是"少了一张卡"，不报任何错。
-     这里认两个名字，比"让调用方记得改名"稳（这条数据要在 UI 和落卡之间走一趟）。 */
-  const unitOf = (it) => (it.sectionId != null ? it.sectionId : it.unitId)
-
-  /* 每一节有哪几条（按 sections 的顺序 = 模型给的顺序 = 讲课顺序）。 */
-  const bySection = new Map(sections.map((s) => [s.id, []]))
-  const loose = []
-  for (const it of items) {
-    if (!it) continue
-    const bucket = bySection.get(unitOf(it))
-    if (bucket) bucket.push(it)
-    else loose.push(it)
-  }
-
-  /* 没有小节归属的（手改过 items？）挂在最后一节后面，别丢。 */
-  const groups = sections.map((s) => ({ section: s, items: bySection.get(s.id) || [] }))
-  if (loose.length) groups.push({ section: { id: null, name: '' }, items: loose })
-
-  /* ══ 摆版是**两趟**（2026-09-22 自检在真浏览器里抓到的两处 bug 促成的）══
-   * 一趟的写法（边摆边判"放得下吗"）在两个地方都是错的，而且都不报错：
-   *   ① 决定"这张卡放哪一栏"必须在写坐标**之前** —— 否则换栏之后那张卡
-   *      留在上一栏的底部，屏幕上多出一张**孤零零的卡**（小节名漂在栏底最好认）；
-   *   ② 换栏之后**不能**把这张卡按上一栏的 y 写进去 —— 新栏的 y 是栏顶。
-   * 所以：**先把"每一栏装哪些卡"算出来，再按算好的分组写坐标。**
-   * 这样"同一栏里谁的 y 在谁下面"在结构上就成立了（不必再靠一条条判断去维持），
-   * 小节卡和它的知识点也允许被分栏切开（一节 20 条时这是必然会发生的）。 */
-  const colMax = Math.max(200, Number(columnH) || 1500)
-  let skipped = 0
-  const columns = []
-  {
-    let col = { items: [], h: 0 }
-    columns.push(col)
-    for (const g of groups) {
-      const list = g.items.filter((it) => sizeOf(it.id))
-      skipped += g.items.length - list.length
-      if (!list.length) continue
-      const name = sectionHeading(g.section)
-      const headW = sizeOf(list[0].id).w
-      /* 一节的开头：先量"开这一节要多少地方"（小节卡 + 那条缝），再看要不要换栏。 */
-      const openH = name ? HEADING_H + HEADING_GAP : 0
-      if (col.items.length && col.h + GROUP_GAP + openH + sizeOf(list[0].id).h > colMax) {
-        col = { items: [], h: 0 }
-        columns.push(col)
-      }
-      if (name) {
-        col.items.push({ kind: 'head', text: name, sectionId: g.section.id, w: headW, h: HEADING_H })
-        col.h += HEADING_H + HEADING_GAP
-      }
-      for (let i = 0; i < list.length; i += 1) {
-        const size = sizeOf(list[i].id)
-        const sep = i === 0 ? 0 : CARD_GAP_Y
-        if (col.items.length && col.h + sep + size.h > colMax) {
-          /* 这一条放不进这一栏 → 另起一栏。**小节卡跟着过去**：
-             一节被切开之后，新栏顶上那个名字就是"接着上一栏的那一节"。 */
-          col = { items: [], h: 0 }
-          columns.push(col)
-          if (name) {
-            col.items.push({ kind: 'head', text: name, sectionId: g.section.id, w: headW, h: HEADING_H })
-            col.h += HEADING_H + HEADING_GAP
-          }
-          col.items.push({ kind: 'item', item: list[i], size })
-          col.h += size.h
-          continue
-        }
-        col.items.push({ kind: 'item', item: list[i], size })
-        col.h += sep + size.h
-      }
-      /* 下一节和这一节之间留一条大缝。 */
-      col.h += GROUP_GAP - CARD_GAP_Y
-    }
-  }
-
-  /* 写坐标：每一栏从 (x, y0) 往下排，栏宽 = 这一栏最宽的那张卡。 */
-  const x0 = Math.round(Number(origin.x) || 0)
-  const y0 = Math.round(Number(origin.y) || 0)
   const cards = []
-  let x = x0
-  for (const col of columns) {
-    if (!col.items.length) continue
-    const w = Math.round(col.items.reduce((m, it) => Math.max(m, it.kind === 'head' ? it.w : it.size.w), 0))
-    let y = y0
-    for (const c of col.items) {
-      if (c.kind === 'head') {
-        cards.push({ itemId: null, sectionId: c.sectionId, x: Math.round(x), y: Math.round(y), w, h: c.h, text: c.text, heading: true })
-        y += c.h + HEADING_GAP
-        continue
-      }
-      const it = c.item
-      const extra = it.kind === 'formula' ? { src: it.tex, tex: it.tex } : { text: cardText(it) }
-      cards.push({ itemId: it.id, sectionId: unitOf(it) || null, x: Math.round(x), y: Math.round(y), w: c.size.w, h: c.size.h, ...extra })
-      y += c.size.h + CARD_GAP_Y
+  const pageGaps = [] // 每一页后面额外留多少空（下标 = 页号 - 1）—— 见下面那段
+  let skipped = 0
+  const noRect = []
+
+  /* ══ 一页 = 一个"讲台"：页面在中间，左右两栏**都从这一页的顶开始** ══
+   *
+   * ★ 为什么不是"两栏各自往下流"（第一版就是这么写的，2026-09-20 用户当场指出问题）：
+   *   讲解常常比页面还高（页面 540 世界像素，400 多字的讲解 ≈ 900），一页的讲解流下去，
+   *   下一页的卡片就被顶得更低 —— **滚下去以后卡片和页面对不上**，学生看到的是
+   *   "第 7 页的讲解挨着第 5 页"。用户原话：「每一页卡片过长会让下一张卡片被顶到更加
+   *   靠下的位置，这样就会让每页 ppt 并没有对齐每个卡片」。
+   * ★ 所以：每页两栏都从**页顶**起，这一页占多高按它自己的内容算 ——
+   *   比"页面 + 那道缝"高出来的部分，当作**这一页后面额外留的空**报出去（pageGaps），
+   *   由调用方写进资料（docs.js 的 pageGaps）把下面那一页推开。
+   *   于是"页面 + 它两侧的讲解"永远是一个整体，往下滚就是一页一课。
+   * ⚠ 位置必须是**加过前面那些空之后**的 y：所以这里自己从头累加一遍 shift，
+   *   而不是直接用 rects[i].y（那个 y 是"没被推开时"的位置）。
+   *   ★★ 但 `rects` 是 `pageRects(doc)` 来的，**里面已经含着资料里写着的那些空** ——
+   *      所以 shift 累加的必须是**增量**（`existing` 那个参数，见上面的说明），
+   *      累加绝对值就等于把已经含着的空又加了一遍。
+   * ⚠ 和"页面矩形只由 docs.js 的 pageRects 算"不冲突：pageRects 仍然是唯一定义，
+   *   这里只是为**还没写进文件的新空**预算一遍（写完盘之后两者必然一致）。 */
+  let shift = 0
+  const topOf = []
+  const list = [...(pages || [])].filter(Boolean).sort((a, b) => Number(a.page) - Number(b.page))
+  for (const p of list) {
+    const n = Number(p.page)
+    const all = p.items || []
+    const items = all.filter((it) => it && sizeOf(it.id))
+    skipped += all.length - items.length
+    const r = rects[n - 1]
+    if (!r) {
+      noRect.push(n)
+      continue
     }
-    x += w + CARD_GAP_X
+    const top = Math.round(r.y + shift)
+    topOf[n - 1] = top
+    const cols = sideColumns(r, sideW, gap)
+    /* ★ 两栏各自的**起点**：页顶，或者"这一栏上面已经有的东西"之下（`occupied`）。
+       ⚠ 没有这一条的话，"先点「留到板上」留了一张答案卡、再整理这一页"会让讲解卡
+         **正正压在**答案卡上 —— 而"压住"在板上是看不出来的（见 columnOccupancy）。
+       `-Infinity` = 这一栏空着（不是 0：资料的 y 可以是负的）。 */
+    const occ = (occupied && occupied[n - 1]) || null
+    const below = (v) => (v == null ? -Infinity : Math.round(Number(v)) + CARD_GAP_Y)
+    const startR = Math.max(top, below(occ && occ.right))
+    const startL = Math.max(top, below(occ && occ.left))
+    /* 右栏：讲解（一条一张，正常就一张） */
+    let rightH = 0
+    let ry = startR
+    for (const it of items.filter((x) => x.kind === 'explain')) {
+      const sz = sizeOf(it.id)
+      /* ⚠ `page` 要跟着卡交出去：落卡的那一侧靠它把"这张卡讲的是第几页"写进卡片的
+         `ask`（圈住讲解卡 → 「？问这里」才知道该问哪一页，见 ask-region.js 第 ② 条路）。 */
+      cards.push({ itemId: it.id, kind: it.kind, side: 'right', page: n, x: cols.right.x, y: Math.round(ry), w: sz.w, h: sz.h, text: cardText(it) })
+      ry += sz.h + CARD_GAP_Y
+    }
+    /* 这一栏占多高**从页顶量起**（含它上面那段已经被占掉的）—— 下一页推多少看的是它。 */
+    if (ry > startR) rightH = ry - CARD_GAP_Y - top
+    /* 左栏：重点在上、公式在下 */
+    let leftH = 0
+    let ly = startL
+    for (const it of items.filter((x) => x.kind !== 'explain')) {
+      const sz = sizeOf(it.id)
+      cards.push({
+        itemId: it.id,
+        kind: it.kind,
+        side: 'left',
+        page: n,
+        x: Math.round(r.x - gap - sz.w), // 右对齐到资料左边：宽公式往左长，不啃页面
+        y: Math.round(ly),
+        w: sz.w,
+        h: sz.h,
+        ...(it.kind === 'formula' ? { src: it.tex, tex: it.tex } : { text: cardText(it) }),
+      })
+      ly += sz.h + CARD_GAP_Y
+    }
+    if (ly > startL) leftH = ly - CARD_GAP_Y - top
+    /* 这一页占多高 = 页面、左栏、右栏里最高的那个。
+       ★ 只有真的比页面还高才推下一页（`pageGapFor` 里那条）：装得下就一个字节都不动 ——
+         否则"整理过的资料"会整体多出一点缝，和没整理过的看起来不一样（假 diff 的来源）。
+       推的量 = 高出来的部分 + 一点缝，减去这一页本来就有的页间距。 */
+    const blockH = Math.max(r.h, leftH, rightH)
+    /* 这一页最后该有多少空 = 算出来的和**文件里已经写着的**取大的那个
+       （调用方也是这么并的：`pageGaps` 只涨不缩 —— 地占下了就留着）。
+       ⚠ 两件事必须一起做：报出去的 `pageGaps` 是 `keep`，而 `shift` 累加的是
+          `keep - was` 这个**增量**。写成 `shift += extra` 就是上面那个加两遍的 bug。 */
+    const was = Math.max(0, Number((existing && existing[n - 1]) || 0) || 0)
+    const keep = Math.max(was, pageGapFor(blockH, r.h))
+    if (keep > 0) pageGaps[n - 1] = keep
+    if (keep !== was) shift += keep - was
   }
 
   const bounds = cards.length
@@ -423,10 +666,12 @@ export function projectDeck({ sections = [], items = [], sizes = null, origin = 
         h: Math.max(...cards.map((c) => c.y + c.h)) - Math.min(...cards.map((c) => c.y)),
       }
     : null
-  return { cards, placed: cards.length, skipped, bounds }
+  /* 加过新空之后的页面矩形：**只给调用方挪视野用**（写盘的是 pageGaps 本身）。 */
+  const shiftedRects = rects.map((r, i) => (topOf[i] != null ? { ...r, y: topOf[i] } : r))
+  return { cards, rects: shiftedRects, pageGaps, placed: cards.length, skipped, noRect, bounds }
 }
 
-/** 一条知识点在一张文字卡里长什么样。
+/** 一条内容在一张文字卡里长什么样。
  *  ★ 为什么标题和正文合成**一张**卡而不是两张：板书是一小块一小块的，
  *    两张卡（标题一张、说明一张）在板上是并排/上下两张要你拖到一起 —— 而它们本来就是一件事。
  *    所以这里拼成一段文本，中间空一行（板上的卡片是 pre-wrap，空行就是段落）。 */
@@ -474,8 +719,11 @@ export function makeMeasureHost(wrap) {
 
 /** 把一段内容塞进屏幕外那张卡里量一次，返回 { w, h, padX, padY }（屏幕像素）。
  *  `content` 决定卡里装什么：文字卡给一个 `.bd-note`，公式卡给一个装了 KaTeX 的 `.bd-tex`。
- *  `maxW` 是这张卡的世界宽度上限（文字卡和公式卡各有一个，见 measureDeck）。 */
-function measureCard(host, { kind, content, s, maxW }) {
+ *  `maxW` 是这张卡的世界宽度上限（文字卡和公式卡各有一个，见 measureDeck）。
+ *  `fixedW`（世界像素，>0 时生效）**跳过"按内容量宽"那一步**，直接按这个宽度量高度 ——
+ *  「老师讲解」那一版要的是**一栏讲义**（固定 400 宽、高度随内容），
+ *  而不是一条按内容撑开的长横幅（那是上一版知识点卡的量法）。 */
+function measureCard(host, { kind, content, s, maxW, fixedW }) {
   const el = document.createElement('div')
   el.className = 'bd-card ' + (kind === 'formula' ? 'is-formula' : 'is-note')
   /* 位置/尺寸都钉死：位置在屏幕外（host 已经挪走了），宽度先给一个"自然宽"的测量值，
@@ -493,7 +741,8 @@ function measureCard(host, { kind, content, s, maxW }) {
     parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth)
   /* 自然宽 → 夹进上下限 → 按**夹完的宽度**再量一次高度（宽度一窄，行数就变多）。
      两次量都在同一帧里做，屏幕上什么都看不见（host 在屏幕外、visibility: hidden）。 */
-  const w = Math.min(Number(maxW) || NOTE_MAX_W, Math.max(NOTE_MIN_W, cardWidthFromContent(bodyEl.offsetWidth, { s, scale: 1, padPx: padX })))
+  const natural = cardWidthFromContent(bodyEl.offsetWidth, { s, scale: 1, padPx: padX })
+  const w = Number(fixedW) > 0 ? Math.round(Number(fixedW)) : Math.min(Number(maxW) || NOTE_MAX_W, Math.max(NOTE_MIN_W, natural))
   el.style.width = worldLenToScreen(w, s) + 'px'
   const h = cardHeightFromContent(bodyEl.offsetHeight, { s, scale: 1, padPx: padY })
   host.removeChild(el)
@@ -503,17 +752,27 @@ function measureCard(host, { kind, content, s, maxW }) {
 const clampNoteW = (w) => Math.min(NOTE_MAX_W, Math.max(NOTE_MIN_W, Number(w) || NOTE_MIN_W))
 
 /**
- * 量出每一条知识点该占多大的卡（世界像素）。
+ * 量出每一条内容该占多大的卡（世界像素）。
  *
  * @param {object} arg
- *   · items   —— normalizeDocExtract 出来的知识点
+ *   · items   —— normalizeDocExtract 出来的条目（讲解 / 重点 / 公式）
  *   · renderTex(tex) → DOM 节点 | null  公式卡的渲染（App 层有 KaTeX，这里不引它）
+ *   · renderRich(text) → HTML 串  讲义卡正文的渲染（`rich.js` 的 richHtml，App 传进来）。
+ *                 **必须和 Card 那一侧同一份**，否则量出来的高度和真实渲染对不上。
  *   · host / s —— 量尺寸的台子；s 是**视图缩放**（和 card-fit.js 那个 s 一个意思）
+ *   · fixedW  —— 文字卡的固定世界宽度（「老师讲解」那一版给 SIDE_W=400）。
+ *                ⚠ 只对文字卡生效：公式卡按式子自己的宽度量（见 projectDeck 的右对齐）。
  * @returns {{ sizes: Map, note, formula, missing }}
  *   `missing` = 量不出来的（公式渲染失败 / 空内容）—— 那些**不会**被摆到板上，
  *   调用方要把它报出来（宁可少一张卡，也不要一张内容被裁掉的卡）。
  */
-export function measureDeck({ items = [], renderTex = null, host, s = 1, maxNoteW = NOTE_MAX_W } = {}) {
+export function measureDeck({ items = [], renderTex = null, renderRich = null, host, s = 1, maxNoteW = NOTE_MAX_W, fixedW = 0 } = {}) {
+  /* ★ 讲义卡（正文里能带 `$…$` 的那几种）**只有一处**说 —— 住 doc-summary.js，
+     因为"整节课的提纲"也是其中一种。这里从前是手写的
+     `it.kind === 'explain' || it.kind === 'points' || it.kind === ANSWER_KIND`，
+     加第四种时必然有一处忘掉，而忘掉的表现是"提纲里那几行式子按纯文本量了高度，
+     摆下去就压住旁边那张卡"—— 板上"压住"看不出来，得拖开才知道。 */
+  const rich = new Set([...TEXT_KINDS, ANSWER_KIND])
   const sizes = new Map()
   let note = 0
   let formula = 0
@@ -541,8 +800,17 @@ export function measureDeck({ items = [], renderTex = null, host, s = 1, maxNote
     }
     node.className = 'bd-note'
     node.style.fontFamily = fontCss(DEFAULT_CARD_FONT)
-    node.textContent = text
-    sizes.set(it.id, measureCard(host, { kind: 'note', content: node, s: scale, maxW: maxNoteW }))
+    /* ★ 讲义卡（讲解 / 重点，以及「留到板上」落下来的**答案卡**）：正文里夹着 `$…$` 的式子，
+       要**按排出来的样子**量 —— 纯文本量一遍、真实渲染又是另一套 DOM 的话，
+       高度差一截，贴上去就互相压住。
+       所以这里向调用方要"和 Card 那一侧同一个 richHtml"（见 rich.js 的文件头）。 */
+    if (renderRich && rich.has(it.kind)) {
+      node.classList.add('rich')
+      node.innerHTML = renderRich(text)
+    } else {
+      node.textContent = text
+    }
+    sizes.set(it.id, measureCard(host, { kind: 'note', content: node, s: scale, maxW: maxNoteW, fixedW }))
     note += 1
   }
   return { sizes, note, formula, missing }
@@ -615,6 +883,35 @@ export function pagesLabel(pages) {
   }
   runs.push(start === prev ? `${start}` : `${start}-${prev}`)
   return '第 ' + runs.join('、') + ' 页'
+}
+
+/* `parsePageSpec` 的**反方向**：`[1,2,3,8]` → `"1-3、8"`。
+ * ★ 为什么要有它（2026-09-21）：选页那个框里"整段往前/往后挪一页"那两颗，
+ *   挪完要把那句话**写回输入框** —— 输入框是唯一的实情，不能另存一份"挪了几页"
+ *   （那样输入框和预览会各说一套）。写成什么样只有这一处说了算：连续的并成区间，
+ *   和 `pagesLabel` 是同一副样子（人读得出来的那副）。
+ * ⚠ 排好序、去重 —— 用户可能打 "8,3,3"。 */
+export function formatPageSpec(pages) {
+  const list = [...new Set((pages || []).map((n) => Math.trunc(Number(n))).filter((n) => n > 0))].sort((a, b) => a - b)
+  const runs = []
+  let start = null
+  let prev = null
+  for (const n of list) {
+    if (start === null) {
+      start = n
+      prev = n
+      continue
+    }
+    if (n === prev + 1) {
+      prev = n
+      continue
+    }
+    runs.push(start === prev ? `${start}` : `${start}-${prev}`)
+    start = n
+    prev = n
+  }
+  if (start !== null) runs.push(start === prev ? `${start}` : `${start}-${prev}`)
+  return runs.join('、')
 }
 
 /* 屏幕上的页码选择那一套（"1-5、8、10-12" → [1,2,3,4,5,8,10,11,12]）。

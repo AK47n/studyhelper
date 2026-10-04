@@ -28,7 +28,7 @@
 import { withBoard } from './lib/board-check.js'
 import { parseBoardDocument, serializeBoardDocument } from '../src/lib/board.js'
 
-/* 四档纸的"应该长什么样"。和 Board.jsx 的 PAPERS / styles.css 的 .paper-* 一一对应。
+/* 四档纸的"应该长什么样"。和 lib/skin.js 的 PAPERS / styles.css 的 .paper-* 一一对应。
  * gradients：computed backgroundImage 里应该出现几个 gradient（纯白是 0 = none）。
  * tile：**世界坐标**里的格距（0 = 没有底纹）。屏幕格距必须是 tile × 视图缩放 ——
  *       这一条就是"字在纸上"的全部内容，也是"背景不动"那个 bug 的判据。 */

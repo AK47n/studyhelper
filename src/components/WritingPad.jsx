@@ -304,6 +304,9 @@ export function OcrSettings({ onClose, onSaved, flash }) {
   const [dsBase, setDsBase] = useState('')
   const [model, setModel] = useState('')
   const [boardModel, setBoardModel] = useState('')
+  /* 「课件整理：同时发几路」（2026-09-22）。它**不是密钥那一类的字段** ——
+     服务端会夹到 1~12，写不出数就回到默认 6（见 server-ocr.js 的 normalizeConfig）。 */
+  const [docConcurrency, setDocConcurrency] = useState('')
   const [advanced, setAdvanced] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState(null)
@@ -318,6 +321,7 @@ export function OcrSettings({ onClose, onSaved, flash }) {
       setDsBase(s.dsBase || '')
       setModel(typeof s.model === 'string' ? s.model : '')
       setBoardModel(typeof s.boardModel === 'string' ? s.boardModel : '')
+      setDocConcurrency(s.docConcurrency ? String(s.docConcurrency) : '')
     })
   }, [])
 
@@ -330,6 +334,9 @@ export function OcrSettings({ onClose, onSaved, flash }) {
     if (model.trim()) patch.model = model.trim()
     // boardModel **总是**带上（它不是密钥，写空 = 清掉专用档、回落到普通模型）
     patch.boardModel = boardModel.trim()
+    /* 并发也**总是**带上：写不出数（空、乱打）就发 NaN —— JSON 里是 null，
+       服务端 normalizeConfig 把它当"没写"，回到默认 6。 */
+    patch.docConcurrency = Number(docConcurrency)
     const r = await ocrSaveConfig(patch)
     if (!r || !r.ok) {
       flash((r && r.error) || '保存失败', 'err')
@@ -337,9 +344,12 @@ export function OcrSettings({ onClose, onSaved, flash }) {
     }
     setStatus(r)
     setToken('')
+    /* 存完把框里的数换成服务端**认下来的那个**（夹过上限、或者本来就写不出数）——
+       不回填的话，界面上显示的和真正在用的会是两个数。 */
+    setDocConcurrency(r && r.docConcurrency ? String(r.docConcurrency) : '')
     onSaved?.(r)
     flash('存好了')
-  }, [token, provider, turbo, base, dsBase, model, boardModel, flash, onSaved])
+  }, [token, provider, turbo, base, dsBase, model, boardModel, docConcurrency, flash, onSaved])
 
   const doTest = useCallback(async () => {
     setTesting(true)
@@ -429,6 +439,24 @@ export function OcrSettings({ onClose, onSaved, flash }) {
                 <div className="dim small">
                   「▤ 收成笔记」的整板转录是这条链路里最难的活（整页手写 + 要出结构），
                   想给它配更强的一档就填这儿；美化手写、认公式照样用上面的普通档。
+                </div>
+              </div>
+              <div className="wp-field">
+                <label>课件整理：同时发几路</label>
+                <input
+                  className="wp-edit"
+                  value={docConcurrency}
+                  spellCheck={false}
+                  inputMode="numeric"
+                  placeholder="默认 6"
+                  onChange={(e) => setDocConcurrency(e.target.value)}
+                />
+                <div className="dim small">
+                  「✧ 课件整理」是一页一次调用，几页同时发。**这个数只影响快慢**：
+                  一次调用的用时实测在 0.5 秒到 16 秒之间（差别全在模型想多久上），
+                  所以 49 页从串行的十几分钟压到 6 路的一分多钟。写不出数就回到 6；最多 12。
+                  ⚠ 代价是「■ 停止」拦不住**已经发出去**的那几次 —— 路数越多，
+                  按下停止那一刻已经花掉的钱越多。
                 </div>
               </div>
               <div className="wp-field">

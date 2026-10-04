@@ -21,7 +21,7 @@
 import fs from 'node:fs'
 import { withBoard } from './lib/board-check.js'
 import { buildSeedBoard } from '../src/seed-board.js'
-import { serializeBoardDocument } from '../src/lib/board.js'
+import { serializeBoardDocument, newBoard, newCard } from '../src/lib/board.js'
 /* 视图映射只有一份实现（src/lib/view.js）：自检和 app 走同一个 module ——
    这样"卡片 CSS 位置"和"canvas 变换"这两条路才算被同一个公式钉住。 */
 import { worldToScreen } from '../src/lib/view.js'
@@ -33,7 +33,7 @@ const SHOT = process.env.SHOT_PATH || '.cache/board-shot.png'
    以前它指向 data/ 里一个手工留下的 board-test.md，两头都错（文件不在 → 整条跑不了；
    文件在 → 每跑一次就被改一次，卡片从 5 张掉到 3 张）。
    现在夹具由 withBoard 造、应用从 ?file= 直接开它，用户的板一个字节都不会被读。 */
-const fails = await withBoard(
+const fails1 = await withBoard(
   {
     tag: 'check',
     port: 5205,
@@ -341,6 +341,16 @@ console.log('\n[6] ★ 对齐：墨迹和卡片必须落在同一处')
       id: card.dataset.cardId,
       left: parseFloat(card.style.left),
       top: parseFloat(card.style.top),
+      /* ★ 2026-09-21：还要读**浏览器真正把它摆在哪**（相对舞台）。
+         卡片那两行现在是世界坐标，屏幕位置在 .bd-cardworld 那一层 ——
+         "module 算的 == 卡片 style.left"那条老判据在世界坐标下必然对不上。
+         ⚠ 这段是**模板字符串里面**（外层是反引号）：注释里一个反引号都不能有，
+           有就把模板字符串提前截断，报出来是"某个变量没定义"（我这次又踩了一次）。 */
+      rel: (() => {
+        const r = card.getBoundingClientRect()
+        const s = document.querySelector('.bd-stagewrap').getBoundingClientRect()
+        return { x: r.left - s.left, y: r.top - s.top }
+      })(),
     }
   })()`)
   const checkAlign = async (tag) => {
@@ -357,13 +367,30 @@ console.log('\n[6] ★ 对齐：墨迹和卡片必须落在同一处')
       bad(`${tag}：DOM 里那张卡 ${a.id} 不在夹具文件里`)
       return
     }
-    const want = worldToScreen({ x: card.x, y: card.y }, view)
-    const dx = Math.abs(want.x - a.left)
-    const dy = Math.abs(want.y - a.top)
-    if (dx <= 1 && dy <= 1) {
-      ok(`${tag}：module 算出的卡片位置 = CSS 实际位置（Δ ${dx.toFixed(2)} / ${dy.toFixed(2)} px，视图 s=${view.s.toFixed(3)} tx=${view.tx.toFixed(1)}）`)
+    /* ★★ 判据（2026-09-21 第十一刀换过一次，原因值得记）：
+       老判据比的是"module 算出的屏幕点" vs "卡片 style.left/top" —— 成立的前提是
+       "卡片自己按屏幕坐标摆"（第九刀之前就是这样）。第九刀把卡片改成世界坐标渲染
+       （`width/left` 都是世界像素，缩放交给 `.bd-cardworld` 那一层的 transform）之后，
+       `style.left` 就是世界坐标，这个比较**必然对不上**（实测 177 vs 60）——
+       而它红了没人看，正是那个性能回归溜过去的原因之一（README 第 58 条）。
+       新判据把同一件事问得更直：**两层坐标不许分家**，那就分两半各自钉住 ——
+         · 卡片自己那两行必须是**世界坐标**（一个 s 都不许乘进去）；
+         · 浏览器**真正摆出来的屏幕位置**必须等于 module 算出的那个点
+           （view 来自 canvas 的 `data-xform`，是墨迹那条独立的路）。
+       两边都成立 ⇔ 只有一份映射，而且它和浏览器实际布局一致。 */
+    const dWorld = Math.max(Math.abs(a.left - card.x), Math.abs(a.top - card.y))
+    if (dWorld <= 1) {
+      ok(`${tag}：卡片自己那两行是世界坐标（left/top ${a.left}/${a.top} ≈ 文件里的 ${card.x}/${card.y}）`)
     } else {
-      bad(`${tag}：module 算 ${JSON.stringify({ x: +want.x.toFixed(2), y: +want.y.toFixed(2) })} vs CSS ${JSON.stringify({ x: a.left, y: a.top })} —— 有人抄了一份映射`)
+      bad(`${tag}：卡片自己那两行不是世界坐标（${a.left}/${a.top} vs 文件里的 ${card.x}/${card.y}）—— 有人把"世界 → 屏幕"抄了一份到卡片身上`)
+    }
+    const want = worldToScreen({ x: card.x, y: card.y }, view)
+    const dx = Math.abs(want.x - a.rel.x)
+    const dy = Math.abs(want.y - a.rel.y)
+    if (dx <= 1.5 && dy <= 1.5) {
+      ok(`${tag}：module 算出的屏幕点 = 浏览器实际摆出来的位置（Δ ${dx.toFixed(2)} / ${dy.toFixed(2)} px，视图 s=${view.s.toFixed(3)} tx=${view.tx.toFixed(1)}）`)
+    } else {
+      bad(`${tag}：module 算 ${JSON.stringify({ x: +want.x.toFixed(2), y: +want.y.toFixed(2) })} vs 浏览器实测 ${JSON.stringify({ x: +a.rel.x.toFixed(2), y: +a.rel.y.toFixed(2) })} —— 两层坐标分家了`)
     }
     return view
   }
@@ -410,10 +437,53 @@ console.log('\n[6] ★ 对齐：墨迹和卡片必须落在同一处')
   if (Math.abs(geo.bitmap[0] - expectW) <= 2) ok(`canvas 位图和 CSS 尺寸吻合（${geo.bitmap[0]} ≈ ${geo.inkCss[0]}×${geo.dpr}），不会糊`)
   else bad(`canvas 位图 ${geo.bitmap[0]} 与 CSS ${geo.inkCss[0]}×dpr=${expectW} 不符，画面会糊`)
 
-  if (geo.cardRel && geo.cardStyle && Math.abs(geo.cardRel[0] - geo.cardStyle[0]) <= 2 && Math.abs(geo.cardRel[1] - geo.cardStyle[1]) <= 2) {
-    ok(`卡片坐标基准一致（style ${JSON.stringify(geo.cardStyle)} ≈ 实测相对容器 ${JSON.stringify(geo.cardRel)}）`)
+  /* ★ 2026-09-21（第十一刀）：老判据是"卡片 style.left/top ≈ 实测相对容器" ——
+     那是**屏幕坐标时代**的算法（那时卡片的 left 就是屏幕位置）。第九刀之后卡片的
+     left/top 是**世界坐标**，实测位置是"世界 × `.bd-cardworld` 的 transform"，
+     两者只在 s=1 且 tx=ty=0 时相等 —— 于是它必然红，而它红了没人看，
+     正是那个性能回归溜过去的原因之一（README 第 58 条）。
+     新的判据是**每一张卡都不许分家**，而且分两半各自钉住（比老判据更强：
+     老判据只在第一张卡上量，且把两个坐标系混在一个等式里）：
+       · 卡片自己那两行必须是世界坐标（等于夹具文件里的 x/y）；
+       · 世界 → 屏幕那一份**只许有一处**：屏幕位置 = 世界 × 卡片容器那条 transform。 */
+  const coord = await s.eval(`(() => {
+    const cw = document.querySelector('.bd-cardworld')
+    const m = /translate\\(\\s*([-\\d.eE]+)px[,\\s]+([-\\d.eE]+)px\\s*\\)\\s*scale\\(\\s*([-\\d.eE]+)\\s*\\)/.exec(cw ? cw.style.transform || '' : '')
+    if (!m) return { err: '读不出 .bd-cardworld 的 transform：' + JSON.stringify(cw ? cw.style.transform : null) }
+    const s = parseFloat(m[3]), tx = parseFloat(m[1]), ty = parseFloat(m[2])
+    const wrap = document.querySelector('.bd-stagewrap').getBoundingClientRect()
+    return {
+      s, tx, ty,
+      cards: [...document.querySelectorAll('.bd-card')].map((c) => {
+        const r = c.getBoundingClientRect()
+        const wx = parseFloat(c.style.left), wy = parseFloat(c.style.top)
+        return {
+          worldX: wx, worldY: wy,
+          dx: r.left - (wrap.left + wx * s + tx),
+          dy: r.top - (wrap.top + wy * s + ty),
+        }
+      }),
+    }
+  })()`)
+  if (coord.err) {
+    bad('卡片坐标基准量不了：' + coord.err)
   } else {
-    bad(`卡片基准不一致：style ${JSON.stringify(geo.cardStyle)} vs 实测 ${JSON.stringify(geo.cardRel)} —— 两层坐标又分家了`)
+    const docAll = (await read()).cards || []
+    const offWorld = coord.cards.filter((c) => {
+      const d = docAll.find((x) => Math.abs(x.x - c.worldX) < 0.5 && Math.abs(x.y - c.worldY) < 0.5)
+      return !d
+    })
+    if (!offWorld.length) {
+      ok(`每一张卡自己那两行都是世界坐标（${coord.cards.length} 张，逐张和夹具文件里的 x/y 对上）`)
+    } else {
+      bad(`有 ${offWorld.length} 张卡自己那两行不是世界坐标：${JSON.stringify(offWorld.slice(0, 3))} —— 有人把"世界 → 屏幕"抄了一份到卡片身上`)
+    }
+    const offScreen = coord.cards.filter((c) => Math.abs(c.dx) > 1.5 || Math.abs(c.dy) > 1.5)
+    if (!offScreen.length) {
+      ok(`世界 → 屏幕只有一处：每张卡的实测位置 = 世界 × 卡片容器那条 transform（s=${coord.s.toFixed(3)} tx=${coord.tx.toFixed(1)}，${coord.cards.length} 张）`)
+    } else {
+      bad(`卡片实测位置和"世界 × 卡片容器 transform"对不上：${JSON.stringify(offScreen.slice(0, 3))} —— 两层坐标又分家了`)
+    }
   }
 
   /* ★ 笔迹必须**画穿一张卡片**才能验对齐。
@@ -593,3 +663,157 @@ console.log('\n[9] ★ 页面上不许有报错')
   }
 }
 })
+
+/* ── 补交互死角①：板框标题被卡片压住也要点得到 ──────────────────────────────
+   关系面板 2026-09-19 删掉之后，板框标题（.bd-frame-t）是选中/拖动/改名的**唯一把手**。
+   但标题画在卡片下面（DOM 顺序：框先于卡片），一张卡压在标题条上就把它整个盖住 →
+   这个框永久选不中、拖不动、改不了名。styles.css 里给 .bd-frame-t / .bd-frame-in
+   加了 z-index:7（> 卡片的 auto），只抬这一颗、框线仍在卡片下面。
+   这条自检造“一张卡压住标题”的场景，用 elementFromPoint + 真鼠标验证标题仍可点、点它真选中框。 */
+const fails2 = await withBoard(
+  {
+    tag: 'frame-cover',
+    port: 5207,
+    cdpPort: 9237,
+    make: () => {
+      const b = newBoard('自检夹具：板框标题被卡片压住')
+      /* A 是框的成员（决定框的位置）；B 故意压在框的左上角、盖住标题条，
+         但不进框（不撑大框）。B 的覆盖区要大到容纳标题（标题在框顶边上方约 23px 屏幕处）。 */
+      const A = newCard('formula', 400, 400, { w: 240, h: 100 })
+      A.id = 'covA'; A.src = 'B = mu0 I / (2 pi r)'; A.tex = 'B = \\frac{\\mu_{0} I}{2 \\pi r}'
+      const B = newCard('note', 300, 250, { w: 380, h: 200 })
+      B.id = 'covB'; B.text = '这张卡故意压在板框标题上，用来复现「标题点不到」的死角'
+      b.cards = [A, B]
+      b.frames = [{ id: 'fcover', title: '这一节被压住', cards: ['covA'] }]
+      b.view = { s: 1, tx: 0, ty: 0 }
+      return serializeBoardDocument(b)
+    },
+  },
+  async ({ s, ok, bad, open }) => {
+    console.log('\n[frame-cover] 板框标题被卡片压住也要点得到')
+    await open()
+    const probe = await s.eval(`(() => {
+      const t = document.querySelector('.bd-frame-t')
+      if (!t) return { ok: false, why: 'no .bd-frame-t（框没渲染出标题把手）' }
+      const r = t.getBoundingClientRect()
+      const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2)
+      const cards = Array.prototype.slice.call(document.querySelectorAll('.bd-card'))
+      const cover = cards.find(function (c) {
+        const b = c.getBoundingClientRect()
+        return cx >= b.left && cx <= b.right && cy >= b.top && cy <= b.bottom
+      })
+      const top = document.elementFromPoint(cx, cy)
+      const cls = top ? (typeof top.className === 'string' ? top.className : (top.className && top.className.baseVal) || '') : ''
+      return {
+        ok: true, cx: cx, cy: cy,
+        coveredByCard: !!cover,
+        topClass: cls,
+        topIsTitle: !!(top && top.classList && top.classList.contains('bd-frame-t')),
+      }
+    })()`)
+    if (!probe.ok) {
+      bad('找不到板框标题把手（' + (probe.why || '') + '）')
+    } else {
+      if (probe.coveredByCard) ok('复现了「卡片压住标题」的场景（标题落在某张卡片的包围盒里）')
+      else bad('夹具没造出"卡片压住标题"—— 死角条件没复现，这条断言没有意义')
+      if (probe.topIsTitle) ok('标题被压住时仍是顶层元素（elementFromPoint 命中 .bd-frame-t，没被卡片抢走）')
+      else bad('标题被卡片压住了：elementFromPoint 命中的是「' + probe.topClass + '」而不是 .bd-frame-t —— 框选不中 / 拖不动 / 改不了名')
+      /* 真鼠标点一下标题：验证“点它真的选中框”，而不是穿透到下面的卡片。 */
+      await s.mouse(probe.cx, probe.cy)
+      await s.sleep(160)
+      const sel = await s.eval(`(() => { const f = document.querySelector('.bd-frame.on'); return f ? (f.getAttribute('data-frame-id') || '') : '' })()`)
+      if (sel) ok('真鼠标点标题 → 框被选中（.bd-frame.on，data-frame-id=' + sel + '）')
+      else bad('真鼠标点标题没选中框（可能穿透到了卡片）')
+    }
+  },
+)
+
+const fails3 = await withBoard(
+  {
+    tag: 'link-cond',
+    port: 5208,
+    cdpPort: 9238,
+    make: () => {
+      const b = newBoard('自检夹具：连接线条件口子')
+      const A = newCard('note', 200, 200, { w: 200, h: 100 })
+      A.id = 'kA'; A.text = '甲'
+      const B = newCard('note', 600, 400, { w: 200, h: 100 })
+      B.id = 'kB'; B.text = '乙'
+      /* 连接线必须用「带端点的那一笔」来表示（应用里唯一的表示法）：
+         stroke 两头的点各自落进一张卡，buildLinks 就派生出一条 declared:false 的连接，
+         带 ids:['lnk1']、strokeId:'lnk1' —— 框住这笔时 readSelection 才能从 linkMap
+         里把它捞成 selLink，.bd-inklink 才会浮出来。手写 board.links=[{id:'rel1',...}]
+         会被 normalizeLinks 丢掉 id/ids，而且宣告的连接 strokeId 为 null（links.js:754）——
+         框选那一笔根本捞不到它。
+         画的连接，cond 记在那一笔上（stroke.cond），不是 board.links[i].cond。
+         ★ newCard 的 x/y 是**中心**（board.js:268 存的是左上角 = x-w/2），所以端点要落进
+           卡中心才稳：甲中心 (200,200)、乙中心 (600,400)。 */
+      const stroke = { id: 'lnk1', points: [200, 200, 0.5, 600, 400, 0.5], w: 3, color: '#888', tool: 'pen' }
+      b.cards = [A, B]
+      b.strokes = [stroke]
+      b.view = { s: 1, tx: 0, ty: 0 }
+      return serializeBoardDocument(b)
+    },
+  },
+  async ({ s, ok, bad, open, untilFile }) => {
+    console.log('\n[link-cond] 连接线浮层里的「不算 / 就是它 / 改回」三颗条件按钮')
+    await open()
+    const rect = await s.eval(`(() => { const c = document.querySelector('canvas'); const r = c.getBoundingClientRect(); return { left: r.left, top: r.top, w: r.width, h: r.height } })()`)
+    if (!rect || !rect.w) { bad('量不到画布位置（canvas 没找到）'); return }
+    /* 先切到「⬚ 框选」工具：点工具条上 data-tool="select" 那颗。
+       默认是画笔，不切的话拖出来的是一笔、不是框选（selLink 自然出不来）。 */
+    const toolBtn = await s.eval(`(() => { const b = document.querySelector('[data-tool="select"]'); if (!b) return null; const r = b.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) } })()`)
+    if (!toolBtn) { bad('找不到「⬚ 框选」工具按钮（[data-tool="select"]）—— 没法切到框选工具'); return }
+    await s.mouse(toolBtn.x, toolBtn.y)
+    await s.sleep(200)
+    /* 大框框住整块画布：夹具里只有这一笔墨迹，必然被框住 → 连接线浮层出现。 */
+    const x0 = rect.left + 12, y0 = rect.top + 12, x1 = rect.left + rect.w - 12, y1 = rect.top + rect.h - 12
+    await s.mouse(x0, y0, { steps: 6, dx: x1 - x0, dy: y1 - y0 })
+    const probe = await s.eval(`(() => {
+      const link = document.querySelector('.bd-inklink')
+      const acts = document.querySelector('.bd-inkacts')
+      const labels = link ? Array.prototype.map.call(link.querySelectorAll('button'), (b) => b.textContent.trim()) : []
+      const actLabels = acts ? Array.prototype.map.call(acts.querySelectorAll('button'), (b) => b.textContent.trim()) : []
+      return { hasLink: !!link, linkLabels: labels, hasActs: !!acts, actLabels: actLabels }
+    })()`)
+    if (!probe.hasLink) {
+      bad('框住连接线后没出现 .bd-inklink 浮层（条件按钮没地方挂）')
+      if (probe.hasActs) bad('  （但 .bd-inkacts 出现了 —— 框选生效，只是 selLink 没成立；当前选区动作：' + probe.actLabels.join('、') + '）')
+      else bad('  （连 .bd-inkacts 都没有 —— 框选没生效，工具没切到框选？）')
+      return
+    }
+    const want = ['不算', '就是它', '改回']
+    const missing = want.filter((w) => !probe.linkLabels.includes(w))
+    if (missing.length) bad('连接线浮层缺了条件按钮：' + missing.join('/') + '（当前：' + probe.linkLabels.join(',') + '）')
+    else ok('连接线浮层出现三颗条件按钮（不算 / 就是它 / 改回）—— 从关系面板请回后的新家')
+
+    const clickBtn = async (label) => {
+      const pos = await s.eval(`(() => {
+        const link = document.querySelector('.bd-inklink')
+        if (!link) return null
+        const b = Array.prototype.slice.call(link.querySelectorAll('button')).find((x) => x.textContent.trim() === ${JSON.stringify(label)})
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }
+      })()`)
+      if (!pos) return false
+      await s.mouse(pos.x, pos.y)
+      return true
+    }
+
+    if (await clickBtn('不算')) {
+      /* drawn 连接：cond 记在那一笔上（stroke.cond），不是 board.links。 */
+      const r1 = await untilFile((d) => (d.strokes || []).some((s) => s.id === 'lnk1' && s.cond === 'none'), { what: '点击「不算」后 stroke[lnk1].cond=none', timeout: 6000 })
+      if (r1.ok) ok('点「不算」→ 这一笔 cond=none（画出来的连接，条件记在笔上，写进了文件）')
+      else bad('点「不算」后盘上 stroke[lnk1].cond 不是 none（按钮没接到 vetoCond）')
+    } else bad('点不到「不算」按钮')
+
+    if (await clickBtn('改回')) {
+      const r2 = await untilFile((d) => { const s = (d.strokes || []).find((x) => x.id === 'lnk1'); return !s || !s.cond }, { what: '点击「改回」后 stroke[lnk1].cond 清空', timeout: 6000 })
+      if (r2.ok) ok('点「改回」→ cond 清空（回到按位置读）')
+      else bad('点「改回」后 stroke[lnk1].cond 还在（按钮没接到 clearCond）')
+    } else bad('点不到「改回」按钮')
+  },
+)
+
+process.exitCode = (fails1 || fails2 || fails3) ? 1 : 0

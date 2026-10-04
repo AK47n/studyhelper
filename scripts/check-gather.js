@@ -33,6 +33,10 @@ await withBoard(
     await open()
 
     // [1] 工具条上那颗按钮看得见、点得到
+    // ⚠ 它 2026-09-26 收进了「⋯ 更多」菜单 —— elementFromPoint 只有菜单开着才命中，
+    //   所以先点开菜单（菜单常驻 DOM，eval click 永远有效；check-deck 同款前置）。
+    await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && !m.classList.contains('on')) m.click(); return 1 })()`)
+    await s.sleep(150)
     const btn = await s.eval(`(() => {
       const b = document.querySelector('[data-tool="gather"]')
       if (!b) return null
@@ -143,6 +147,9 @@ await withBoard(
     fs.writeFileSync(NOTE_PATH, SENTINEL, 'utf8')
 
     const gatherAgain = async () => {
+      /* 「▤ 收成笔记」在「⋯ 更多」菜单里 —— 先开菜单再量坐标（见上面 [1] 的说明）。 */
+      await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && !m.classList.contains('on')) m.click(); return 1 })()`)
+      await s.sleep(150)
       const btn = await s.eval(`(() => {
         const b = document.querySelector('[data-tool="gather"]')
         if (!b) return null

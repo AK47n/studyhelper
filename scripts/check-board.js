@@ -81,7 +81,7 @@ import { CHIP_MARGIN_BOTTOM, CHIP_MARGIN_TOP, CHIP_MARGIN_X, chipPlacement } fro
    那一节拿假 target 就能钉住整张表（见 [6t]）。 */
 import {
   FOCUS_NONE, PAPER_SELECTOR, beginEdit, clearInkFocus, deleteIntent, editingCardId, editingFrameId, endEdit,
-  escapeIntent, focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkCards, focusInkIds, isTextField, onPaper,
+  escapeIntent, focusCard, focusCardId, focusFrame, focusFrameId, focusInk, focusInkBox, focusInkCards, focusInkIds, isTextField, onPaper,
 } from '../src/lib/focus.js'
 /* 复制 / 粘贴（框住一块 → 装进剪贴板 → 落到任何一块板上）在 clipboard.js ——
    三条规矩（只装内容不装关系 / 落点用相对偏移 / 贴出来是新 id）见 [6w]。 */
@@ -1810,6 +1810,61 @@ console.log('\n[6l] 卡片量尺寸（`createCardFitter`）：DOM 读数是注�
     if (!left.length) ok('★ Board.jsx 里没有这套时序的残留（防抖 / 开跑 / 排公式卡都在 card-fit.js 一处）')
     else bad(`Board.jsx 里还留着：${left.join(' / ')} —— 这条政策应该只有 card-fit.js 一处`)
   }
+
+  /* ⑪ ★★ 量纲：拟合的结果**和视图缩放无关**（2026-09-21「越修越卡」那一刀）。
+     根是这么长出来的：卡片改成世界坐标渲染之后，DOM 读数量的是**世界像素**
+     （`offsetWidth` 不受祖先 transform 影响），而这段策略还在按**屏幕像素**算 ——
+     于是 `wantW = card.w × s` 和 `domW = card.w` 只在 s=1 时相等，
+     别的档位每一张卡每一帧都是 'stale' → 下一帧再来 → **永远不停**。
+     用户那张板实测：空转 1 秒改 2625 次 data-fit，125 张卡卡在 stale。
+     所以判据不是"某个数对不对"，是**这一条不变式**：s 不该参与拟合的量纲。
+     ⚠ 别把这条改成"只测 s=1"—— 那正是它当初漏掉这个病的原因。 */
+  {
+    const c = mkCard({ w: 220, h: 90 })
+    const at = (s, over = {}) => fitPass(mkSnap(c, { s, ...over }), { fitWidth: true })
+    const r1 = at(1)
+    const r2 = at(2)
+    const r3 = at(0.5)
+    eq(r2.state, r1.state, '★ s=2 和 s=1 的结论必须一样（量纲里没有 s）')
+    eq(r3.state, r1.state, '★ s=0.5 也一样')
+    eq(JSON.stringify(r2.patch), JSON.stringify(r1.patch), '★ 同一个世界读数 → 同一个补丁（s 变了不许改结果）')
+    eq(JSON.stringify(r3.patch), JSON.stringify(r1.patch), '  （s=0.5 也是）')
+
+    /* 反过来钉：**屏幕像素**的读数必须被认成 stale（DOM 还没跟上），不能被当成世界像素用掉。
+       这是同一个不变式的另一面 —— 谁把 sample 改回"乘过 s 的屏幕像素"，这条当场红。 */
+    eq(at(1, { domW: c.w }).state, 'done', 'DOM 世界宽 = 数据世界宽 → done')
+    eq(at(2, { domW: c.w * 2 }).state, 'stale', 'DOM 报的是**屏幕宽**（= 世界 × 2）→ stale（单位不对就不许提交）')
+
+    /* 高度那条同样与世界像素对齐：内容 63 + 上下内边距 10 = 73，**不除以 s**。 */
+    const hAt = (s) => fitPass(mkSnap(mkCard({ w: 260, h: 40 }), { s, bodyH: 63, padY: 10 }), {}).h
+    near(hAt(1), 73, 0.05, '内容 63 + 内边距 10 → 73 世界像素（s=1）')
+    near(hAt(2), 73, 0.05, '★ s=2 时还是 73：高度也不许除以 s（除以 s 会算出 36.5，卡片被压扁）')
+  }
+
+  /* ⑫ ★ 兜底：**一直 stale 也有个头**。
+     ⑨ 那条管的是"量不稳"（'done' 的那条路）；这条管"DOM 一直没跟上"——
+     它从前是个没有上限的重试（每帧再来），于是量纲一错就变成每帧全板重排。
+     超了上限就出队，并且把这件事**记在 data-fit 里**（state: 'gave-up'）——
+     不能悄悄咽下去：屏幕上"卡片尺寸不对"和"拟合器放弃了"长得一模一样。
+     ⚠ 上限别设成 1~2：紧接着提交的那一帧本来就该是 stale（坑 ③），
+       真正的病是"永远"。 */
+  {
+    const { fitter, pass, patches } = mkFitter({
+      maxStale: 3,
+      sample: () => mkSnap(mkCard({ w: 220, h: 90 }), { domW: 999 }), // DOM 永远对不上
+    })
+    fitter.queue('c1', { fitWidth: true })
+    for (let i = 0; i < 8 && fitter.size; i++) pass()
+    eq(fitter.size, 0, '★ DOM 一直没跟上 → 到头就出队（不许每帧永远再来）')
+    eq(patches.length, 0, '  （一个补丁都没提交 —— stale 那些趟不许改尺寸）')
+    const stuck = mkFitter({ maxStale: 3, sample: () => mkSnap(mkCard({ w: 220, h: 90 }), { domW: 999 }) })
+    stuck.fitter.queue('c1', { fitWidth: true })
+    for (let i = 0; i < 8 && stuck.fitter.size; i++) stuck.pass()
+    eq(stuck.fitter.size, 0, '  （也出队了）')
+    const framesWhenDone = stuck.frames.length
+    for (let i = 0; i < 3; i++) stuck.pass()
+    eq(stuck.frames.length, framesWhenDone, '★ 出队之后**不再排帧** —— 空转的 rAF 就是这么来的')
+  }
 }
 
 // ═════════════════════ 6m. 选中那一族 ═════════════════════
@@ -2964,6 +3019,33 @@ console.log('\n[6t] 焦点仲裁（`focus.js`）：焦点是一个值、按键�
   eq(focusInk(['s1', 's2']), { kind: 'ink', ids: ['s1', 's2'] }, '框住两笔')
   eq(focusInk([]), FOCUS_NONE, '什么也没框住 → 空焦点（不是"空的墨迹选中"）')
   eq(focusCard(null), FOCUS_NONE, '给个 null 也是空焦点（调用方不用先判）')
+  /* ★★ 2026-09-21：**圈住课件上的一块**也是一个合法的焦点 —— 框里可以一笔都没有。
+     用户原话：「我框选的肯定是 ppt 上的一部分或者解说卡片啊，我不可能框选我自己的字迹」。
+     从前"框里没笔"被表达成 FOCUS_NONE，那个**矩形**就跟着丢了 —— 于是"我圈了哪一块"
+     在系统里无处安放，「？问这里」被人为地绑在"你得先框到字"上。 */
+  {
+    const b = { x0: 10, y0: 20, x1: 110, y1: 220 }
+    const f = focusInk([], [], b)
+    eq(f.kind, 'ink', '★ 空笔 + 有框 → 仍然是一个焦点（圈住课件就够了）')
+    eq(focusInkIds(f), [], '  …ids 是空数组（"没有笔"说得出，不是 null）')
+    eq(focusInkBox(f), b, '  …★ 那个矩形留得住 —— 这才是"我圈了哪一块"的唯一住处')
+    eq(focusInk([], [], { x0: 1, y0: 2 }), FOCUS_NONE, '  （半个框不算：四个数得齐，认不出的不硬凑）')
+    eq(focusInk([], [], { x0: 'a', y0: 2, x1: 3, y1: 4 }), FOCUS_NONE, '  （NaN 更不算）')
+    eq(focusInk([], [], null), FOCUS_NONE, '  ★ 没给框 = 什么都没发生（好几处拿 focusInk 当"清空"用，不能反过来）')
+    eq(focusInk(['s1'], [], b).box, b, '  …框里有笔时，框照样带着')
+    /* 空框 + 空笔 → 没东西可删。少了这一道，Delete 会变成"要删零样东西"的意图。 */
+    eq(deleteIntent(f, 'Delete', { tagName: 'CANVAS', closest: () => ({}) }), { kind: 'none' }, '  ★ 只有框、框里空的 → Delete 什么都不做（没有"删零样东西"这种事）')
+    /* 只框不选时，Esc 仍然收得掉（不然一个看不见的焦点会一直在） */
+    eq(escapeIntent({ focus: f }).kind, 'clear-focus', '  …Esc 照样收得掉它')
+  }
+  /* 框选松手那条路：`clearInkFocus(f, box)` 要留下框（不是清空） */
+  {
+    const b = { x0: 1, y0: 2, x1: 3, y1: 4 }
+    const kept = clearInkFocus(focusInk(['s1']), b)
+    eq([kept.kind, focusInkIds(kept), focusInkBox(kept)], ['ink', [], b], '★ 框选没框到东西 → 只清笔、**留下那个框**（框本身是这一次框选的产物）')
+    eq(clearInkFocus(focusInk(['s1'])), FOCUS_NONE, '  …不给框的调用方一个都没改：照旧清空')
+    eq(clearInkFocus(focusCard('k1'), b), { kind: 'card', id: 'k1', editing: false }, '  …卡片那种仍然原样返回（哪怕给了框）')
+  }
   {
     const f = focusCard('k1', true)
     eq([focusCardId(f), focusFrameId(f), focusInkIds(f)], ['k1', null, null], '焦点在卡片上：板框 / 墨迹那两个问题都是 null')
@@ -3086,7 +3168,24 @@ console.log('\n[6u] data/ 里的路径（`paths.js`）：什么样的名字能�
   eq(parentPath('大物/电磁学/board-1.md'), '大物/电磁学', 'parentPath')
   eq(parentPath('board-1.md'), '', '根上的文件 → 目录是空串（不是 "/"）')
   eq(baseName('大物/电磁学/board-1.md'), 'board-1.md', 'baseName')
-  eq(pathTitle('大物/电磁学/board-1.md'), 'board-1', 'pathTitle：左栏那一行显示的字（不含 .md）')
+  eq(pathTitle('大物/电磁学/board-1.md'), '1', 'pathTitle：左栏那一行显示的字（去掉 .md，白板还要去掉 board- 前缀）')
+
+  /* ★ `pathTitle` 是"左栏那一行显示成什么"的**唯一**实现（2026-09-23 用户要求
+     「白板名字前面不要带 board-」）。它是**显示名**，和盘上那个文件名不是一回事：
+     `board-` 前缀是为了**排序和识别**才加在盘上的（见 links.js 第 799 行），
+     不该出现在用户眼前。四条判据一起看才说明问题：
+       · 白板：前缀去掉（这就是用户要的）
+       · 大小写：`BOARD-` 也认（盘上理论上不会有，但认了不亏 —— 正则本来就 'i'）
+       · 中段：名字里头的 `board-` **必须留着**（用户自己打的字，只去开头那一处）
+       · 笔记：不带前缀的**原样返回**（这条保证"改白板显示"没碰到笔记那一侧） */
+  eq(pathTitle('board-新白板.md'), '新白板', '白板：前缀去掉，只留标题（用户要的那条）')
+  eq(pathTitle('大物/电磁学/board-第一章.md'), '第一章', '白板：分层路径的最后一截照样去掉前缀')
+  eq(pathTitle('BOARD-大写.md'), '大写', '前缀大小写都认（正则 ' + "'i'" + '，盘上不会有但不能因此漏掉）')
+  eq(pathTitle('board-board-两层.md'), 'board-两层', '只去**开头那一处** —— 名字里自己打的 board- 要留着')
+  eq(pathTitle('board-的用法.md'), '的用法', '前缀去掉后剩下的正文照留（这个板名叫「的用法」）')
+  eq(pathTitle('我的笔记.md'), '我的笔记', '笔记：不带前缀 → 原样返回（改白板显示没碰到笔记）')
+  eq(pathTitle('大物/电磁学/8.2 电磁感应.md'), '8.2 电磁感应', '笔记带层：一样只去 .md')
+  eq(pathTitle('board-.md'), '', '只剩前缀的空名 → 空串（不崩、也不留下一个孤零零的 board-）')
   eq(splitPath('a/b/c.md'), ['a', 'b', 'c.md'], 'splitPath')
   eq(joinPath('a', 'b', 'c.md'), 'a/b/c.md', 'joinPath')
   eq(joinPath('', 'a.md'), 'a.md', 'joinPath 根上：不能拼出 /a.md（那样树里会多一个空名字的节点）')
@@ -3169,8 +3268,71 @@ console.log('\n[6u] data/ 里的路径（`paths.js`）：什么样的名字能�
   eq(layerNeeds('', []), false, '根永远在（空路径不是"一层"，不需要建）')
   eq(layerNeeds(null, []), false, 'layerNeeds 收 null 也当根')
   /* ⚠ 这一条是那条"两种代价不对称"的判据：`folders` 里没有 → 说"要建"，
-     而服务端对已存在的层**不算错**（回 existed）—— 所以宁可多问一次，也不能漏。 */
+     而服务端对已存在的层**不存在**（回 existed）—— 所以宁可多问一次，也不能漏。 */
   eq(layerNeeds('大物', ['大物', '大物/电磁学']), false, 'layerNeeds 只看自己那一个名字，不被邻居干扰')
+}
+
+// ═════════════════════ 6u-2. 删除（`/api/delete`）═════════════════════
+console.log('\n[6u-2] 删掉一个文件 / 一整层（2026-09-21）：路径闸 + "删完打开哪一张"')
+{
+  /* 为什么单开一节：删除这条路有**两个**不出声的失败姿势，两边都不报错 ——
+   *   · 服务端那边：判错"要删的是谁"，删掉的是别的东西（最坏是 data/ 整个没了）。
+   *     而 `fs.rmSync` / 回收站这条路**没有撤销**，删错了只能去回收站翻。
+   *   · 前端那边：删完没把 `current` 换掉 → 白板下一次自动存盘会拿着那条
+   *     已经不存在的路径**把文件重新建出来**（用户："我明明删了，它又回来了"）。
+   * 真浏览器那半在 `check:sidetree` ①⓪ 那一节（点行尾的「删除」→ 确认 → 盘上真没了）。
+   *
+   * ⚠ 这一节**只验纯逻辑**（路径怎么归一化、哪些行会从树里消失）——
+   *   和 /api/delete 里那几道闸用的是**同一个** `normalizeRel` / `isUnder`，
+   *   所以"服务端会拒什么"在这儿能提前钉住。真正的请求由 check-storage 打。 */
+
+  /* ① 路径闸：删的那条路径走的是**收请求**那一套（normalizeRel，不许修） */
+  eq(normalizeRel('board-x.md'), 'board-x.md', '删一个文件：路径照常归一化')
+  eq(normalizeRel('大物/电磁学/board-一.md'), '大物/电磁学/board-一.md', '删深处那一张：分层路径照样通过')
+  eq(normalizeRel('../evil.md'), null, '★ 穿越一律拒（删除是**最不能**修的那一侧：修它等于猜用户想删哪儿）')
+  eq(normalizeRel('大物/../../board-x.md'), null, '★ 中间夹 .. 也拒')
+  eq(normalizeRel('C:/Users/x/board-x.md'), null, '★ 盘符拒')
+  /* 目录那一侧：`{ file: false }`，最后一段不要求 .md */
+  eq(normalizeRel('大物/电磁学', { file: false }), '大物/电磁学', '删一整层：目录不带 .md 也通过')
+  eq(normalizeRel('大物/电磁学'), null, '⚠ 但**不带** { file: false } 时它会被当成"没写 .md 的文件" —— 所以调用方必须按"最后一段是不是 .md"自己选 ({ file })，别一律传 true/false')
+
+  /* ② 根目录不能删。这一条是**这个接口最危险的一格**：`resolveInData('')`
+   *    会把 DATA_DIR 原样还回来，不挡就是一次请求删光所有笔记。
+   *    ⚠ 判据落在 normalizeRel **之前**那一步（服务端是先判空再归一化的）——
+   *      因为 `'/'` 归一化之后和 `''` 长得一样，两个都该拒。 */
+  for (const p of ['', '/', '//', '   ', null]) {
+    const trimmed = String(p == null ? '' : p).trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    if (trimmed === '') ok(`根那一层被拒（传的是 ${JSON.stringify(p)}）`)
+    else bad(`根那一层漏过去了：传 ${JSON.stringify(p)} 时判出来是「${trimmed}」`)
+  }
+  /* 反证：只要还有段，就不该被那条判据拦下 —— 不然"删根"这条闸会顺手把正常路径也拒了 */
+  if (normalizeRel('大物.md') !== null) ok('  反证：有名字的路径照样通过（那条闸只挡"一个段都没有"的）')
+  else bad('  "根"那条闸把正常路径也拦了')
+
+  /* ③ `.` 开头的拒（`.资料` / `.导出` / `.git`）：它们不出现在左栏里，
+   *    左栏就没有理由请求删它们。这一条挡的是手写请求和"以后有人往左栏加了点开头的行"。 */
+  for (const p of ['.资料/x.pdf', '.导出/x.html', '.git']) {
+    const segs = splitPath(p)
+    const hit = segs.some((s) => s.startsWith('.'))
+    if (hit) ok(`点开头的路径被拒：${p}（左栏里根本没有这一行）`)
+    else bad(`点开头的路径漏过去了：${p}`)
+  }
+  if (!splitPath('大物/电磁学').some((s) => s.startsWith('.'))) ok('  反证：普通的层不被这条闸误伤')
+  else bad('  "." 那条闸误伤了普通路径')
+
+  /* ④ 删完"哪些行会消失"：`isUnder` 是前端决定"要不要换一张打开"的判据。
+   *    删**一层**的时候，打开着的那张板可能在那一层**底下**（不是等于它）。 */
+  if (isUnder('大物/电磁学/board-1.md', '大物/电磁学')) ok('删这一层 → 底下那张板也得跟着算"没了"')
+  else bad('isUnder 判错了：删一层时底下的文件没被算进去（那下次自动保存会把它建回来）')
+  if (!isUnder('大物/力学/board-1.md', '大物/电磁学')) ok('  …但别的层底下那张不算（不该换掉用户正开着的东西）')
+  else bad('  isUnder 把邻居那一层也算进去了')
+  if (!isUnder('大物/电磁学 2/board-1.md', '大物/电磁学')) ok('  …前缀像但不是一层：不算')
+  else bad('  isUnder 认了前缀（`大物/电磁学 2` 不是 `大物/电磁学` 里面）')
+  /* 删的是**文件本身**（`current === path`）：这一条只能看等号，
+     用 isUnder 会把"同一层里的兄弟文件"也算成"没了"（它会删掉别的层底下的一切） */
+  if (isUnder('大物/电磁学/board-2.md', '大物/电磁学/board-1.md') === false) {
+    ok('  ★ 删一个文件时不许用 isUnder 判兄弟文件：`board-2.md` 不是 `board-1.md` 里面（判据得先看等号）')
+  } else bad('  isUnder 把"另一个文件"当成了"它里面" —— 删一个文件会连带把别人算没')
 }
 
 // ═════════════════════ 6w. 复制 / 粘贴 ═════════════════════

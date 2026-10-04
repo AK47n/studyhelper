@@ -455,38 +455,329 @@ const fails = await withBoard(
       }
     }
 
-    /* ── [3] Ctrl+Z：粘贴是一步撤销 ─────────────────────────────────────── */
+    /* ── [2b] 工具条上那颗「⧉ 粘贴」（2026-09-23，用户报的 Surface 场景）────
+       ★ 用户原话：「加一个方便黏贴的，现在复制框选即可复制，但是黏贴需要 ctrl+v，
+         这对于 surface 来说要去接一个外置键盘才方便，我们不希望额外引入这个键盘，
+         采用其他方式比如价格按钮」。
+       ⇒ 上一节 [2] 走的正是**那条不满意的路**（Ctrl+V，得敲键盘）。
+         这一节要走**用户真正要的那条**：**一个键都不按**，只点界面上那颗按钮。
+         ⚠ 所以这里**不许出现任何键盘事件** —— 混进一个 Ctrl+V，
+           这条判据证明的还是键盘那条路（那正是它要修的毛病）。
+
+       三件事，缺一不可：
+         ① 那颗按钮**在**、**点得到**（本仓库的"点不到"栽过两次：浮层/工具条压住）；
+         ② 点下去**真的贴上**了 —— 而且和 Ctrl+V 是**同一颗东西**（同一句话、同一个落点）；
+         ③ ★ 加这颗按钮**没有吃掉画布**（工具条换行那条线，见下面 why）。
+
+       ★★ 为什么 ③ 要写在这儿：工具条是 `flex-wrap`，**每多一行就从画布底下
+          啃掉 34px**（styles.css 里 .bd-tools 那段警告，2026-09-20 加「∑ 公式架」
+          时压过一条线、把 check-ocr-browser 的落笔点算到了工具条上）。
+          ★ 这颗按钮**第一版就放错过**（2026-09-23）：先按"和复制挨着"的直觉
+            贴在左边那组，看着挺对 —— 直到把**同一颗按钮搬进每一组**量了一遍
+            （`.cache/probe-cbar5.mjs`），才看出真相：
+
+              视口   工具条宽   摘掉后   组0    组1    组2    组3~组6
+              1246    988      109px    =      =      =      =
+              1386   1128      109px    =      =      =      =
+              1406   1148       75px   +34    +34    +34     =
+              1426   1168       75px   +34    +34    +34     =
+              1466   1208       75px    =      =      =      =
+              1886   1628       77px    =      =      =      =
+
+            ⇒ **组0/组1/组2 在 1440 那档窗口会多啃一行**，而 1440 正是最常见的
+              笔记本宽度。最后落在**组3**（撤销/重做那组）—— 量过的每个宽度都白拿。
+
+          ⇒ 判据就是**差值**（见下）：它对"又换了一行"有分辨力，而且真换行了
+            会明确报出啃掉多少像素。
+          ⚠ 这一条**红不代表粘贴坏了**：它管的是"工具条有没有多啃一行画布"。
+            真红了先跑 `.cache/probe-cbar5.mjs` 看该挪到哪一组，
+            再确认 `check-ocr-browser` 的落笔点有没有跟着挪。
+          ⚠ 量不到按钮/工具条时**明说跳过**，别拿 null 去比 ——
+            那样报出来是"工具条是 nullpx"，看着像按钮坏了，其实是这一节没跑成。 */
+    console.log('\n[2b] 工具条上那颗「⧉ 粘贴」：不碰键盘也贴得上，而且没吃掉画布')
+    {
+      /* ── ③ ★ 加这颗按钮**没有吃掉画布** ──────────────────────────────
+         判据 = **把这颗按钮藏起来，工具条会不会变矮**：
+           变矮 = 它的宽度就是压出那一行的最后一根稻草（真吃了画布，报出差值）；
+           不变 = 它塞得进现有的行里，白拿。
+
+         ★★ 为什么用**差值**、而不是记一个固定高度基线：
+            基线跟着视口宽 / 字号档 / 字体渲染走 —— 连 `--window-size=1440,900`
+            在 headless 下实测视口都只有 **1406×729**（浏览器自己占掉一圈），
+            写死一个数换台机器就红。而**差值**是自证的：同一页、同一瞬间、
+            唯一的差别就是这一颗按钮在不在。这样"基线是多少"永远不会过期。
+
+         ★ 三个宽度各有分工，不是凑数：
+             1406 —— 实测的**刀刃**（组0/1/2 在这里会多啃一行）；
+             1466 —— 刀刃另一侧（同一颗按钮在这里又不啃了）；
+             1886 —— 宽屏（工具条只有 2 行，最宽松的样子）。
+           ⚠ 只测这三个。再多的尺寸只会多出"哪天改个字号就红"的地方，
+             而这条判据要守的是**换行**这一件事。 */
+      const PROBE_W = [
+        [1406, 729, '刀刃那一档（实测 组0/1/2 会在这里多啃一行）'],
+        [1466, 789, '刀刃另一侧'],
+        [1886, 909, '宽屏，最宽松'],
+      ]
+      const barDiff = async (w, h) => {
+        await s.send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false })
+        /* 等一次重排（尺寸改了不一定立刻反映到 getBoundingClientRect）。 */
+        await until(async () => (await ev(`!!document.querySelector('.bd-tools [data-tool="paste"]')`)) ? 1 : undefined, { timeout: 3000 })
+        await s.sleep(200)
+        /* ★ 藏 / 量 / 还 全在**一个同步块**里：JS 单线程，同步块中途 React 插不进来，
+           所以不会出现"藏了一半被重渲染收回去"的中间态。 */
+        return ev(`(() => {
+          const t = document.querySelector('.bd-tools')
+          const p = t && t.querySelector('[data-tool="paste"]')
+          if (!t || !p) return null
+          const hh = () => Math.round(t.getBoundingClientRect().height)
+          const hWith = hh()
+          p.style.display = 'none'
+          const hWithout = hh()
+          p.style.display = ''
+          return { hWith, hWithout, restored: hh() }
+        })()`)
+      }
+      for (const [w, h, why] of PROBE_W) {
+        const r = await barDiff(w, h)
+        if (!r) {
+          console.log(`      （${w}px 下量不到工具条或粘贴按钮 —— 这一档跳过了）`)
+          continue
+        }
+        /* 先守一道"这一趟真在量东西"的闸：高度得是个像样的正数。
+           没有它的话，"工具条根本没渲染出来"（高度 0）会让差值也变成 0 而蒙混过关。 */
+        if (!(r.hWith > 40)) {
+          bad(`${w}px 下工具条高度只有 ${r.hWith}px —— 不像真的排出来了，这一档的差值不算数`)
+          continue
+        }
+        const cost = r.hWith - r.hWithout
+        if (cost === 0) {
+          ok(`${w}px（${why}）下藏掉「⧉ 粘贴」工具条**一点都不矮**（${r.hWith}px → ${r.hWithout}px）—— 它没吃掉画布`)
+        } else {
+          bad(`${w}px（${why}）下藏掉「⧉ 粘贴」工具条从 ${r.hWith}px 掉到 ${r.hWithout}px —— 这颗按钮多啃了 ${cost}px 画布，换一组放（见 .cache/probe-cbar5.mjs）`)
+        }
+      }
+      await s.send('Emulation.clearDeviceMetricsOverride')
+      await s.sleep(200)
+
+      /* ── ① 按钮在、点得到 ────────────────────────────────────────────
+         ★ 量**工具条上**那一颗（`[data-tool="paste"]`），不是选区浮层里有没有。
+         命中测试必须用 `elementFromPoint`（合成事件绕过命中测试 —— 本仓库
+         那个"点删除按钮没有用"的 bug 就是这么一路绿灯的）。 */
+      const pb = await ev(`(() => {
+        const b = document.querySelector('.bd-tools [data-tool="paste"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2)
+        const e = document.elementFromPoint(cx, cy)
+        return { x: cx, y: cy, w: Math.round(r.width), h: Math.round(r.height), txt: (b.textContent || '').trim(), hit: e ? (e.className || e.tagName) : null, self: e === b || (e && e.closest ? e.closest('[data-tool="paste"]') === b : false) }
+      })()`)
+      if (!pb) {
+        bad('工具条上找不到「⧉ 粘贴」那颗按钮（`[data-tool="paste"]`）—— Surface 用户还是只能敲 Ctrl+V')
+      } else {
+        if (pb.txt === '⧉ 粘贴') ok(`工具条上那颗按钮上写着「${pb.txt}」（用户能找到它）`)
+        else bad(`按钮上的字是 ${JSON.stringify(pb.txt)}，期望「⧉ 粘贴」`)
+        if (pb.self) ok(`「⧉ 粘贴」在 (${pb.x}, ${pb.y}) **点得到**（${pb.w}×${pb.h}，最上面就是它自己）`)
+        else bad(`「⧉ 粘贴」点不到 —— 那个位置最上面是 ${JSON.stringify(pb.hit)}（有东西压着它）`)
+
+        /* ── ② 点下去真的贴上，而且和 Ctrl+V 同一条路 ────────────────────
+           ★★ 判据要和 [2] 逐字对齐 —— 同一个落点规矩、同一句话。
+             对不齐的话"两条路各写一份"就会悄悄分叉（这正是 onPaste={pasteSel}
+             那个接线要防的事）：界面说"粘贴了…"、盘上多出东西，两条都得成立。
+           ★ 起点不假设 —— **读盘上板 B 现在有几张卡**（[2] 粘过一次，所以这里应当
+             是 1）。不赌 [2] 的结果：它失败时这张卡数就不一样，而这颗按钮的判据
+             是"点一下**多了一整块**"，不是"最后是几张"。
+         ★★ 两条判据都要，各自有分辨力、别合并：
+             · 盘上笔数（读文件）—— "真的落盘了"；
+             · 界面上卡数（读 DOM）—— "屏幕上也立刻看得见"。
+           只判盘上会漏掉"贴了但没重绘"；只判界面会漏掉"重绘了但没写盘"。 */
+        const readB = () => {
+          try {
+            return JSON.parse(fs.readFileSync(B_PATH, 'utf8'))
+          } catch {
+            return null
+          }
+        }
+        const diskBefore = readB()
+        const before = await ev(`window.__clip.cards().length`)
+        const rawBefore = await ev(`window.__clip.raw()`)
+        const strokesBefore = diskBefore ? diskBefore.strokes.length : null
+        console.log(`      点之前：盘上 ${strokesBefore == null ? '(读不到)' : strokesBefore} 笔、界面上 ${before} 张卡`)
+        /* 真鼠标点（不是 `b.click()`）—— 要验的是"手指/笔点得动"这件事本身。
+           ★ dispatchMouseEvent 的**按下/抬起两发**才算一次点击；
+             直接 `elem.click()` 走的是 DOM 合成事件、**绕过命中测试**，
+             而那恰恰是本仓库"按钮点不到"的病灶（那个 bug 就这样一路绿灯过）。 */
+        await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pb.x, y: pb.y, button: 'left', buttons: 1, clickCount: 1 })
+        await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pb.x, y: pb.y, button: 'left', buttons: 0, clickCount: 1 })
+        await s.sleep(400)
+        const after = await ev(`window.__clip.cards().length`)
+        const toastP = await ev(`window.__clip.toast()`)
+        if (after === before + 1) {
+          ok(`**只用鼠标点那颗按钮**，板 B 上从 ${before} 张卡变成 ${after} 张 —— 一个键都没按就贴上了`)
+        } else {
+          bad(`点了「⧉ 粘贴」之后卡数是 ${after}（点之前 ${before}），期望 ${before + 1} —— 按钮没接上 pasteSel？`)
+        }
+        /* ★ 真的落盘（贴出来的笔数比点之前多 2 —— 就是上面复制的那两笔）。 */
+        if (strokesBefore == null) {
+          console.log('      （盘上读不到板 B —— 落盘那条跳过了）')
+        } else {
+          const afterDisk = await until(async () => {
+            const d = readB()
+            return d && d.strokes.length === strokesBefore + 2 ? d : undefined
+          }, { what: '点按钮之后板 B 盘上多了两笔', timeout: 6000 })
+          if (afterDisk.ok) ok(`点按钮贴的东西落盘了：板 B 盘上从 ${strokesBefore} 笔变成 ${afterDisk.value.strokes.length} 笔`)
+          else bad(`点按钮之后板 B 盘上没有多出那两笔（点之前 ${strokesBefore} 笔）—— 只重绘了没写盘？`)
+        }
+        console.log(`      界面说：${toastP || '(没说话)'}`)
+        /* ★ 和 [2] 那句**同一个词**（"粘贴了"）—— 两条路是同一颗东西的证据。 */
+        if (/粘贴了/.test(toastP)) ok(`界面说的是"${toastP}" —— 和按 Ctrl+V 时**同一句话**（两条路确实共用 pasteSel）`)
+        else bad(`点按钮之后界面没有说"粘贴了…"（实际说：${JSON.stringify(toastP)}）—— 和 Ctrl+V 那条路分叉了`)
+
+        /* ★ 贴出来的东西照样落在**视野里**（落点规矩对两条路都要成立）。 */
+        const vis2 = await ev(`window.__clip.onScreen()`)
+        if (vis2 && vis2.n >= 1 && vis2.n === vis2.visible) {
+          ok(`点按钮贴出来的东西也落在**视野里**（${vis2.visible}/${vis2.n} 在舞台矩形内）—— 和 Ctrl+V 同一个落点规矩`)
+        } else {
+          bad(`点按钮贴出来的东西不在视野里：${JSON.stringify(vis2)} —— 两条路的落点算法分叉了`)
+        }
+
+        /* ★ 剪贴板**没被点坏**（点一下只该多一块东西，不该改写剪贴板本身）。 */
+        const rawAfter2 = await ev(`window.__clip.raw()`)
+        if (rawAfter2 && rawAfter2 === rawBefore) ok('点「⧉ 粘贴」没有改写剪贴板本身（还能接着往下一块板贴）')
+        else bad('点「⧉ 粘贴」把剪贴板改写了 —— 第二次粘贴就贴不出原来的东西了')
+      }
+
+      /* ── ④ 第二处入口：**选区浮层**里那颗「⧉ 粘贴」（紧挨着「⧉ 复制」）────
+         ★ 为什么要验第二处：工具条那颗管的是"**切到另一块板**"（那时没有选区、
+           浮层根本不出现）；而"刚复制完、手还在原地"那种场景，最顺的是浮层里
+           这一颗。两处 + Ctrl+V 共用**同一个 `pasteSel`**（见 Board.jsx 的接线），
+           所以三处的"贴到哪儿"不会分叉。
+         ★ 此刻浮层**应当正开着** —— 上一步 `pasteSel` 把焦点放在了刚贴出来的
+           东西上（这是它的既定行为，见 Board.jsx `pasteSel` 末尾那次 setFocus）。
+           所以不用另造一次框选，直接验就行。
+           ⚠ 反过来说：**找不到它时要分清是哪一种**（浮层没开 / 按钮没接上）——
+             混成一句话报出来会指错方向。
+         ⚠ 判据和工具条那颗同一套：在不在、`elementFromPoint` 命中不命中。 */
+      const ob = await ev(`(() => {
+        const acts = document.querySelector('.bd-inkacts')
+        const b = document.querySelector('.bd-inkacts .bd-inkpaste')
+        if (!b) return { actsOpen: !!acts }
+        const r = b.getBoundingClientRect()
+        const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2)
+        const e = document.elementFromPoint(cx, cy)
+        return {
+          actsOpen: true, x: cx, y: cy, w: Math.round(r.width), h: Math.round(r.height),
+          txt: (b.textContent || '').trim(),
+          hit: e ? (e.className || e.tagName) : null,
+          self: e === b || (e && e.closest ? e.closest('.bd-inkpaste') === b : false),
+        }
+      })()`)
+      if (!ob || !ob.actsOpen) {
+        bad('贴完东西之后选区浮层没开着 —— 这一节验不到浮层那颗「⧉ 粘贴」（`pasteSel` 应当把焦点放在刚贴出来的东西上）')
+      } else if (ob.txt === undefined) {
+        bad('选区浮层开着，但里面没有「⧉ 粘贴」（`.bd-inkpaste`）—— 第二处入口没接上')
+      } else {
+        if (ob.txt === '⧉ 粘贴') ok(`选区浮层里也有一颗「${ob.txt}」（紧挨着「⧉ 复制」—— 复制完顺手就能贴）`)
+        else bad(`浮层里那颗按钮的字是 ${JSON.stringify(ob.txt)}，期望「⧉ 粘贴」`)
+        if (ob.self) ok(`浮层里的「⧉ 粘贴」在 (${ob.x}, ${ob.y}) **点得到**（${ob.w}×${ob.h}，最上面就是它自己）`)
+        else bad(`浮层里的「⧉ 粘贴」点不到 —— 那个位置最上面是 ${JSON.stringify(ob.hit)}`)
+        /* ★ 点它一下，板上要多出一整块 —— 证明这颗也真的接上了（不是个摆设）。 */
+        const n0 = await ev(`window.__clip.cards().length`)
+        await s.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: ob.x, y: ob.y, button: 'left', buttons: 1, clickCount: 1 })
+        await s.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: ob.x, y: ob.y, button: 'left', buttons: 0, clickCount: 1 })
+        await s.sleep(400)
+        const n1 = await ev(`window.__clip.cards().length`)
+        const t1 = await ev(`window.__clip.toast()`)
+        if (n1 === n0 + 1) ok(`点浮层里那颗「⧉ 粘贴」也贴上了（卡数 ${n0} → ${n1}）—— 两处入口真的都通`)
+        else bad(`点浮层里那颗「⧉ 粘贴」之后卡数是 ${n1}（点之前 ${n0}），期望 ${n0 + 1} —— 浮层那颗没接上 pasteSel？`)
+        if (/粘贴了/.test(t1)) ok(`浮层那颗说的话也是"粘贴了…"（${t1}）—— 三处（工具条 / 浮层 / Ctrl+V）共用同一句话`)
+        else bad(`点浮层那颗之后界面没有说"粘贴了…"（实际说：${JSON.stringify(t1)}）`)
+      }
+    }
+
+    /* ── [3] Ctrl+Z：粘贴是一步撤销 ───────────────────────────────────────
+       ★★ 这一步的起点是**自己造出来的**，不依赖上一步剩下的状态（[2] 贴了一份、
+          [2b] 又贴了一份）。原来的写法是"等板 B 盘上回到 0 笔" —— 那假定
+          "此刻板 B 上正好只有一份贴进来的东西"，而 [2b] 一加进来这个前提就没了：
+          板 B 变成两份，Ctrl+Z 只退得掉一份，报出来是"还有 2 笔"（**假红**）。
+          ⇒ 退回去那一步真正管的事只有一件：**"贴一次 → 撤一次 → 干净"**。
+            所以这里自己造局面：**先等板安静下来**（应用说「已存」）→ 记下此刻
+            盘上的笔数 n0 → Ctrl+V（"+2"）→ Ctrl+Z（应当退回 n0）。
+
+          ★★ 为什么开头要等「已存」、而且**不许等"恰好等于 n0+2"**（第一次就是栽在这儿）：
+            自动保存是**防抖 + 合并**的 —— 盘上不会出现中间态。
+            实测：进来时盘上 4 笔（[2b] 刚点完那一下还没落盘），Ctrl+V 之后
+            内存是 8、一次防抖写盘直接从 **4 跳到 8**，于是"等盘上变成 6"永远等不到，
+            报出来是"Ctrl+V 没多出两笔"—— 而 Ctrl+V 其实好好儿的（**假红**，
+            还指错了方向：会让人去查粘贴，其实是存档节奏）。
+            ⇒ 两条一起改：① 量基准前先等「已存」，盘上数和内存就对上了；
+                       ② 判"变大了"用**严格大于**，别钉一个中间值。
+            而"撤回 n0"这条能钉死 —— 它回到的是**刚才亲眼见过的**那个值，
+            不是中途某个没人写过的数。
+
+          ⚠ 为什么不用 Ctrl+Shift+Z 那条（重做）来收尾：这条要验的是"粘贴进撤销栈"，
+            不是重做；多走一步只会多一个失败面。
+          ⚠ 也别拿"板 B 是空的"当收尾判据 —— 那是[2]时代留下的巧合，
+            夹具板改成非空的那天它就静默失效了（本仓库那条"断言的前提若是上一节
+            留下的状态，就是颗雷"）。 */
     console.log('\n[3] Ctrl+Z：一次粘贴 = 一步撤销')
     {
-      await s.send('Input.dispatchKeyEvent', {
-        type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2,
-      })
-      await s.send('Input.dispatchKeyEvent', {
-        type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2,
-      })
-      await s.send('Input.dispatchKeyEvent', {
-        type: 'char', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2, text: 'z', unmodifiedText: 'z',
-      })
-      await s.send('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2,
-      })
-      await s.send('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 0,
-      })
-      await s.sleep(500)
-
-      const gone = await until(async () => {
+      const readB3 = () => {
         try {
-          const d = JSON.parse(fs.readFileSync(B_PATH, 'utf8'))
-          return d.strokes.length === 0 && d.cards.length === 0 ? d : undefined
+          return JSON.parse(fs.readFileSync(B_PATH, 'utf8'))
         } catch {
-          return undefined
+          return null
         }
-      }, { what: 'Ctrl+Z 之后板 B 回到空的', timeout: 6000 })
-      if (gone.ok) ok(`Ctrl+Z 把整次粘贴收回去了（板 B 又空了，等了 ${gone.waited}ms）—— 一次粘贴确实是一步`)
-      else {
-        const d = read() || {}
-        bad(`Ctrl+Z 之后板 B 还有东西（盘上 ${(d.strokes || []).length} 笔）—— 粘贴没进撤销栈，或者退不干净`)
+      }
+      /* ★ 先把板等安静：`.bd-save` 说「已存」= 写盘真的落地了。
+         不等这一步，下面量到的 n0 会是"上一节还没落盘的旧数"，
+         而后面的判据全建在一个过期的基准上。 */
+      const quiet = await untilSaved({ timeout: 10000 })
+      if (!quiet.ok) console.log('      （板一直没说「已存」—— 还是接着量，但基准可能偏旧）')
+
+      /* 先看起点。读不到就明说跳过（别让"读不到"冒充"撤销坏了"）。 */
+      const b0 = readB3()
+      if (!b0) {
+        bad('读不到板 B 的文件 —— 这一节没法验（不是撤销坏了，是夹具没落盘）')
+      } else {
+        const n0 = b0.strokes.length
+        await CTRL_V()
+        /* ★ 等盘上**严格变大**（不是等于 n0+2）：存档是防抖合并的，中间值不会出现。 */
+        const added = await until(async () => {
+          const d = readB3()
+          return d && d.strokes.length > n0 ? d : undefined
+        }, { what: 'Ctrl+V 之后盘上变多了（造撤销判据的起点）', timeout: 8000 })
+        if (!added.ok) {
+          bad(`Ctrl+V 之后盘上还是 ${n0} 笔（没变多）—— 撤销判据的起点没造出来`)
+        } else {
+          const n1 = added.value.strokes.length
+          /* 现在撤一步：应当**正好退回 n0**（回到刚刚亲眼见过的那一版）。 */
+          await s.send('Input.dispatchKeyEvent', {
+            type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 2,
+          })
+          await s.send('Input.dispatchKeyEvent', {
+            type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2,
+          })
+          await s.send('Input.dispatchKeyEvent', {
+            type: 'char', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2, text: 'z', unmodifiedText: 'z',
+          })
+          await s.send('Input.dispatchKeyEvent', {
+            type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90, modifiers: 2,
+          })
+          await s.send('Input.dispatchKeyEvent', {
+            type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: 0,
+          })
+          await s.sleep(500)
+
+          const gone = await until(async () => {
+            const d = readB3()
+            return d && d.strokes.length === n0 ? d : undefined
+          }, { what: 'Ctrl+Z 之后盘上退回贴之前那个数', timeout: 8000 })
+          if (gone.ok) ok(`Ctrl+Z 把**这一次**粘贴整块收回去了（盘上从 ${n1} 笔退回 ${n0} 笔）—— 一次粘贴确实是一步`)
+          else {
+            const d = readB3() || {}
+            bad(`Ctrl+Z 之后盘上是 ${(d.strokes || []).length} 笔，期望退回 ${n0} 笔（贴之前那版）—— 粘贴没进撤销栈，或者没退干净`)
+          }
+        }
       }
     }
 

@@ -292,6 +292,22 @@ console.log('\n[6] 箭头工具（A）：从一张卡划到另一张卡 —— �
   if (String(toolHit).includes('bd-t')) ok(`那颗按钮**点得到**（命中的是 ${toolHit}）`)
   else bad(`箭头按钮中心命中的是「${toolHit}」—— 用户点不到`)
 
+  /* ★★ 先**点那颗按钮**（2026-09-24 补的这一条）。
+     从前这里只验按 A —— 而 2026-09-17 加那颗按钮时，按钮自己写了一行
+     `setTool('arrow')` + 一句提示，可它在那个组件里**拿不到 `flash`**
+     （`flash` 是 App 传下来的 prop，不是全局函数）：点一下当场 `ReferenceError`，
+     好在 `setTool` 在前面已经跑完，工具照样切了 —— 界面上看不出事，
+     报错只落在控制台里，所以一直没人发现（搬组件的时候才用静态扫读出来）。
+     现在两条入口合成一个 `pickArrow`，这一条钉的是"点按钮也不能报错"。 */
+  const errBefore = s.errors().length
+  await s.mouse(toolBtn.x, toolBtn.y)
+  const armedByBtn = await s.eval(`!!document.querySelector('.bd-tools .bd-t[data-tool="arrow"].on')`)
+  if (armedByBtn) ok('点工具条上那颗按钮也切到了箭头工具')
+  else bad('点了工具条上那颗箭头按钮，工具没切过去')
+  const newErrs = s.errors().slice(errBefore)
+  if (!newErrs.length) ok('★ 点那颗按钮**没有报错**（从前它在这里 ReferenceError：那个组件拿不到 flash）')
+  else bad(`点那颗按钮报错了：${newErrs.join(' | ')}`)
+
   /* 用键盘 A 起手（用笔的人就是这么用的），再从 A 卡划到 B 卡。 */
   await s.key('a', 'KeyA', 65)
   const armed = await s.eval(`!!document.querySelector('.bd-tools .bd-t[data-tool="arrow"].on')`)

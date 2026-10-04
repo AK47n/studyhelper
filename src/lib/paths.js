@@ -121,9 +121,35 @@ export function parentPath(p) {
   return s.join('/')
 }
 
-/** 文件名去掉 `.md` —— 左栏显示的就是它（板自己的标题在文件内容里，见 board.js） */
+/* 白板文件的文件名前缀，**显示的时候要去掉**（2026-09-23 用户要求：
+   「白板名字前面不要带 board-」）。
+   ⚠ 为什么在这儿又写了一遍、不 import board.js 的 BOARD_PREFIX：
+     两个模块**反向依赖** —— board.js 要 `baseName`，所以 import 了 paths.js。
+     这里再回头 import board.js 就是**循环依赖**，在 ESM 里会变成
+     "某些情况下那个值是 undefined"，而表现出来只是"前缀没去掉"这种软故障，
+     极难查。一行字符串的代价换掉一个环，划算。
+   ⚠ 两边改一处必须改两处：`board.js` 的 BOARD_PREFIX 和这里。 */
+const BOARD_FILE_PREFIX = 'board-'
+
+/** 文件名去掉 `.md` —— 左栏显示的就是它（板自己的标题在文件内容里，见 board.js）
+ *
+ *  ★ 白板还要**再去掉 `board-` 前缀**：那个前缀是**为了排序和识别**才加到
+ *    盘上的（`links.js` 第 799 行的老说明：「文件名前缀 board- 让列表一眼能分开
+ *    白板和笔记」），不是给用户看的名字。用户看到的应该只是「新白板」「第一章」。
+ *  ⚠ 为什么改在这儿、不改成"左栏单独去掉一层"：
+ *     · 这个函数的 doc 上一句就写着「**左栏显示的就是它**」—— 它就是"这文件
+ *       该显示成什么"的**唯一**实现。左栏另写一遍 = 同一个规矩两份，
+ *       将来"导出标题""改名框初值"又会各漏一次（这个仓库最怕的那种 bug）。
+ *     · 对**笔记**是安全的空操作：笔记文件名从不带 `board-` 前缀
+ *       （`files.js` 的 boardFileName 才加），所以正则不命中、原样返回。
+ *     · 对**白板**是正解：`board-新白板.md` → `新白板`，
+ *       和 `board.js` 里 load() 算出来的板标题（`replace(/^board-/i,'')`）**口径一致**。
+ *  ⚠ 只去**开头**那一处（`^`），不是全文替换 —— 用户完全可能给板起名
+ *     「board-的用法」，那种名字里头的 board- 是他自己打的字，必须留着。 */
 export function pathTitle(p) {
-  return baseName(p).replace(/\.md$/i, '')
+  return baseName(p)
+    .replace(/\.md$/i, '')
+    .replace(new RegExp(`^${BOARD_FILE_PREFIX}`, 'i'), '')
 }
 
 /** 这个名字改过没有？（改名对话框靠它决定"确定"亮不亮、点下去算不算数）

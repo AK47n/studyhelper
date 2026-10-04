@@ -21,10 +21,11 @@ import { extractFilePart, extractTextPart, buildMultipart } from '../src/lib/mul
 import { httpRequest } from '../src/lib/http.js'
 import { cleanText, interpretOcrResponse } from '../src/lib/ocr.js'
 import {
-  BOARD_PROMPT, BOARD_LINES_PROMPT, CONFIG_KEYS, DEFAULT_CONFIG, DOC_PROMPT, PROVIDERS, STRUCT_PROMPT, TEXT_PROMPT, authHeaders, boardLinesPrompt,
+  BOARD_PROMPT, BOARD_LINES_PROMPT, CONFIG_KEYS, DEFAULT_CONFIG, DOC_CONCURRENCY_DEFAULT, DOC_CONCURRENCY_MAX, DOC_PROMPT, MODE_EFFORT, MODE_LIMITS,
+  PROVIDERS, STRUCT_PROMPT, TEXT_PROMPT, authHeaders, boardLinesPrompt,
   callDeepSeek, callProvider, callSimpleTex, cleanLatex,
   cleanModelOutput, cleanTextOutput, configFile, endpointOf, hasKey, loadConfig, normalizeConfig, parseProviderResponse,
-  publicStatus, saveConfig, testProvider, tinyWhitePng,
+  publicStatus, saveConfig, testProvider, tinyWhitePng, usageOf,
 } from '../server-ocr.js'
 
 let fails = 0
@@ -129,6 +130,22 @@ console.log('\n[2] 配置：密钥进得来、出不去')
     eq(publicStatus(kept).boardModel, 'strong-model-x', '状态里报得出它（设置面板回显要用）')
     await saveConfig(root, { boardModel: '', token: 'abcdef1234567890' })
     eq((await loadConfig(root)).boardModel, '', '清空 = 回落到普通模型（不是删掉这个键）')
+  }
+
+  /* ★ 「课件整理：同时发几路」（2026-09-22 加的旋钮）。
+     它是**浏览器在用**的数（doc-read.js 的 readDeck），前端只能从 /api/ocr/status 拿到它 ——
+     所以"存得住"和"状态里报得出来"这两条缺一不可（缺了的表现是：设置里改了、跑起来还是 6）。 */
+  {
+    eq(DEFAULT_CONFIG.docConcurrency, DOC_CONCURRENCY_DEFAULT, '默认并发 = DOC_CONCURRENCY_DEFAULT')
+    const saved = await saveConfig(root, { docConcurrency: 4, token: 'abcdef1234567890' })
+    eq(saved.docConcurrency, 4, '存得住')
+    eq(publicStatus(saved).docConcurrency, 4, '★ /api/ocr/status 里报得出来（浏览器就是靠它拿到这个数的）')
+    eq(normalizeConfig({ docConcurrency: 200 }).docConcurrency, DOC_CONCURRENCY_MAX, '★ 写得再大也被夹到上限（200 路只会把额度和本机打爆，那不是"更快"）')
+    eq(normalizeConfig({ docConcurrency: 0 }).docConcurrency, DOC_CONCURRENCY_DEFAULT, '写 0 → 回默认（0 路等于什么都不发）')
+    eq(normalizeConfig({ docConcurrency: -3 }).docConcurrency, DOC_CONCURRENCY_DEFAULT, '负数 → 回默认')
+    eq(normalizeConfig({ docConcurrency: 'abc' }).docConcurrency, DOC_CONCURRENCY_DEFAULT, '乱打的字 → 回默认（不是 NaN 发下去）')
+    eq(normalizeConfig({ docConcurrency: 2.7 }).docConcurrency, 2, '小数向下取整')
+    await saveConfig(root, { docConcurrency: DOC_CONCURRENCY_DEFAULT, token: 'abcdef1234567890' })
   }
 
   await fs.rm(root, { recursive: true, force: true })
@@ -319,6 +336,77 @@ console.log('\n[5] DeepSeek：请求形状和回话清洗')
   else bad('图片块形状不对：' + JSON.stringify(img).slice(0, 120))
   if (s.json && s.json.temperature === 0) ok('temperature=0（识别是"抄"不是"创作"）')
   else bad('没有把 temperature 设成 0')
+
+  /* ★★ 两件 2026-09-22 加的东西，都在这儿钉住 ──────────────────────────
+     ① `max_tokens`：**跑飞兜底**。它把 thinking 也算在内 —— 实测 `max_tokens=100`
+        那一次，100 个 token 全被思维链吃掉、`content` 长度是 0。所以这里钉的是
+        "每一趟都有上限、而且值给得够宽"，**不是**"上限很小"（给小了会把答案掐掉）。
+     ② `usage` 透传：上游回了多少就原样报出来 —— 界面那一行"这一趟花了多少"全靠它。
+        在这之前整个仓库一次都没读过 `usage`，于是"改了之后是不是更省"只能靠感觉。 */
+  {
+    /* ★ 这份清单要跟着 `MODE_LIMITS` 长：加了新模式（`docsum` / `rules` / `hwask`…）
+       就要把它列进来 —— 漏掉一个的后果是"那一趟上限是 384K，一次最贵能到 $0.46"
+       而这里一片绿（它漏在名单外，压根没被查）。 */
+    const LIMIT_NAMES = ['formula', 'text', 'board', 'structure', 'doc', 'docsum', 'rules', 'ask', 'homework', 'hwask']
+    const missing = LIMIT_NAMES.filter((m) => !(MODE_LIMITS[m] >= 2000))
+    eq(missing.join(','), '', '★ 每一趟各有各的 max_tokens，而且都 ≥ 2000（thinking 也算在里面，给小了会把答案掐掉）')
+    if (s.json && Number.isFinite(s.json.max_tokens)) ok('请求体里带着 max_tokens=' + s.json.max_tokens + '（跑飞兜底，不是省钱开关）')
+    else bad('请求体里没有 max_tokens —— 不设的话上限是 384K，一次调用最贵能到 $0.46')
+
+    /* ★★ 每趟"想多深"那张表（2026-09-23 加）。
+       两条盯的都是**登记**，不是值本身 —— 值写错了看得见（钱没少），
+       漏登记看不出来（那一趟静默走上游默认 high，屏幕上一样绿）。 */
+    const EFFORT_NAMES = Object.keys(MODE_EFFORT)
+    eq(
+      EFFORT_NAMES.slice().sort().join(','),
+      Object.keys(MODE_LIMITS).slice().sort().join(','),
+      '★ MODE_EFFORT 和 MODE_LIMITS 登记的 mode 一模一样（加新 mode 两处都要登记）',
+    )
+    const oddEffort = EFFORT_NAMES.filter((m) => MODE_EFFORT[m] !== 'off' && MODE_EFFORT[m] !== 'high')
+    eq(
+      oddEffort.join(','),
+      '',
+      "★ 每趟的 effort 只能是 'off' 或 'high'（2026-09-23 实测：'low' 只省 15 个 token、时间没变 —— 那一档等于不存在）",
+    )
+
+    /* 真发一次逐页讲解那趟，盯请求体。
+       ★ 第二条是全组里最要紧的一条：**关掉 thinking 之后 temperature 才开始生效**
+       （thinking 模式下它被上游忽略）。讲解那趟因此必须拿 0.3 —— 拿 0 会被压成
+       教科书腔，而那正是用户抱怨过的"读完还是不懂"。这条错了不会报错，只会变难读。 */
+    const nBefore = seen.length
+    await callDeepSeek(cfg, png, { mode: 'doc', page: 3 })
+    const dj = (seen[seen.length - 1] || {}).json || {}
+    eq(seen.length, nBefore + 1, '逐页讲解那一趟发出去了（下面几条查的就是它）')
+    eq(dj.thinking && dj.thinking.type, 'disabled', '★ 逐页讲解关掉了思维链（实测 8.5s→2.8s、输出砍 67%，讲解反而更完整）')
+    eq(dj.temperature, 0.3, '★ 关掉思维链之后 temperature 才生效 —— 讲解必须拿 0.3，不是 0')
+    eq(dj.reasoning_effort, undefined, "发了 thinking 就不该再发 reasoning_effort（两个是互斥的说法）")
+
+    reply = {
+      code: 200,
+      body: {
+        choices: [{ message: { content: 'B=\\frac{a}{b}' } }],
+        usage: {
+          prompt_tokens: 1979,
+          completion_tokens: 1327,
+          total_tokens: 3306,
+          prompt_cache_hit_tokens: 768,
+          prompt_cache_miss_tokens: 1211,
+          completion_tokens_details: { reasoning_tokens: 916 },
+        },
+      },
+    }
+    const ru = await callDeepSeek(cfg, png)
+    eq(ru.ok, true, '带 usage 的回包照样收下')
+    eq(ru.usage && ru.usage.prompt, 1979, '★ usage 原样带出来了（输入）')
+    eq(ru.usage && ru.usage.cached, 768, '★ 缓存命中那一份也带出来了（"每一轮那两张图到底重付了没有"靠它说话）')
+    eq(ru.usage && ru.usage.miss, 1211, '未命中那一份也带出来了')
+    eq(ru.usage && ru.usage.reasoning, 916, '★ 思维链的 token 单独报出来（它常常占输出的大半）')
+    /* 上游只给 details 那一套形状时也要读得出来（两套字段名都实测见过） */
+    const alt = usageOf({ prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 64 } })
+    eq(alt.cached, 64, '另一套字段名（prompt_tokens_details.cached_tokens）也读得出来')
+    eq(alt.miss, 36, '没给 miss 就自己算（prompt − hit）')
+    eq(usageOf(undefined), null, '★ 读不出来是 **null**，不是一堆 0（"没有这个数"和"这个数是 0"是两句不同的话）')
+  }
 
   // 错误分流（DeepSeek 和 SimpleTex 共用同一套分类）
   reply = { code: 401, body: { error: { message: 'Authentication Fails' } } }
@@ -569,10 +657,17 @@ console.log('\n[8] mode=text：认普通文字')
   eq(rd.ok, true, '课件整理那一趟成功')
   eq(promptOf(seen[0]).startsWith(DOC_PROMPT), true, '发出去的是课件整理那段提示词')
   eq(promptOf(seen[0]).includes('这一页是**第 7 页**'), true, '★ 页码写进了图上那段文字里（doc-cards 靠它把知识点挂到页上）')
-  eq(/points/.test(DOC_PROMPT) && /"kind": "note"/.test(DOC_PROMPT), true, '提示词里给了回话的 JSON 形状（含 kind:note）')
-  eq(/kind":"formula"|kind": "formula"/.test(DOC_PROMPT), true, '提示词里说清了"公式单独成一条"（公式要落成公式卡）')
+  /* 2026-09-22 订正：产出从"一页 0~4 条知识点卡（`kind: note|formula`）"换成了
+     **老师讲解**（`explain` / `points` / `formulas`，见 README 那一节），
+     而这三条断言还在找旧版提示词里的字 —— 它们已经跟着换过来了。
+     ⚠ 换产出时提示词口径变了的话，`doc-read.js` 的 `DOC_FLAVOR` 也要跟着换
+       （不换就会原样命中上一版的老稿，屏幕上看着跟没改一样）。 */
+  eq(/"explain"/.test(DOC_PROMPT) && /"points"/.test(DOC_PROMPT) && /"formulas"/.test(DOC_PROMPT), true,
+    '提示词里给了回话的 JSON 形状（page / unit / explain / points / formulas）')
+  eq(/0~4 条/.test(DOC_PROMPT) && /不带 \$ 定界符/.test(DOC_PROMPT), true,
+    '提示词里说清了"公式一条一条给、tex 不带 $ 定界符"（`formulas` 要落成公式卡）')
   eq(/绝对不要编造/.test(DOC_PROMPT), true, '★ "绝对不要编造"在（白板是学生要信的起点，混进编的比少几条糟得多）')
-  eq(/宁可少而准/.test(DOC_PROMPT), true, '★ "宁可少而准"在（凑数的条目会把白板淹掉）')
+  eq(/空着比硬讲好/.test(DOC_PROMPT), true, '★ "空着比硬讲好"在（凑数的条目会把白板淹掉 —— 老版那句是"宁可少而准"）')
   /* ⚠ 判据要写得具体：`/x|y/` 会命中 `tex`（提示词里到处是它）—— 那种断言看着绿、
      其实什么都没验。这里只挑"坐标/尺寸"那一族的说法。 */
   eq(/"x"\s*:|"y"\s*:|坐标为|位置为|宽度|高度|左上角/.test(DOC_PROMPT), false, '★ 提示词里**没有**位置/尺寸这一族字段（摆版由 doc-cards.js 的 projectDeck 算）')
@@ -629,9 +724,37 @@ console.log('\n[9] 服务端旧版：不许把"认公式的结果"当成文字�
   eq(interpretOcrResponse(null, 'text').kind, 'bad', '空回包 → bad，不崩')
 
   /* 第 ① 道防线就在 status 里：`modes` 是老服务端不会有的字段。
-     这里断言它确实跟着 PROVIDERS 一起发出去（面板靠它提前警告）。 */
+     这里断言它确实跟着 PROVIDERS 一起发出去（面板靠它提前警告）。
+     ⚠ **别把它当成一张手抄的清单**：
+        加一种模式（2026-09-22 加的 `docsum`，整节课的提纲那一趟）就得记着来改这里 ——
+        忘了改的话会红成"status 里少了点东西"，看着像服务端坏了。
+        所以每一种都**点名**（缺一个、多一个都该被逮到），但按集合比、不锁顺序
+        （顺序是 PROVIDERS 里那个数组的事，不是这条断言该管的）。 */
   const st = publicStatus(normalizeConfig({ provider: 'deepseek' }))
-  eq(st.providers.deepseek.modes, ['formula', 'text', 'board', 'structure', 'doc'], 'status 里报得出"DeepSeek 能认公式、认文字、整板转录、结构整理、课件整理"（老服务端没这个字段 —— 这是第一道防线）')
+  const modes = st.providers.deepseek.modes
+  const MODE_MEANING = {
+    formula: '认公式',
+    text: '认文字',
+    board: '整板转录',
+    structure: '结构整理',
+    doc: '课件整理',
+    docsum: '整节课的提纲',
+    /* ★ 2026-09-22 加的第七个：整节课的第二张卡（和 docsum 共用那份摘要输入）——
+       它**必须**单列一条，不许并进 docsum：前端是靠 `modes.includes(...)` 判断
+       "本地服务认不认这个口"的（见 DeckReview 的 genSummary），
+       并在一起的话老服务端会被当成"认"，然后安静地退回提纲那一路。 */
+    rules: '做题须知',
+  }
+  const missingMode = Object.keys(MODE_MEANING).filter((m) => !modes.includes(m))
+  if (!missingMode.length && modes.length === Object.keys(MODE_MEANING).length) {
+    eq(true, true, `status 里报得出 DeepSeek 的全部 ${modes.length} 种模式（${Object.values(MODE_MEANING).join('、')}）（老服务端没这个字段 —— 这是第一道防线）`)
+  } else {
+    eq(
+      { missing: missingMode, extra: modes.filter((m) => !(m in MODE_MEANING)) },
+      { missing: [], extra: [] },
+      'status 里的 modes 和这份清单对不上（加了新模式就把它加进 MODE_MEANING —— 别直接删断言）'
+    )
+  }
   eq(st.providers.simpletex.formulaOnly, true, 'status 里说清了 SimpleTex 只认公式（面板据此提前警告，而不是等失败）')
 }
 

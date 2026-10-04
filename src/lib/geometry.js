@@ -453,18 +453,58 @@ export function relationCurve(ra, rb, bow = 0.18) {
      在 758×426 的窗口里（笔记本分屏、或者浏览器窗口拖小了），
      "全部装进去"会算出 0.37 倍，卡片上的公式小到看不清。
      装不下就装不下，宁可让你**平移着看**，也不能把板缩成蚂蚁。
-     （Ctrl+0 是"装回屏幕"，会走这里；想真的看到全部内容就用它，然后自己放大。） */
+     （Ctrl+0 是"装回屏幕"，会走这里；想真的看到全部内容就用它，然后自己放大。）
+ *
+ *   ★★ 那个 2 倍上限（`Math.min(raw, 2)`）是给"内容很少的一块板"留的：
+ *     只有一张小卡时 raw 能算出十几倍，不夹一下会一开窗就怼到脸上。
+ *     但它有个副作用：界面字号档调大（`--s`，最多 2.0）时卡片是**按 `--s` 撑大的**，
+ *     而这里只管世界坐标、对 `--s` 一无所知 —— 于是"装回屏幕"算出来的 2 倍
+ *     在屏幕上还要再乘一份字号档的膨胀，卡片右边缘就那样越过画布，
+ *     贴着卡片右边那颗 × 跟着出界。
+ *     实测（卡片贴画布右边沿、窗口 900×620、字号档 2.0）：
+ *       卡片屏幕宽 440，右边缘 896 > 画布右边界 866 —— 出界 30px。
+ *     ⚠ 这一条**和手柄的尺寸无关**（手柄那半边 2026-09-21 已用 `zoom` 修好，
+ *       布局盒恒为 22×22、屏幕上恒定）。这是"卡片本身就没装进画布"。
+ *     `--s` 不进这个纯函数（它拿不到 DOM，也不该拿到）——
+ *     由调用方按字号档折算，见 Board.jsx 里 fit 那几处传进来的 screenW/screenH。 */
 export const READABLE_FIT_S = 0.55
-export function fitView(board, screenW, screenH, pad = 60) {
-  const box = boundsOfAll(
-    [...((board && board.strokes) || [])],
-    strokeBounds
-  )
+/* ★★ `fitView` 是"装进 `screenW × screenH` 的正中间"。
+ *
+ * ⚠ "装得下的区域"和"能用的区域"**不是同一块**：白板底部浮着工具条
+ *   （`.bd-cbar`，absolute），它盖住的那一条既看不见也点不到。
+ *   且**光把 `screenH` 改小修不了** —— 那只是让内容缩得更小，中心仍落在
+ *   整个容器的一半处，底下照样被工具条吃掉一截。
+ *   （实测 1000×700、字号档 2.0：只改 screenH 时卡片顶部还越出画布 119px、
+ *     被工具条压住 139px；而改成下面这个"在能用区域里居中"之后全部归零。）
+ *
+ * 所以"装回屏幕"走 `fitViewIn`：**在给定的那一块能用的区域里居中**。
+ * ⚠ 内容真的装不下时（撞上 READABLE_FIT_S 下限）就让它溢出 —— 那是这个下限
+ *   本来就接受的代价（"宁可让你平移着看"）。此处**不再额外做"贴左上角"**：
+ *   试过，反而把内容整体推到工具条底下（实测被压住的深度 139px → 475px），
+ *   因为"左上角"是**内容包围盒**的左上角，而那块板上内容的坐标跨度很大。
+ *   居中至少保证"能看的那一块在正中间"，多出来的部分左右上下均匀地摊在外面。
+ * `usable` 是相对容器左上角的那个矩形（`{x, y, w, h}`），工具条占掉的高度由调用方
+ * 从 `h` 里扣（见 Board.jsx 的 fitForView —— 它能量到工具条真实高度）。 */
+export function fitViewIn(board, usable, pad = 60) {
+  const v = fitView(board, usable.w, usable.h, pad)
+  /* `fitView` 的 tx/ty 是相对"它自己那个 w×h 画布左上角"的，
+     而可用区域整体偏移了 (usable.x, usable.y) —— 补上偏移就落位了。 */
+  return { s: v.s, tx: v.tx + usable.x, ty: v.ty + usable.y }
+}
+
+/* 板里所有内容的包围盒（笔迹 + 卡片 + 资料）—— fitView 和 fitViewIn 共用一份口径。
+   ⚠ 只此一处：两处各算一遍就一定会有一处忘了加某类内容（资料那类最容易漏）。 */
+export function contentBounds(board) {
+  const box = boundsOfAll([...((board && board.strokes) || [])], strokeBounds)
   const cbox = boundsOfAll((board && board.cards) || [], cardBounds)
-  /* 资料也算"内容"：一张只插了 PDF、还没写字的板，装回屏幕必须看得到那份 PDF。 */
   const dbox = boundsOfAll((board && board.docs) || [], docBounds)
   let all = box && cbox ? unionRect(box, cbox) : box || cbox
   all = all && dbox ? unionRect(all, dbox) : all || dbox
+  return all
+}
+
+export function fitView(board, screenW, screenH, pad = 60) {
+  const all = contentBounds(board)
   if (!all || all.w <= 0 || all.h <= 0) return { s: 1, tx: screenW / 2, ty: screenH / 2 }
   const raw = Math.min((screenW - pad * 2) / all.w, (screenH - pad * 2) / all.h)
   const s = clampViewScale(Math.max(READABLE_FIT_S, Math.min(raw, 2)))
