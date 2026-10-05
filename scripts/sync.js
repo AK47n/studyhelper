@@ -81,6 +81,8 @@ function buildCommitMessage(statusText) {
   if (!lines.length) return { subject: `笔记更新 ${stamp}`, body: '' }
 
   const paths = lines.map((l) => l.slice(3).replace(/^"|"$/g, ''))
+  /* ⚠ 2026-10-05 起 `data/` 被 `.gitignore` 挡住了，这一支**恒为 false**（已知不可达）。
+     留着没删：它本身没坏，而且哪天 data/ 重新进 Git，它自己就活了。 */
   const notesOnly = paths.every((p) => p.startsWith('data/'))
 
   const MAX = 200
