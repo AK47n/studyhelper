@@ -17,6 +17,12 @@
     "check:highlight": "esbuild scripts/check-highlight.js --bundle --platform=node --format=cjs --outfile=.cache/check-highlight.cjs --external:katex --log-level=error && node .cache/check-highlight.cjs",
     "check:render": "esbuild scripts/check-render.js --bundle --platform=node --format=cjs --outfile=.cache/check-render.cjs --external:katex --log-level=error && node .cache/check-render.cjs",
     "check:rich": "node scripts/check-rich.js",
+    "check:calc": "node scripts/check-calc.js",
+    "check:chart": "node scripts/check-chart.js",
+    "check:chart-layout": "node scripts/check-chart-layout.js",
+    "check:chart-browser": "node scripts/check-chart-browser.js",
+    "check:plot": "node scripts/check-plot.js",
+    "check:plot-browser": "node scripts/check-plot-browser.js",
     "check:mount": "node scripts/bundle-mount.mjs && node .cache/check-mount-entry.mjs",
     "check:browser": "node scripts/cdp-open.js 9222 && timeout /t 5 >nul && node scripts\\cdp-align.js && node scripts\\cdp-caretfit.js",
     "check:board": "node scripts/check-board.js",
@@ -77,6 +83,7 @@
     "check:all": "npm run check && npm run check:keys && npm run check:scale && npm run check:align && npm run check:highlight && npm run check:render && npm run check:rich && npm run check:mount && npm run check:board && npm run check:shape && npm run check:storage && npm run check:delete && npm run check:ocr && npm run check:homework && npm run check:keep && npm run check:docslice"
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
     "katex": "^0.16.11",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.3.289",

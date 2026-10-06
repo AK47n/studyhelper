@@ -1416,6 +1416,17 @@ const fails = await withBoard(
     /* ★ 这一节全是**命中测试**的事 —— `dispatchEvent` 合成事件绕过命中测试、
        能"点中"一个实际上点不到的按钮（README 第 11/19 条）。所以每一条都先问
        `elementFromPoint` 再动手，而且**走真鼠标**。 */
+    /* ⚠⚠ 先把「⋯ 更多」菜单**收掉**再测这一段（2026-10-06 修）。
+       这一段测的是"📌 点得到"，而前面 [2] / [6] 为了点「✧ 课件整理」都**打开过**那个菜单
+       （菜单常驻 DOM，z-index 30），谁也没收 —— 于是它正好浮在那颗 📌 上，
+       `elementFromPoint` 命中的是菜单而不是按钮。
+       ⚠ 原话是"被别的东西盖住了，点不到"，但**被浮层盖住本来就是应该的**：
+       菜单开着时下面的东西点不到是设计，不是 bug。那条断言真正要说的是
+       "**菜单没开**的时候 📌 点得到" —— 所以收掉菜单再量，而不是去查是什么盖住了。
+       ⚠ 判据别写成"清掉所有 open 类"：那会把别的浮层（复习窗口之类）也关掉，
+         把这一段变成"顺手把现场清了"。只收这一个按钮自己开的那个。 */
+    await s.eval(`(() => { const m = document.querySelector('[data-tool="more"]'); if (m && m.classList.contains('on')) m.click(); return 1 })()`)
+    await s.sleep(120)
     {
       const lockInfo = await s.eval(`(() => {
         const el = document.querySelector('.bd-card')
@@ -1431,6 +1442,19 @@ const fails = await withBoard(
         const px = pinRect ? Math.round(pinRect.left + pinRect.width / 2) : 0
         const py = pinRect ? Math.round(pinRect.top + pinRect.height / 2) : 0
         const atPin = pin ? document.elementFromPoint(px, py) : null
+        /* ⚠ 报"被谁盖住"而不只是"点不到" —— 原来只说 pinHitSelf=false，
+           定位不到是浮层、还是另一张卡、还是画布，只能靠猜（2026-10-06 卡在这条上）。
+           ⚠⚠ 这整段是一个**反引号模板**里的代码：注释里绝对不许出现反引号字符，
+           否则模板在那里就结束了、后面全成语法错误，而报错指向的是模板**开头**那一行
+           （真实原因在几十行外，极难定位）。 */
+        const blocker = atPin && !(atPin.closest && atPin.closest('.bd-card-pin'))
+          ? {
+              cls: String(atPin.className || atPin.tagName || '').slice(0, 60),
+              tag: atPin.tagName,
+              cardId: (atPin.closest && atPin.closest('.bd-card') && atPin.closest('.bd-card').getAttribute('data-card-id')) || null,
+              z: getComputedStyle(atPin).zIndex,
+            }
+          : null
         return {
           id: el.getAttribute('data-card-id'),
           locked,
@@ -1439,6 +1463,9 @@ const fails = await withBoard(
           bodyHit: at ? (at.className || at.tagName) : null,
           pinHitSelf: !!(atPin && atPin.closest && atPin.closest('.bd-card-pin')),
           pinAt: { x: px, y: py },
+          pinRect: pinRect ? { x: Math.round(pinRect.left), y: Math.round(pinRect.top), w: Math.round(pinRect.width), h: Math.round(pinRect.height) } : null,
+          inViewport: pinRect ? pinRect.top >= 0 && pinRect.bottom <= innerHeight && pinRect.left >= 0 && pinRect.right <= innerWidth : null,
+          blocker,
         }
       })()`)
       if (!lockInfo) bad('屏幕上找不到卡片（这一节没得测）')

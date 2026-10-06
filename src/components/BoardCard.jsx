@@ -11,11 +11,12 @@
  * ⚠ 这个文件**不碰板的状态**：它只认传进来的 props 和"按 id 办事"的回调。
  * ⚠ 传进来的父级回调必须都是 useCallback 造的稳定引用（别在 render 里现写）。
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Tex } from './Tex.jsx'
-import { CARD_FONTS, DEFAULT_CARD_FONT, fontCss, nextCardScale } from '../lib/board.js'
+import { CARD_FONTS, CARD_PROVENANCE_KEYS, DEFAULT_CARD_FONT, fontCss, nextCardScale } from '../lib/board.js'
 import { richHtml } from '../lib/rich.js'
 import { displayTex, snippetFor, toTex } from '../lib/formula.js'
+import { readFormula } from '../lib/calc.js'
 import { combinedScale, worldLenToScreen } from '../lib/view.js'
 import { ASK_MARK_GLYPH } from '../lib/answer-cards.js'
 import { ASK_BUTTON } from '../lib/followup.js'
@@ -26,6 +27,7 @@ import { buildRelations } from '../lib/geometry.js'
 import { translateShape } from '../lib/shape-object.js'
 import { drawStroke } from '../lib/ink.js'
 import BoardCanvas from './BoardCanvas.jsx'
+import { Calc } from './BoardCalc.jsx'
 import { DocBars } from './DocLayer.jsx'
 import { parseBoardDocument } from '../lib/board.js'
 import { applyViewTo, screenLenToWorld } from '../lib/view.js'
@@ -101,6 +103,20 @@ function Card({ card, selected, dimmed, editing, inPick, onSelect, onStartEdit, 
   const [draft, setDraft] = useState('')
   const [draftFont, setDraftFont] = useState(DEFAULT_CARD_FONT)
   const isFormula = card.kind === 'formula'
+
+  /* 「这条式子能不能算」—— 见下面 `<Calc>` 那段。
+     ★ 挂载后在 `useMemo` 里算一次就够：解析是纯函数，只有 src 变了才会不一样。
+       别在 render 里直接调 —— 卡片每一次重渲染都要过一遍解析器，
+       而卡片在视图变化时本来就可能被 framework 重画（见上面那层稳定外壳的说明）。 */
+  const calc = useMemo(() => (isFormula && card.src ? readFormula(card.src) : null), [isFormula, card.src])
+  const [calcOpen, setCalcOpen] = useState(false)
+  const [calcVals, setCalcVals] = useState({})
+  /* ★ 卡片不再被选中 ⇒ 把那个浮窗收掉。
+     浮窗还挂在屏幕上、所属的那张卡却已经不在焦点里 —— 看着像它是谁的都分不清了。
+     ⚠ 这里**不看 locked**：固定住的卡片也能是这个焦点（点不到整张卡，但按钮能点）。 */
+  useEffect(() => {
+    if (!selected) setCalcOpen(false)
+  }, [selected])
   /* 固定（钉住）：这张卡不再收指针事件 —— 见下面 .bd-card.locked 和 pinCard 的说明。 */
   const locked = card.locked === true
   /* 卡片的"放大缩小"倍率（见 lib/board.js 的 nextCardScale）。
@@ -270,11 +286,12 @@ function Card({ card, selected, dimmed, editing, inPick, onSelect, onStartEdit, 
          和画布那三个 dataset.strokes/pts/flat 是同一个道理。
          data-card-locked 也一样：锁定是个**行为**，自检要能一眼读到它。 */
       data-card-kind={card.kind}
-      /* ★ 「这张是整节课的提纲」/「这张是做题须知」——**出处是独立字段**，不是 kind
-         （见 placeDeckCards 那条注）。自检靠它们在屏幕上认出那两张
-         （文件里靠卡上的 `sum: true` / `rules: true`）。 */
-      data-card-sum={card.sum ? '1' : undefined}
-      data-card-rules={card.rules ? '1' : undefined}
+      /* ★ 「这张卡是从哪儿来的」三个出处标记（提纲 / 做题须知 / 答案卡）——
+         **从 `CARD_PROVENANCE` 那张清单展开**，不再一个个手写（2026-10-06 收拢）。
+         出处是**独立字段**、不是 kind（见 placeDeckCards 那条注）。
+         自检靠它们在屏幕上认出那几张（文件里靠 `sum: true` 那种字段）。
+         ⚠ 属性名不能变（`data-card-sum` 等）—— `check-deck.js` 那些命中测试按它找。 */
+      {...Object.fromEntries(CARD_PROVENANCE_KEYS.map((k) => [`data-card-${k}`, card[k] === true ? '1' : undefined]))}
       data-card-font={card.kind === 'note' ? card.font || DEFAULT_CARD_FONT : undefined}
       data-card-locked={locked ? '1' : undefined}
       /* data-card-id 是给"插完量一下真实高度"用的（fitCardHeight 靠它找内容元素）。
@@ -382,6 +399,20 @@ function Card({ card, selected, dimmed, editing, inPick, onSelect, onStartEdit, 
           永远量不出"其实只有一行字"）。这一层不参与任何布局计算，只是给量高度一个准星。 */}
       <div className="bd-card-body">{body}</div>
 
+      {/* 「这条式子，代入数字算一算」那个浮窗。
+          ⚠ 它挂在**卡片的 DOM 里面**：位置跟着卡片走（卡片被拖走它也跟着），
+             不用另外去算"它在屏幕上的哪里" —— 和 .bd-card-pin 那一族同一条路。
+          ⚠ 面板里的操作必须自己接住指针事件（见 `<Calc>` 的 onPointerDown）：
+             否则按在输入框上就变成"开始拖这张卡"。 */}
+      {calcOpen && calc && calc.ok && (
+        <Calc
+          parsed={calc}
+          vals={calcVals}
+          onVal={(k, v) => setCalcVals((m) => ({ ...m, [k]: v }))}
+          onClose={() => setCalcOpen(false)}
+        />
+      )}
+
       {/* 固定：**锁定之后整张卡只剩这一个能点**（它自己带 pointer-events: auto），
           所以"钉死了拿不下来"这件事不会发生。
           没锁的时候只在你选中它时出现 —— 和 × / 缩放柄同一个规矩：
@@ -427,6 +458,25 @@ function Card({ card, selected, dimmed, editing, inPick, onSelect, onStartEdit, 
               }
             >
               {ASK_MARK_GLYPH}
+            </button>
+          )}
+          {/* 「这条式子，代入数字算一算」—— 只有公式卡、而且我真的读得懂它才有这一颗。
+              ★ 放在**这一组**（而不是下面"选中且没锁"那一组）：
+                课件整理推上来的公式卡**默认是固定住的**（见 README「固定」那条），
+                摆到下面那一组的话，恰恰是**最需要它的那些卡没有这颗按钮**。 */}
+          {calc && calc.ok && (
+            <button
+              className={'bd-card-calc' + (calcOpen ? ' on' : '')}
+              /* 同样是给自检看的钩子：emoji / 字形分不出"开着还是关着"。 */
+              data-card-calc={calcOpen ? 'close' : 'open'}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                setCalcOpen((v) => !v)
+              }}
+              title={calcOpen ? '收起' : '把数代进去算一算（这条式子我读得懂）'}
+            >
+              =
             </button>
           )}
         </>

@@ -1551,7 +1551,7 @@ kbd {
  *   工具条浮在画布上、`fitView` 又不知道 `--s`，字号档大时卡片本身就越界。
  *   那一半在 Board.jsx 的 `fitForView`（按字号档折算 + 扣掉工具条占的高度）。
  *   两半都没修的话，表现一模一样：屏幕上看得见那颗 ×，点下去 elementFromPoint 回 null。 */
-.bd-card-del, .bd-card-resize, .bd-card-pin, .bd-card-ask {
+.bd-card-del, .bd-card-resize, .bd-card-pin, .bd-card-ask, .bd-card-calc {
   position: absolute; border-radius: 50%; border: 1px solid #d5dae4; background: #fff; color: #666;
   line-height: 1; cursor: pointer; padding: 0; opacity: 0.55; transition: opacity 0.12s;
   /* 视图缩放的倒数 —— 抵消祖先 `.bd-cardworld` 的 scale(s)，手柄的**屏幕大小恒定**。
@@ -1620,6 +1620,96 @@ kbd {
 }
 .bd-card-ask.on { opacity: 1; border-color: #e2a3a3; background: #fff5f5; color: #c92a2a; }
 .bd-card-ask:hover { background: #eef3ff; border-color: #a9c4ee; color: #2f6fd0; }
+
+/* ---------- 「这条式子，代入数字算一算」（2026-10-05）----------
+   排在 📌 / ◎ 右边：那一排是**锁定卡片上唯一还能点的一带**（锁定 = 整张卡不收事件），
+   而课件整理推上来的公式卡默认是锁定的 —— 摆到别处去，
+   正好最需要它的那些卡就没有这颗按钮。 */
+.bd-card-calc {
+  left: 42px; bottom: -10px;
+  width: 22px; height: 22px;
+  font-size: calc(14px * var(--s));
+  font-weight: 500;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: auto;
+}
+.bd-card-calc.on { opacity: 1; border-color: #bcd6ae; background: #f3fbf1; color: #2f7a25; }
+.bd-card-calc:hover { background: #eef3ff; border-color: #a9c4ee; color: #2f6fd0; }
+
+/* 那个浮窗。贴在**卡片下方**、挂在卡片的 DOM 里 —— 卡片被拖走它自己跟着走。
+   ⚠ `zoom` 那一行和 .bd-card-pin 同一条口径：抵消祖先 .bd-cardworld 的 scale(s)，
+     不然视野一缩小，输入框就跟着缩到点不中。 */
+.bd-calc {
+  position: absolute; left: -4px; top: calc(100% + 10px); z-index: 20;
+  width: max-content; min-width: 190px; max-width: 330px;
+  padding: 8px 10px 10px;
+  background: #fff; border: 1px solid #d5dae4; border-radius: 10px;
+  box-shadow: 0 4px 14px rgba(20, 24, 33, 0.12);
+  pointer-events: auto; cursor: default;
+  --ck-inv: calc(1 / var(--bd-world-s, 1));
+  zoom: var(--ck-inv);
+}
+.bd-calc-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-size: 12px; color: #777; margin-bottom: 8px;
+}
+.bd-calc-head b { color: #333; font-weight: 500; font-family: var(--mono); }
+.bd-calc-x { border: none; background: none; cursor: pointer; color: #bbb; font-size: 15px; line-height: 1; padding: 0 2px; }
+.bd-calc-x:hover { color: #c92a2a; }
+.bd-calc-vars { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.bd-calc-var { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #444; font-family: var(--mono); }
+.bd-calc-var input {
+  width: 86px; padding: 3px 6px; font: inherit; font-size: 12px;
+  border: 1px solid #d5dae4; border-radius: 6px; color: var(--ink);
+}
+.bd-calc-var input:focus { outline: none; border-color: #4c8eda; box-shadow: 0 0 0 2px rgba(76, 142, 218, 0.15); }
+.bd-calc-note { font-size: 11px; color: #999; }
+.bd-calc-out {
+  margin-top: 9px; padding-top: 8px; border-top: 1px solid #eee;
+  font-family: var(--mono); font-size: 16px; font-weight: 500; color: #1d7a44;
+  word-break: break-all; line-height: 1.4;
+}
+/* 还没填全的时候那一行是**提示**，不是答案 —— 用安静的小字。
+   16px 的等宽绿字是用来宣布结果的，拿它显示"还不知道 a 是多少"会让人当成答案。 */
+.bd-calc-out.wait { font-family: var(--font-sans); font-size: 12px; font-weight: 400; color: #a08a6a; line-height: 1.5; }
+.bd-calc-warn {
+  margin-top: 7px; padding: 5px 7px; font-size: 11px; line-height: 1.6;
+  color: #8a6100; background: #fff8e6; border: 1px solid #f0dca8; border-radius: 6px;
+}
+.bd-calc-warn code { background: #f3e6c4; border-radius: 3px; padding: 0 3px; }
+
+/* ─────────── 同一个浮窗的下半截：这条式子的图 ───────────
+   ⚠ 面板宽度上限是 330px，图定死 268 宽就是为了留够 padding ——
+     图比 min-width(190) 宽，所以有图的时候面板会自己撑开到 288，那是想要的。 */
+.bd-plot { margin-top: 9px; padding-top: 8px; border-top: 1px solid #eee; }
+.bd-plot-bar {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: #888; margin-bottom: 6px;
+}
+.bd-plot-bar > span { flex: none; }
+.bd-plot-sym {
+  font: inherit; font-family: var(--mono); font-size: 12px; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 5px; padding: 1px 2px; background: #fff;
+}
+.bd-plot-sym-static {
+  font-family: var(--mono); font-size: 12px; font-weight: 500; color: #333;
+}
+.bd-plot-end {
+  width: 62px; padding: 2px 5px; font: inherit; font-size: 11px;
+  border: 1px solid #d5dae4; border-radius: 5px; color: var(--ink); background: #fff;
+}
+.bd-plot-end:focus { outline: none; border-color: #4c8eda; box-shadow: 0 0 0 2px rgba(76, 142, 218, 0.15); }
+.bd-plot-svg { display: block; width: 268px; height: 138px; touch-action: none; cursor: crosshair; }
+.bd-plot-axis { stroke: #dfe3ea; stroke-width: 1; }
+.bd-plot-curve { fill: none; stroke: #2f6fd0; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.bd-plot-cross { stroke: #c9b48a; stroke-width: 1; stroke-dasharray: 3 3; }
+.bd-plot-dot { fill: #fff; stroke: #2f6fd0; stroke-width: 1.6; }
+.bd-plot-tick { font-family: var(--mono); font-size: 9px; fill: #a6adba; }
+.bd-plot-read { font-family: var(--mono); font-size: 10px; fill: #1d7a44; font-weight: 500; }
+.bd-plot-note {
+  margin-top: 5px; font-size: 11px; line-height: 1.6; color: #a08a6a;
+}
+.bd-plot-note[data-plot-note='err'] { color: #8a6100; }
 
 /* 锁定后的卡片：**不收任何指针事件**（除了上面那颗 📌）。
    视觉上给一点暗示就行 —— 别把卡片弄丑，它不是坏掉了。 */
@@ -3105,3 +3195,104 @@ kbd {
 
 
 
+
+/* ─────────── 实验图那个窗口（2026-10-05）───────────
+   它长什么样、每块多宽，全在这儿。两条原则：
+   ① 数据框和预览**并排**（左边填、右边立刻看见），34 张来回切的时候手不用来回跑；
+   ② 预览那块底是白的、边是浅的 —— 和打出来的纸一致，不骗眼睛。 */
+.chbox { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
+  background: rgba(22, 26, 35, 0.3); }
+.ch-panel { display: flex; flex-direction: column; width: min(1060px, 94vw); height: min(690px, 92vh);
+  background: #fff; border-radius: 14px; box-shadow: 0 12px 40px rgba(20, 24, 33, 0.22); overflow: hidden; }
+.ch-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #eceff3; }
+.ch-title { font-size: 14px; font-weight: 600; color: #333; }
+.ch-name { width: 170px; padding: 4px 8px; font: inherit; font-size: 12px; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-names { font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid #d5dae4; border-radius: 6px; color: #555; background: #fff; }
+.ch-saved { font-size: 11px; color: #8d99ad; }
+.ch-x { margin-left: auto; border: none; background: none; cursor: pointer; font-size: 18px; line-height: 1; color: #b6bcc7; }
+.ch-x:hover { color: #c92a2a; }
+.ch-body { flex: 1; display: flex; min-height: 0; }
+/* 左列：这一份里所有的图。34 张都在这儿，一次看得到。 */
+.ch-list { width: 184px; flex: none; border-right: 1px solid #eceff3; overflow: auto; padding: 8px 8px 12px; }
+.ch-item { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 6px 8px; margin-bottom: 3px; border-radius: 6px; cursor: pointer; font-size: 12px; color: #444; }
+.ch-item:hover { background: #f5f7fa; }
+.ch-item.on { background: #eef3ff; color: #2f6fd0; font-weight: 500; }
+.ch-item-n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ch-item-r { flex: none; display: flex; align-items: center; gap: 6px; }
+.ch-item-m { flex: none; font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 8px; background: #eef1f5; color: #6b7280; }
+.ch-item-m[data-chart-item-mode="fit"] { background: #fff3e0; color: #c77700; }
+.ch-item-p { flex: none; font-size: 11px; color: #a6adba; }
+.ch-add { width: 100%; margin-top: 6px; padding: 6px; font: inherit; font-size: 12px; color: #2f6fd0;
+  background: #fff; border: 1px dashed #b9c8de; border-radius: 6px; cursor: pointer; }
+.ch-add:hover { background: #f3f7ff; }
+.ch-main { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 12px 14px; }
+.ch-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ch-fn { width: 150px; padding: 4px 8px; font: inherit; font-size: 13px; font-weight: 500; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-lab { font-size: 12px; color: #888; }
+.ch-ax { width: 62px; padding: 4px 7px; font: inherit; font-size: 12px; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-un { width: 46px; padding: 4px 7px; font: inherit; font-size: 12px; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-modes { display: flex; gap: 4px; margin-left: auto; }
+.ch-mode { padding: 4px 10px; font: inherit; font-size: 12px; color: #555; background: #fff;
+  border: 1px solid #d5dae4; border-radius: 6px; cursor: pointer; }
+.ch-mode.on { background: #eef3ff; border-color: #a9c4ee; color: #2f6fd0; font-weight: 500; }
+.ch-edit { flex: 1; display: flex; gap: 14px; min-height: 0; margin-top: 10px; }
+/* ⚠ 加了「第二条曲线」之后这一列要放两个数据框 + 两行名字 + 两组画法按钮，
+   296px 挤不下（名字输入框会被压到 0 宽）。放宽到 360 并允许自己滚 ——
+   数据多的时候本来就该滚，而不是把框越挤越窄。 */
+.ch-data { width: 360px; flex: none; display: flex; flex-direction: column; overflow: auto; }
+/* ⚠ 别再用 `flex: 1`：父容器改成可滚之后，flex 项在两条曲线时会被压成 0 高
+   （第一个框吃满、第二个框看不见）。给固定高度 + 自己的滚动条更稳。 */
+.ch-ta { flex: none; height: 132px; width: 100%; resize: vertical; padding: 8px 10px;
+  font-family: var(--mono); font-size: 12px;
+  line-height: 1.7; color: var(--ink); border: 1px solid #d5dae4; border-radius: 8px; }
+.ch-ta:focus { outline: none; border-color: #4c8eda; box-shadow: 0 0 0 2px rgba(76, 142, 218, 0.15); }
+.ch-hint { margin-top: 6px; font-size: 11px; color: #888; min-height: 17px; }
+.ch-note { color: #8a6100; }
+.ch-bad { color: #c0563a; }
+/* ── 一张图里画几条曲线（2026-10-05 加）────────────────────────────
+   左边那个 ○/□/△ 是**图上真的那个形状** —— 界面里看到的和纸上印出来的一致，
+   不用记"第二条是方块"这种对应关系。点它换下一种（循环）。 */
+.ch-srow { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.ch-smark { flex: none; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1; color: #444; background: #fff; border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-smark.btn { cursor: pointer; }
+.ch-smark.btn:hover { background: #eef4ff; border-color: #a9c4ee; }
+.ch-sname { flex: 1; min-width: 0; padding: 5px 8px; font: inherit; font-size: 12px; color: var(--ink);
+  border: 1px solid #d5dae4; border-radius: 6px; }
+.ch-sname:focus { outline: none; border-color: #4c8eda; box-shadow: 0 0 0 2px rgba(76, 142, 218, 0.15); }
+.ch-modes.sm { margin-left: 0; }
+.ch-modes.sm .ch-mode { padding: 3px 7px; font-size: 11px; }
+.ch-sdel { flex: none; width: 24px; height: 26px; font: inherit; font-size: 15px; line-height: 1; color: #98a1b0;
+  background: #fff; border: 1px solid #d5dae4; border-radius: 6px; cursor: pointer; }
+.ch-sdel:hover { color: #c0563a; border-color: #e3b8ab; background: #fdf3f0; }
+/* 附加曲线那一块用左边框+浅底隔开：一眼看出"这是第二条，和上面那个框是两回事"。 */
+.ch-extra { margin-top: 10px; padding: 8px 0 2px 8px; border-left: 2px solid #dbe3ef; }
+.ch-ta.sm { min-height: 74px; font-size: 11px; }
+.ch-addextra { margin-top: 10px; padding: 7px 10px; font: inherit; font-size: 12px; color: #2f6fd0;
+  background: #f6f9ff; border: 1px dashed #b9cdf0; border-radius: 8px; cursor: pointer; }
+.ch-addextra:hover { background: #eef4ff; border-style: solid; }
+/* 左列表里"这张图有两条曲线"的标记 */
+.ch-item-s { flex: none; font-size: 10px; line-height: 1; padding: 2px 5px; border-radius: 8px;
+  background: #eaf4ff; color: #2f6fd0; }
+.ch-view { flex: 1; display: flex; flex-direction: column; align-items: center; min-width: 0; overflow: auto; }
+.ch-pic { padding: 10px; background: #fff; border: 1px solid #e5e8ee; border-radius: 8px; }
+.ch-num { margin-top: 8px; font-family: var(--mono); font-size: 12px; color: #1d7a44; min-height: 18px; text-align: center; }
+.ch-foot { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid #eceff3; }
+.ch-tip { font-size: 11px; color: #a6adba; }
+.ch-err { font-size: 12px; color: #c0563a; }
+.ch-btn { margin-left: auto; padding: 6px 14px; font: inherit; font-size: 12px; color: #444;
+  background: #fff; border: 1px solid #d5dae4; border-radius: 7px; cursor: pointer; }
+.ch-btn:hover { background: #f5f7fa; }
+.ch-btn.main { margin-left: 0; color: #fff; background: #2f6fd0; border-color: #2f6fd0; font-weight: 500; }
+.ch-btn.main:hover { background: #2a63bb; }
+.ch-btn:disabled { opacity: 0.55; cursor: default; }
+
+.ch-shot { margin-bottom: 8px; padding: 6px 10px; font: inherit; font-size: 12px; color: #2f6fd0;
+  background: #f7faff; border: 1px dashed #b9c8de; border-radius: 7px; cursor: pointer; text-align: center; }
+.ch-shot:hover:enabled { background: #eef4ff; }
+.ch-shot:disabled { opacity: 0.6; cursor: default; }

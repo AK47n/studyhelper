@@ -37,6 +37,84 @@ import { normalizeAsk, serializeAsk } from './ask-region.js'
 export const BOARD_VERSION = 4
 export const BOARD_PREFIX = 'board-' // 白板文件都叫 board-xxx.md（内容其实是 JSON，见下）
 export const CARD_KINDS = ['formula', 'note']
+
+/* ══════════ 卡片上的「出处标记」：这一族字段的唯一清单 ══════════
+ *
+ * 这些字段说的是**这张卡是从哪儿来的**（提纲 / 做题须知 / 答案卡），
+ * 不是"画成什么" —— 所以它们**各自独立一个字段、一个字都不动 `kind`**。
+ * 板层的 `kind` 只有 `formula` / `note` 两种，多出来的值会被 `newCard` 夹回去、
+ * 夹回去就丢了"这张卡从哪儿来"这件事（先例是 `ink`，见 CONTEXT.md「出处写在另一个字段上」）。
+ *
+ * ★ 为什么要一份清单（2026-10-06 收拢）：
+ *   加一个新出处（比如"作业页码表"）要改**四处**，漏一处都是**静默**的 ——
+ *     ① `normalizeCard` 的白名单（漏了 → 读回来是 undefined，**文件里看不出这张卡是提纲**，
+ *        而界面上一切正常、卡片照画、不报错）
+ *     ② `serializeBoardDocument` 的白名单（漏了 → **存的时候丢掉**，下次打开就变回普通卡）
+ *     ③ `homework.js` 的 `isDeckLevelCard`（漏了 → 提纲被当成"某一页的卡"混进知识点）
+ *     ④ `isLessonCard` 的排除名单（漏了 → 上题的答案被当成本节课讲过的东西，模型抄自己）
+ *   而 `board.js` 里那三段注释（`sum` / `rules` / `answer`）本来就写着
+ *   "和 rich/locked 同一条闸""和 sum 同一个套路的第二例""第三例" ——
+ *   也就是说这个套路**每加一例就要抄一遍闸**，抄漏了不会有人发现。
+ *   ⇒ 现在 normalize / serialize 两处都从**这张表**展开，加一例只改这一份。
+ *
+ * ⚠ 三条贯穿全族的规矩（改这张表时逐条对照，别只顾着加字段名）：
+ *   ① **严格 `=== true` 才算**：手改文件写个 `"false"` 不该让一张手写笔记突然被当成提纲。
+ *   ② **默认不写进文件**（serialize 只在真的时候写）：老文件因此一个字节都不动。
+ *   ③ 这几个字段**互不蕴含**：一张卡可以同时是提纲和答案卡（虽然现在不会发生），
+ *      所以清单是平的，不做互斥。
+ *
+ * @type {Array<{key: string, what: string, why: string}>}
+ */
+export const CARD_PROVENANCE = [
+  {
+    key: 'sum',
+    what: '整节课的提纲',
+    why: '课件整理第二趟的产出，落在第一页左栏（Board.jsx 的 placeDeckCards）。它是**形状**，给学生复习用。',
+  },
+  {
+    key: 'rules',
+    what: '做题须知',
+    why: '和提纲是**两张卡**（提纲=形状/须知=口径），各记各的字段：homework 的 collectKnowledge 对须知要特殊对待。',
+  },
+  {
+    key: 'answer',
+    what: '留到板上落下来的答案卡',
+    why: '长得和讲解卡一模一样（都是 rich 文字卡），不带这个标记的话 isLessonCard 会把上一题的解法当下节课讲过的东西喂回去。',
+  },
+]
+
+/** 这些标记字段的键（给 normalize / serialize 展开用）。 */
+export const CARD_PROVENANCE_KEYS = CARD_PROVENANCE.map((p) => p.key)
+
+/** 一张卡是不是「整节课那一层」的（提纲 / 须知）—— 不属于任何一页、`page` 必须是 0。
+ *
+ * ★ 板层的判据，**吃的是卡上的 `sum` / `rules` 字段**，不是 `kind`：
+ *   板层 kind 只有 formula/note，所以对 `kind` 判 summary/rules **永远为假** ——
+ *   而表现是"提纲照旧被当成某一页的卡混在中间"，静默（homework.js 原注释已记）。
+ * ⚠ 不要用位置判（"它没贴在任何一页旁边"）：板书上一条普通笔记也可能落在页面左边，
+ *   而那正是这一趟最不该误伤的东西（它是学生自己写的）。
+ * ⚠ 也不要在这里用 `doc-summary.js` 的 `isSummary` / `isDeckLevel` —— 那两个吃的是
+ *   **条目层**的 kind（课件整理还没落板时的 `items[]`）。两层混用判据恒为假。
+ */
+export function isDeckLevelCard(c) {
+  return !!c && (c.sum === true || c.rules === true)
+}
+
+/** 一张卡带的是哪个出处标记（没带就 null）。答：'sum' | 'rules' | 'answer' | null。 */
+export function cardProvenance(c) {
+  if (!c) return null
+  if (c.sum === true) return 'sum'
+  if (c.rules === true) return 'rules'
+  if (c.answer === true) return 'answer'
+  return null
+}
+
+/** 出处标记 → 人话（界面上用它给卡片标一行小字、提示词里用它分段）。
+ *  认不出来的键返回键本身 —— 宁可显示一个怪词，也不要静默显示空。 */
+export const PROVENANCE_LABEL = { sum: '提纲', rules: '做题须知', answer: '答案卡' }
+export function provenanceLabel(key) {
+  return PROVENANCE_LABEL[String(key || '')] || String(key || '')
+}
 /* 新卡片的默认框。
    ⚠ `h` 在这个应用里是**最小高度**，不是"内容该多高"：
      · 一张便签可以被你故意开得很大 —— 它是"装住别的卡"的容器。
@@ -615,30 +693,16 @@ function normalizeCard(c) {
        和 locked 同一条判据：**严格 true 才算**，别的一律当普通文字卡 ——
        手改文件写个 "false" 不该让一张手写笔记突然被当 Markdown 渲染。 */
     rich: c.rich === true,
-    /* ★ 「这张是整节课的提纲」（课件整理第二趟的产出，见 doc-summary.js / Board.jsx 的
-       placeDeckCards）。**出处记在这个独立字段上，不动 `kind`** ——
-       板层的 `kind` 只管"画成什么形状"（公式 / 文字），只有两种，
-       而提纲就是一张文字卡，画法一个字都不差。`ink` 已经是同一个先例
-       （出处写在另一个字段上，不新造 kind，见 CONTEXT.md）。
-       ⚠ 它必须**显式列在这儿**：这一层是白名单，没列到字段在**写出去时就被丢掉**，
-       读回来自然是 undefined —— 表现是"文件里看不出哪张是提纲"，
-       而界面上一切正常（卡片照画、不报错）。和 rich / locked 同一条判据：严格 true。 */
-    sum: c.sum === true,
-    /* ★ 「这张是做题须知」（`rules`，2026-09-22 加的 —— 和 `sum` 是**同一个套路**的第二例，
-       见 doc-summary.js 的 RULES_KIND / Board.jsx 的 placeDeckCards）。
-       它和提纲是**两张卡**（提纲 = 形状，给学生复习；须知 = 口径，给做题那一趟看），
-       所以**各记各的字段**、不合并成一个"是整节课的东西"：
-       两者的去处不同（`collectKnowledge` 对须知要特殊对待，见 homework.js）。
-       ⚠ 同样必须**显式列在这儿**（白名单，没列到写出去就丢 —— 上面 `sum` 那句的理由）。 */
-    rules: c.rules === true,
-    /* ★ 「这张是「留到板上」落下来的答案卡」（`answer`，2026-09-24 加的 —— 和 `sum`/`rules`
-       **同一个套路**的第三例）。为什么非要有这个字段：答案卡是一张 `rich: true` 的文字卡，
-       而 `homework.js` 的 `isLessonCard` 判"算不算这节课的知识"用的正是「note + rich」——
-       于是上一题的答案会被当成"讲过的东西"喂给下一题（模型抄自己），
-       表现是"第二题的答案里混着第一题的解法"。板层 kind 只有 note/formula，
-       所以出处照样写在独立字段上，由 `isLessonCard` 明说排除。
-       ⚠ 同样必须**显式列在这儿**（白名单，没列到字段写出去时就被丢）。 */
-    answer: c.answer === true,
+    /* ★ 「这张卡是从哪儿来的」三个出处标记（提纲 / 做题须知 / 答案卡）——
+       **从 `CARD_PROVENANCE` 那张清单展开，不再一个个手抄**（2026-10-06 收拢）。
+       每一项的判据是同一条：**严格 `=== true`**，别的值一律 false（和上面
+       `locked` / `rich` 同一条闸；理由是手改文件写个 `"false"` 不该让一张手写笔记
+       突然被当成提纲）。
+       ⚠ 这一层是**白名单**：没列到的字段**写出去时会被丢掉**。所以"加一个出处标记"
+         只改 `CARD_PROVENANCE` 一处就够 —— 以前要抄两遍闸（这里 + serialize），
+         抄漏了的表现是"文件里看不出这张卡是提纲"而界面上一切正常、不报错。
+         三项各自是什么、为什么非要有那个字段，见 board.js 顶上 `CARD_PROVENANCE` 那一段。 */
+    ...Object.fromEntries(CARD_PROVENANCE_KEYS.map((k) => [k, c[k] === true])),
     /* 「这一问落在课件的哪一块」（`ask`，见 ADR-0006）：**只有知道自己在讲第几页的卡才有**
        —— 「留到板上」落下来的那两张（追问的答案、作业的答案，带 `region`），
        以及课件整理贴上去的讲解卡（只带 `page`：它讲的是那一页，没被圈过哪一块）。
@@ -747,18 +811,11 @@ export function serializeBoardDocument(board) {
       /* 讲义卡（正文带公式）同理：只有真是讲义卡才写。普通文字卡不写，
          老文件因此一个字节都不动。 */
       ...(c.rich === true ? { rich: true } : {}),
-      /* ★ 「这张是整节课的提纲」（`sum`，见 doc-summary.js）：**出处记在这个独立字段上，
-         不动 `kind`**（和 `ask` 一个道理 —— `kind` 是板子层的东西，
-         板子层的 CARD_KINDS 只有 formula/note 两种，多出来的值会被 newCard 夹回去，
-         夹回去就丢了"这张是提纲"这件事）。
-         和 rich / locked 同一条闸：不是提纲的卡一个字节都不多。 */
-      ...(c.sum === true ? { sum: true } : {}),
-      /* ★ 「这张是做题须知」（`rules`）：和 `sum` 同一个套路（出处记在独立字段上，
-         不动 kind）、同一条闸（不是须知卡的卡一个字节都不多）。见上面 normalize 那一段。 */
-      ...(c.rules === true ? { rules: true } : {}),
-      /* ★ 「这张是答案卡」（`answer`）：和 `sum`/`rules` 同一个套路、同一条闸
-         （不是答案卡的卡一个字节都不多，老文件不受影响）。见上面 normalize 那一段。 */
-      ...(c.answer === true ? { answer: true } : {}),
+      /* ★ 三个出处标记（提纲 / 做题须知 / 答案卡）：**从 `CARD_PROVENANCE` 展开**
+         （2026-10-06 收拢，和上面 normalize 那段同一份清单）。
+         判据是同一条闸：**只在真的时写、不是它的卡一个字节都不多**，
+         老文件因此一个字节都不动。和 `locked` / `rich` / `ask` 同一个道理。 */
+      ...Object.fromEntries(CARD_PROVENANCE_KEYS.filter((k) => c[k] === true).map((k) => [k, true])),
       /* 「这一问落在课件的哪一块」（`ask`，见 ADR-0006 / ask-region.js）：**只有问出来的卡**
          才有（「留到板上」落下来的那两张）。没问过的板、手写的卡一个字节都不多 ——
          和 locked / rich 同一条闸。

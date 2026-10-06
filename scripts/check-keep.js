@@ -38,7 +38,7 @@ import {
   askThreadText,
   homeworkText,
 } from '../src/lib/answer-cards.js'
-import { CARD_GAP_Y, ORIGIN_GAP, SIDE_W, columnOccupancy, pageGapDeltas, pageGapFor, planAnswerCard, projectDeck, shiftLaterPageCards } from '../src/lib/doc-cards.js'
+import { CARD_GAP_Y, ORIGIN_GAP, SIDE_W, columnOccupancy, growPageGaps, mergePageGap, pageGapDeltas, pageGapFor, planAnswerCard, projectDeck, shiftLaterPageCards } from '../src/lib/doc-cards.js'
 
 let fails = 0
 let checks = 0
@@ -305,7 +305,73 @@ console.log('\n[F] 某页的 pageGaps 涨了 → 后面那些页上的卡片要�
   eq(REAL_DELTA, 418,
     'F3★ 增量 = 418 —— 第 38 页被推下去 418px，而它那 5 张卡原来**一个都不动**（用户看到的就是这个）')
 
-  /* ══ ② `pageGapDeltas`：只留正的、下标和 pageGaps 对齐、**稠密**（length = 页数） */
+  /* ══ ②★ `mergePageGap` / `growPageGaps`：那笔账的**唯一**实现（2026-10-06 从三处收拢）。
+     收拢的理由不是"少写两遍"：`pageGaps` 有三个入口（贴讲解 / 落讲解卡 / 留答案卡），
+     每一处都要做同样三件事（只涨不缩 + 算增量 + 挪后面的卡），
+     而**最容易漏的是第三步，漏了不报错** —— 那就是 2026-09-23 那个错位。 */
+  eq(mergePageGap(0, 100), { keep: 100, delta: 100 }, 'G1 这一页从空变 100 → 留 100、涨 100')
+  eq(mergePageGap(238, 656), { keep: 656, delta: 418 },
+    'G2★ 用户那张板的真数：238 → 656，增量 418（第 38 页那 5 张卡要挪的就是它）')
+  eq(mergePageGap(656, 238), { keep: 656, delta: 0 },
+    'G3★★ 只涨不缩：新的比旧的小 → 一个字节都不动（`delta` 必须是 0，不能是负数 —— 负数会把后面的卡往上推）')
+  eq(mergePageGap(-5, 100), { keep: 100, delta: 100 }, 'G4 老文件里的垃圾值（负数）当 0 处理')
+  eq(mergePageGap(100, -5), { keep: 100, delta: 0 }, 'G5 想写个负数 → 不动')
+  eq(mergePageGap(undefined, undefined), { keep: 0, delta: 0 }, 'G6 两个都是空 → 0/0（不是 NaN）')
+
+  /* 批量版：`want` 可以稀疏（没给的格子 = 不动），但 `deltas` 必须**稠密**。 */
+  {
+    /* ⚠ 用**真数**：原来 238（讲解卡已经把第 2 页撑高了），现在答案卡接在它下面
+       又要 656 ⇒ 增量 418。写成「原来 0、现在 656」的话增量就是 656，
+       那测的是另一回事（首次整理），418 这条链就没被钉住。 */
+    const one = []
+    one[2] = 656 // 第 3 页想涨到 656（原来 238）
+    const g = growPageGaps([0, 238, 238], one)
+    eq(g.gaps[2], 656, 'G7★ 稀疏 `want` 里那一格被并进去了（第 3 页 = 656）')
+    eq(g.deltas.length, 3, 'G8★ `deltas` 是**稠密**的：length = 3（`shiftLaterPageCards` 要按它做前缀和）')
+    eq(g.deltas, [0, 0, 418], 'G9 增量只有第 3 页那 418（前两页一个字节都没动）')
+    eq(g.grew, true, 'G10 `grew` 说"真的涨了" → 调用方据此决定要不要写回文件')
+    eq(g.gaps.length, 3, 'G11 `gaps` 长度对齐（调方按 `gaps[i]` 回填 doc）')
+    eq(g.gaps[1], 238, 'G12 `gaps` 里**别的页原样保留**（第 2 页那个 238 没被这次写掉 —— 并的是整份，不只是第 3 页）')
+
+    /* ⚠ 这条是 C2 的正题：**稠密不是洁癖**。`shiftLaterPageCards` 按 `d[i]` 累加前缀和，
+       稀疏的话"第 3 页该挪多少"算不出来（它会当成后面几页都没涨）。
+       下面用一个真会分叉的场景钉住它。 */
+    const two = growPageGaps([], [100, 50])
+    eq(two.deltas, [100, 50], 'G13 一次涨两页 → 两格都有（曾经 `keepAnswer` 那处用稀疏数组，只在这一处恰好成立）')
+    eq(two.deltas.length, 2, 'G14 两格 → length 2')
+    /* 稀疏版会怎样：把第 1 页挪到第 2 页后面，前缀和就不对。 */
+    eq(
+      (() => {
+        const sparse = []
+        sparse[1] = 50 // 只有第 2 页有值 —— 旧写法
+        return sparse[0] === undefined ? 'undefined' : String(sparse[0])
+      })(),
+      'undefined',
+      'G15（反证）稀疏数组第 0 格是 undefined → 前缀和从 undefined 起算 —— 这就是 G8 要稠密的理由',
+    )
+  }
+
+  /* 整条链子按真数跑一遍：`growPageGaps` 出来的 deltas 喂给 `shiftLaterPageCards`。 */
+  {
+    const D3 = '.资料/甲.pdf'
+    const before = [
+      { id: 'p1', y: 0, ask: { doc: D3, page: 1 } },
+      { id: 'p2', y: 0, ask: { doc: D3, page: 2 } },
+      { id: 'p3', y: 0, ask: { doc: D3, page: 3 } },
+    ]
+    const one3 = []
+    one3[1] = 656 // 第 2 页要涨（原来 238）
+    const g3 = growPageGaps([0, 238], one3)
+    const sh = shiftLaterPageCards({ cards: before, docPath: D3, deltas: g3.deltas })
+    eq(sh.cards[1].y, 0, 'G16★ 第 2 页自己涨的空不挪它自己（只有**后面**那些页才挪）')
+    eq(sh.cards[2].y, 418, 'G17★★ 第 3 页的卡挪了 418 —— 页面被推下去了，卡也跟着走（用户 2026-09-23 报的那个）')
+    eq(sh.cards[0].y, 0, 'G18 第 1 页的卡不动')
+    eq(sh.moved, 1, 'G19 只有 1 张挪了（挪了几张要如实告诉用户，别让他以为界面乱了）')
+  }
+
+  /* ══ ③ `pageGapDeltas`：只留正的、下标和 pageGaps 对齐、**稠密**（length = 页数）
+     ⚠ 2026-10-06 起**生产代码里已经零调用**（那笔账走 `growPageGaps`），
+        留着只为兼容旧断言；将来清掉这段断言时可以连它一起删。 */
   eq(pageGapDeltas([0, 100, 0, 50], [0, 0, 0, 0]), [0, 100, 0, 50],
     'F4 下标 = 页号 - 1，和 pageGaps 本身对齐')
   eq(pageGapDeltas([0, 100, 0, 50], [0, 0, 0, 0]).length, 4,
@@ -363,24 +429,39 @@ console.log('\n[F] 某页的 pageGaps 涨了 → 后面那些页上的卡片要�
   const noPath = shiftLaterPageCards({ cards: same, docPath: '', deltas: [100] })
   yes(noPath.cards === same && noPath.moved === 0, 'F17 没给资料路径 → 一个字节都不动（宁可不挪，也不"猜着挪"）')
 
-  /* ══ ⑦**源码扫描**：接线有没有真的接上。
+/* ══ ⑦**源码扫描**：接线有没有真的接上。
      这一族最阴的失败方式是"函数写得对、**没人调**"—— 本仓库栽过一模一样的
      （`allCards` 算出来了位置、flash 里也说了，就是没进 commit，界面上一切正常）。
-     判据：`Board.jsx` 里**每一个写 `pageGaps` 的地方**，附近都得有一次
-     `shiftLaterPageCards` 调用 —— 写空和挪卡是同一条不变量，缺一半就是这次的 bug。
+     判据：`Board.jsx` 里**每一个算出那笔空的地方**，都必须调 `growPageGaps`
+     （唯一实现，"只涨不缩 + 算增量"只此一家）**和** `shiftLaterPageCards`
+     —— 写空和挪卡是同一条不变量，缺一半就是这次的 bug。
      ⚠ 这是"附近"（±900 字），不是语法分析：够用，而且将来多一处写入时它会红，
-     那时候回来看这条扫描、把新那处也补上。
+       那时候回来看这条扫描、把新那处也补上。
      ⚠ 判据别写成"调了几次"：`>=` 会放过"新增一处写 pageGaps 却忘了挪"，
-        而"恰好 2 次"又会被一次无关的重构弄红 —— 逐个写入点查附近才是对的那条。 */
+       而"恰好 2 次"又会被一次无关的重构弄红 —— 逐个写入点查附近才是对的那条。
+     ⚠⚠ 扫的是 **`growPageGaps(` 的调用点**，不是 `pageGaps:` 字面 ——
+       2026-10-06 之前这里扫的是 `pageGaps: keep`（写入时的变量名），
+       一改名就红，而**代码其实是对的**。扫"唯一实现被谁调"才是不变量的形状：
+       变量名是实现细节，谁调那份实现才是约定。 */
   const boardSrc = readFileSync(new URL('../src/components/Board.jsx', import.meta.url), 'utf8')
-  const WRITE = /pageGaps: keep/g
-  const sites = [...boardSrc.matchAll(WRITE)].map((m) => m.index)
-  eq(sites.length, 2, 'F18 写 pageGaps 的地方正好两处（`keepAnswer` / `placeDeckCards`）—— 多一处就回来补这条扫描')
+  const sites = [...boardSrc.matchAll(/growPageGaps\(/g)]
+    .map((m) => m.index)
+    /* `import { … growPageGaps … } from` 那行不算写入点。 */
+    .filter((i) => !/import[\s\S]{0,200}$/.test(boardSrc.slice(Math.max(0, i - 220), i)))
+  eq(sites.length, 2, 'F18 算那笔空的地方正好两处（`keepAnswer` / `placeDeckCards`）—— 多一处就回来补这条扫描')
   for (let i = 0; i < sites.length; i += 1) {
     const at = sites[i]
     const near = boardSrc.slice(Math.max(0, at - 900), at + 900)
-    yes(/shiftLaterPageCards\(/.test(near), `F19.${i + 1}★ 第 ${i + 1} 处写 pageGaps 的地方**真的调了** shiftLaterPageCards（写空不挪卡 = 用户报的那个错位）`)
+    yes(/shiftLaterPageCards\(/.test(near), `F19.${i + 1}★ 第 ${i + 1} 处算空的地方**真的调了** shiftLaterPageCards（写空不挪卡 = 用户报的那个错位）`)
+    yes(/commit\(/.test(near), `F20.${i + 1}  它和那张新卡在**同一个 commit** 里（分两次写中间那一帧就是错的版面）`)
   }
+  /* ★★ 反过来：`Board.jsx` 里**不许**自己写那个并入算式（`Math.max(was, …)`）。
+     三处各写一遍正是 2026-09-23 那个错位的根因，现在只有 `mergePageGap` 一处能算。 */
+  eq(
+    [...boardSrc.matchAll(/pageGaps\[[^\]]*\]\s*=\s*Math\.max|Math\.max\(was\b/g)].length,
+    0,
+    'F21★★ Board.jsx 里没有自己写「只涨不缩」的算式（那笔账只有 growPageGaps 一处算）',
+  )
 
   /* ══ ⑧★★ **整条链子**按用户那页的真数跑一遍（不是只测 `shiftLaterPageCards`）。
      上面 ③ 是"我喂给它一个 418"，这一节是"**那个 418 是 `planAnswerCard` 算出来的**" ——

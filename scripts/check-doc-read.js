@@ -37,6 +37,11 @@ import {
   stripTexDelims,
 } from '../src/lib/doc-cards.js'
 import { DOC_PAGE_GAP, normalizeDoc, pageRects, serializeDoc } from '../src/lib/docs.js'
+/* ★ 缓存键那两个纯函数（2026-10-06 加）。
+ *   在此之前 `scripts/` 里**零处**引 `doc-read.js` —— 而这一族出过两次静默错
+ *   （页集合漏在键外、键里不带 kind），两次都只有靠真浏览器自检撞出来。
+ *   键的形状是纯函数，能直接断言，就不该只靠"跑一遍看看对不对"。 */
+import { cacheKey, sumKeyOf, sumKeyHead, SUM_KINDS } from '../src/lib/doc-read.js'
 /* 整节课的提纲那一半 —— 它和逐页那一套**是两个文件**（见 doc-summary.js 的文件头），
    所以这里也分两处 import，一眼看得出哪几条断言在盯哪一边。 */
 import {
@@ -535,6 +540,50 @@ console.log('\n[13] ★ 源码扫描：提纲那一半不许碰"一页一课"的
   yes(/TEXT_KINDS/.test(cards), '★ doc-cards.js 是**引**那张表，不是自己再列一遍')
   /* 单方向：doc-summary 不许引 doc-cards（引了就成环，vite 会炸但 node 自检不一定）。 */
   yes(!/from '\.\/doc-cards\.js'/.test(code), '★ doc-summary.js 不引 doc-cards.js（单方向，不成环）')
+}
+
+/* ══════════════ 缓存键：键的**形状**本身就是判据（2026-10-06 加）══════════════
+ *
+ * 这一段每一条都对着一个**真踩过的坑**，不是"跑一遍看着对"。
+ * 这一族两次静默错的共同点：**键算错了，而界面有内容、不报错、也不说它是旧的** ——
+ *   ① 页集合漏在键外（`doc-read.js` 那段长注释记着：先读 1、3 再读 1、2，
+ *      直接命中那份旧的 ⇒ "屏幕上显示的是上 3 页的提纲"）；
+ *   ② 键里不带 kind（须知显示成提纲的六段）。
+ * 两次都只能靠真浏览器自检撞出来，因为键此前是**私有的** ——
+ * 而"哪些页集合算同一份"是一个**纯函数问题**，本来就该能直接断言。
+ */
+{
+  const P = '大物/电磁学/board-8.md'
+  const P2 = '大物/电磁学/board-9.md'
+
+  /* ── ① 逐页那一趟：路径 + 页号 ── */
+  yes(cacheKey(P, 1) !== cacheKey(P, 2), '逐页：同一份课件的两页是两个键（否则第二页永远命中第一页）')
+  yes(cacheKey(P, 1) !== cacheKey(P2, 1), '逐页：两份课件的同一页是两个键')
+  yes(cacheKey(P, 1).includes(P), '逐页：键里带路径（认的是"哪一份课件"，不是"哪一页"）')
+  yes(cacheKey(P, 1).endsWith('|1'), '逐页：页号在键的末尾（换页 = 换键）')
+
+  /* ── ② 整节课那两张：页集合必须进键（历史 bug ①）── */
+  const kA = sumKeyOf(P, [1, 2, 3])
+  const kB = sumKeyOf(P, [1, 3, 2])
+  yes(kA === kB, '整节课：页集合**排序去重**后算同一个键（1,2,3 和 1,3,2 是同一件事）')
+  yes(sumKeyOf(P, [1, 2]) !== sumKeyOf(P, [1, 2, 3]), '★ 整节课：换一批页 → 换键（**页集合漏出键外时这里会红**，那正是 2026-09 的那个 bug）')
+  yes(sumKeyOf(P, [1, 2]).includes('1,2'), '整节课：键里看得见是哪几页（不是只留个数）')
+  yes(sumKeyOf(P, [1, 1, 2]) === sumKeyOf(P, [1, 2]), '整节课：重复的页算同一批（去重）')
+  yes(sumKeyOf(P, [0, -1, 2]) === sumKeyOf(P, [2]), '整节课：0 和负页号不算页（页号 1 起）')
+
+  /* ── ③ kind 必须进键（历史 bug ②）── */
+  yes(sumKeyOf(P, [1, 2], 'docsum') !== sumKeyOf(P, [1, 2], 'rules'), '★ 整节课：提纲和须知是两个键（**漏了它，须知就显示成提纲的六段**）')
+  yes(SUM_KINDS.includes('docsum') && SUM_KINDS.includes('rules'), '整节课：两张卡的名字是那一个模块常量（别处不写裸字符串）')
+
+  /* ── ④ 路径要进键（否则清一份会误伤别的一份）── */
+  yes(sumKeyOf(P, [1, 2]) !== sumKeyOf(P2, [1, 2]), '整节课：两份课件的两个键不同')
+
+  /* ── ⑤ 「重新生成」按前缀清：清这一份 = 这两份课件互不误伤 ── */
+  yes(sumKeyHead(P).startsWith(sumKeyHead(P2)) === false, '前缀：两份课件的前缀不同（清 A 不会删到 B）')
+  yes(sumKeyOf(P, [1, 2], 'rules').startsWith(sumKeyHead(P)), '★ 前缀：须知那条键也归这一份（前缀**不含 kind** ⇒「↻ 重新生成」把两张都清了，这是要的）')
+  yes(sumKeyOf(P2, [1], 'rules').startsWith(sumKeyHead(P)) === false, '前缀：B 的键不在A 的前缀里')
+  /* 页号非法 / 空页集合也要算得出一个键（不许抛）—— 清缓存那条路会遍历它们。 */
+  yes(typeof sumKeyOf(P, []) === 'string' && sumKeyOf(P, []).length > 0, '整节课：空页集合也算得出键（不抛）')
 }
 
 console.log('\n' + '─'.repeat(56))

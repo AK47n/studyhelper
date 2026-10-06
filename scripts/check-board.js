@@ -8,10 +8,13 @@
  */
 import {
   CARD_FONTS, CARD_FONT_IDS, CARD_FIT_MIN_W, CARD_MAX_SCALE, CARD_MAX_W, CARD_MIN_H,
-  CARD_MIN_SCALE, CARD_MIN_W, DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE, DEFAULT_CARD_SIZE, TEXT_CARD_MAX_W,
-  TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y, cardHeightFromContent, cardWidthFromContent, clampCardScale,
-  fontCss, isBoardDocument, isBoardName, newBoard, newCard, linkId, newFrameId,
-  newStroke, nextCardScale, normalizeFrames, normalizeLinks, parseBoardDocument, serializeBoardDocument, textCardRect,
+  CARD_MIN_SCALE, CARD_MIN_W, CARD_PROVENANCE, CARD_PROVENANCE_KEYS, BOARD_VERSION,
+  DEFAULT_CARD_FONT, DEFAULT_CARD_SCALE,
+  DEFAULT_CARD_SIZE, TEXT_CARD_MAX_W, TEXT_CARD_LINE_H, TEXT_CARD_MIN_W, TEXT_CARD_PAD_Y,
+  cardHeightFromContent, cardProvenance, cardWidthFromContent, clampCardScale,
+  fontCss, isBoardDocument, isBoardName, isDeckLevelCard, newBoard, newCard, linkId, newFrameId,
+  newStroke, nextCardScale, normalizeFrames, normalizeLinks, parseBoardDocument, provenanceLabel,
+  serializeBoardDocument, textCardRect,
   liveNodeIdFn, liveNodesOf,
 } from '../src/lib/board.js'
 /* 点 / 几何 / 关系搬去了 geometry.js（2026-09-16 架构 review 的 C5）；
@@ -88,7 +91,7 @@ import {
 import { CLIPBOARD_VERSION, copySelection, isPayload, pastePayload, payloadCount } from '../src/lib/clipboard.js'
 /* 常用形状规整（画个圆 → 变成真正的圆）在 shapes.js ——
    "该认的必须认得 + 该拒的必须拒"两批一起钉，见 [6x]。 */
-import { fitShape, recognizeShape, recognizeShapeObject, recognizeStrokes, regularizeStrokes, shapeLabel } from '../src/lib/shapes.js'
+import { fitShape, recognizeShape, recognizeShapeObject, recognizeStrokes, regularizeStrokes, shapeLabel, MIN_DIAG, AUTO_SHAPE_MIN_DIAG } from '../src/lib/shapes.js'
 import {
   bakeShapePoints,
   normAngle,
@@ -3685,6 +3688,16 @@ console.log('\n[6x] 常用形状规整（`shapes.js`）：画个圆 → 变成�
     eq(recognize([300, 300, 0.5, 312, 316, 0.5, 308, 330, 0.5]), null, '★ 很短的一勾认不出来（MIN_DIAG 那道闸）')
   }
 
+  /* ── ②bis两道闸的**取值**必须一样（Board.jsx:1657 注释里承诺过这条）───────
+   * ★ 这条断言 2026-10-06 才补上 —— 它在注释里被承诺了半年，而全仓grep 零处。
+   *   判读层那道（`shapes.js` 的 `MIN_DIAG`，**抽稀之后**算）
+   *   和调度层那道（`Board.jsx` 的 `AUTO_SHAPE_MIN_DIAG`，**抽稀之前**粗算）
+   *   是有意的两道闸，**不是重复** —— 但取值必须相等：
+   *     · 调大调度那道 → 本该被认成图形的短笔画永远排不上定时器（**行为 bug**，用户看不出来）；
+   *     · 调小调度那道 → 排了定时器、判读又挡掉（白跑一趟，不报错，调参的人会以为自己改的是同一道闸）。
+   *   两个方向都不报错，所以只能靠一条断言钉住。 */
+  eq(AUTO_SHAPE_MIN_DIAG, MIN_DIAG, '★ 调度层的粗筛阈值 = 判读层的闸（AUTO_SHAPE_MIN_DIAG 必须等于 MIN_DIAG）')
+
   /* ── ③ 两道采样密度闸（真板上量出来的，见 shapes.js 里那段注释）──────────────
    * ★ 这一条是**真板上 42 笔误判的直接产物**：那批是 12~19 点、20~30px 的碎笔迹，
    *   因为点太少、拟合毫无约束，全拿到 score = 1.000。
@@ -4037,6 +4050,32 @@ console.log('\n[6x] 常用形状规整（`shapes.js`）：画个圆 → 变成�
         }
         eq(near >= 3, true, '★ ★ 对象里的顶点**就是屏幕上画出来那三个**（两套顶点会让图形拖一下就跳）')
       }
+    }
+
+    /* (c2) ★ 三角形的顶点必须带**绝对坐标**（2026-10-06 加）。
+     *   判读层 `fitTriangle` 拿的是 `normalize` **归一化之后**的 `pts`（点被平移到原点了），
+     *   而 `withOffset` 给每个对外字段补 `ox/oy` —— `box`、`cx`、`a`/`b` 都补了。
+     *   ⚠ 漏补 `verts` 的话，三个顶点会留在**板原点附近**而包围盒在它真正的位置：
+     *     图形一落板就跳到左上角，**不报错**（`shape.t` 有三个数，一切看着正常）。
+     *   上面那条断言挡不住这个—— 它比的是"两处同源的结果"，同源之后它就自己比自己了。
+     *   这条断言落在**绝对位置**上：三角形画在 (500,300) 一带（远离原点），
+     *   顶点就必须在 (500,300) 一带，不能在 (0,0)。 */
+    {
+      const V = [[500, 300], [620, 320], [560, 430]]
+      const off = tri(V[0], V[1], V[2])
+      const r = recognize(off)
+      eq(r && r.kind, 'triangle', '(c2) 画在远处的三角形照样认出来')
+      const v0 = r && r.verts && r.verts[0]
+      /* ⚠ 这里断言的是"**远离原点**"，不是"精确等于 500/300"——
+       *   顶点取自**原笔迹**（`tri` 夹具带抖动），所以 496/296.5 才是对的；
+       *   而"归一化坐标漏补偏移"会给出0~5 那一带。两件事差着 500 个世界像素，
+       *   用容差（±20）既能抓住那个错，又不会在抖动 ±4 的范围内假红。 */
+      eq(v0 && Math.abs(v0.x - 500) < 20 && Math.abs(v0.y - 300) < 20, true,
+        '(c2) ★ 顶点带绝对坐标（500,300 一带）—— 没被留在板原点')
+      const objOff = recognizeShapeObject(mkStroke(off))
+      const t0 = objOff && objOff.t && objOff.t[0]
+      eq(t0 && Math.abs(t0[0] - 500) < 20 && Math.abs(t0[1] - 300) < 20, true,
+        '  (c2) ★ 对象层同样是绝对坐标（没回退到原点）')
     }
 
     /* (d) 缩放：分轴 → 圆变椭圆、正方形变长方形。这正是"修正真正形状"那句话的意思。 */
@@ -5111,6 +5150,190 @@ console.log('\n[19] 公式架（已经认过的公式收成一条随手可取用
   eq(shelfItems(null), [], 'null → 空（不崩）')
   /* 认过但还没渲染出来的（只有 src）：照样上架 —— 手打的那种卡也是"我已经有的公式"。 */
   eq(shelfItems([card('f5', 0, 0, 'v = \\lambda f', '')]).length, 1, '只有 src 的也上架')
+}
+
+/* ══════════════ 出处标记（`CARD_PROVENANCE`）：一个字段 = 两张白名单 = 一处判据 ══════════════
+ *
+ * 这一族字段（提纲 `sum` / 做题须知 `rules` / 答案卡 `answer`）2026-10-06 之前**抄了三遍**：
+ *   `board.js` 的 normalize 白名单、`board.js` 的 serialize 白名单、
+ *   `homework.js` 里的 `isDeckLevelCard` + 猜标签那行。
+ * 而"漏抄一处"的后果全是**静默**的：文件里看不出这张卡是提纲、提纲被当成某一页的卡
+ * 混进知识点、答案卡被当下节课讲过的东西喂回给模型 —— 界面全都不报错。
+ *
+ * 所以下面这几条**不是测行为**，是测"那三处真的只剩一处了"。
+ */
+{
+  /* ① 清单本身是平的、键不重、每项都写清楚了它是哪张卡。 */
+  eq(Array.isArray(CARD_PROVENANCE), true, 'P1 `CARD_PROVENANCE` 是一张清单（不是几个散着的常量）')
+  eq(CARD_PROVENANCE.length > 0, true, 'P2 清单不是空的')
+  eq(new Set(CARD_PROVENANCE_KEYS).size, CARD_PROVENANCE_KEYS.length, 'P3★ 清单里没有重复的键（重复会让 serialize 写两次同一字段）')
+  for (const p of CARD_PROVENANCE) {
+    eq(typeof p.key === 'string' && p.key.length > 0, true, `P4 ${p.key}：有键名`)
+    eq(typeof p.what === 'string' && /[^　\s]/.test(p.what), true, `P5 ${p.key}：写了它是哪张卡（${p.what}）`)
+    eq(typeof p.why === 'string' && p.why.length > 20, true, `P6 ${p.key}：写了"为什么非要有这个字段"（少了它下次有人会当冗余删掉）`)
+  }
+  eq(CARD_PROVENANCE_KEYS, CARD_PROVENANCE.map((p) => p.key), 'P7 键数组就是清单按顺序 map 出来的（没有第二份手抄的键名）')
+
+  /* ② 严格 true —— 这一族闸的**全部**内容。`"false"` / `1` / `"true"` 都不算。
+     ⚠⚠ 测试数据**必须**写成 `{ ...newCard('note', 0, 0), [k]: true }`：
+       `newCard` 自己也是一道白名单（它只认 CARD_KINDS / CARD_FONTS 那几个），
+       把 `[k]` 塞进它的 `extra` 里会被**当场夹掉** —— 板上的提纲是 Board.jsx
+       `placeDeckCards` 那样"先建卡再展开标记"才建出来的。
+       这个坑本身就是这一族要收拢的理由之一：三个写入点都得知道"标记得单独展开"。 */
+  const readCard = (raw) => parseBoardDocument(JSON.stringify({ version: BOARD_VERSION, title: 't', cards: [raw] })).cards[0]
+  for (const k of CARD_PROVENANCE_KEYS) {
+    const yes = { ...newCard('note', 0, 0, { text: 'x' }), [k]: true }
+    const n = readCard(yes)
+    eq(n[k], true, `P8 ${k}: true → 认（读盘那一层）`)
+    eq(cardProvenance(n), k, `P9 ${k}★ cardProvenance 认出它带的是哪个出处`)
+    /* 手改文件最可能写成的三个"半真"值。 */
+    eq(readCard({ ...yes, [k]: 'true' })[k], false, `P10 ${k}: 字符串 "true" 不算（手改文件写错了不该反转语义）`)
+    eq(readCard({ ...yes, [k]: 1 })[k], false, `P11 ${k}: 数字 1 不算`)
+    eq(readCard({ ...yes, [k]: 'false' })[k], false, `P12 ${k}★ 字符串 "false" 不算 —— 这是最毒的一个：真值判断会把它当成"是"`)
+  }
+
+  /* ③ serialize 那一侧：只有真的时候才写，老文件因此一个字节都不动。
+     ⚠ `serializeBoardDocument` 返回的是**存盘的文本**（不是对象），所以判据是
+       "那句话里有没有那个字段名"，而不是 `out.cards[0][k]`。 */
+  for (const k of CARD_PROVENANCE_KEYS) {
+    const plain = newCard('n1', 0, 0, { text: '手写笔记' })
+    const text1 = serializeBoardDocument({ title: 't', cards: [plain] })
+    eq(new RegExp(`"${k}"`).test(text1), false,
+      `P13★ ${k}: 普通卡片存出去**一个字节都不多**（否则每次存盘都让老文件在 Git 里变脏）`)
+    const tagged = { ...newCard('n2', 0, 0, { text: '提纲' }), [k]: true }
+    const text2 = serializeBoardDocument({ title: 't', cards: [tagged] })
+    eq(new RegExp(`"${k}"\\s*:\\s*true`).test(text2), true, `P14 ${k}: 带标记的卡原样写出去`)
+    /* 往返：写出去再读回来，标记还在 —— normalize / serialize 两侧认的是同一份清单，
+       漏一处的话这里就红（这一族原来是手抄的两遍，抄漏的表现就是这个）。 */
+    const back = parseBoardDocument(text2, 'x')
+    eq(back && back.cards[0] && back.cards[0][k], true, `P15★★ ${k}: 存→读 往返后标记还在（两侧漏一处的话，这里就红）`)
+  }
+
+  /* ④ 板层判据：`isDeckLevelCard` 只认提纲/须知，**不认**答案卡。 */
+  eq(isDeckLevelCard({ sum: true }), true, 'P16 提纲是整节课那一层的')
+  eq(isDeckLevelCard({ rules: true }), true, 'P17 做题须知是整节课那一层的')
+  eq(isDeckLevelCard({ answer: true }), false, 'P18★ 答案卡**不是**整节课那一层的（它是「留到板上」落的答案，不进提纲/须知那一趟）')
+  eq(isDeckLevelCard({ kind: 'note', rich: true, text: '学生自己写的' }), false, 'P19 学生在页面左边写的一条普通笔记不算 —— 这正是这一趟最不该误伤的东西')
+  eq(isDeckLevelCard({ kind: 'note', sum: 'true' }), false, 'P20 严格闸：字符串 "true" 不算（否则一张手写笔记会被当提纲丢掉）')
+  eq(isDeckLevelCard(null), false, 'P21 null 不崩')
+
+  /* ⑤ 判据吃的是**板层字段**，不是条目层的 kind —— 混用恒为假（一个已记过的静默 bug）。 */
+  eq(isDeckLevelCard({ kind: 'summary' }), false, 'P22★ 对板层卡判条目层的 kind（"summary"）恒为假 —— homework.js 原来手抄时踩过这一类')
+  eq(isDeckLevelCard({ kind: 'rules' }), false, 'P23 同上（"rules"）')
+
+  /* ⑥ 人话标签：界面上给卡片标小字、提示词里分段都用它。 */
+  eq(provenanceLabel('sum'), '提纲', 'P24 sum → 提纲')
+  eq(provenanceLabel('rules'), '做题须知', 'P25 rules → 做题须知')
+  eq(provenanceLabel('answer'), '答案卡', 'P26 answer → 答案卡')
+  eq(provenanceLabel('sumcard'), 'sumcard', 'P27 认不出的键原样返回（宁可显示个怪词，也不要静默显示空）')
+  eq(provenanceLabel(null), '', 'P28 没带标记 → 空串（调用方自己决定"没有"怎么写）')
+
+  /* ⑦ 源码扫描：**三处抄写必须真的只剩清单那一处**。
+     ⚠ 扫的是"这份清单在哪儿被展开"（`CARD_PROVENANCE_KEYS` 的用法），
+       不是"变量名长什么样" —— 变量名是实现细节，谁用那份清单才是约定
+       （C2 那次栽过：扫变量名，改个名就假红，而代码是对的）。
+     ⚠⚠ 扫之前必须先**剥掉注释和字符串**：这一族的历史（"和 sum 同一个套路的第二例"）
+       在注释里写得很详细，而那些说明文字恰好长得像代码 —— 我第一版直接扫整份文件，
+       三条断言全部被注释命中、假红。判据扫的是"**代码**里还有没有第二份实现"。 */
+  const codeOnly = (path) =>
+    readFileSync(new URL(path, import.meta.url), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '') // 块注释
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1') // 行注释（不碰 URL 里的 //）
+      .replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""') // 字符串字面量
+  const boardSrc = codeOnly('../src/lib/board.js')
+  const hwSrc = codeOnly('../src/lib/homework.js')
+  for (const [n, s] of [['board.js', boardSrc], ['homework.js', hwSrc]]) {
+    /* ⚠⚠ 判据不能只盯 `sum|rules|answer` 那三个字面量：我反证时让"有人加了个新出处
+       `deck` 但手抄了一行"，只盯名单的旧版判据**一条都没红**。
+       但也不能扫**所有** `某键: 卡[某键] === true` 的形状 —— `locked` / `rich` / `answer`
+       那些**合法**的同形状写法会被误报。
+       ⇒ 两条合起来正好判得准：**列在 `CARD_PROVENANCE` 里的键**不许手写（它们必须
+         来自清单）；**不在清单里**的同形状键也不许出现在 normalize 的白名单里
+         （那说明有人加了个出处却忘了进清单 —— 这才是"新增第四例漏同步"的样子）。 */
+    const handWritten = [...s.matchAll(/(\w+)\s*:\s*c\.(\w+)\s*===\s*true/g)]
+      .filter((m) => m[1] === m[2])
+      .map((m) => m[1])
+    const inList = (k) => CARD_PROVENANCE_KEYS.includes(k)
+    eq(handWritten.filter(inList).length, 0,
+      `P30★ ${n} 没手写清单里那几项（${CARD_PROVENANCE_KEYS.join('/')} 必须从 CARD_PROVENANCE 展开）`)
+    /* "加了个新出处但没进清单"的形状。⚠ 只在 **normalizeCard** 那段里查
+       （整个文件里 `locked`/`rich` 等合法同形状很多），段界用 CARD_PROVENANCE 展开那行当锚。 */
+    const normStart = s.indexOf('function normalizeCard')
+    const normSeg = normStart >= 0 ? s.slice(normStart, normStart + 2500) : ''
+    const stray = [...normSeg.matchAll(/(\w+)\s*:\s*c\.(\w+)\s*===\s*true/g)]
+      .filter((m) => m[1] === m[2] && !inList(m[1]))
+      .map((m) => m[1])
+      .filter((k) => !['locked', 'rich', 'viewPinned'].includes(k)) // 这几个不是"出处标记"，是别的闸
+    eq(stray.length, 0,
+      `P35★★ ${n} 的 normalizeCard 里没有"清单外的出处标记"（${stray.join('/') || '无'}）—— 加出处标记的唯一入口是 CARD_PROVENANCE`)
+    /* serialize 那一侧：只看那个 `...( … : {} )` 的展开段。 */
+    const handWritten2 = [...s.matchAll(/c\.(\w+)\s*===\s*true\s*\?\s*\{/g)].map((m) => m[1])
+    eq(handWritten2.filter(inList).length, 0,
+      `P31★ ${n} 没手写"卡[清单里的键] === true ? { … }"（serialize 那一侧必须从清单展开）`)
+  }
+  /* board.js 是清单的家，它自己必须真的在用（normalize + serialize 两处，
+     两处写法不同：一个 map、一个 filter 后再 map —— 所以判"用了几次"而不是"哪种写法"）。 */
+  const provUses = boardSrc.split('CARD_PROVENANCE_KEYS').length - 1
+  eq(provUses >= 3, true,
+    'P29★ board.js 至少三处提到 CARD_PROVENANCE_KEYS（清单自己 + normalize 的白名单 + serialize 的白名单）')
+
+  /* ⑧ ★★ 「导出的阈值常量必须真的被用着」—— 一条通用护栏。
+   *
+   * 起因（2026-10-06，核实架构 review 的 C7 时撞到）：`shapes.js` 里有个
+   * `SEG_TOL_DEG = 24`，注释写得极认真（"调小会让手抖被数成角，调大会漏掉平角"），
+   * 但**文件内零使用** —— 切点是 `fitCorners` 的 DP 按"误差 + 复杂度惩罚"选的，
+   * 压根不比较角度。⇒ **注释承诺了一个旋钮，旋钮接在空气上**：谁照注释去调它，
+   * 一个字节都不会变，而且不报错。
+   * 比 C6 那个病更毒：C6 承诺的是"自检里有一条对着比"（缺了无害），
+   * 这个承诺的是"改这个数能改行为"（缺了就是改它是白改）。
+   *
+   * 判据：每个 `export const <名字>` 必须在本文件里**被引用过**。
+   * ⚠ 剥注释再扫 —— 这族常量的注释里全是"调 X 会怎样"，写得详细、
+   *   而且**长得像代码**，不剥会把自己写的历史当成引用（那就永远绿了）。
+   * ⚠ 只扫 `const`：函数导出（`export function foo`）的"被引用"往往是自检在用，
+   *   那是正当的；这里只管**数值旋钮**这一类 —— 它们一旦没人用，注释就是纯误导。
+   */
+  const shpSrc = readFileSync(new URL('../src/lib/shapes.js', import.meta.url), 'utf8')
+  const shpCode = shpSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  const shpConsts = [...shpCode.matchAll(/^export const (\w+)/gm)].map((m) => m[1])
+  /* ⚠⚠ 判据必须扫**全仓**，不能只看 shapes.js 自己（第一版就写成只看本文件，
+       立刻把 `AUTO_SHAPE_MIN_DIAG` 误判成死的 —— 它是 C6 刚加的、
+       真正用它的在 `Board.jsx`。"没人用"说的是没人**用**，不是在哪个文件里。
+     ⚠ 剥注释再扫 —— 这族常量的注释全是"调 X 会怎样"，写得详细、
+       而且**长得像代码**，不剥会把自己写的历史当成引用（那就永远绿了）。 */
+  const repoCode = [
+    shpCode,
+    ...['src/components/Board.jsx', 'src/lib/board.js', 'src/lib/homework.js', 'src/lib/selection.js', 'src/lib/clipboard.js']
+      .map((f) => {
+        try {
+          return readFileSync(new URL('../' + f, import.meta.url), 'utf8')
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+        } catch {
+          return ''
+        }
+      }),
+  ].join('\n')
+  const deadThresholds = shpConsts.filter((k) => (repoCode.match(new RegExp(`\\b${k}\\b`, 'g')) || []).length < 2)
+  eq(deadThresholds.length, 0,
+    `P37★★ shapes.js 没有任何"导出但全仓都没人用"的数值旋钮（${deadThresholds.join('/') || '无'}）—— 一个没人用的旋钮，它的注释就是在骗人：照着调行为不会变，且不报错`)
+  /* 反证（陈年旧事，不留着就会被重新"优化"掉）：曾经有过 SEG_TOL_DEG。 */
+  ok(/export const CORNER_MIN_TURN = 26/.test(shpCode)
+    && !/export const SEG_TOL_DEG/.test(shpSrc),
+    'P38 那个"接在空气上的旋钮"SEG_TOL_DEG 不在了（方向容差认 CORNER_MIN_TURN 一处 —— 删掉它的理由写在那个常量的注释里）')
+
+  /* homework.js 不许自己再判一遍"是不是整节课那一层"。 */
+  eq(/function isDeckLevelCard/.test(hwSrc), false,
+    'P32★ homework.js 不再自己定义 isDeckLevelCard（它从 board.js 引那份 —— 一个"这张卡是提纲吗"只准有一个答案）')
+  /* ⚠ 这里用**没剥字符串**的原文查 import：上面的 codeOnly 把 `'./board.js'` 这个
+     路径连同引号一起替换成了 `""`，于是"从 board.js 引的"这条判据永远为假
+     —— 判据自己把自己否掉了（第一版就这么写的，报红后才发现）。 */
+  const hwRaw = readFileSync(new URL('../src/lib/homework.js', import.meta.url), 'utf8')
+  const hwImportLine = (hwRaw.split('\n').find((l) => /^\s*import\b/.test(l) && l.includes('isDeckLevelCard')) || '').replace(/\/\*[\s\S]*?\*\//g, '')
+  eq(/from '\.\/board\.js'/.test(hwImportLine), true, 'P33 homework.js 确实是从 board.js 引的（不是从别处）')
+  /* ⚠ 别为了"统一"把条目层和板层搞混：homework.js 引 doc-summary.js 的 isSummary 会恒为假。 */
+  eq(/is(Summary|ItemDeckLevel|Rules)\b/.test(hwSrc), false,
+    'P34★ homework.js 不引 doc-summary.js 的那些谓词（它们吃条目层的 kind，混用判据恒为假 —— 静默把提纲当成某一页的卡）')
 }
 
 // ═════════════════════ 结果 ═════════════════════

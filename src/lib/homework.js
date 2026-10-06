@@ -31,6 +31,14 @@
  */
 import { ORIGIN_GAP, SIDE_W } from './doc-cards.js'
 import { pageRects } from './docs.js'
+/* ★ 出处标记的判据住在 `board.js`（那一族的唯一清单 `CARD_PROVENANCE` 也在那儿）。
+   以前这一族判据在本文件里**手抄**了一遍（`c.sum === true || c.rules === true`），
+   而 `board.js` 那两张白名单又各抄了一遍 —— 同一个"这张卡是提纲吗"答了三遍。
+   ⚠ 成环检查过：`board.js` 不引本文件，所以引它安全。
+   ⚠ 但**别**改成引 `doc-summary.js` 的 `isSummary` / `isDeckLevel`：那两个吃的是
+     **条目层**的 kind（课件整理还没落板时的 `items[]`），板层卡的 kind 是 'note'，
+     混用判据恒为假、表现是"提纲照旧被当成某一页的卡混在中间"（静默）。 */
+import { cardProvenance, isDeckLevelCard, provenanceLabel } from './board.js'
 
 /** 工具条上那颗按钮上的字（自检靠它找按钮；改字别只改 JSX）。只有一处。 */
 export const HW_BUTTON = '✎ 作业辅导'
@@ -314,23 +322,11 @@ function isLessonCard(c) {
   /* ★ 答案卡不算"这节课讲过的东西"：它是「留到板上」落下来的**上一题的答案**，
      和课件整理贴上去的讲解长得一模一样（都是 `rich` 的文字卡）—— 带进来就是让模型抄自己
      （第二题的答案里混着第一题的解法，而且它会一路攒下去）。
-     出处是独立字段 `answer`（和 sum/rules 同一个套路，Board.jsx 的 keepAnswer 写上去的）。 */
+     出处是独立字段 `answer`（`CARD_PROVENANCE` 那一族里的第三个，见 board.js）。 */
   if (c.answer === true) return false
   if (c.kind === 'note') return c.rich === true && !!String(c.text || '').trim()
   if (c.kind === 'formula') return c.locked === true && !!String(c.src || c.tex || '').trim()
   return false
-}
-
-/* 这一张是不是"整节课那一层"的卡（提纲 / 须知）。
- * ★ 判据是卡上的**出处字段**（`sum` / `rules`）—— 和 Board 那边
- *   "认亲不动 kind"同一条（板层的 kind 只有 formula/note 两种，出处写在独立字段上）。
- * ⚠ **不要**用位置判（"它没贴在任何一页旁边"）：板书上一条普通笔记也可能落在页面左边，
- *   而那正是这一趟最不该误伤的东西（它是学生自己写的）。
- * ⚠ 也不要在这里 import doc-summary.js 的 `isSummary`：那两个谓词吃的是**条目层**
- *   的 kind（`'summary'`/`'rules'`），而这里手里拿到的是**板层的卡**（它们的 kind 是 'note'）。
- *   两层混用会让判据永远为假 —— 而表现是"提纲照旧被当成某一页的卡混在中间"（静默）。 */
-function isDeckLevelCard(c) {
-  return !!c && (c.sum === true || c.rules === true)
 }
 
 /* 一张卡属于**哪一份资料的哪一页**：按位置判（卡片是贴着页面摆的，位置就是它唯一的关联）。
@@ -479,7 +475,7 @@ export function collectKnowledge(cards = [], docs = [], { path = '', maxChars = 
   for (const it of picked.filter((x) => x.deck)) {
     const body = bodyOf(it.card)
     if (!body) continue
-    const label = it.card.rules === true ? '做题须知' : '提纲'
+    const label = provenanceLabel(cardProvenance(it.card))
     const block = `\n<${label}>\n${body}\n`
     if (cap && deckUsed + block.length > deckCap) {
       deckDropped += 1

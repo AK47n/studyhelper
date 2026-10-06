@@ -61,6 +61,21 @@ import { retargetStroke, shapeFromRecognized } from './shape-object.js'
    世界坐标像素。下面很多判据要先过这一关，不然一小段噪声的相对误差可以任意大。 */
 export const MIN_DIAG = 26
 
+/* ★ **调度**那一层的同一道闸（收笔停顿半秒 → 排一次判读）。
+ *
+ * 为什么要另有一个数：判读那道是在**抽稀之后**算的，而调度要的是"这一笔够不够大到
+ * 值得排一次判读"—— 得按**抽稀前**的点粗算一遍，于是"笔画短横"在**排定时器之前**
+ * 就被挡掉（一秒里画十笔，就少排十次判读）。
+ * ⚠⚠ 所以它**必须和 `MIN_DIAG` 相等**，而它在这里写成从 `MIN_DIAG` 推出来的 ——
+ *   不是又抄一份字面量（抄的那份 2026-10-06 才被拆掉：它住在 `Board.jsx` 里，
+ *   注释写着"自检里有一条对着比"，而全仓 grep 零处 —— 一个不存在的保护）。
+ *   两个方向都不报错：
+ *     · 调大 → 本该认成图形的短笔画永远排不上定时器（**行为 bug**，用户看不出来）；
+ *     · 调小 → 排了定时器、判读又挡掉（白跑一趟，不报错）。
+ *   `check-board.js` 有一条断言钉住这两个相等。
+ */
+export const AUTO_SHAPE_MIN_DIAG = MIN_DIAG
+
 /* ★★ 一笔至少要**这么多点**才谈得上"是个形状"。这一条是拿用户的真板量出来的。
  *
  * ⚠⚠ 为什么非要它（这是本轮踩出来的第二个大坑）：光看"够不够长"根本不够。
@@ -254,16 +269,26 @@ export const LINE_MAX_AREA = 0.03
 export const LINE_TYPICAL_AREA = 0.011
 export const LINE_TYPICAL_TURN = 18
 
-/* 多边形的"角"的判据：顶点处两侧方向的夹角（外角）至少要这么大才算一个真拐角，
-   比这小的当成手抖（不造就近顶点）。 */
+/* ★ 多边形的"角"的判据：顶点处两侧方向的夹角（外角）至少要这么大才算一个真拐角，
+     比这小的当成手抖（不造就近顶点）。
+     ★ **这个 26° 就是"方向容差"本身** —— 「一条边走偏 26° 才承认拐了」。
+       手画直线的来回抖实测 3°~8°（见上面 `LINE_TYPICAL_TURN` 那段），
+       所以直边不会被劈开；而直角是 90°、三角形的角 40°~120°，都远超它。
+     ⚠ 调小会让手抖被数成角（矩形被切成五个六个角）；
+       调大会让"画得很平的角"被漏掉（三角形算成一条折线）。
+     ⚠⚠ 改它之前先读这一段（2026-10-06 删掉过一个 `SEG_TOL_DEG = 24`）：
+       那条注释写的是**一模一样**的量（"分段判这里是不是角的方向容差"），
+       连"手抖 3°~8°"这句都是同一份测量 —— 但那个数**文件内零使用**，
+       切点是 `fitCorners` 的 DP 按"误差 + `CORNER_PENALTY`"选的，压根不比较角度。
+       ⇒ 也就是说：**注释承诺了一个旋钮，旋钮接在空气上** ——
+         照它去调 24 那个数，一个字节都不会变，而且不报错
+         （和 C6 那条"承诺了自检里有一条对着比"同一个病，但更毒：
+           C6 那条缺了无害，这条缺了就是"改它是白改"）。
+         所以宁可不留一个假的旋钮 —— 角度容差认这一处（`CORNER_MIN_TURN`，
+         用在 `fitTriangle` / `fitRect` 的 `min(turns) < 26` 那两处）就够了。
+         ⚠ 若哪天真要**在分段里**也判方向（不是分段后判），那时才需要一个新常数，
+           到时候在这里定义，并**当场接上** + 补一条对着比的自检。 */
 export const CORNER_MIN_TURN = 26 // 度
-
-/* ★ 分段判"这里是不是一个角"的方向容差（度）。
- *   24° = 一条边走偏了 24° 才承认拐了 —— 手画直线的来回抖通常 3°~8°，
- *   所以不会把直边劈开；而直角是 90°、三角形的角 40°~120°，都远超它。
- *   ⚠ 调小会让手抖被数成角（矩形被切成五个六个角）；
- *     调大会让"画得很平的角"被漏掉（三角形算成一条折线）。 */
-export const SEG_TOL_DEG = 24
 
 /* 一段至少要有几个点才算一段（防"在同一个点附近切好几刀"）。 */
 export const MIN_SEG_PTS = 3
@@ -976,7 +1001,29 @@ function fitTriangle(pts) {
   if (perim > 0 && pathLen(pts) / perim > 1.9) return null
 
   const score = clamp01(1 - Math.abs(sum - 360) / (360 * 0.25))
-  return { kind: 'triangle', box, score, closed: true, turns, cuts: f.cuts }
+  /* ★★ 三角形的三个顶点**在这里交出去**（2026-10-06）。
+   *   它们是这一族图形的**身份** —— 图形长什么样、尖在哪，只有用户自己的笔知道，
+   *   判读的时候就已经找到了（`fitCorners` 给的角下标 + 接缝那个角就是笔的起点）。
+   *   ⚠ 之前顶点**不在判读结果里**，于是谁要顶点谁就自己再算一遍：
+   *     `fitShape`（规整成点）和 `recognizeShapeObject`（落成图形）**各算一遍**，
+   *     两处一字不差，而文件自己在另一处写着「两次计算的结果**必然相同**……
+   *     改这里任何一条时，另一处必须一起看」。
+   *     漏一处的表现是"图形拖一下手柄就跳到另一个位置"（`shape-object.js` 文件头记着这个症状）。
+   *   现在顶点是判读结果的一部分，那份重复和那条警告一起删掉。 */
+  const verts = triangleVerts(f, pts)
+  return { kind: 'triangle', box, score, closed: true, turns, cuts: f.cuts, verts }
+}
+
+/** 三角形的三个顶点 = `fitCorners` 找到的角 + **接缝那个角**（它就是笔的起点 `pts[0]`）。
+ *  ⚠ 接缝那个角必须补回来：不补的话三个顶点里会缺"首尾相接"那一个 ——
+ *    而那恰恰是用户画三角形时**最后收笔**的地方，位置是准的。
+ *  @returns {Array<[number,number]>|null} 挑不出来就null（调用方退回按包围盒画）
+ */
+function triangleVerts(f, pts) {
+  if (!f || !f.corners || !f.corners.length) return null
+  let verts = f.corners.map((i) => pts[i]).filter(Boolean)
+  if (f.seam) verts = [pts[0], ...verts]
+  return verts.length === 3 ? verts : null
 }
 
 // ─────────────────────────────── 圆 / 椭圆 ───────────────────────────────
@@ -1233,6 +1280,13 @@ function withOffset(s, n) {
     o.cy = s.cy + n.oy
   }
   if (s.box) o.box = { x: s.box.x + n.ox, y: s.box.y + n.oy, w: s.box.w, h: s.box.h }
+  /* ⚠⚠ 三角形的顶点**也要补偏移**（2026-10-06 踩到）。
+   * `fitTriangle` 里算 verts 用的是**归一化之后**的 `pts`（`normalize` 把点平移到原点了），
+   * 而这一层每个对外的字段都在补 `ox/oy` —— 漏了 `verts` 的话，三角形的三个顶点
+   * 会留在**板原点附近**，而包围盒在它真正的位置：图形一落板就跳到左上角。
+   * ⚠ 别用"直接调`fitCorners(toPoints(...))`取原笔迹坐标"来绕开：那正是 2026-10-06 删掉的那份重复，
+     而它和这里必须给出**同一个**结果（`normalize` 只平移、不缩放，所以补回偏移就相等）。*/
+  if (s.verts) o.verts = s.verts.map((v) => ({ x: v.x + n.ox, y: v.y + n.oy }))
   return o
 }
 
@@ -1314,18 +1368,13 @@ export function fitShape(stroke, shape) {
     /* ★ 三角形的三个顶点**从原笔迹里取**，不是从包围盒推。
        理由：包围盒推出来的三个点是一个"固定的"三角形（比如正三角/等腰），
        而用户画的那个三角形长什么样、尖在哪，只有他自己的笔知道。
-       直接用判读时找到的那三个角（fitCorners 给出的点下标）——
-       那是**尊重原笔**的做法：规整的是"边直不直、角清不清楚"，
-       不是"换成我认定的那个三角形"。
-       ⚠ 之前这里是"从包围盒四角里挑最接近的三个再回头找原笔的点"，绕了两圈；
-         fitCorners 已经把角的位置算准了，直接取就行。 */
-    const src = toPoints(stroke && stroke.points)
-    const f = fitCorners(src, MAX_SEG, true)
-    let verts = f && f.corners ? f.corners.map((i) => src[i]).filter(Boolean) : null
-    /* ★ 接缝那个角要补回来：它就是笔的起点（pts[0]）。
-       不补的话，一个三角形的三个顶点里会缺"首尾相接"那一个 ——
-       而那恰恰是用户画三角形时最后收笔的地方，位置是准的。 */
-    if (verts && f.seam) verts = [src[0], ...verts]
+       那三个角是**判读的时候**找到的（`fitCorners` 给的点下标 + 接缝那个角 = 笔的起点），
+       现在由判读结果直接交出来（`shape.verts`，见 `fitTriangle`）——
+       ⚠ 2026-10-06 之前这里是**自己再算一遍** `fitCorners`，和 `recognizeShapeObject`
+         那段一字不差；而对象层同样自己算了一遍。于是"屏幕上画出来的顶点"和
+         "对象层拿到的顶点"是两套，拖一下手柄图形就跳到另一个位置。
+         现在两边都读**同一次判读**交出来的 `shape.verts`，那份重复删掉了。 */
+    const verts = shape.verts
     if (!verts || verts.length !== 3) {
       /* 挑不出来就退回"按包围盒画一个直角三角形" —— 比什么都不做强，
          但这条分支**不该发生**（判读已经确认有三个角了）。 */
@@ -1427,15 +1476,12 @@ export function regularizeStrokes(strokes) {
 
 /* ── 判读结果 → **可以缩放/旋转的图形对象**（`shape-object.js` 的 `shapeFromRecognized`）──
  *
- * ★ 为什么不直接在 `recognizeShape` 的返回值上补一个 `verts` 完事：
- *   因为**三角形的顶点不在判读结果里**。`fitTriangle` 只给包围盒和三个角的下标，
- *   真正的三个顶点是 `fitShape` 现场从原笔迹里取的（见它那段"尊重原笔"）。
- *   于是"对象层拿到的那三个顶点"和"屏幕上画出来的那三个顶点"必须来自**同一处**，
- *   否则拖一下手柄，图形会跳到另一个位置上（两套顶点，必然差一次更新）。
- *   ⇒ 这一个函数就是那一处：它把 `fitShape` 用的那份顶点**再算一遍、交给调用方**
- *     （`fitShape` 内部也算一遍，但那一次的结果已经变成点了 —— 这里要的是参数）。
- *   ⚠ 两次计算的结果**必然相同**：同一份 `pts`、同一个 `MAX_SEG` / `true`、
- *     同一个 `src[0]` 补缝逻辑。改这里任何一条时，`fitShape` 里那一段必须一起看。
+ * ★ 三角形的顶点**由判读层交出来**（2026-10-06 改，见 `fitTriangle` 里那段）：
+ *   `recognizeShape` 的返回值上带着 `verts`，所以这一层**只搬运、不重算**。
+ *   ⚠ 之前这里是"再算一遍 `fitCorners`、再补一遍接缝"，和 `fitShape` 里那段一字不差 ——
+ *     而"两套顶点"的表现是**拖一下手柄图形就跳到另一个位置**
+ *     （`shape-object.js` 文件头记着这个症状）。
+ *   ⇒ 现在"屏幕上画出来的那三个顶点"和"对象层拿到的那三个顶点"来自**同一次判读**。
  *
  * ★ 认不出的形状或取不到参数 → **返回 null**（那一笔就只是一条普通笔迹，
  *   不带 `shape` 字段、没有手柄）。宁可少一个手柄，也不许造一个"和屏幕上那一笔
@@ -1444,12 +1490,10 @@ export function recognizeShapeObject(stroke, recog) {
   const r = recog || recognizeShape(stroke)
   if (!r) return null
   if (r.kind === 'triangle') {
-    const src = toPoints(stroke && stroke.points)
-    const f = fitCorners(src, MAX_SEG, true)
-    let verts = f && f.corners ? f.corners.map((i) => src[i]).filter(Boolean) : null
-    if (verts && f.seam) verts = [src[0], ...verts]
-    if (!verts || verts.length !== 3) verts = null
-    return shapeFromRecognized({ ...r, verts })
+    /* 判读没交出顶点（理论上不会 —— `fitTriangle` 一定给）就当这一笔认不出来，
+       不在这里退回"自己算一遍"：宁可少一个手柄，也不要两套顶点。 */
+    if (!r.verts || r.verts.length !== 3) return null
+    return shapeFromRecognized(r)
   }
   return shapeFromRecognized(r)
 }

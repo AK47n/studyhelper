@@ -139,7 +139,7 @@ export function FormulaShelf({ items, onUse, onDrop, onClose }) {
    ③ 弹层用 `position: absolute` 挂在这一组里 —— **别用 fixed**：
      `.bd-tools` 有 `backdrop-filter`（毛玻璃），fixed 后代的包含块会被它劫持
      （公式架影子卡那个坑，见上面 FormulaShelf 里的长注释）。 */
-export function Toolbar({ tool, setTool, onPickArrow, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onAsk, onLook, onGather, onInsertDoc, docBusy, deckBusy, docs = [], onReadDeck, onHomework, onUnlockAll, onResetGestures, onPaste, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen, shelfOpen, shelfCount, onToggleShelf, onHelp }) {
+export function Toolbar({ tool, setTool, onPickArrow, color, setColor, width, setWidth, paper, onPaper, onWriteFormula, onBeautify, onAsk, onLook, onGather, onInsertDoc, docBusy, deckBusy, docs = [], onReadDeck, onHomework, onCharts, onUnlockAll, onResetGestures, onPaste, onUndo, onRedo, canUndo, canRedo, onFit, onZoom, scale, onScale, onScaleReset, dirty, fullscreen, onToggleFullscreen, shelfOpen, shelfCount, onToggleShelf, onHelp }) {
   const [moreOpen, setMoreOpen] = useState(false)
   const moreRef = useRef(null)
 
@@ -379,6 +379,14 @@ export function Toolbar({ tool, setTool, onPickArrow, color, setColor, width, se
             <button className="bd-t" data-tool="gather" onClick={() => onGather()}
               title="收拢成笔记：卡片/板框/连接拣成草稿 + 整板手写由机器转录成文字（有手写时要几十秒；没配识别密钥就只收卡片）">
               ▤ 收成笔记
+            </button>
+            {/* 📈 实验图（2026-10-05）：一周一次的实验报告要用几十张图，
+                而那些图现在是"一张一张让 AI 画 → 下载 → 打印 → 剪下来贴"。
+                这里一次管完，最后一页纸打出来。
+                ★ 它**不出网**（数据是你的、算术是本机的），所以不放进上面"出网"那一组。 */}
+            <button className="bd-t" data-tool="charts" onClick={onCharts}
+              title="实验图：把测到的数据粘进去 → 点 + 拟合线，几十张一次管完 → 一页 A4 打出来剪了贴（每张 58mm 宽、一页 15 张）。斜率和不确定度会印在每张图下面">
+              📈 实验图
             </button>
             <div className="bd-more-h">看这块板</div>
             {/* 🔓 全部解开：课件整理贴的讲义卡一律先钉住（Board.jsx 贴卡那条 ★★），

@@ -263,6 +263,18 @@ const fails = await withBoard(
         滚动只是**准备**，命中照样用真鼠标 + elementFromPoint 验。
        ⚠ 这段注释活在**模板字符串里面**：这儿不许出现反引号（会把模板当场截断，
          报的是 "SyntaxError: missing ) after argument list"）。 */
+    /* 找到那颗按钮，量它的中心，验真鼠标点得到。
+     * ⚠⚠ 这一条**长期报红**（2026-10-06 核实：git 回到改动前重跑、报红一字不差，
+     *   所以与那轮的收拢无关）。真因是**测法**：`open()` 只等 `.topbar` 挂上，
+     *   而工具条里的按钮**还要再排一次版**才有尺寸；那一刻立刻去量，
+     *   `getBoundingClientRect()` 全是 0 → 中心落在 (0,0) →
+     *   `elementFromPoint` 命中左上角的 brand → 报成"按钮点不到"（**按钮其实好好的**），
+     *   后面 7 条全被它带塌。
+     *   我试过"等它量出非零矩形"，结果变成"找不到那颗按钮"（等 8 秒仍然 0×0，
+     *   工具条大概在那个视口下把这一颗收进了别的容器）—— 两种报法都是红的，
+     *   都不是真相。⚠ **没有查清之前别把它改成"通过"**：宁可红着，
+     *   也不要一条自己把假红解释成绿的断言。
+     *   真相大概在"视口宽度下工具条把哪些按钮收起来了"，待查。 */
     const rectOfText = (sel, text) =>
       s.eval(`(() => {
         for (const b of document.querySelectorAll(${JSON.stringify(sel)})) {

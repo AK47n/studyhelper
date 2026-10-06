@@ -358,6 +358,60 @@ export function pageGapFor(blockH, rectH) {
   return h > r ? Math.max(0, Math.ceil(h + PAGE_PUSH - (r + DOC_PAGE_GAP))) : 0
 }
 
+/** ★ 「这一页多占的那点空」这一笔的**唯一**实现（2026-10-06 从三处收拢到这儿）。
+ *
+ * ── 为什么要收（和 C1 同一个病）────────────────────────────────────────
+ *   `pageGaps` 那笔账有三个入口（`projectDeck` 贴讲解、`placeDeckCards` 落讲解卡、
+ *   `keepAnswer` 留答案卡），每一处都要做**同样三件事**：
+ *     ① 并进文件里已经写着的那个值 —— **只涨不缩**（地占下了就留着）；
+ *     ② 算出每页**涨了多少**（`pageGaps` 记的是"多高"，不记"谁因此被推下去"）；
+ *     ③ 把后面那些页上**已经在板上**的卡片按同样的量往下挪。
+ *   三处各写一遍的后果不是"啰嗦"，是**2026-09-23 那个真 bug**（第 37 页涨 418、
+ *   第 38 页那 5 张卡当场错位，文件里一切正常）：第三步最容易漏，而漏了**不报错**。
+ *   ⚠ 真的已经漏过一次：留答案卡那处算 delta 时用的是 `const deltas = []` +
+ *     `deltas[n-1] = delta`，即**稀疏数组** —— 而 `pageGapDeltas` 上面那段注释
+ *     恰恰写着"稀疏数组的 `.length` 不等于页数，第一版写错过"。同一个陷阱有两个入口。
+ *
+ * @param {number} was  文件里这一页**已经写着的**空（0 / 垃圾值 / 负数都当 0）
+ * @param {number} want 这一笔想让这一页有多少空（0 = 不动它）
+ * @returns {{keep:number, delta:number}}
+ *   `keep` = 并完之后该写的值；`delta` = 涨了多少（**只涨不缩**，所以恒 ≥ 0）。
+ */
+export function mergePageGap(was, want) {
+  const lo = Math.max(0, Number(was) || 0)
+  const hi = Math.max(0, Number(want) || 0)
+  const keep = hi > lo ? hi : lo
+  return { keep, delta: keep - lo }
+}
+
+/**
+ * 整份 `pageGaps` 的同一笔账（`mergePageGap` 的批量版，**稠密**）。
+ *
+ * @param {Array<number>} was  文件里已经写着的（`[]` = 没整理过）
+ * @param {Array<number>} want 这一笔想让每一页有多少空（可以稀疏：没给的格子当 0 = 不动）
+ * @returns {{gaps:Array<number>, deltas:Array<number>, grew:boolean}}
+ *   · `gaps`   并完之后该写进文件的那份（0 的格子不写，保持稀疏 —— 和旧文件一样干净）
+ *   · `deltas` 每页涨了多少，**稠密且长度 = max(两份的长度)**，
+ *               可以直接喂 `shiftLaterPageCards`（它要按下标做前缀和，
+ *               稀疏的话 `.length` 不等于页数，第 3 页该挪多少就算不出来）
+ *   · `grew`   到底有没有涨 —— 调用方靠它决定"这次要不要把 `pageGaps` 写回文件"
+ */
+export function growPageGaps(was, want) {
+  const a = Array.isArray(was) ? was : []
+  const b = Array.isArray(want) ? want : []
+  const n = Math.max(a.length, b.length)
+  const gaps = []
+  const deltas = new Array(n)
+  let grew = false
+  for (let i = 0; i < n; i += 1) {
+    const m = mergePageGap(a[i], b[i])
+    if (m.keep > 0) gaps[i] = m.keep
+    deltas[i] = m.delta
+    if (m.delta > 0) grew = true
+  }
+  return { gaps, deltas, grew }
+}
+
 /**
  * 这一份资料的每一页、左右两栏里**已经有的东西**占到哪儿了（世界坐标的底边）。
  *
@@ -648,14 +702,13 @@ export function projectDeck({ pages = [], sizes = null, rects = [], sideW = SIDE
          否则"整理过的资料"会整体多出一点缝，和没整理过的看起来不一样（假 diff 的来源）。
        推的量 = 高出来的部分 + 一点缝，减去这一页本来就有的页间距。 */
     const blockH = Math.max(r.h, leftH, rightH)
-    /* 这一页最后该有多少空 = 算出来的和**文件里已经写着的**取大的那个
-       （调用方也是这么并的：`pageGaps` 只涨不缩 —— 地占下了就留着）。
-       ⚠ 两件事必须一起做：报出去的 `pageGaps` 是 `keep`，而 `shift` 累加的是
-          `keep - was` 这个**增量**。写成 `shift += extra` 就是上面那个加两遍的 bug。 */
-    const was = Math.max(0, Number((existing && existing[n - 1]) || 0) || 0)
-    const keep = Math.max(was, pageGapFor(blockH, r.h))
+    /* 这一页最后该有多少空 = 算出来的和**文件里已经写着的**取大的那个。
+       ★ 「只涨不缩」那笔账在 `mergePageGap` 里（全仓唯一实现）——
+         报出去的 `pageGaps` 是 `keep`，而 `shift` 累加的是 `keep - was` 这个**增量**。
+         ⚠ 写成 `shift += extra` 就是上面那个"加两遍"的 bug（把已经含着的空又加一次）。 */
+    const { keep, delta } = mergePageGap(existing && existing[n - 1], pageGapFor(blockH, r.h))
     if (keep > 0) pageGaps[n - 1] = keep
-    if (keep !== was) shift += keep - was
+    shift += delta
   }
 
   const bounds = cards.length

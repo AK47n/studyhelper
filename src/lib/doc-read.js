@@ -83,7 +83,19 @@ export const DOC_PAGE_BYTES_EST = 250 * 1024
 
 const memCache = new Map()
 
-const cacheKey = (path, page) => CACHE_PREFIX + DOC_FLAVOR + '|' + path + '|' + page
+/** ★ 逐页那一趟的缓存键 —— **导出**，是为了让自检能直接断言它（2026-10-06）。
+ *
+ *  为什么必须可测：这一族出过**两次静默错**，两次都是**键的形状**错了 ——
+ *   ① 提纲那一趟把**页集合漏在键外**：先读 1、3 存一份，再读 1、2 时直接命中那份旧的、
+ *      一个请求都不发 ⇒ 屏幕上显示的是"上 3 页的提纲"，有内容、不报错、也不说它是旧的；
+ *   ② 键里**不带 kind**：两张卡（提纲 / 做题须知）输入长得一模一样，
+ *      先算的那张把后算的盖掉 ⇒ 须知显示成提纲的六段，同样不报错。
+ *  这两处都在 `sumKeyOf` 那一族（见下），而它们此前是**私有的**：
+ *  `scripts/` 里零处引这个文件，所以那两次只有真浏览器自检撞出来过。
+ *  ⚠ 导出的不是"缓存"（缓存那个 Map 仍然私有、不导出），
+ *    而是**"怎么算出一个键"这个纯函数** —— 它才是该被断言的那件事。
+ */
+export const cacheKey = (path, page) => CACHE_PREFIX + DOC_FLAVOR + '|' + path + '|' + page
 
 function cacheGet(path, page) {
   const k = cacheKey(path, page)
@@ -332,8 +344,18 @@ const SUM_CACHE_PREFIX = 'sh.docsum.'
  *    和**前端 kind 名**共用的那一个字符串。 */
 export const SUM_KINDS = ['docsum', 'rules']
 
-/** 这一趟的缓存键：路径 + 那一趟读的页（排序去重）+ **是哪一张卡** + 口径号。 */
-function sumKeyOf(path, pages, kind = 'docsum') {
+/** 这一趟的缓存键：路径 + 那一趟读的页（排序去重）+ **是哪一张卡** + 口径号。
+ *
+ *  ★ **导出**，是为了让自检能直接断言它（2026-10-06）—— 理由和 `cacheKey` 那条一样：
+ *    这一族出过两次静默错（页集合漏在键外 / 键里不带 kind），而它此前是私有的，
+ *    `scripts/` 零处引这个文件 ⇒ 两次都只有靠真浏览器自检撞出来。
+ *  ⚠ 键里**必须**有的三样，每一样都对应一个已经踩过的坑：
+ *    · **页集合**（排序去重）—— `1,2` 和 `2,1` 是同一件事；漏了它 = 换一批页直接命中旧的；
+ *    · **kind** —— 两张卡输入一样，漏了它 = 后算的盖掉先算的；
+ *    · **口径号** —— 提示词改了而键没改 = 老稿照样命中（界面看着像"没改成功"）。
+ *    这三条现在由 `check-doc-read.js` 一条一条钉住。
+ */
+export function sumKeyOf(path, pages, kind = 'docsum') {
   const set = [...new Set((pages || []).map(Number).filter((n) => n > 0))].sort((a, b) => a - b)
   const flavor = kind === 'rules' ? RULES_FLAVOR : SUM_FLAVOR
   return SUM_CACHE_PREFIX + String(path) + '|' + (set.length ? set.join(',') : '-') + '|' + flavor
@@ -343,7 +365,14 @@ function sumKeyOf(path, pages, kind = 'docsum') {
  *  页集合有无数种，只能按前缀扫）。
  *  ★ 前缀**不含 kind**（两张卡共用 `sh.docsum.` 这个头）：于是"重新生成"那一颗
  *    按钮顺手把两张都清了 —— 那正是要的（点它的人意思是"这次算出来的我不信"）。 */
-function sumKeyHead(path) {
+/** 这一份课件的**所有**整节课缓存共用的前缀（`forgetSummary` 按它扫着删）。
+ *  ★ **导出**是为了让自检能断言"清这一份不会误伤别的东西"（见 `check-doc-read.js`）。
+ *  ⚠ 前缀**不含 kind** —— 两张卡共用：于是「↻ 重新生成」顺手把两张都清了，
+ *    那正是要的（点它的人意思是"这次算出来的我不信"）。
+ *  ⚠ 前缀**必须含路径**，否则清 A 的提纲会顺手删掉 B 的（键里后面还有页集合和口径号，
+ *    少了路径这一段，前缀就变成了"整盘"）。
+ */
+export function sumKeyHead(path) {
   return SUM_CACHE_PREFIX + String(path) + '|'
 }
 

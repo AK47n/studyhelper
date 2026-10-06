@@ -41,6 +41,7 @@ import QuickLook from './QuickLook.jsx'
    ⚠ 它和「课件整理」是两件事：整理是老师讲他的（一页一遍、贴到板上），
      辅导是老师做**你的**题（你点哪几道就哪几道，答案浮在窗里、板上一个字节不动）。 */
 import HomeworkBox from './HomeworkBox.jsx'
+import ChartBox from './ChartBox.jsx'
 /* 「这本书有几百页，我只要那几页」—— 问页码的小窗（2026-09-21）。
    ⚠ 它是浮层那一族的新成员（回车 / Esc 关），所以这两个键不许漏到画布上去。 */
 import DocPagePicker from './DocPagePicker.jsx'
@@ -52,7 +53,7 @@ import { HW_BUTTON } from '../lib/homework.js'
    讲解贴右边、重点和公式贴左边。
    ⚠ 这个文件里**不解析模型的话、也不摆版** —— 那两件事在 doc-cards.js（纯函数、有自检）；
      渲染那一趟在 doc-read.js。这里只做三件本地的事：量尺寸、摆版、写盘。 */
-import { SIDE_W, cardText, columnOccupancy, makeMeasureHost, measureDeck, pageGapDeltas, pagesLabel, planAnswerCard, projectDeck, shiftLaterPageCards } from '../lib/doc-cards.js'
+import { SIDE_W, cardText, columnOccupancy, growPageGaps, makeMeasureHost, measureDeck, pagesLabel, planAnswerCard, projectDeck, shiftLaterPageCards } from '../lib/doc-cards.js'
 /* 整节课那一层（提纲 + 做题须知）那一半：判据（`isDeckLevel` / `SUMMARY_KIND` / `RULES_KIND`）
    和它们自己的摆位（`placeDeckCard` —— 两张**共用同一个摆位函数**，一上一下排开）。
    **它们不在 doc-cards.js 里** —— 那一份是"一页一课"的，整节课那两张是"一节课一张卡"，
@@ -122,7 +123,7 @@ import { copySelection, isPayload, pastePayload, payloadCount } from '../lib/cli
 /* 常用形状规整（画个圆 → 变成真正的圆）在 shapes.js —— 纯几何，不碰界面。
    ★ 它和 ADR-0001 砍掉的"形状判读"是什么关系，写在那个文件的**第一段注释**里，
      动手改之前先看那一段（那里也写着这条功能的铁律：宁可认不出来，也不许认错）。 */
-import { recognizeStrokes, regularizeStrokes } from '../lib/shapes.js'
+import { recognizeStrokes, regularizeStrokes, AUTO_SHAPE_MIN_DIAG } from '../lib/shapes.js'
 /* 图形对象那一族（"认出来之后怎么缩放/旋转/重开还在"）——
    和上面 `shapes.js` 是两件事，见那个 module 的文件头。
    ★ 2026-09-21 之后这里只剩**问句**：`shapeName`（形状的人话名字）、
@@ -1653,12 +1654,15 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
    *   `MIN_DIAG = 26`，但那是在**抽稀之后**算的。这里先按抽稀前的点粗算一遍，
    *   是为了让"一个笔画短横"在**调度**那一层就被挡掉，连定时器都不排
    *   （一秒里画十笔，就少排十次判读）。
-   *   ★ 它和 `shapes.js` 的 `MIN_DIAG` **必须一样**（自检里有一条对着比）：
-   *     不一样的话，会出现"排了定时器、判读又把它挡掉"这种白跑的中间地带 ——
-   *     不报错，只是白白多跑一趟，而且调参的人会以为自己改的是同一道闸。
+   *   ★ 它和 `shapes.js` 的 `MIN_DIAG` **必须一样**，而这两个数**现在住在同一个地方**
+   *     （`shapes.js` 的 `AUTO_SHAPE_MIN_DIAG`，它自己就是从 `MIN_DIAG` 推的）：
+   *     不一样的话有两个方向，**都不报错** ——
+   *       · 调度那道调大 → 本该认成图形的短笔画永远排不上定时器（行为 bug）；
+   *       · 调度那道调小 → 排了定时器、判读又挡掉（白跑一趟，调参的人会以为改的是同一道闸）。
+   *     `check-board.js` 有一条断言钉住这两个相等（这条断言 2026-10-06 才补上 ——
+   *     在那之前这里写着"自检里有一条对着比"，而全仓 grep 零处）。
    */
   const AUTO_SHAPE_MS = 550
-  const AUTO_SHAPE_MIN_DIAG = 26
 
   /* 唯一那个待办：{ id, timer }。 */
   const autoShapeRef = useRef(null)
@@ -3040,6 +3044,8 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
      `hwTarget` = 这一次是从**框住的那一块**进来的（非空 = {docId, doc, page, region}）。
      见下面「作业辅导」那一节。 */
   const [hwOpen, setHwOpen] = useState(false)
+  /* 实验图那个窗口（2026-10-05）。和 hwOpen 同一族：都是"一次性的窗口、不碰板"。 */
+  const [chOpen, setChOpen] = useState(false)
   const [hwDoc, setHwDoc] = useState('')
   const [hwTarget, setHwTarget] = useState(null)
 
@@ -3531,16 +3537,16 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           没记"谁因此被推下去"）。判据和挪法都在 `shiftLaterPageCards`。 */
     let shiftedMoved = 0
     commit((cur) => {
-      const keep = Array.isArray(d.pageGaps) ? d.pageGaps.slice() : []
-      for (let i = 0; i < plan.pageGaps.length; i += 1) {
-        const g = Number(plan.pageGaps[i]) || 0
-        if (g > 0) keep[i] = Math.max(Number(keep[i]) || 0, g) // **只涨不缩**：地占下了就留着
-      }
-      const shifted = shiftLaterPageCards({ cards: cur.cards || [], docPath: d.path, deltas: pageGapDeltas(keep, d.pageGaps) })
+      /* ★★★「这一页多占的空」这一整笔账（只涨不缩 + 算增量 + 挪后面的卡）
+         在 `doc-cards.js` 的 `growPageGaps` / `shiftLaterPageCards` 里，全仓唯一实现。
+         这里只负责"把算出来的东西写进 board 这一份 doc"—— 判据一个字都不许在这里另写。 */
+      const was = Array.isArray(d.pageGaps) ? d.pageGaps : []
+      const { gaps, deltas, grew } = growPageGaps(was, plan.pageGaps)
+      const shifted = shiftLaterPageCards({ cards: cur.cards || [], docPath: d.path, deltas })
       shiftedMoved = shifted.moved
       return {
         ...cur,
-        docs: (cur.docs || []).map((x) => (x.id === d.id && keep.some((v) => v > 0) ? { ...x, pageGaps: keep } : x)),
+        docs: (cur.docs || []).map((x) => (x.id === d.id && grew ? { ...x, pageGaps: gaps } : x)),
         cards: [...shifted.cards, ...fresh],
       }
     })
@@ -3689,12 +3695,17 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
           ⇒ `shiftLaterPageCards` 把那些卡按**同样的增量**挪一遍（判据是卡片自己
              `ask.page`，见那个函数的说明）。这一笔必须和 `pageGaps`、和这张新卡
              **在同一个 commit 里**，否则中间那一帧就是错的版面。 */
-    const was = Math.max(0, Number((Array.isArray(d.pageGaps) ? d.pageGaps : [])[n - 1]) || 0)
-    const gap = Math.max(was, Number(plan.pageGap) || 0)
-    const delta = gap - was
-    /* 交给 `shiftLaterPageCards` 的"涨了多少"：**只有这一页**涨了（这一笔只动第 n 页）。 */
-    const deltas = []
-    if (delta > 0) deltas[n - 1] = delta
+    /* ★★★ 这一笔也走 `growPageGaps`（全仓唯一实现，同 `placeDeckCards` 那处）。
+       ⚠⚠ 旧写法是 `const deltas = []; deltas[n-1] = delta` —— **稀疏**，
+       而 `shiftLaterPageCards` 要按下标做**前缀和**（第 n 页该挪前面所有页涨的那些之和）：
+       稀疏数组的 `.length` 不等于页数，它只在这一处恰好成立（n 恰好是唯一那个下标），
+       换个场景（一次涨两页）就会漏。现在由 `growPageGaps` 保证稠密。 */
+    const was = Array.isArray(d.pageGaps) ? d.pageGaps : []
+    /* 这一笔只动第 n 页：想要的那份只有第 n 页有值，其余格子空着 = 不动它们。 */
+    const wantOne = []
+    wantOne[n - 1] = Number(plan.pageGap) || 0
+    const { gaps, deltas, grew } = growPageGaps(was, wantOne)
+    const delta = deltas[n - 1] || 0
     /* ⚠ `moved` 是在 commit 的**回调**里拿到的（它读的是 `cur.cards`，那一刻的板），
        而 `commit` 是同步的 —— 所以回调返回之后这个变量一定已经填好了，
        下面那句 flash 读得到。别把它改成"commit 之前先算一遍"：那等于读两次板，
@@ -3705,13 +3716,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
       shiftedMoved = shifted.moved
       return {
         ...cur,
-        docs: (cur.docs || []).map((x) => {
-          if (x.id !== d.id) return x
-          if (!(gap > 0)) return x
-          const keep = Array.isArray(x.pageGaps) ? x.pageGaps.slice() : []
-          keep[n - 1] = gap
-          return { ...x, pageGaps: keep }
-        }),
+        docs: (cur.docs || []).map((x) => (x.id !== d.id || !grew ? x : { ...x, pageGaps: gaps })),
         cards: [...shifted.cards, fresh],
       }
     })
@@ -4207,6 +4212,7 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
          ★ 两条入口（工具条 + 选区浮层）走的是**同一个** `openHomework` ——
            你正框着题号的话，它顺手把那一块带进窗里。 */
       onHomework={openHomework}
+      onCharts={() => setChOpen(true)}
       /* 「🔓 全部解开」：见 unlockAllCards 那条注 —— 196 张钉住的讲义卡一次全开。 */
       onUnlockAll={unlockAllCards}
       /* 「⟲ 恢复操作」：见 resetGestures 那条注 —— 手势没收尾时用它，不用刷新页面。 */
@@ -4416,6 +4422,9 @@ export default function Board({ file, initialText, reloadToken, onSave, flash, s
               （哪一份、第几页、哪一块、什么内容），落不落、落在哪儿由 `keepAnswer` 决定。
           ⚠ 挂在 `.bd` 里、`.bd-stagewrap` 的**兄弟**位置：画布那一层 overflow: hidden，
             挂进去会被裁掉半截；而且它是"看的方式"，不是纸上的内容（和询问框、公式架同一族）。 */}
+      {/* 实验图那个窗口（2026-10-05）：一次管几十张图，最后一页 A4 打出来。
+          和 HomeworkBox 一样**不碰板**（它拿不到 board，图集是自己的文件）。 */}
+      {chOpen && <ChartBox onClose={() => setChOpen(false)} flash={flash} />}
       {hwOpen && (
         <HomeworkBox
           docs={board.docs || []}

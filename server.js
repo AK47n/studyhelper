@@ -26,7 +26,7 @@ import { docExtOf, isDocPath } from './src/lib/docs.js'
 import { HW_MAX_PAGES } from './src/lib/homework.js'
 /* 导出：**依赖被关在 server-export.js 里**（那个文件才 import katex）。
    server.js 自己的底线是"没有任何第三方依赖"，别在这儿直接 import 排版模块。 */
-import { exportNoteHtml, warmUp as warmUpExport } from './server-export.js'
+import { exportNoteHtml, makeChartPdf, warmUp as warmUpExport } from './server-export.js'
 import { collectFontFiles } from './src/lib/fonts.js'
 import {
   EXPORT_DIR,
@@ -1273,7 +1273,112 @@ async function handleApi(req, res, url) {
     })
   }
 
+  /* ── 实验图（2026-10-05）─────────────────────────────────────────────
+     一次实验报告要几十张图，那些图**不是板的一部分**（板是一节课的笔记），
+     所以它们自己一个文件：`data/.图表/<图集名>.json`。
+     整份读写（不是一页一个文件）—— 一份就是一次报告，一次讲完一起存，
+     不存在"两个人同时改一半"那种事（那才是讲稿要拆成一页一文件的原因）。
+     ⚠ 名字不许带路径分隔符：`safeName` 那道闸是"别让它写到 data/ 外面去"。 */
+  if (p === '/api/charts') {
+    const dir = path.join(DATA_DIR, '.图表')
+    if (req.method === 'GET') {
+      const rel = String(url.searchParams.get('name') || '')
+      if (!rel) {
+        /* 没给名字 = 只要一份"存过哪些"的清单，顺便把**最近改过**的那个放第一个
+           （打开窗口时默认接着上次的那个继续）。 */
+        let names = []
+        try {
+          names = fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith('.json'))
+            .map((f) => ({
+              n: f.slice(0, -5),
+              t: (() => {
+                try {
+                  return fs.statSync(path.join(dir, f)).mtimeMs
+                } catch {
+                  return 0
+                }
+              })(),
+            }))
+            .sort((a, b) => b.t - a.t)
+            .map((x) => x.n)
+        } catch {
+          names = [] // 目录还不存在 = 一份都没存过，那不是错误
+        }
+        return sendJson(res, 200, { ok: true, names, last: names[0] || '' })
+      }
+      if (!safeName(rel)) return sendJson(res, 400, { error: '图集名里有不能用的字符（别带斜杠）' })
+      try {
+        const t = fs.readFileSync(path.join(dir, rel + '.json'), 'utf8')
+        return sendJson(res, 200, { ok: true, data: JSON.parse(t) })
+      } catch {
+        /* 读不出来（还没有 / 坏了）不是错误 —— 窗口那边会当成"从头开始"。 */
+        return sendJson(res, 200, { ok: true, data: null })
+      }
+    }
+    /* 出 PDF：这几张图 → 一页 A4（上下排），下载下来直接打印。
+       ⚠ 依赖（pdf-lib + 字体）关在 server-export.js 里 —— server.js 本身仍然零依赖。
+       ⚠⚠ **必须排在存盘那个 POST 前面**：存盘那支看的是"有 name、有 charts"就存，
+          它先吃掉的话 `as=pdf` 永远走不到 —— 症状是"下载下来的是一个 {ok:true}"。 */
+    if (req.method === 'POST' && String(url.searchParams.get('as') || '') === 'pdf') {
+      const rel = String(url.searchParams.get('name') || '').trim()
+      let o = null
+      try {
+        o = JSON.parse((await readBody(req)) || '{}')
+      } catch {
+        return sendJson(res, 400, { error: '不是合法 JSON' })
+      }
+      const charts = o && Array.isArray(o.charts) ? o.charts : null
+      if (!charts) return sendJson(res, 400, { error: '没有图' })
+      try {
+        const bytes = await makeChartPdf(charts, { title: rel || '实验图' })
+        /* ⚠ 文件名是中文：`Content-Disposition` 得用 RFC 5987 那套编码，
+           直接把中文塞进去，浏览器会存成一个乱七八糟的名字（或者干脆叫 download.pdf）。 */
+        const fn = encodeURIComponent((rel || '实验图') + '.pdf')
+        return send(res, 200, Buffer.from(bytes), {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename="chart.pdf"; filename*=UTF-8''${fn}`,
+          'Cache-Control': 'no-store',
+        })
+      } catch (e) {
+        return sendJson(res, 400, { error: String(e && e.message ? e.message : e) })
+      }
+    }
+    if (req.method === 'POST') {
+      const rel = String(url.searchParams.get('name') || '').trim()
+      if (!rel) return sendJson(res, 400, { error: '还没给这份图集起名字' })
+      if (!safeName(rel)) return sendJson(res, 400, { error: '图集名里有不能用的字符（别带斜杠）' })
+      let o = null
+      try {
+        o = JSON.parse((await readBody(req)) || '{}')
+      } catch {
+        return sendJson(res, 400, { error: '这份图集不是合法 JSON' })
+      }
+      const charts = o && Array.isArray(o.charts) ? o.charts : null
+      if (!charts) return sendJson(res, 400, { error: '没有图（charts 不是数组）' })
+      /* 几十张图、每张几十个点，撑死几百 KB；给个宽松的口子挡"拿它当网盘"就够。 */
+      const text = JSON.stringify({ charts })
+      if (text.length > 4000000) return sendJson(res, 400, { error: '这份图集太大了' })
+      try {
+        await fsp.mkdir(dir, { recursive: true })
+        await fsp.writeFile(path.join(dir, rel + '.json'), text, 'utf8')
+        return sendJson(res, 200, { ok: true })
+      } catch (e) {
+        return sendJson(res, 400, { error: String(e && e.message ? e.message : e) })
+      }
+    }
+  }
+
   return sendJson(res, 404, { error: '未知接口' })
+}
+
+/** 图集名：只许一个文件名该有的样子 —— 不许跑出 `data/.图表/` 这个目录。 */
+function safeName(n) {
+  const s = String(n || '').trim()
+  if (!s || s.length > 80) return false
+  if (s.includes('..') || /[\\/:*?"<>|]/.test(s)) return false
+  return s === path.basename(s)
 }
 
 /* 从 multipart/form-data 里抠出那个文件。
